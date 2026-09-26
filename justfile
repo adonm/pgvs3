@@ -110,7 +110,13 @@ ci:
     python3 -m unittest discover -s deploy/bench/suites -p 'test_osb_run.py'
     mbx build --release --locked
     mbx test --workspace
+    just contract
     just smoke
+
+# S3/DB tests against a temporary local PostgreSQL; no kind cluster required.
+[group('dev')]
+contract:
+    bash deploy/bench/contract.sh
 
 # --- kind: Postgres 18 + pgvs3 + DuckLake + Quickwit on one disk -----------
 # One command per step. Full-scale `kind-bench` runs six suites with caches on;
@@ -147,25 +153,20 @@ kind-down:
 kind-reset:
     bash deploy/kind/reset.sh
 
-# TPC-H on DuckLake through the gateway, stable DuckDB (extra = harness args).
+# TPC-H on DuckLake through the gateway (extra = harness args).
 [group('bench')]
 tpch sf="10" stack="lake-s3" extra="":
-    uv run --with "duckdb==$DUCKDB_PY_STABLE" python crates/pgvs3/tpch_bench.py --stack {{ stack }} --sf {{ sf }} --load --passes 2 {{ extra }}
-
-# TPC-H on the DuckDB 2.0 pre-release.
-[group('bench')]
-tpch2 sf="10" stack="lake-s3" extra="":
-    uv run --with "duckdb==$DUCKDB_PY_PRE" python crates/pgvs3/tpch_bench.py --stack {{ stack }} --sf {{ sf }} --load --passes 2 {{ extra }}
+    uv run --with "duckdb==$DUCKDB_PY" python deploy/bench/harness/tpch_bench.py --stack {{ stack }} --sf {{ sf }} --load --passes 2 {{ extra }}
 
 # ClickBench (43 queries) on DuckLake through the gateway.
 [group('bench')]
 clickbench stack="lake-s3" passes="3" extra="":
-    uv run --with "duckdb==$DUCKDB_PY_PRE" python crates/pgvs3/analytics_bench.py --bench click --stack {{ stack }} --download --load --passes {{ passes }} {{ extra }}
+    uv run --with "duckdb==$DUCKDB_PY" python deploy/bench/harness/analytics_bench.py --bench click --stack {{ stack }} --download --load --passes {{ passes }} {{ extra }}
 
 # SpatialBench (12 queries) on DuckLake through the gateway.
 [group('bench')]
 spatialbench sf="10" stack="lake-s3" passes="3" extra="":
-    uv run --with "duckdb==$DUCKDB_PY_PRE" python crates/pgvs3/analytics_bench.py --bench spatial --sf {{ sf }} --stack {{ stack }} --download --load --passes {{ passes }} {{ extra }}
+    uv run --with "duckdb==$DUCKDB_PY" python deploy/bench/harness/analytics_bench.py --bench spatial --sf {{ sf }} --stack {{ stack }} --download --load --passes {{ passes }} {{ extra }}
 
 # Stand up an EC2 kind rig and Aurora Serverless v2 I/O-Optimized.
 [group('rig')]

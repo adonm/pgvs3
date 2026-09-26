@@ -15,7 +15,7 @@ PG_PASSWORD=${PG_PASSWORD:-postgres}
 PG_URL=${PG_URL:-"postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:5432/pgvs3"}
 # pgbench authenticates with PGPASSWORD, not the URL.
 export PGPASSWORD="$PG_PASSWORD"
-# The harness talks to the gateway directly (DuckDB s3_endpoint, stats route).
+# The harness talks to the gateway directly (DuckDB s3_endpoint).
 QW_URL=${QUICKWIT_URL:-http://quickwit:7280}
 QW_INGEST_URL=${QUICKWIT_INGEST_URL:-$QW_URL}
 PGVS3_URL=${PGVS3_URL:-http://pgvs3:8014}
@@ -63,14 +63,11 @@ validate)
   check "postgres (pg_isready)" pg_isready -h "$PG_HOST" -U "$PG_USER"
   check "ducklake (catalog database)" psql -v ON_ERROR_STOP=1 -h "$PG_HOST" -U "$PG_USER" -d ducklake_catalog -tAc 'SELECT 1'
   check "quickwit (metastore database)" psql -v ON_ERROR_STOP=1 -h "$PG_HOST" -U "$PG_USER" -d quickwit_metastore -tAc 'SELECT 1'
-  # /healthz, not /_pgvs3/stats: the stats route is behind SigV4 (s3s
-  # rejects unsigned GETs with 403), so it is not a probe path.
   check "pgvs3 (healthz)" curl -fsS --max-time 10 "$PGVS3_URL/healthz"
   # Quickwit's REST API has no /healthz; /api/v1/cluster is the live node view.
   check "quickwit (search API)" curl -fsS --max-time 10 "$QW_URL/api/v1/cluster"
   check "quickwit (ingest API)" curl -fsS --max-time 10 "$QW_INGEST_URL/api/v1/cluster"
   check "ducklake (attach + read)" python3 /bench/suites/duck_check.py
-  check "pgvs3 (overwrite self-heal)" python3 /bench/suites/overwrite_check.py
   echo "validate: $pass passed, $fail failed"
   [ "$fail" = 0 ]
   ;;

@@ -1,12 +1,12 @@
-//! Pinned metadata cache: bucket/key -> Meta, count-capped, never evicted by
-//! byte pressure. Its only job is removing the lookup round trip per GET.
+//! Metadata cache: bucket/key -> Meta, count-capped. Its only job is removing
+//! the lookup round trip per GET.
 //!
 //! Coherence: a write through this process updates or drops its entry, and a
 //! GET that finds stale rows (missing) or a stale size (range clamped into a
 //! bogus 416) re-resolves and retries before failing. HEAD fetches metadata
 //! from PostgreSQL to avoid stale existence, size and ETag across gateways.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -50,14 +50,12 @@ fn cache() -> &'static Mutex<MetaCache> {
     C.get_or_init(|| {
         Mutex::new(MetaCache {
             map: HashMap::new(),
-            order: VecDeque::new(),
         })
     })
 }
 
 struct MetaCache {
     map: HashMap<(String, String), Meta>,
-    order: VecDeque<(String, String)>,
 }
 
 pub fn meta_get(bucket: &str, key: &str) -> Option<Meta> {
@@ -72,22 +70,15 @@ pub fn meta_get(bucket: &str, key: &str) -> Option<Meta> {
 pub fn meta_put(bucket: &str, key: &str, meta: Meta) {
     let mut c = cache().lock().unwrap();
     let k = (bucket.to_owned(), key.to_owned());
-    if c.map.insert(k.clone(), meta).is_none() {
-        c.order.push_back(k);
-        if c.map.len() > META_CAP {
-            if let Some(old) = c.order.pop_front() {
-                c.map.remove(&old);
-            }
-        }
+    if c.map.len() >= META_CAP && !c.map.contains_key(&k) {
+        c.map.clear();
     }
+    c.map.insert(k, meta);
 }
 
 pub fn meta_invalidate(bucket: &str, key: &str) {
     let k = (bucket.to_owned(), key.to_owned());
-    let mut c = cache().lock().unwrap();
-    if c.map.remove(&k).is_some() {
-        c.order.retain(|entry| entry != &k);
-    }
+    cache().lock().unwrap().map.remove(&k);
 }
 
 /// Timestamp from a `EXTRACT(EPOCH FROM ...)` float.
@@ -100,7 +91,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalidation_does_not_leave_unbounded_fifo_entries() {
+    fn invalidation_removes_metadata() {
         let bucket = "test-cache-invalidation";
         let key = "same-key";
         for _ in 0..1000 {
@@ -121,6 +112,5 @@ mod tests {
         let c = cache().lock().unwrap();
         let k = (bucket.to_owned(), key.to_owned());
         assert!(!c.map.contains_key(&k));
-        assert!(!c.order.contains(&k));
     }
 }

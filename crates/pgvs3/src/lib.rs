@@ -5,5 +5,3 @@ pub mod ingest;
 pub mod pg;
 pub mod seed;
 pub mod server;
-pub mod stats;
-pub mod warmup;

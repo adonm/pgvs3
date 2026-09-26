@@ -16,8 +16,8 @@ Benches:
 
 Examples:
   ./target/release/pgvs3 serve &                     # the gateway
-  python3 crates/pgvs3/analytics_bench.py --bench click --stack lake-s3 --download --load --passes 3
-  python3 crates/pgvs3/analytics_bench.py --bench spatial --sf 10 --stack lake-s3 --download --load
+  python3 deploy/bench/harness/analytics_bench.py --bench click --stack lake-s3 --download --load --passes 3
+  python3 deploy/bench/harness/analytics_bench.py --bench spatial --sf 10 --stack lake-s3 --download --load
 """
 
 import argparse
@@ -212,33 +212,15 @@ def main() -> None:
         print(f"[{args.stack}] load: {record['load_s']}s rows={record['rows']}")
 
     for p in range(args.passes):
-        before = benchlib.gateway_counters(benchlib.gateway_stats())
         times, errors = run_pass(con, queries, numbers, args.query_timeout or None)
-        after = benchlib.gateway_counters(benchlib.gateway_stats())
-        # Resample until both ends of the diff come from one gateway instance.
-        for _ in range(20):
-            if not (before and after and after[2] != before[2]):
-                break
-            after = benchlib.gateway_counters(benchlib.gateway_stats())
         total = sum(times.values())
         rec = {"times": times, "errors": errors}
         line = f"[{args.stack}] pass {p + 1}: total {total:.1f}s"
-        if before and after and after[2] == before[2]:
-            mib, gets = after[0] - before[0], after[1] - before[1]
-            if mib >= 0 and gets >= 0:
-                rec.update(sampled_gateway_read_mib=mib, sampled_gateway_gets=gets)
-                line += f" | one gateway: {gets} GETs, {mib} MiB (not cluster total)"
         record["passes"].append(rec)
         print(line)
         print("  " + "  ".join(f"{k}={v:.2f}" for k, v in times.items()))
         for k, v in errors.items():
             print(f"  {k}: {v}")
-
-    # Gateway telemetry (signed debug route): span histogram + GET stage
-    # counters, captured per run.
-    if st := benchlib.gateway_stats():
-        record["gateway_stats"] = st
-        print("gateway:", st)
 
     benchlib.write_record(record, args.out or f".tmp/pgvs3/{name}-{args.stack}-sf{args.sf:g}.json")
     # One compact line for the results JSONL (the pretty record goes to --out).

@@ -589,27 +589,6 @@ impl S3 for PgS3 {
     }
 }
 
-/// Debug endpoint: `GET /_pgvs3/stats` returns the cache telemetry line so
-/// harnesses snapshot it on demand (the 60s log cadence misses short runs).
-struct StatsRoute;
-
-#[async_trait::async_trait]
-impl s3s::route::S3Route for StatsRoute {
-    fn is_match(
-        &self,
-        method: &hyper::http::Method,
-        uri: &hyper::http::Uri,
-        _: &hyper::http::HeaderMap,
-        _: &mut hyper::http::Extensions,
-    ) -> bool {
-        *method == hyper::http::Method::GET && uri.path() == "/_pgvs3/stats"
-    }
-    async fn call(&self, _req: S3Request<s3s::Body>) -> S3Result<S3Response<s3s::Body>> {
-        let line = format!("{}\n", crate::stats::stage_stats_line());
-        Ok(S3Response::new(s3s::Body::from(bytes::Bytes::from(line))))
-    }
-}
-
 /// Dispatch layer: an unauthenticated health path for probes, everything else
 /// to the SigV4-protected S3 service. Kubernetes probes cannot sign requests,
 /// and `s3s` rejects them with 403 (which used to make liveness kill the pod).
@@ -684,22 +663,12 @@ fn listener_config(cfg: &ServeConfig) -> Result<(SocketAddr, Option<tokio_rustls
 
 pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
     let (addr, tls) = listener_config(&cfg)?;
-    // Best-effort performance warmup; no gateway-owned cleanup or cursor.
-    let warm = pool.clone();
-    tokio::spawn(async move {
-        match crate::warmup::prewarm_index(&warm).await {
-            Ok(Some(blocks)) => eprintln!("pgvs3: prewarmed chunk index ({blocks} blocks)"),
-            Ok(None) => eprintln!("pgvs3: chunk index exceeds 10% of shared_buffers: left cold"),
-            Err(e) => eprintln!("pgvs3: prewarm skipped: {e}"),
-        }
-    });
     let s3 = PgS3 { pool };
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(SimpleAuth::from_single(
         cfg.access_key.as_str(),
         cfg.secret_key.as_str(),
     ));
-    builder.set_route(StatsRoute);
     let service = Gateway {
         s3: builder.build(),
     };
@@ -711,13 +680,6 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
         listener.local_addr()?,
         cfg.access_key
     );
-    tokio::spawn(async {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tick.tick().await;
-            eprintln!("{}", crate::stats::stage_stats_line());
-        }
-    });
     loop {
         let (stream, peer) = listener.accept().await?;
         stream.set_nodelay(true).ok(); // no Nagle: request/response latency matters

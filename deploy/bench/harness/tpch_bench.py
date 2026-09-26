@@ -11,9 +11,9 @@ Loads with `CALL dbgen`, times every TPC-H query for `--passes` passes, and
 writes a JSON record. Example:
 
   ./target/release/pgvs3 serve &                     # the gateway
-  python3 crates/pgvs3/tpch_bench.py --stack lake-s3 --sf 10 --load
-  python3 crates/pgvs3/tpch_bench.py --stack lake-local --sf 10 --load
-  python3 crates/pgvs3/tpch_bench.py --stack plain --sf 10 --load
+  python3 deploy/bench/harness/tpch_bench.py --stack lake-s3 --sf 10 --load
+  python3 deploy/bench/harness/tpch_bench.py --stack lake-local --sf 10 --load
+  python3 deploy/bench/harness/tpch_bench.py --stack plain --sf 10 --load
 """
 
 import argparse
@@ -93,12 +93,6 @@ def main() -> None:
         total = sum(times.values())
         print(f"[{args.stack}] pass {p + 1}: total {total:.1f}s")
         print("  " + "  ".join(f"Q{q}={times[q]:.2f}" for q in queries))
-
-    # Gateway telemetry (signed debug route): span histogram + GET stage
-    # counters, captured per run.
-    if st := benchlib.gateway_stats():
-        record["gateway_stats"] = st
-        print("gateway:", st)
 
     benchlib.write_record(record, args.out or f".tmp/pgvs3/tpch-{args.stack}-sf{args.sf:g}.json")
     # One compact line for the results JSONL (the pretty record goes to --out).

@@ -61,7 +61,7 @@ for _ in $(seq 1 60); do
   if curl -fsS --max-time 1 http://127.0.0.1:18016/healthz >/dev/null 2>&1; then break; fi
   sleep 0.25
 done
-bash deploy/kind/buckets.sh http://127.0.0.1:18016 lake smoke quickwit
+bash deploy/kind/buckets.sh http://127.0.0.1:18016 lake quickwit
 kill "$forward" 2>/dev/null || true
 wait "$forward" 2>/dev/null || true
 trap - EXIT

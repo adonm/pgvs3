@@ -14,10 +14,24 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from search_bench import TS_BASE, make_doc
-
 OUT = Path(os.environ.get("OSB_OUT_DIR", "/bench/out/osb"))
 SCRIPT = Path(__file__).resolve()
+TS_BASE = 1727240000
+SERVICES = ["checkout", "cart", "search", "auth", "payments"]
+LEVELS = ["ERROR", "WARN", "INFO", "DEBUG"]
+LEVEL_WEIGHTS = [1, 2, 5, 2]
+HOSTS = ["web-03", "web-07", "web-11", "api-02"]
+MSGS = ["timeout after 100ms", "connection reset", "upstream slow", "all good"]
+
+
+def make_doc(i):
+    return {
+        "timestamp_nanos": TS_BASE + i,
+        "severity_text": random.choices(LEVELS, weights=LEVEL_WEIGHTS)[0],
+        "service_name": random.choice(SERVICES),
+        "body": {"message": random.choice(MSGS)},
+        "attributes": {"host": random.choice(HOSTS), "duration_ms": random.randint(1, 900)},
+    }
 
 
 def quickwit_json(endpoint, path):

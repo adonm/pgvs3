@@ -22,13 +22,13 @@ use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
 use crate::cache::{epoch, meta_get, meta_invalidate, meta_put, Meta};
 use crate::ingest::{IngestMsg, IngestResult, RowFramer, COPY_HEADER, COPY_SQL, SEND_BATCH};
 pub use crate::pg::Pool;
-use crate::stats::SMALL_MAX;
 
 pub const SCHEMA: &str = include_str!("../schema.sql");
 
 /// Row payload: file_id(8) + no(4) + varlena(4) + 8120 = 8136 data bytes,
 /// tuple 8160 bytes = one row per 8 KB page.
 pub const ROW_BYTES: i64 = 8120;
+const SMALL_MAX: usize = 8 << 20;
 
 /// Whole rows for a contiguous `no` range (cheaper than `= ANY` on Aurora:
 /// 1.74 vs 2.02 ms server time per warm 8 MiB span).
@@ -99,32 +99,28 @@ async fn init_locked(client: &mut Client) -> Result<()> {
             .query_typed_one("SELECT to_regclass('s3p.layout') IS NOT NULL", &[])
             .await?
             .try_get(0)?;
-        let found: Option<i32> = if marked {
-            tx.query_typed_one("SELECT max(version) FROM s3p.layout", &[])
-                .await?
-                .try_get(0)?
-        } else {
-            Some(1) // v1 predates the marker (unpartitioned s3p.chunks)
-        };
-        match found {
-            Some(v) if v == LAYOUT_VERSION => {}
-            Some(3) => {
-                // v3 allowed only one active upload per key. Dropping this
-                // constraint preserves existing uploads and object bytes.
-                tx.batch_execute("ALTER TABLE s3p.uploads DROP CONSTRAINT uploads_bucket_key_key")
-                    .await?;
-                tx.query_typed(
-                    "UPDATE s3p.layout SET version = $1",
-                    &[(&LAYOUT_VERSION, Type::INT4)],
-                )
-                .await?;
-            }
-            Some(v) => anyhow::bail!(
-                "s3p holds storage layout v{v}; this pgvs3 reads v{LAYOUT_VERSION} \
-                 (migrate the data, or point it at a fresh database)"
-            ),
-            None => anyhow::bail!("s3p.layout is empty: refusing to guess the storage layout"),
-        }
+        anyhow::ensure!(
+            marked,
+            "s3p.layout is missing: refusing to guess the storage layout"
+        );
+        let found: Option<i32> = tx
+            .query_typed_one("SELECT max(version) FROM s3p.layout", &[])
+            .await?
+            .try_get(0)?;
+        anyhow::ensure!(
+            found == Some(LAYOUT_VERSION),
+            "s3p holds storage layout {found:?}; this pgvs3 reads v{LAYOUT_VERSION} \
+             (migrate the data explicitly, or point it at a fresh database)"
+        );
+    } else {
+        let marked: bool = tx
+            .query_typed_one("SELECT to_regclass('s3p.layout') IS NOT NULL", &[])
+            .await?
+            .try_get(0)?;
+        anyhow::ensure!(
+            !marked,
+            "s3p.layout exists without chunks: refusing a partial layout"
+        );
     }
     tx.batch_execute(SCHEMA).await?;
     tx.query_typed(
@@ -353,9 +349,6 @@ pub async fn get_body(
         if len == 0 {
             return Ok(Some((smeta, PieceBody::OneShot(Bytes::new()))));
         }
-        crate::stats::span_record(len);
-        let class = usize::from(len > SMALL_MAX);
-        let t0 = std::time::Instant::now();
         // ~8 MiB of chunks queue for the response; parts buffer their own rows.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
         let pool_c = pool.clone();
@@ -363,11 +356,8 @@ pub async fn get_body(
             if let Err(e) = stream_span(&pool_c, &m, start, end, &tx).await {
                 let _ = tx.send(Err(io_err(e))).await;
             }
-            let us = t0.elapsed().as_micros() as u64;
-            crate::stats::get_record(class, us, len as u64);
         });
         let head = rx.recv().await;
-        crate::stats::ttfb_record(class, t0.elapsed().as_micros() as u64);
         match head {
             Some(Ok(head)) if head.len() == len => {
                 return Ok(Some((smeta, PieceBody::OneShot(head))))
@@ -594,9 +584,7 @@ async fn fetch_part(
     p: Piece,
     tx: &tokio::sync::mpsc::Sender<Result<Option<Row>>>,
 ) -> Result<()> {
-    let t0 = std::time::Instant::now();
     let mut conn = pool.get().await?;
-    crate::stats::part_record(t0.elapsed().as_micros() as u64);
     let params: [&(dyn ToSql + Sync); 3] = [&p.file_id, &p.lo, &p.hi];
     let range = conn.range().await?.clone();
     let mut rows = std::pin::pin!(conn.query_raw(&range, params).await?);
@@ -1439,10 +1427,25 @@ mod tests {
                 PieceBody::OneShot(bytes) => got.extend_from_slice(&bytes),
                 PieceBody::Streamed(mut stream) => {
                     // get_body has already fetched its first response chunk.
-                    put(&pool, bucket, &key, b"replacement").await?;
-                    while let Some(bytes) = stream.next().await {
+                    let writer_pool = pool.clone();
+                    let writer_key = key.clone();
+                    let overwrite = tokio::spawn(async move {
+                        put(&writer_pool, bucket, &writer_key, b"replacement").await
+                    });
+                    let mut read_after_overwrite = false;
+                    while let Some(bytes) =
+                        tokio::time::timeout(std::time::Duration::from_secs(15), stream.next())
+                            .await
+                            .context("GET stalled during concurrent overwrite")?
+                    {
                         got.extend_from_slice(&bytes?);
+                        read_after_overwrite |= overwrite.is_finished();
+                        // Keep consuming: a paused 8+ MiB result fills the
+                        // kubectl port-forward tunnel and stalls the writer.
+                        tokio::time::sleep(std::time::Duration::from_millis(4)).await;
                     }
+                    overwrite.await??;
+                    anyhow::ensure!(read_after_overwrite, "overwrite did not overlap GET");
                 }
             }
             anyhow::ensure!(got == old, "concurrent overwrite interrupted GET");

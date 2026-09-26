@@ -1,4 +1,4 @@
--- Layout v4 (db::LAYOUT_VERSION); v3 is migrated at startup.
+-- Layout v4 (db::LAYOUT_VERSION); older layouts require an explicit migration.
 --
 -- Object bytes are fixed-size INLINE rows: 8120-byte payloads stay inline
 -- with toast_tuple_target = 8160 (heaptoast.c only externalises while

@@ -432,6 +432,37 @@ async fn zero_byte_cache_entry_not_used_after_remote_overwrite() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires kind; run just kind-contract"]
+async fn direct_database_overwrite_refreshes_cached_gets() -> Result<()> {
+    let (gateway, _) = endpoints()?;
+    let bucket = "pgvs3-contract";
+    let key = format!("{}/direct-overwrite", prefix());
+    let path = Path::from(key.clone());
+    let result: Result<()> = async {
+        let old = vec![0x41; 8120 * 2];
+        gateway.put(&path, Bytes::from(old).into()).await?;
+        gateway.get_range(&path, 8000..16000).await?;
+        let pool = pool().await?;
+        let same_size = vec![0x42; 8120 * 2];
+        pgvs3::db::put(&pool, bucket, &key, &same_size).await?;
+        ensure!(gateway.get_range(&path, 8000..16000).await?.as_ref() == &same_size[8000..16000]);
+        let grown = vec![0x43; 12 * 1024 * 1024];
+        pgvs3::db::put(&pool, bucket, &key, &grown).await?;
+        ensure!(
+            gateway
+                .get_range(&path, 10_485_760..10_486_760)
+                .await?
+                .as_ref()
+                == &grown[10_485_760..10_486_760]
+        );
+        Ok(())
+    }
+    .await;
+    let _ = gateway.delete(&path).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
 async fn conditional_puts_are_atomic_across_gateways() -> Result<()> {
     let (a, b) = endpoints()?;
     let path = Path::from(format!("{}/conditional", prefix()));

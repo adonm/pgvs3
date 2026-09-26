@@ -13,7 +13,7 @@ helm=(helm --kube-context "kind-$cluster")
 mbx build --release -p pgvs3
 cp target/release/pgvs3 deploy/bench/pgvs3-bin
 trap 'rm -f deploy/bench/pgvs3-bin' EXIT
-docker build -q -t kind-bench:latest -f deploy/bench/Dockerfile .
+docker build -q -t kind-bench:latest --build-arg "DUCKDB_PY=${DUCKDB_PY:?run with mise}" -f deploy/bench/Dockerfile .
 kind load docker-image kind-bench:latest --name "$cluster"
 
 suites=${SUITES:-pgbench,tpch,click,spatial,search,stress}

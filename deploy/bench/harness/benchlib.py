@@ -7,7 +7,6 @@ signed gateway telemetry fetch.
 import json
 import os
 import re
-import subprocess
 import threading
 import time
 
@@ -90,29 +89,6 @@ def run_sql(con, sql: str, timeout: float | None = None) -> tuple[float, str | N
         if timer:
             timer.cancel()
     return round(time.perf_counter() - t0, 3), err
-
-
-def gateway_stats():
-    """Signed debug route: cache telemetry for the run record."""
-    try:
-        st = subprocess.run(
-            ["curl", "-s", "--aws-sigv4", "aws:amz:us-east-1:s3",
-              "--user", f"{os.environ['AWS_ACCESS_KEY_ID']}:{os.environ['AWS_SECRET_ACCESS_KEY']}",
-             f"{os.environ.get('PGVS3_URL', 'http://127.0.0.1:8014')}/_pgvs3/stats"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
-    except Exception:
-        return None
-    return st if st.startswith("perf:") else None
-
-
-def gateway_counters(st):
-    """(MiB served, GETs, instance) from one gateway perf line, or None.
-
-    Container PIDs repeat; the instance token includes the pod and start time.
-    A Service can route successive requests to different replicas."""
-    m = st and re.search(r"instance=([^ ]+).*small n=(\d+) .*\| stream n=(\d+) .* served=(\d+)MiB", st)
-    return (int(m.group(4)), int(m.group(2)) + int(m.group(3)), m.group(1)) if m else None
 
 
 def write_record(record: dict, out: str) -> None:

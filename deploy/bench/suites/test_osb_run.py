@@ -10,8 +10,9 @@ class WorkloadTest(unittest.TestCase):
     def test_corpus_is_deterministic_and_create_only(self):
         with tempfile.TemporaryDirectory() as temp:
             a, b = Path(temp) / "a.json", Path(temp) / "b.json"
-            self.assertEqual(corpus(a, "otel-logs-v0_9", 100),
-                             corpus(b, "otel-logs-v0_9", 100))
+            expected = (20268, "40aaeeca32cee7d0bdba4f2fb8d95ff75b566923e18ff24df622a64fef357908")
+            self.assertEqual(corpus(a, "otel-logs-v0_9", 100), expected)
+            self.assertEqual(corpus(b, "otel-logs-v0_9", 100), expected)
             lines = a.read_text().splitlines()
             self.assertEqual(len(lines), 200)
             for i in range(100):

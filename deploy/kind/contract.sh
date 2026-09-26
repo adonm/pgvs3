@@ -66,7 +66,7 @@ export PGVS3_TEST_DB_URL="$url"
 export PGVS3_ACCESS_KEY PGVS3_SECRET_KEY
 PGVS3_ACCESS_KEY=$("${kubectl[@]}" get secret pgvs3-s3 -o jsonpath='{.data.accessKey}' | base64 --decode)
 PGVS3_SECRET_KEY=$("${kubectl[@]}" get secret pgvs3-s3 -o jsonpath='{.data.secretKey}' | base64 --decode)
-export PGVS3_DB_CA_FILE=.tmp/pgvs3/contract-db-ca.pem
+export PGVS3_DB_CA_FILE="$PWD/.tmp/pgvs3/contract-db-ca.pem"
 "${kubectl[@]}" get secret "$secret" -o jsonpath='{.data.caCert}' | base64 --decode > "$PGVS3_DB_CA_FILE"
 export PGVS3_POOL_MIN=1 PGVS3_POOL_MAX=4
 bash deploy/kind/buckets.sh "$PGVS3_TEST_ENDPOINT_A" pgvs3-contract

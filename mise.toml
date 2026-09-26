@@ -13,9 +13,7 @@ kind = "0.33"
 kubectl = "1"
 helm = "4"
 
-# Python duckdb wheels the benchmark harness imports (the CLI pin is under
-# [tools]): stable for `just tpch`, the 2.0 pre-release for everything else.
-# The pre-release pin is a date-stamped nightly; bump when 2.0 GA lands.
+# The benchmark image and local harness share one date-stamped DuckDB wheel.
+# Bump this when 2.0 GA lands.
 [env]
-DUCKDB_PY_STABLE = "1.5.5"
-DUCKDB_PY_PRE = "2.0.0.dev2609222040"
+DUCKDB_PY = "2.0.0.dev2609222040"
