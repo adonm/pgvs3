@@ -30,6 +30,38 @@ multi-query boundary. They are not a same-rig A/B against the old read path and
 cannot establish whether the historical AWS GET or analytics numbers still
 hold. Re-run those workloads before using them as current performance claims.
 
+### Current-path EC2/Aurora quick stress, 2026-09-27
+
+One m7i.4xlarge kind rig, two gateways, Aurora PostgreSQL 18.6, a 1 GiB seed
+(16 × 64 MiB objects), and the same signed GET benchmark before and after
+the metadata-listing and write-setup changes. Both versions use the
+snapshot-protected multi-query GET path. One run each, warm reads, not a
+controlled multi-run A/B; Aurora state, connection load and cache residency
+can differ.
+
+| GET size / clients | Before, MiB/s | After, MiB/s | After p50 |
+| --- | ---: | ---: | ---: |
+| 8 MiB / 1 | 445 | 454 | 17.61 ms |
+| 16 MiB / 1 | 442 | 454 | 34.72 ms |
+| 64 MiB / 1 | 436 | 449 | 137.58 ms |
+| 8 MiB / 32 | 1,328 | 1,309 | 103.67 ms |
+| 64 MiB / 32 | 1,382 | 1,251 | 1,208.12 ms |
+
+The small-bucket LIST p50 increased from 0.84 to 1.38 ms: the scoped
+index-scan transaction pays extra round trips. A large ordered listing wins
+on the query plan below, but end-to-end Aurora listing with 100,000 keys has
+not been measured. The GET differences here do not establish a read-path
+improvement or regression.
+
+## Ordered listing plan check, 2026-09-27
+
+On a PostgreSQL 18 temporary table with 100,000 keys and a matching
+`(bucket, key)` primary key, returning the first 1,000 keys took 32.6 ms with
+the byte-read session's `enable_indexscan=off` (sequential scan + sort) and
+0.39 ms with index scans on (ordered primary-key scan). These are server-side
+`EXPLAIN ANALYZE` times, not S3 request latencies or an Aurora measurement;
+the listing transaction also pays additional round trips.
+
 ## Historical runs
 
 ### AWS rig, 2026-09-25

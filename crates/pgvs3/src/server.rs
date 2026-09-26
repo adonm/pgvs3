@@ -205,12 +205,6 @@ impl S3 for PgS3 {
             }
             _ => return Err(s3_error!(InvalidRequest)),
         };
-        if !db::bucket_exists(&self.pool, &input.bucket)
-            .await
-            .map_err(internal)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
         let body = input
             .body
             .take()
@@ -221,25 +215,20 @@ impl S3 for PgS3 {
             input.bucket.clone(),
             input.key,
             condition,
-        )
-        .await
-        .map_err(internal)?;
+        );
         let (_size, sum) = match db::ingest_body(writer, body).await {
             Ok(done) => done,
             Err(e) => {
                 if e.downcast_ref::<db::PreconditionFailed>().is_some() {
                     return Err(s3_error!(PreconditionFailed));
                 }
-                return Err(
-                    if db::bucket_exists(&self.pool, &input.bucket)
-                        .await
-                        .map_err(internal)?
-                    {
-                        internal(e)
-                    } else {
-                        s3_error!(NoSuchBucket)
-                    },
-                );
+                if matches!(
+                    e.downcast_ref::<db::MissingResource>(),
+                    Some(db::MissingResource::Bucket)
+                ) {
+                    return Err(s3_error!(NoSuchBucket));
+                }
+                return Err(internal(e));
             }
         };
         Ok(S3Response::new(PutObjectOutput {
@@ -343,27 +332,30 @@ impl S3 for PgS3 {
         if !(1..=10_000).contains(&input.part_number) {
             return Err(s3_error!(InvalidPart));
         }
-        if !db::upload_exists(&self.pool, &input.upload_id, &input.bucket, &input.key)
-            .await
-            .map_err(internal)?
-        {
-            return Err(s3_error!(NoSuchUpload));
-        }
         // Each part streams straight into its own COPY, in any arrival order
         // and in parallel with its siblings; a re-sent part replaces the
         // earlier attempt atomically.
         let writer = db::ChunkWriter::start_part(
             self.pool.clone(),
             input.upload_id.clone(),
+            input.bucket,
+            input.key,
             input.part_number,
-        )
-        .await
-        .map_err(internal)?;
+        );
         let body = input
             .body
             .take()
             .unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
-        let (size, sum) = db::ingest_body(writer, body).await.map_err(internal)?;
+        let (size, sum) = db::ingest_body(writer, body).await.map_err(|e| {
+            if matches!(
+                e.downcast_ref::<db::MissingResource>(),
+                Some(db::MissingResource::Upload)
+            ) {
+                s3_error!(NoSuchUpload)
+            } else {
+                internal(e)
+            }
+        })?;
         eprintln!(
             "pgvs3: upload_part {} no={} {size} bytes",
             input.upload_id, input.part_number

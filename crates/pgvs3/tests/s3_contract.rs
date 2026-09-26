@@ -664,6 +664,14 @@ async fn missing_upload_cannot_complete_an_existing_object() -> Result<()> {
             Some("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"unknown\"</ETag></Part></CompleteMultipartUpload>"),
         )?;
         ensure!(status == 404 && body.contains("NoSuchUpload"), "{status}: {body}");
+        let (status, body) = signed_request_body(
+            &endpoint,
+            "PUT",
+            &format!("pgvs3-contract/{path}?partNumber=1&uploadId=missing-upload"),
+            &[],
+            Some("orphan attempt"),
+        )?;
+        ensure!(status == 404 && body.contains("NoSuchUpload"), "{status}: {body}");
         ensure!(a.get(&path).await?.bytes().await? == b"original"[..]);
         Ok(())
     }

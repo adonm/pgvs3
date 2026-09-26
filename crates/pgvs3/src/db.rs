@@ -668,7 +668,7 @@ pub struct Slice {
 /// as the S3 PUT handler. The writer hashes and publishes in its COPY
 /// transaction; failed writes leave no committed chunk rows behind.
 pub async fn put(pool: &Pool, bucket: &str, key: &str, data: &[u8]) -> Result<()> {
-    let writer = ChunkWriter::start_object(pool.clone(), bucket.to_owned(), key.to_owned()).await?;
+    let writer = ChunkWriter::start_object(pool.clone(), bucket.to_owned(), key.to_owned());
     for chunk in data.chunks(SEND_BATCH) {
         writer.push(Bytes::copy_from_slice(chunk)).await?;
     }
@@ -684,6 +684,8 @@ enum WriterTarget {
     },
     Part {
         upload_id: String,
+        bucket: String,
+        key: String,
         part_no: i32,
     },
 }
@@ -705,6 +707,20 @@ impl std::fmt::Display for PreconditionFailed {
 
 impl std::error::Error for PreconditionFailed {}
 
+#[derive(Debug)]
+pub enum MissingResource {
+    Bucket,
+    Upload,
+}
+
+impl std::fmt::Display for MissingResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} does not exist", self)
+    }
+}
+
+impl std::error::Error for MissingResource {}
+
 /// Streaming ingest: bytes flow into one open binary COPY stream through
 /// `push` (rows cut across pushes through a single cursor). Every ingest has
 /// its own connection and COPY, so PUTs and multipart parts write in parallel.
@@ -714,16 +730,16 @@ pub struct ChunkWriter {
 }
 
 impl ChunkWriter {
-    pub async fn start_object(pool: Pool, bucket: String, key: String) -> Result<Self> {
-        Self::start_object_if(pool, bucket, key, PutCondition::Unconditional).await
+    pub fn start_object(pool: Pool, bucket: String, key: String) -> Self {
+        Self::start_object_if(pool, bucket, key, PutCondition::Unconditional)
     }
 
-    pub async fn start_object_if(
+    pub fn start_object_if(
         pool: Pool,
         bucket: String,
         key: String,
         condition: PutCondition,
-    ) -> Result<Self> {
+    ) -> Self {
         Self::begin(
             pool,
             WriterTarget::Object {
@@ -732,31 +748,35 @@ impl ChunkWriter {
                 condition,
             },
         )
-        .await
     }
 
     /// A multipart part: its rows and its `upload_parts` record commit in one
     /// transaction, so a part is either fully recorded or absent.
-    pub async fn start_part(pool: Pool, upload_id: String, part_no: i32) -> Result<Self> {
-        Self::begin(pool, WriterTarget::Part { upload_id, part_no }).await
+    pub fn start_part(
+        pool: Pool,
+        upload_id: String,
+        bucket: String,
+        key: String,
+        part_no: i32,
+    ) -> Self {
+        Self::begin(
+            pool,
+            WriterTarget::Part {
+                upload_id,
+                bucket,
+                key,
+                part_no,
+            },
+        )
     }
 
-    async fn begin(pool: Pool, target: WriterTarget) -> Result<Self> {
-        let file_id: i64 = pool
-            .get()
-            .await?
-            .query_typed_one(
-                "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))",
-                &[],
-            )
-            .await?
-            .try_get(0)?;
+    fn begin(pool: Pool, target: WriterTarget) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel::<IngestMsg>(8);
-        let done = tokio::spawn(ingest_writer(pool, file_id, target, rx));
-        Ok(Self {
+        let done = tokio::spawn(ingest_writer(pool, target, rx));
+        Self {
             tx: Some(tx),
             done: Some(done),
-        })
+        }
     }
 
     pub async fn push(&self, chunk: Bytes) -> Result<()> {
@@ -811,7 +831,6 @@ where
 
 async fn ingest_writer(
     pool: Pool,
-    file_id: i64,
     target: WriterTarget,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
 ) -> Result<(i64, Vec<u8>)> {
@@ -821,17 +840,35 @@ async fn ingest_writer(
 
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
-    if let WriterTarget::Object { bucket, .. } = &target {
-        anyhow::ensure!(
-            tx.query_typed_opt(
+    match &target {
+        WriterTarget::Object { bucket, .. } => {
+            if tx.query_typed_opt(
                 "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE",
                 &[(&bucket, Type::TEXT)],
             )
             .await?
-            .is_some(),
-            "bucket does not exist"
-        );
+            .is_none() {
+                return Err(MissingResource::Bucket.into());
+            }
+        }
+        WriterTarget::Part { upload_id, bucket, key, .. } => {
+            if tx.query_typed_opt(
+                "SELECT 1 FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3 FOR KEY SHARE",
+                &[(&upload_id, Type::TEXT), (&bucket, Type::TEXT), (&key, Type::TEXT)],
+            )
+            .await?
+            .is_none() {
+                return Err(MissingResource::Upload.into());
+            }
+        }
     }
+    let file_id: i64 = tx
+        .query_typed_one(
+            "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
     let mut sink = std::pin::pin!(tx.copy_in::<_, Bytes>(COPY_SQL).await?);
     sink.send(Bytes::from_static(COPY_HEADER)).await?;
 
@@ -869,7 +906,9 @@ async fn ingest_writer(
             )
             .await?;
         }
-        WriterTarget::Part { upload_id, part_no } => {
+        WriterTarget::Part {
+            upload_id, part_no, ..
+        } => {
             commit_part(&tx, upload_id, *part_no, file_id, total, &sum).await?;
         }
     }
@@ -1133,22 +1172,6 @@ pub async fn create_upload(pool: &Pool, bucket: &str, key: &str) -> Result<Optio
     Ok(Some(id))
 }
 
-pub async fn upload_exists(pool: &Pool, upload_id: &str, bucket: &str, key: &str) -> Result<bool> {
-    Ok(pool
-        .get()
-        .await?
-        .query_typed_opt(
-            "SELECT 1 FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
-            &[
-                (&upload_id, Type::TEXT),
-                (&bucket, Type::TEXT),
-                (&key, Type::TEXT),
-            ],
-        )
-        .await?
-        .is_some())
-}
-
 pub enum Completed {
     Done {
         bucket: String,
@@ -1321,9 +1344,12 @@ pub async fn list(
     after: &str,
     limit: i64,
 ) -> Result<Vec<Listed>> {
-    let rows = pool
-        .get()
-        .await?
+    let mut conn = pool.get().await?;
+    let tx = conn.build_transaction().read_only(true).start().await?;
+    // Chunk ranges favor bitmap scans on cold pages, but ordered metadata
+    // pages need the primary-key index. Scope this override to one listing.
+    tx.batch_execute("SET LOCAL enable_indexscan = on").await?;
+    let rows = tx
         .query_typed(
             "SELECT key, size, etag, EXTRACT(EPOCH FROM created_at)::float8 \
              FROM s3p.objects \
@@ -1339,6 +1365,7 @@ pub async fn list(
             ],
         )
         .await?;
+    tx.commit().await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         out.push(Listed {
@@ -1410,6 +1437,15 @@ mod tests {
     use object_store::path::Path;
     use object_store::ObjectStoreExt;
 
+    async fn last_file_id(pool: &Pool) -> Result<i64> {
+        Ok(pool
+            .get()
+            .await?
+            .query_typed_one("SELECT last_value FROM s3p.objects_file_id_seq", &[])
+            .await?
+            .try_get(0)?)
+    }
+
     #[tokio::test]
     #[ignore = "requires kind; run just kind-contract"]
     async fn large_get_survives_overwrite_after_first_chunk() -> Result<()> {
@@ -1461,15 +1497,7 @@ mod tests {
     async fn a_failed_publish_rolls_back_its_copy_rows() -> Result<()> {
         let url = std::env::var("PGVS3_TEST_DB_URL")?;
         let pool = connect(&url).await?;
-        let file_id: i64 = pool
-            .get()
-            .await?
-            .query_typed_one(
-                "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))",
-                &[],
-            )
-            .await?
-            .try_get(0)?;
+        let before = last_file_id(&pool).await?;
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         tx.send(IngestMsg::Data(Bytes::from(vec![
             42;
@@ -1481,10 +1509,9 @@ mod tests {
         // The precondition fails after COPY has received its rows.
         let result = ingest_writer(
             pool.clone(),
-            file_id,
             WriterTarget::Object {
                 bucket: "pgvs3-contract".to_owned(),
-                key: format!("contract/failed-publish-{file_id}"),
+                key: format!("contract/failed-publish-{}", std::process::id()),
                 condition: PutCondition::IfMatch("\"missing\"".to_owned()),
             },
             rx,
@@ -1496,6 +1523,11 @@ mod tests {
                 .downcast_ref::<PreconditionFailed>()
                 .is_some(),
             "conditional publish did not fail at the expected boundary"
+        );
+        let file_id = last_file_id(&pool).await?;
+        anyhow::ensure!(
+            file_id == before + 1,
+            "failed publish did not allocate one file"
         );
         let count: i64 = pool
             .get()
@@ -1526,31 +1558,18 @@ mod tests {
         let key = format!("contract/concurrent-{}", std::process::id());
         let path = Path::from(key.clone());
         let result: Result<()> = async {
-            let mut ids = Vec::new();
-            for _ in 0..2 {
-                let id: i64 = pool
-                    .get()
-                    .await?
-                    .query_typed_one(
-                        "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))",
-                        &[],
-                    )
-                    .await?
-                    .try_get(0)?;
-                ids.push(id);
-            }
+            let before = last_file_id(&pool).await?;
             let mut writers = Vec::new();
-            for id in &ids {
+            for id in 0..2 {
                 let (tx, rx) = tokio::sync::mpsc::channel(2);
                 tx.send(IngestMsg::Data(Bytes::from(vec![
-                    *id as u8;
+                    (id + 1) as u8;
                     ROW_BYTES as usize + 1
                 ])))
                 .await?;
                 drop(tx);
                 writers.push(ingest_writer(
                     pool.clone(),
-                    *id,
                     WriterTarget::Object {
                         bucket: "pgvs3-contract".to_owned(),
                         key: key.clone(),
@@ -1567,6 +1586,8 @@ mod tests {
             for failed in [one, two].into_iter().filter_map(Result::err) {
                 anyhow::ensure!(failed.downcast_ref::<PreconditionFailed>().is_some());
             }
+            let after = last_file_id(&pool).await?;
+            anyhow::ensure!(after == before + 2, "each CREATE should allocate one file");
             let conn = pool.get().await?;
             let current: i64 = conn
                 .query_typed_one(
@@ -1575,7 +1596,7 @@ mod tests {
                 )
                 .await?
                 .try_get(0)?;
-            for id in ids {
+            for id in before + 1..=after {
                 let count: i64 = conn
                     .query_typed_one(
                         "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",

@@ -27,14 +27,15 @@ figures.
 | Workload | Measured result | Status |
 | --- | --- | --- |
 | 8 / 16 MiB GET, one client | 1,292 / 1,306 MiB/s | Current snapshot read path, local Docker; not an Aurora result |
+| 8 / 16 / 64 MiB GET, one client | 454 / 454 / 449 MiB/s | Current snapshot read path, quick EC2/Aurora check; not a full-scale analytics result |
 | ClickBench, 100M rows, 43 queries | 35.35 s first / 30.13 s warm | Historical EC2/Aurora run before the snapshot read change |
 | SpatialBench SF10, four AOI queries | 7.85 s first / 4.54 s warm | Historical EC2/Aurora run before the snapshot read change |
 | Quickwit, 100M logs, 8 clients | 52.04 ms search p95 | Historical OSB run |
 
-The full methodology, caveats and dated runs are in
-[benchmark history](docs/benchmarks.md). The local GET result cannot validate
-Aurora or DuckLake performance; rerun those workloads before using the
-historical numbers as current claims.
+The methodology, caveats and dated runs are in
+[benchmark history](docs/benchmarks.md). The quick GET checks do not validate
+DuckLake performance; rerun those workloads before using the historical
+analytics numbers as current claims.
 
 ## Quick start
 
@@ -154,8 +155,9 @@ Each is backed by a measurement on the AWS rig:
   ClickBench passes 9% faster, 8 MiB GETs 15.2 → 13.4 ms.
 - **Reads up to 8 MiB are one query.** Splitting them across connections
   (2 MiB or 1 MiB parts) made ClickBench and SpatialBench 5–20% slower.
-- **Bitmap heap scans.** On cold data they are ~5× faster than index scans,
-  thanks to PostgreSQL 18's read-ahead.
+- **Bitmap heap scans for chunk bytes.** On cold data they are ~5× faster than
+  index scans, thanks to PostgreSQL 18's read-ahead. Ordered bucket listings
+  enable the metadata index scan for only their transaction.
 - **Chunks are hash-partitioned 32 ways.** One table caps at 32 TiB, parallel
   writers spread over 32 heaps, and each GET touches one partition.
 - **Multipart parts are separate files.** Parts upload in parallel with no
