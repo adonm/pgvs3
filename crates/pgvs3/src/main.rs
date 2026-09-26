@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         } => {
             let pool = db::connect(&cli.url).await?;
             db::init(&pool).await?;
+            db::ensure_maintenance(&pool).await?;
             server::serve(
                 pool,
                 server::ServeConfig {

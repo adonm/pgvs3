@@ -42,9 +42,7 @@ spec:
                   fi
                   echo "$db ready"
                 done
-              else
                 psql -v ON_ERROR_STOP=1 -d pgvs3 -c 'CREATE EXTENSION IF NOT EXISTS pg_cron'
-                psql -v ON_ERROR_STOP=1 -d pgvs3 -c "SELECT cron.schedule('pgvs3-expire-uploads', '* * * * *', 'SELECT s3p.expire_uploads()')"
               fi
           resources:
             requests: { cpu: 100m, memory: 64Mi }

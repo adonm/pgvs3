@@ -71,8 +71,8 @@ fn range_params(range: Option<Range>) -> (i64, i64, i64) {
 }
 
 /// One row of a `list_objects_v2` scan: push it onto `contents` or, past a
-/// `delimiter`, onto `common`. Returns the new cursor and whether the listing
-/// is full.
+/// `delimiter`, onto `common`. Returns whether the listing is full; the caller
+/// must only advance its cursor past a row that was handled.
 fn listing_step(
     r: &db::Listed,
     prefix: &str,
@@ -81,22 +81,22 @@ fn listing_step(
     contents: &mut Vec<Object>,
     common: &mut Vec<CommonPrefix>,
     seen: &mut BTreeSet<String>,
-) -> (String, bool) {
+) -> bool {
     let rest = &r.key[prefix.len()..];
     if !delimiter.is_empty() {
         if let Some(idx) = rest.find(delimiter) {
             let cp = format!("{prefix}{}", &rest[..idx + delimiter.len()]);
             if seen.insert(cp.clone()) {
                 if contents.len() + common.len() >= max {
-                    return (r.key.clone(), true);
+                    return true;
                 }
                 common.push(CommonPrefix { prefix: Some(cp) });
             }
-            return (r.key.clone(), false);
+            return false;
         }
     }
     if contents.len() + common.len() >= max {
-        return (r.key.clone(), true);
+        return true;
     }
     contents.push(Object {
         key: Some(r.key.clone()),
@@ -105,7 +105,7 @@ fn listing_step(
         last_modified: Some(Timestamp::from(r.created_at)),
         ..Default::default()
     });
-    (r.key.clone(), false)
+    false
 }
 
 #[async_trait::async_trait]
@@ -470,33 +470,44 @@ impl S3 for PgS3 {
         let mut common: Vec<CommonPrefix> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut truncated = false;
-
-        'outer: loop {
-            let rows = db::list(&self.pool, bucket, &prefix, &bound, &after, 1024)
-                .await
-                .map_err(internal)?;
-            if rows.is_empty() {
-                break;
-            }
-            let last_row = rows.len() < 1024;
-            for r in rows {
-                let (cursor, full) = listing_step(
-                    &r,
-                    &prefix,
-                    &delimiter,
-                    max,
-                    &mut contents,
-                    &mut common,
-                    &mut seen,
-                );
-                after = cursor;
-                if full {
-                    truncated = true;
-                    break 'outer;
+        // A continuation inside a common prefix must not emit that prefix
+        // again on the next page (or when using StartAfter).
+        if !delimiter.is_empty() {
+            if let Some(rest) = after.strip_prefix(&prefix) {
+                if let Some(idx) = rest.find(&delimiter) {
+                    seen.insert(format!("{prefix}{}", &rest[..idx + delimiter.len()]));
                 }
             }
-            if last_row {
-                break;
+        }
+
+        if max > 0 {
+            'outer: loop {
+                let rows = db::list(&self.pool, bucket, &prefix, &bound, &after, 1024)
+                    .await
+                    .map_err(internal)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let last_row = rows.len() < 1024;
+                for r in rows {
+                    let full = listing_step(
+                        &r,
+                        &prefix,
+                        &delimiter,
+                        max,
+                        &mut contents,
+                        &mut common,
+                        &mut seen,
+                    );
+                    if full {
+                        truncated = true;
+                        break 'outer;
+                    }
+                    after = r.key;
+                }
+                if last_row {
+                    break;
+                }
             }
         }
 

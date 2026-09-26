@@ -13,9 +13,10 @@ the catalog sees the same tables and the same data.
 - No data cache: clients such as DuckDB cache what they read. A per-process
   metadata cache only removes the lookup round trip per GET.
 
-The performance figures below were measured before the consistent-snapshot
-change for multi-query GETs. Re-benchmark large reads before using them as
-current throughput claims.
+The full-scale performance figures below were measured before the
+consistent-snapshot change for multi-query GETs. A [quick current-path check](#quick-current-path-check-2026-09-26)
+covers GETs on local PostgreSQL, but does not revalidate the AWS or analytics
+figures.
 
 > Postgres is all you need. ;P — for durable bytes and metadata here; DuckDB
 > and Quickwit still do the actual analytics and search.
@@ -59,8 +60,8 @@ price/performance equivalence.
 
 ## Quick start
 
-Needs [mise](https://mise.jdx.dev/) and Docker (or any PostgreSQL 13+: pass
-`--url`).
+Needs [mise](https://mise.jdx.dev/) and Docker (or PostgreSQL 13+ with
+`pg_cron` preloaded and installed in the target database: pass `--url`).
 
 ```sh
 just setup    # toolchain (rust, mbx, just, python, uv, kind, helm, kubectl) + cargo fetch
@@ -118,10 +119,14 @@ file id, size, sha256 ETag and, for multipart objects, the list of part files;
   before relying on the older parallel-read benchmark numbers. Rows stream to
   the client as they arrive.
 - **Maintenance** belongs to PostgreSQL: a bounded cleanup function reaps
-  abandoned multipart parts after 24 hours (scheduled by `pg_cron` in kind
-  and on Aurora), and per-partition autovacuum runs without a gateway janitor
-  or manual table VACUUM. `kind-up` registers the cron job after schema setup;
-  the standalone `dev-db` command does not install a scheduler.
+  abandoned multipart parts after 24 hours, and per-partition autovacuum runs
+  without a gateway janitor or manual table VACUUM. Before listening, the
+  gateway verifies the partition settings, requires `pg_cron` in the target
+  database with `cron.database_name` pointing at it, and installs or refreshes
+  the minute-by-minute cleanup job. It exits with an error if any of these
+  requirements cannot be met. `just dev-db` and `just kind-up` install the
+  extension; other deployments must preload `pg_cron` and install its extension
+  before starting the gateway. The database role must be able to schedule jobs.
 - **Buckets** are explicit: create them through S3 before writing. Empty
   buckets remain listed; deleting a bucket with objects or an incomplete upload
   returns `BucketNotEmpty`. The kind harness provisions its three workload
@@ -186,9 +191,29 @@ Each is backed by a measurement on the AWS rig:
 
 ## Performance
 
-The following GET and analytics throughput numbers are historical: they
-predate the snapshot-protected multi-query read path. No new full-scale A/B
-has been run for that change.
+The AWS and kind GET and analytics throughput numbers in the historical
+sections below predate the snapshot-protected multi-query read path. No new
+full-scale A/B has been run for that change.
+
+### Quick current-path check, 2026-09-26
+
+A release build against PostgreSQL 18 in an isolated local Docker container,
+with two 64 MiB objects and warm caches. The gateway and client used loopback
+HTTP; this is a small read-path sanity check, **not** a re-run of the EC2/Aurora
+or DuckLake workloads. The 8 MiB range is one query; the 16 MiB range uses
+multiple queries in one repeatable-read snapshot.
+
+| GET range | Clients | Samples | p50 | Aggregate throughput |
+| --- | ---: | ---: | ---: | ---: |
+| 8 MiB | 1 | 37 | 5.40 ms | 1,292 MiB/s |
+| 16 MiB | 1 | 18 | 12.04 ms | 1,306 MiB/s |
+| 8 MiB | 4 | 40 | 8.46 ms | 3,332 MiB/s |
+| 16 MiB | 4 | 20 | 14.57 ms | 3,748 MiB/s |
+
+These quick samples show no obvious local throughput collapse at the
+multi-query boundary. They are not a same-rig A/B against the old read path and
+cannot establish whether the historical AWS GET or analytics numbers still
+hold. Re-run those workloads before using them as current performance claims.
 
 ### AWS rig, 2026-09-25
 

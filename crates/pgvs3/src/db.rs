@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::task::Context;
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, Stream, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
@@ -133,6 +133,73 @@ async fn init_locked(client: &mut Client) -> Result<()> {
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// A serving gateway must not accumulate abandoned multipart bytes silently.
+/// The schema is installed by `init`; pg_cron is a database prerequisite and
+/// this check installs (or refreshes) the bounded cleanup job before listening.
+pub async fn ensure_maintenance(pool: &Pool) -> Result<()> {
+    let conn = pool.get().await?;
+    let cron_installed: bool = conn
+        .query_typed_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron')",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    anyhow::ensure!(
+        cron_installed,
+        "pg_cron is required for multipart cleanup; preload it and CREATE EXTENSION pg_cron in this database before serving"
+    );
+    let row = conn
+        .query_typed_one(
+            "SELECT current_database(), current_setting('cron.database_name', true)",
+            &[],
+        )
+        .await?;
+    let database: String = row.try_get(0)?;
+    let cron_database: Option<String> = row.try_get(1)?;
+    anyhow::ensure!(
+        cron_database.as_deref() == Some(database.as_str()),
+        "pg_cron must have cron.database_name={database} to run multipart cleanup"
+    );
+    let partitions: i64 = conn
+        .query_typed_one(
+            "SELECT count(*) FROM pg_partition_tree('s3p.chunks') p \
+             JOIN pg_class c ON c.oid = p.relid \
+             WHERE p.isleaf AND c.reloptions @> \
+               ARRAY['toast_tuple_target=8160', 'autovacuum_vacuum_scale_factor=0.01', \
+                     'autovacuum_analyze_scale_factor=0.02', 'autovacuum_vacuum_threshold=1000']",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    anyhow::ensure!(
+        partitions == 32,
+        "s3p.chunks must have 32 partitions with the expected inline storage and autovacuum settings (found {partitions})"
+    );
+    conn.query_typed_one(
+        "SELECT cron.schedule($1, $2, $3)",
+        &[
+            (&"pgvs3-expire-uploads", Type::TEXT),
+            (&"* * * * *", Type::TEXT),
+            (&"SELECT s3p.expire_uploads()", Type::TEXT),
+        ],
+    )
+    .await
+    .context("scheduling multipart cleanup with pg_cron")?;
+    let jobs: i64 = conn
+        .query_typed_one(
+            "SELECT count(*) FROM cron.job WHERE jobname = 'pgvs3-expire-uploads' \
+             AND database = current_database() AND username = current_user \
+             AND schedule = '* * * * *' AND command = 'SELECT s3p.expire_uploads()' AND active",
+            &[],
+        )
+        .await
+        .context("checking pg_cron multipart cleanup job")?
+        .try_get(0)?;
+    anyhow::ensure!(jobs == 1, "pg_cron multipart cleanup job is not active");
     Ok(())
 }
 
@@ -1351,7 +1418,6 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context as _;
     use object_store::aws::AmazonS3Builder;
     use object_store::path::Path;
     use object_store::ObjectStoreExt;

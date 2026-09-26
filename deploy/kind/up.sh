@@ -79,7 +79,6 @@ fi
 # ConfigMap and Secret updates do not change Deployment pod templates.
 "${kubectl[@]}" -n "$namespace" rollout restart deployment/quickwit
 "${kubectl[@]}" -n "$namespace" rollout status deployment/quickwit --timeout=300s
-bash deploy/kind/db.sh "$secret" schedule
 if [ "$searchers" -gt 0 ]; then
   "${kubectl[@]}" -n "$namespace" rollout restart deployment/quickwit-searcher
   "${kubectl[@]}" -n "$namespace" rollout status deployment/quickwit-searcher --timeout=300s

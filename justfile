@@ -17,7 +17,7 @@ setup:
     cargo fetch
     @echo "ready. next: just smoke (or just dev-db for local development)"
 
-# PostgreSQL 18 in Docker (any reachable PostgreSQL works: set PG_URL).
+# PostgreSQL 18 + pg_cron in Docker (external DBs need pg_cron too: set PG_URL).
 [group('dev')]
 dev-db:
     #!/usr/bin/env bash
@@ -31,8 +31,10 @@ dev-db:
     elif docker inspect pgvs3-pg >/dev/null 2>&1; then
       docker start pgvs3-pg >/dev/null
     else
+      docker build -q -t pgvs3-postgres:18-cron deploy/postgres
       docker run -d --name pgvs3-pg -p 127.0.0.1:5432:5432 \
-        -e POSTGRES_PASSWORD=postgres postgres:18
+        -e POSTGRES_PASSWORD=postgres pgvs3-postgres:18-cron \
+        -c shared_preload_libraries=pg_cron -c cron.database_name=pgvs3_bench
     fi
     for i in $(seq 1 30); do
       docker exec pgvs3-pg psql -U postgres -c 'SELECT 1' >/dev/null 2>&1 && break
@@ -42,6 +44,11 @@ dev-db:
     for db in pgvs3_bench ducklake_catalog ducklake_catalog_local; do
       docker exec pgvs3-pg psql -U postgres -c "CREATE DATABASE $db" 2>/dev/null || true
     done
+    docker exec pgvs3-pg psql -U postgres -d pgvs3_bench -v ON_ERROR_STOP=1 \
+      -c 'CREATE EXTENSION IF NOT EXISTS pg_cron' || {
+      echo 'pgvs3 requires pg_cron; an existing pgvs3-pg without it must be upgraded (preserve its data) or replaced explicitly with just dev-db-clean' >&2
+      exit 1
+    }
     echo "postgres up: {{ URL }}"
 
 # Delete the Docker PostgreSQL and its data.

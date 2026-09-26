@@ -15,6 +15,12 @@ fn bucket_request(endpoint: &str, method: &str, bucket: &str) -> Result<(u16, St
     signed_request(endpoint, method, bucket, &[])
 }
 
+fn xml_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let (_, rest) = body.split_once(&format!("<{tag}>"))?;
+    rest.split_once(&format!("</{tag}>"))
+        .map(|(value, _)| value)
+}
+
 fn signed_request(
     endpoint: &str,
     method: &str,
@@ -205,6 +211,88 @@ async fn clean_failed_prior_contract_objects() -> Result<()> {
         store.delete(&object.location).await?;
     }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
+async fn listing_pages_keep_every_key_and_emit_common_prefixes_once() -> Result<()> {
+    let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
+    let store = store(&endpoint, "pgvs3-contract")?;
+    let base = format!("{}/listing/", prefix());
+    let paths: Vec<_> = ["a", "b", "group/one", "group/two", "z"]
+        .iter()
+        .map(|name| Path::from(format!("{base}{name}")))
+        .collect();
+    let result: Result<()> = async {
+        for path in &paths {
+            store.put(path, Bytes::from_static(b"data").into()).await?;
+        }
+        let (status, empty_page) = signed_request(
+            &endpoint,
+            "GET",
+            &format!("pgvs3-contract?list-type=2&prefix={base}&max-keys=0"),
+            &[],
+        )?;
+        ensure!(status == 200, "LIST failed: {empty_page}");
+        ensure!(xml_tag(&empty_page, "KeyCount") == Some("0"));
+        ensure!(xml_tag(&empty_page, "IsTruncated") == Some("false"));
+        let (status, after_page) = signed_request(
+            &endpoint,
+            "GET",
+            &format!(
+                "pgvs3-contract?list-type=2&prefix={base}&delimiter=/&start-after={base}group/one"
+            ),
+            &[],
+        )?;
+        ensure!(status == 200, "LIST failed: {after_page}");
+        ensure!(xml_tag(&after_page, "KeyCount") == Some("1"));
+        ensure!(after_page.contains(&format!("<Key>{base}z</Key>")));
+        ensure!(!after_page.contains("<CommonPrefixes>"));
+        for (delimiter, expected) in [
+            ("", vec!["a", "b", "group/one", "group/two", "z"]),
+            ("/", vec!["a", "b", "group/", "z"]),
+        ] {
+            let mut token = None;
+            let mut listed = Vec::new();
+            for _ in 0..10 {
+                let mut path = format!(
+                    "pgvs3-contract?list-type=2&prefix={base}&max-keys=1&delimiter={delimiter}"
+                );
+                if let Some(ref token) = token {
+                    path.push_str(&format!("&continuation-token={token}"));
+                }
+                let (status, body) = signed_request(&endpoint, "GET", &path, &[])?;
+                ensure!(status == 200, "LIST failed: {body}");
+                ensure!(xml_tag(&body, "KeyCount") == Some("1"), "{body}");
+                let entry = if let Some((_, contents)) = body.split_once("<Contents>") {
+                    xml_tag(contents, "Key")
+                } else {
+                    body.split_once("<CommonPrefixes>")
+                        .and_then(|(_, common)| xml_tag(common, "Prefix"))
+                }
+                .ok_or_else(|| anyhow::anyhow!("LIST page has no entry: {body}"))?;
+                listed.push(entry.strip_prefix(&base).unwrap_or(entry).to_owned());
+                if xml_tag(&body, "IsTruncated") == Some("false") {
+                    break;
+                }
+                token = Some(
+                    xml_tag(&body, "NextContinuationToken")
+                        .ok_or_else(|| anyhow::anyhow!("LIST has no next token: {body}"))?
+                        .to_owned(),
+                );
+            }
+            ensure!(
+                listed == expected,
+                "LIST with delimiter {delimiter:?}: {listed:?}"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    for path in &paths {
+        let _ = store.delete(path).await;
+    }
+    result
 }
 
 #[tokio::test]

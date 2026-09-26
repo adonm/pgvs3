@@ -9,7 +9,7 @@ phase=${2:-databases}
   echo "invalid database Secret name: $secret" >&2
   exit 2
 }
-case "$phase" in databases|schedule|reset) ;; *) echo "invalid database phase: $phase" >&2; exit 2 ;; esac
+case "$phase" in databases|reset) ;; *) echo "invalid database phase: $phase" >&2; exit 2 ;; esac
 job="pgvs3-db-$phase"
 kubectl=(kubectl --context kind-pgvs3 -n pgvs3)
 "${kubectl[@]}" get secret "$secret" >/dev/null
