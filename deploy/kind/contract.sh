@@ -23,6 +23,7 @@ exec 9>.tmp/pgvs3/contract.lock
 flock -n 9 || { echo 'another S3 contract test is running' >&2; exit 3; }
 pids=()
 cleanup() {
+  rm -f .tmp/pgvs3/contract-db-ca.pem
   if [ "${#pids[@]}" -gt 0 ]; then
     kill "${pids[@]}" 2>/dev/null || true
     wait "${pids[@]}" 2>/dev/null || true
@@ -62,6 +63,11 @@ fi
 export PGVS3_TEST_ENDPOINT_A=http://127.0.0.1:18014
 export PGVS3_TEST_ENDPOINT_B=http://127.0.0.1:18015
 export PGVS3_TEST_DB_URL="$url"
+export PGVS3_ACCESS_KEY PGVS3_SECRET_KEY
+PGVS3_ACCESS_KEY=$("${kubectl[@]}" get secret pgvs3-s3 -o jsonpath='{.data.accessKey}' | base64 --decode)
+PGVS3_SECRET_KEY=$("${kubectl[@]}" get secret pgvs3-s3 -o jsonpath='{.data.secretKey}' | base64 --decode)
+export PGVS3_DB_CA_FILE=.tmp/pgvs3/contract-db-ca.pem
+"${kubectl[@]}" get secret "$secret" -o jsonpath='{.data.caCert}' | base64 --decode > "$PGVS3_DB_CA_FILE"
 export PGVS3_POOL_MIN=1 PGVS3_POOL_MAX=4
 bash deploy/kind/buckets.sh "$PGVS3_TEST_ENDPOINT_A" pgvs3-contract
 # A previous failed run may have left published *test* objects behind. Purge

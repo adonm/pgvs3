@@ -4,6 +4,8 @@
 image: kind-bench:latest
 # The same Secret shape for CI/local PostgreSQL and external Aurora.
 pgSecretName: postgres
+s3SecretName: pgvs3-s3
+allowPlaintextDb: false
 quickwitUrl: http://quickwit:7280
 quickwitIngestUrl: http://quickwit-core:7280
 pgvs3Url: http://pgvs3:8014

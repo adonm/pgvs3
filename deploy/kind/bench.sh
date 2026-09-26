@@ -26,6 +26,8 @@ if [ -n "${PGVS3_DB_SECRET:-}" ]; then
     resource_args+=(--set "resources.limits.memory=24Gi")
     DUCKDB_MEMORY_LIMIT=${DUCKDB_MEMORY_LIMIT:-16GiB}
   fi
+else
+  env_args+=(--set allowPlaintextDb=true)
 fi
 for key in QUICK SCALE CLIENTS SECONDS_RUN SF PASSES PARTS QUERIES DOCS \
            SPATIAL_SF SPATIAL_QUERIES SPATIAL_QUERY_TIMEOUT \

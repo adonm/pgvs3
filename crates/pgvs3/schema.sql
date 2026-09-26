@@ -1,4 +1,4 @@
--- Layout v3 (db::LAYOUT_VERSION); gateways reject incompatible layouts.
+-- Layout v4 (db::LAYOUT_VERSION); v3 is migrated at startup.
 --
 -- Object bytes are fixed-size INLINE rows: 8120-byte payloads stay inline
 -- with toast_tuple_target = 8160 (heaptoast.c only externalises while
@@ -64,9 +64,9 @@ CREATE TABLE IF NOT EXISTS s3p.uploads (
   bucket     text COLLATE "C" NOT NULL,
   key        text COLLATE "C" NOT NULL,
   created_at timestamptz      NOT NULL DEFAULT now(),
-  UNIQUE (bucket, key),
   FOREIGN KEY (bucket) REFERENCES s3p.buckets (name)
 );
+CREATE INDEX IF NOT EXISTS uploads_by_bucket_key ON s3p.uploads (bucket, key);
 
 CREATE TABLE IF NOT EXISTS s3p.upload_parts (
   upload_id text  NOT NULL REFERENCES s3p.uploads ON DELETE CASCADE,

@@ -1,7 +1,7 @@
 # Static musl binary on scratch: no shell, no libc, no CVE surface. TLS is
 # rustls + ring (bundled assembly), so nothing links against OpenSSL; the
-# PostgreSQL connection does not verify certificates (sslmode=require), so the
-# CA bundle is included only as a convenience for anything else in the image.
+# PostgreSQL verifies certificates and hostnames against this CA bundle (and
+# optionally PGVS3_DB_CA_FILE for a private CA such as Amazon RDS).
 #
 # Build both architectures with `just image` (docker buildx). The builder
 # image's Rust version should match or exceed mise.toml's; CI builds and tests

@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -17,19 +18,29 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::tls::{ChannelBinding, MakeTlsConnect, TlsConnect, TlsStream};
 use tokio_postgres::types::Type;
-use tokio_postgres::{Client, Socket, Statement};
+use tokio_postgres::{config::SslMode, Client, Socket, Statement};
 
 /// A checkout waits at most this long for a free connection.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle connections beyond `Options::min` close after this long unused.
 const IDLE_MAX: Duration = Duration::from_secs(600);
+
+fn local_db(config: &tokio_postgres::Config) -> bool {
+    !config.get_hosts().is_empty()
+        && config.get_hosts().iter().all(|host| match host {
+            tokio_postgres::config::Host::Tcp(name) => {
+                name == "localhost" || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            }
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(_) => true,
+        })
+        && config.get_hostaddrs().iter().all(IpAddr::is_loopback)
+}
 
 pub struct Options {
     /// Connections opened at start and kept however idle.
@@ -68,6 +79,12 @@ struct Conn {
 impl Pool {
     pub async fn connect(url: &str, opts: Options) -> Result<Pool> {
         let mut config: tokio_postgres::Config = url.parse()?;
+        anyhow::ensure!(
+            config.get_ssl_mode() == SslMode::Require
+                || local_db(&config)
+                || std::env::var("PGVS3_DB_ALLOW_PLAINTEXT").as_deref() == Ok("true"),
+            "remote PostgreSQL requires sslmode=require (or explicitly set PGVS3_DB_ALLOW_PLAINTEXT=true for an isolated rig)"
+        );
         if config.get_application_name().is_none() {
             config.application_name("pgvs3");
         }
@@ -191,9 +208,8 @@ impl Drop for Pooled {
 }
 
 // ---------------------------------------------------------------------------
-// TLS: rustls on ring. As with libpq's sslmode=require without a root
-// certificate (and sqlx before), the channel is encrypted but the server
-// certificate is not verified; handshake signatures still are.
+// TLS: verify the server's certificate chain and hostname. PostgreSQL's
+// sslmode=require forces TLS; sslmode=prefer allows plaintext for local DBs.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -201,12 +217,29 @@ struct MakeRustls(Arc<rustls::ClientConfig>);
 
 impl MakeRustls {
     fn new() -> Result<Self> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(EncryptOnly(provider)))
-            .with_no_client_auth();
+        let native = rustls_native_certs::load_native_certs();
+        anyhow::ensure!(
+            native.errors.is_empty(),
+            "could not load system CAs: {:?}",
+            native.errors
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in native.certs {
+            roots.add(cert)?;
+        }
+        if let Ok(path) = std::env::var("PGVS3_DB_CA_FILE") {
+            let pem = std::fs::read(path)?;
+            let mut input = std::io::Cursor::new(pem);
+            for cert in rustls_pemfile::certs(&mut input) {
+                roots.add(cert?)?;
+            }
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         Ok(Self(Arc::new(config)))
     }
 }
@@ -288,52 +321,25 @@ impl AsyncWrite for RustlsStream {
     }
 }
 
-/// Accepts any server certificate (sslmode=require semantics) but still
-/// checks the handshake signatures against it.
-#[derive(Debug)]
-struct EncryptOnly(Arc<CryptoProvider>);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl ServerCertVerifier for EncryptOnly {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+    #[test]
+    fn only_loopback_database_addresses_allow_plaintext_by_default() {
+        for url in [
+            "postgres://localhost/db?sslmode=disable",
+            "postgres://127.0.0.1/db?sslmode=prefer",
+            "postgres://[::1]/db?sslmode=disable",
+        ] {
+            assert!(local_db(&url.parse().unwrap()), "{url}");
+        }
+        for url in [
+            "postgres://db.example/db?sslmode=prefer",
+            "postgres://localhost/db?hostaddr=192.0.2.1&sslmode=disable",
+            "postgres://127.0.0.1/db?hostaddr=192.0.2.1&sslmode=disable",
+        ] {
+            assert!(!local_db(&url.parse().unwrap()), "{url}");
+        }
     }
 }

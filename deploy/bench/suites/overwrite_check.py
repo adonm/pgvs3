@@ -31,8 +31,7 @@ def seed(object_mib):
 def get_len(byte_range):
     out = subprocess.run(
         ["curl", "-fsS", "--aws-sigv4", "aws:amz:us-east-1:s3",
-         "--user", f"{os.environ.get('AWS_ACCESS_KEY_ID', 'cachebench')}:"
-                   f"{os.environ.get('AWS_SECRET_ACCESS_KEY', 'cachebench-local-only')}",
+          "--user", f"{os.environ['AWS_ACCESS_KEY_ID']}:{os.environ['AWS_SECRET_ACCESS_KEY']}",
          "-H", f"Range: bytes={byte_range}", f"{URL}/{BUCKET}/{KEY}"],
         check=True, stdout=subprocess.PIPE,
     )

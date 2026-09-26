@@ -4,9 +4,10 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use hyper::service::Service as HyperService;
 use hyper::{Request, Response};
@@ -320,8 +321,8 @@ impl S3 for PgS3 {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
-        // Idempotent per (bucket, key): a client retry of Create re-attaches
-        // to the in-progress upload instead of forking a second id.
+        // Each Create starts an independent upload, including for a key that
+        // already has another active upload.
         let id = db::create_upload(&self.pool, &input.bucket, &input.key)
             .await
             .map_err(internal)?
@@ -339,6 +340,9 @@ impl S3 for PgS3 {
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let mut input = req.input;
+        if !(1..=10_000).contains(&input.part_number) {
+            return Err(s3_error!(InvalidPart));
+        }
         if !db::upload_exists(&self.pool, &input.upload_id, &input.bucket, &input.key)
             .await
             .map_err(internal)?
@@ -422,23 +426,7 @@ impl S3 for PgS3 {
                 }))
             }
             db::Completed::InvalidPart => Err(s3_error!(InvalidPart)),
-            db::Completed::NoSuchUpload => {
-                // Retried after a lost success response: the object is
-                // already published (S3 clients treat identical
-                // re-completion as success).
-                match db::meta_fresh(&self.pool, &input.bucket, &input.key)
-                    .await
-                    .map_err(internal)?
-                {
-                    Some(meta) => Ok(S3Response::new(CompleteMultipartUploadOutput {
-                        bucket: Some(input.bucket),
-                        key: Some(input.key),
-                        e_tag: etag(&meta.etag),
-                        ..Default::default()
-                    })),
-                    None => Err(s3_error!(NoSuchUpload)),
-                }
-            }
+            db::Completed::NoSuchUpload => Err(s3_error!(NoSuchUpload)),
         }
     }
 
@@ -638,9 +626,53 @@ pub struct ServeConfig {
     pub addr: String,
     pub access_key: String,
     pub secret_key: String,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub allow_http: bool,
+}
+
+fn tls_acceptor(cert_path: &str, key_path: &str) -> Result<tokio_rustls::TlsAcceptor> {
+    let cert = std::fs::read(cert_path).context("reading HTTPS certificate")?;
+    let key = std::fs::read(key_path).context("reading HTTPS private key")?;
+    let certs: Vec<_> =
+        rustls_pemfile::certs(&mut std::io::Cursor::new(cert)).collect::<std::io::Result<_>>()?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "HTTPS certificate file has no certificates"
+    );
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key))?
+        .context("HTTPS private key file has no private key")?;
+    let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)?;
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+fn listener_config(cfg: &ServeConfig) -> Result<(SocketAddr, Option<tokio_rustls::TlsAcceptor>)> {
+    anyhow::ensure!(
+        !cfg.access_key.is_empty() && !cfg.secret_key.is_empty(),
+        "S3 access and secret keys must not be empty"
+    );
+    let addr: SocketAddr = cfg.addr.parse().context("invalid listen address")?;
+    let tls = match (&cfg.tls_cert, &cfg.tls_key) {
+        (Some(cert), Some(key)) => Some(tls_acceptor(cert, key)?),
+        (None, None) => {
+            anyhow::ensure!(
+                addr.ip().is_loopback() || cfg.allow_http,
+                "HTTPS certificate/key required outside loopback (or explicitly set PGVS3_ALLOW_HTTP=true for an isolated rig)"
+            );
+            None
+        }
+        _ => anyhow::bail!("both PGVS3_TLS_CERT and PGVS3_TLS_KEY must be set"),
+    };
+    Ok((addr, tls))
 }
 
 pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
+    let (addr, tls) = listener_config(&cfg)?;
     // Best-effort performance warmup; no gateway-owned cleanup or cursor.
     let warm = pool.clone();
     tokio::spawn(async move {
@@ -661,9 +693,10 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
         s3: builder.build(),
     };
 
-    let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     println!(
-        "pgvs3 serving on http://{} (sigv4 key: {})",
+        "pgvs3 serving on {}://{} (sigv4 key: {})",
+        if tls.is_some() { "https" } else { "http" },
         listener.local_addr()?,
         cfg.access_key
     );
@@ -677,14 +710,53 @@ pub async fn serve(pool: db::Pool, cfg: ServeConfig) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         stream.set_nodelay(true).ok(); // no Nagle: request/response latency matters
-        let io = hyper_util::rt::TokioIo::new(stream);
         let svc = service.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
             let builder =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-            if let Err(e) = builder.serve_connection(io, svc).await {
+            let result = if let Some(tls) = tls {
+                match tls.accept(stream).await {
+                    Ok(stream) => builder
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            } else {
+                builder
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            if let Err(e) = result {
                 eprintln!("connection {peer}: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_http_requires_an_explicit_opt_in() {
+        let mut cfg = ServeConfig {
+            addr: "0.0.0.0:8014".into(),
+            access_key: "test".into(),
+            secret_key: "test-secret".into(),
+            tls_cert: None,
+            tls_key: None,
+            allow_http: false,
+        };
+        assert!(listener_config(&cfg).is_err());
+        cfg.addr = "127.0.0.1:8014".into();
+        assert!(listener_config(&cfg).is_ok());
+        cfg.addr = "0.0.0.0:8014".into();
+        cfg.allow_http = true;
+        assert!(listener_config(&cfg).is_ok());
+        cfg.secret_key.clear();
+        assert!(listener_config(&cfg).is_err());
     }
 }

@@ -23,6 +23,8 @@ s3s = "0.16"
 # TLS to PostgreSQL (Aurora rejects plaintext): rustls on ring, the provider
 # the rest of the tree already uses.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tokio-postgres = "0.7.18"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

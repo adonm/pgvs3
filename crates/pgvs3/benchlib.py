@@ -59,8 +59,10 @@ def connect(stack: str, args, extensions: tuple = ()) -> duckdb.DuckDBPyConnecti
         con.sql(f"SET s3_endpoint='{os.environ.get('PGVS3_ENDPOINT', '127.0.0.1:8014')}'")
         con.sql("SET s3_use_ssl=false")
         con.sql("SET s3_url_style='path'")
-        con.sql("SET s3_access_key_id='cachebench'")
-        con.sql("SET s3_secret_access_key='cachebench-local-only'")
+        for setting, key in (("s3_access_key_id", "AWS_ACCESS_KEY_ID"),
+                             ("s3_secret_access_key", "AWS_SECRET_ACCESS_KEY")):
+            value = os.environ[key].replace("'", "''")
+            con.sql(f"SET {setting}='{value}'")
         con.sql(f"ATTACH 'ducklake:postgres:{args.catalog or PG}' AS lake (DATA_PATH '{args.data_path}')")
     elif stack == "lake-local":
         os.makedirs(args.local_dir, exist_ok=True)
@@ -95,7 +97,7 @@ def gateway_stats():
     try:
         st = subprocess.run(
             ["curl", "-s", "--aws-sigv4", "aws:amz:us-east-1:s3",
-             "--user", "cachebench:cachebench-local-only",
+              "--user", f"{os.environ['AWS_ACCESS_KEY_ID']}:{os.environ['AWS_SECRET_ACCESS_KEY']}",
              f"{os.environ.get('PGVS3_URL', 'http://127.0.0.1:8014')}/_pgvs3/stats"],
             capture_output=True, text=True, timeout=5,
         ).stdout.strip()

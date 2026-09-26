@@ -2,12 +2,12 @@
 //! plus one row in `s3p.objects` (layout: schema.sql).
 //!
 //! Reads cache metadata, never row bytes. Ranges stream rows in 8 MiB spans;
-//! larger ranges use up to eight connections concurrently.
+//! multi-query GETs hold a snapshot until the last part has been fetched.
 //!
 //! Writes use a binary COPY per PUT or multipart part. Object publication
 //! shares the COPY transaction; multipart Complete publishes existing parts.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::task::Context;
 use std::time::SystemTime;
@@ -17,7 +17,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, Stream, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio_postgres::types::{ToSql, Type};
-use tokio_postgres::{Client, Row, Transaction};
+use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
 
 use crate::cache::{epoch, meta_get, meta_invalidate, meta_put, Meta};
 use crate::ingest::{IngestMsg, IngestResult, RowFramer, COPY_HEADER, COPY_SQL, SEND_BATCH};
@@ -35,12 +35,9 @@ pub const ROW_BYTES: i64 = 8120;
 const GET_RANGE_SQL: &str =
     "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3";
 
-/// Rows per part: any span up to SMALL_MAX (it may start mid-row) fits one.
+/// Rows per part: any span up to SMALL_MAX (it may start mid-row) fits one;
+/// longer reads are split into snapshot-protected queries.
 const PART_ROWS: usize = SMALL_MAX / ROW_BYTES as usize + 2;
-/// Parts in flight per GET, each on its own pool connection. Smaller parts
-/// measured slower at DuckDB's concurrency (2 MiB: +5% pass time, 1 MiB:
-/// +12-21%), so a span is only split above 8 MiB.
-const PARTS_INFLIGHT: usize = 8;
 /// Rows go to the response in chunks of about this size.
 const CHUNK: usize = 256 << 10;
 
@@ -74,36 +71,36 @@ pub async fn connect(url: &str) -> Result<Pool> {
 
 /// Storage layout this binary reads and writes (schema.sql); bumped only by
 /// breaking layout changes.
-pub const LAYOUT_VERSION: i32 = 3;
+pub const LAYOUT_VERSION: i32 = 4;
 
 /// Create the layout if absent, and fail closed on any other version rather
 /// than misread it. Serialized across gateways by an advisory lock, so
 /// concurrent first starts do not race the DDL.
 pub async fn init(pool: &Pool) -> Result<()> {
     const LOCK: i64 = 0x7067_7673; // "pgvs"
-    let conn = pool.get().await?;
+    let mut conn = pool.get().await?;
     conn.query_typed("SELECT pg_advisory_lock($1)", &[(&LOCK, Type::INT8)])
         .await?;
-    let result = init_locked(&conn).await;
+    let result = init_locked(&mut conn).await;
     let _ = conn
         .query_typed("SELECT pg_advisory_unlock($1)", &[(&LOCK, Type::INT8)])
         .await;
     result
 }
 
-async fn init_locked(client: &Client) -> Result<()> {
-    let chunks: bool = client
+async fn init_locked(client: &mut Client) -> Result<()> {
+    let tx = client.transaction().await?;
+    let chunks: bool = tx
         .query_typed_one("SELECT to_regclass('s3p.chunks') IS NOT NULL", &[])
         .await?
         .try_get(0)?;
     if chunks {
-        let marked: bool = client
+        let marked: bool = tx
             .query_typed_one("SELECT to_regclass('s3p.layout') IS NOT NULL", &[])
             .await?
             .try_get(0)?;
         let found: Option<i32> = if marked {
-            client
-                .query_typed_one("SELECT max(version) FROM s3p.layout", &[])
+            tx.query_typed_one("SELECT max(version) FROM s3p.layout", &[])
                 .await?
                 .try_get(0)?
         } else {
@@ -111,6 +108,17 @@ async fn init_locked(client: &Client) -> Result<()> {
         };
         match found {
             Some(v) if v == LAYOUT_VERSION => {}
+            Some(3) => {
+                // v3 allowed only one active upload per key. Dropping this
+                // constraint preserves existing uploads and object bytes.
+                tx.batch_execute("ALTER TABLE s3p.uploads DROP CONSTRAINT uploads_bucket_key_key")
+                    .await?;
+                tx.query_typed(
+                    "UPDATE s3p.layout SET version = $1",
+                    &[(&LAYOUT_VERSION, Type::INT4)],
+                )
+                .await?;
+            }
             Some(v) => anyhow::bail!(
                 "s3p holds storage layout v{v}; this pgvs3 reads v{LAYOUT_VERSION} \
                  (migrate the data, or point it at a fresh database)"
@@ -118,13 +126,13 @@ async fn init_locked(client: &Client) -> Result<()> {
             None => anyhow::bail!("s3p.layout is empty: refusing to guess the storage layout"),
         }
     }
-    client.batch_execute(SCHEMA).await?;
-    client
-        .query_typed(
-            "INSERT INTO s3p.layout (version) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM s3p.layout)",
-            &[(&LAYOUT_VERSION, Type::INT4)],
-        )
-        .await?;
+    tx.batch_execute(SCHEMA).await?;
+    tx.query_typed(
+        "INSERT INTO s3p.layout (version) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM s3p.layout)",
+        &[(&LAYOUT_VERSION, Type::INT4)],
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -270,6 +278,11 @@ pub async fn get_body(
             end,
         };
         let len = smeta.len() as usize;
+        if len == 0 && m.size == 0 && attempt == 0 {
+            // No rows can reveal a zero-byte object replaced on another gateway.
+            meta_fresh(&pool, &bucket, &key).await?;
+            continue;
+        }
         if len == 0 {
             return Ok(Some((smeta, PieceBody::OneShot(Bytes::new()))));
         }
@@ -370,11 +383,9 @@ fn part_ranges(first_row: i32, last_row: i32, step: usize) -> impl Iterator<Item
         .map(move |lo| (lo, lo.saturating_add(step as i32 - 1).min(last_row)))
 }
 
-/// Rows of `[start, end]` in `no` order, forwarded in ~CHUNK pieces as they
-/// arrive. Parts fetch concurrently (PARTS_INFLIGHT at a time), each in its
-/// own task (`spawn_part`); the head part is cut through while later parts
-/// queue their rows. A missing row (e.g. the object was replaced under a
-/// stale meta-cache entry) is an error, never a short body.
+/// Rows of `[start, end]` in `no` order, forwarded in ~CHUNK pieces. A single
+/// query has one statement snapshot. Multiple queries share a repeatable-read
+/// transaction, so concurrent overwrites cannot remove later rows mid-GET.
 async fn stream_span(
     pool: &Pool,
     m: &Meta,
@@ -382,23 +393,21 @@ async fn stream_span(
     end: i64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<()> {
-    let mut todo = plan(m, start, end, PART_ROWS).into_iter();
-    let mut running = VecDeque::with_capacity(PARTS_INFLIGHT);
+    let pieces = plan(m, start, end, PART_ROWS);
+    let mut snapshot = (pieces.len() > 1).then(|| spawn_snapshot_span(pool, pieces.clone()));
     let mut chunk = BytesMut::with_capacity(CHUNK + ROW_BYTES as usize);
     let mut sent = 0i64;
-    loop {
-        while running.len() < PARTS_INFLIGHT {
-            let Some(p) = todo.next() else { break };
-            running.push_back((p, spawn_part(pool, p)));
-        }
-        let Some((p, mut rows)) = running.pop_front() else {
-            break;
+    for p in pieces {
+        let mut single = None;
+        let rows = match &mut snapshot {
+            Some(rows) => rows,
+            None => single.get_or_insert_with(|| spawn_part(pool, p)),
         };
         // Bitmap heap scans return TID order: hold any row that runs ahead.
         let mut early: BTreeMap<i32, Row> = BTreeMap::new();
         let mut next = p.lo;
         while let Some(row) = rows.recv().await {
-            let row = row?;
+            let Some(row) = row? else { break };
             let no: i32 = row.try_get(0)?;
             if no != next {
                 early.insert(no, row);
@@ -453,10 +462,8 @@ fn put_row(
     Ok(())
 }
 
-/// Fetch one part in its own task, into a channel with room for all its
-/// rows: the fetch never waits on the consumer (which drains parts in order),
-/// so every in-flight part streams from PostgreSQL at full speed.
-fn spawn_part(pool: &Pool, p: Piece) -> tokio::sync::mpsc::Receiver<Result<Row>> {
+/// A one-query GET streams without opening an explicit transaction.
+fn spawn_part(pool: &Pool, p: Piece) -> tokio::sync::mpsc::Receiver<Result<Option<Row>>> {
     let (tx, rx) = tokio::sync::mpsc::channel((p.hi - p.lo + 2) as usize);
     let pool = pool.clone();
     tokio::spawn(async move {
@@ -467,13 +474,58 @@ fn spawn_part(pool: &Pool, p: Piece) -> tokio::sync::mpsc::Receiver<Result<Row>>
     rx
 }
 
+/// A multi-query GET holds one snapshot until its last row is read. The
+/// bounded channel backpressures PostgreSQL when the HTTP client is slow.
+fn spawn_snapshot_span(
+    pool: &Pool,
+    pieces: Vec<Piece>,
+) -> tokio::sync::mpsc::Receiver<Result<Option<Row>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        if let Err(e) = fetch_snapshot_span(&pool, pieces, &tx).await {
+            let _ = tx.send(Err(e)).await;
+        }
+    });
+    rx
+}
+
+async fn fetch_snapshot_span(
+    pool: &Pool,
+    pieces: Vec<Piece>,
+    tx: &tokio::sync::mpsc::Sender<Result<Option<Row>>>,
+) -> Result<()> {
+    let mut conn = pool.get().await?;
+    let range = conn.range().await?.clone();
+    let snapshot = conn
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    for p in pieces {
+        let params: [&(dyn ToSql + Sync); 3] = [&p.file_id, &p.lo, &p.hi];
+        let mut rows = std::pin::pin!(snapshot.query_raw(&range, params).await?);
+        while let Some(row) = rows.try_next().await? {
+            if tx.send(Ok(Some(row))).await.is_err() {
+                return Ok(());
+            }
+        }
+        if tx.send(Ok(None)).await.is_err() {
+            return Ok(());
+        }
+    }
+    snapshot.commit().await?;
+    Ok(())
+}
+
 /// One contiguous row-range query (the prepared GET_RANGE_SQL) on its own
 /// pool connection; rows go to `tx` as they arrive. Each keeps its bytes in
 /// the connection's receive buffer until copied into a response chunk.
 async fn fetch_part(
     pool: &Pool,
     p: Piece,
-    tx: &tokio::sync::mpsc::Sender<Result<Row>>,
+    tx: &tokio::sync::mpsc::Sender<Result<Option<Row>>>,
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut conn = pool.get().await?;
@@ -482,7 +534,7 @@ async fn fetch_part(
     let range = conn.range().await?.clone();
     let mut rows = std::pin::pin!(conn.query_raw(&range, params).await?);
     while let Some(row) = rows.try_next().await? {
-        if tx.send(Ok(row)).await.is_err() {
+        if tx.send(Ok(Some(row))).await.is_err() {
             break; // the span was abandoned
         }
     }
@@ -1001,7 +1053,7 @@ pub async fn delete_bucket(pool: &Pool, name: &str) -> Result<BucketDeletion> {
     Ok(BucketDeletion::Deleted)
 }
 
-/// Start (or re-attach, for a retried Create) the multipart upload of a key.
+/// Each Create has its own upload ID, even for the same key.
 pub async fn create_upload(pool: &Pool, bucket: &str, key: &str) -> Result<Option<String>> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
@@ -1017,8 +1069,7 @@ pub async fn create_upload(pool: &Pool, bucket: &str, key: &str) -> Result<Optio
     }
     let id = tx
         .query_typed_one(
-            "INSERT INTO s3p.uploads (upload_id, bucket, key) VALUES (gen_random_uuid()::text, $1, $2) \
-              ON CONFLICT (bucket, key) DO UPDATE SET bucket = EXCLUDED.bucket RETURNING upload_id",
+            "INSERT INTO s3p.uploads (upload_id, bucket, key) VALUES (gen_random_uuid()::text, $1, $2) RETURNING upload_id",
             &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
         )
         .await?
@@ -1054,9 +1105,9 @@ pub enum Completed {
     NoSuchUpload,
 }
 
-/// Complete: every recorded part listed exactly once with a matching ETag (any
-/// listing order), then the object publishes as its ordered part files. No
-/// data moves. ETag = sha256 over the part sha256s (S3's hash-of-part-hashes).
+/// Complete: listed parts must be ascending and have matching ETags. Unlisted
+/// uploaded parts are discarded in the publication transaction. No selected
+/// data moves. ETag = sha256 over the selected part sha256s.
 pub async fn complete_upload(
     pool: &Pool,
     upload_id: &str,
@@ -1085,26 +1136,39 @@ pub async fn complete_upload(
             &[(&upload_id, Type::TEXT)],
         )
         .await?;
-    let mut want: Vec<&(i32, String)> = listed.iter().collect();
-    want.sort_by_key(|(no, _)| *no);
-    if want.is_empty() || want.len() != rows.len() {
+    if listed.is_empty()
+        || listed.iter().any(|(no, _)| !(1..=10_000).contains(no))
+        || listed.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+    {
         return Ok(Completed::InvalidPart);
     }
+    let mut want = listed.iter().peekable();
     let (mut ids, mut ends, mut size) = (
-        Vec::with_capacity(rows.len()),
-        Vec::with_capacity(rows.len()),
+        Vec::with_capacity(listed.len()),
+        Vec::with_capacity(listed.len()),
         0i64,
     );
+    let mut unused = Vec::new();
     let mut hasher = Sha256::new();
-    for (p, r) in want.iter().zip(&rows) {
+    for r in &rows {
+        let no: i32 = r.try_get(0)?;
+        let id: i64 = r.try_get(1)?;
+        if want.peek().is_none_or(|p| p.0 != no) {
+            unused.push(id);
+            continue;
+        }
+        let p = want.next().expect("matched part");
         let sha: Vec<u8> = r.try_get(3)?;
-        if p.0 != r.try_get::<_, i32>(0)? || p.1 != hex(&sha) {
+        if p.1 != hex(&sha) {
             return Ok(Completed::InvalidPart);
         }
         hasher.update(&sha);
         size += r.try_get::<_, i64>(2)?;
-        ids.push(r.try_get::<_, i64>(1)?);
+        ids.push(id);
         ends.push(size);
+    }
+    if want.next().is_some() {
+        return Ok(Completed::InvalidPart);
     }
     let etag = hasher.finalize().to_vec();
     swap_object(
@@ -1120,6 +1184,13 @@ pub async fn complete_upload(
         },
     )
     .await?;
+    if !unused.is_empty() {
+        tx.query_typed(
+            "DELETE FROM s3p.chunks WHERE file_id = ANY($1)",
+            &[(&unused, Type::INT8_ARRAY)],
+        )
+        .await?;
+    }
     tx.query_typed(
         "DELETE FROM s3p.uploads WHERE upload_id = $1",
         &[(&upload_id, Type::TEXT)],
@@ -1280,9 +1351,41 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use object_store::aws::AmazonS3Builder;
     use object_store::path::Path;
     use object_store::ObjectStoreExt;
+
+    #[tokio::test]
+    #[ignore = "requires kind; run just kind-contract"]
+    async fn large_get_survives_overwrite_after_first_chunk() -> Result<()> {
+        let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
+        let bucket = "pgvs3-contract";
+        let key = format!("contract/snapshot-{}", std::process::id());
+        let old = vec![0x5a; SMALL_MAX * 2 + 8120];
+        let result: Result<()> = async {
+            put(&pool, bucket, &key, &old).await?;
+            let (_, body) = get_body(pool.clone(), bucket.into(), key.clone(), 0, -1, -1)
+                .await?
+                .context("missing object")?;
+            let mut got = Vec::new();
+            match body {
+                PieceBody::OneShot(bytes) => got.extend_from_slice(&bytes),
+                PieceBody::Streamed(mut stream) => {
+                    // get_body has already fetched its first response chunk.
+                    put(&pool, bucket, &key, b"replacement").await?;
+                    while let Some(bytes) = stream.next().await {
+                        got.extend_from_slice(&bytes?);
+                    }
+                }
+            }
+            anyhow::ensure!(got == old, "concurrent overwrite interrupted GET");
+            Ok(())
+        }
+        .await;
+        let _ = delete(&pool, bucket, &key).await;
+        result
+    }
 
     #[tokio::test]
     #[ignore = "requires kind; run just kind-contract"]
@@ -1347,8 +1450,8 @@ mod tests {
             .with_bucket_name("pgvs3-contract")
             .with_region("us-east-1")
             .with_endpoint(&endpoint)
-            .with_access_key_id("cachebench")
-            .with_secret_access_key("cachebench-local-only")
+            .with_access_key_id(std::env::var("PGVS3_ACCESS_KEY")?)
+            .with_secret_access_key(std::env::var("PGVS3_SECRET_KEY")?)
             .with_allow_http(true)
             .build()?;
         let key = format!("contract/concurrent-{}", std::process::id());

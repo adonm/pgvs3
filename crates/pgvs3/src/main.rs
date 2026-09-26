@@ -29,14 +29,18 @@ enum Cmd {
         /// Listen address. In a container use `PGVS3_ADDR=0.0.0.0:8014`.
         #[arg(long, env = "PGVS3_ADDR", default_value = "127.0.0.1:8014")]
         addr: String,
-        #[arg(long, env = "PGVS3_ACCESS_KEY", default_value = "cachebench")]
+        #[arg(long, env = "PGVS3_ACCESS_KEY")]
         access_key: String,
-        #[arg(
-            long,
-            env = "PGVS3_SECRET_KEY",
-            default_value = "cachebench-local-only"
-        )]
+        #[arg(long, env = "PGVS3_SECRET_KEY")]
         secret_key: String,
+        /// PEM certificate and private key for HTTPS. Both must be configured.
+        #[arg(long, env = "PGVS3_TLS_CERT")]
+        tls_cert: Option<String>,
+        #[arg(long, env = "PGVS3_TLS_KEY")]
+        tls_key: Option<String>,
+        /// Allow plaintext HTTP on a non-loopback address (isolated benchmark rigs only).
+        #[arg(long, env = "PGVS3_ALLOW_HTTP", default_value_t = false)]
+        allow_http: bool,
     },
     /// Seed deterministic incompressible objects.
     Seed {
@@ -55,9 +59,9 @@ enum Cmd {
         endpoint: String,
         #[arg(long, default_value = "lake")]
         bucket: String,
-        #[arg(long, default_value = "cachebench")]
+        #[arg(long, env = "AWS_ACCESS_KEY_ID")]
         access_key: String,
-        #[arg(long, default_value = "cachebench-local-only")]
+        #[arg(long, env = "AWS_SECRET_ACCESS_KEY")]
         secret_key: String,
         #[arg(
             long,
@@ -84,6 +88,9 @@ async fn main() -> Result<()> {
             addr,
             access_key,
             secret_key,
+            tls_cert,
+            tls_key,
+            allow_http,
         } => {
             let pool = db::connect(&cli.url).await?;
             db::init(&pool).await?;
@@ -93,6 +100,9 @@ async fn main() -> Result<()> {
                     addr,
                     access_key,
                     secret_key,
+                    tls_cert,
+                    tls_key,
+                    allow_http,
                 },
             )
             .await

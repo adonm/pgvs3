@@ -23,6 +23,16 @@ kind load docker-image "$image:latest" --name "$cluster"
 "${kubectl[@]}" create namespace "$namespace" --dry-run=client -o yaml \
   | "${kubectl[@]}" apply -f -
 
+# This key is local to this disposable kind namespace. Reuse it on redeploy;
+# never put it in Helm release values, a ConfigMap or the repository.
+if ! "${kubectl[@]}" -n "$namespace" get secret pgvs3-s3 >/dev/null 2>&1; then
+  python3 -c 'import json,secrets; print(json.dumps({"apiVersion":"v1","kind":"Secret","metadata":{"name":"pgvs3-s3","namespace":"pgvs3"},"type":"Opaque","stringData":{"accessKey":"pgvs3-"+secrets.token_hex(8),"secretKey":secrets.token_hex(32)}}))' \
+    | "${kubectl[@]}" -n "$namespace" apply -f - >/dev/null
+fi
+export PGVS3_ACCESS_KEY PGVS3_SECRET_KEY
+PGVS3_ACCESS_KEY=$("${kubectl[@]}" -n "$namespace" get secret pgvs3-s3 -o jsonpath='{.data.accessKey}' | base64 --decode)
+PGVS3_SECRET_KEY=$("${kubectl[@]}" -n "$namespace" get secret pgvs3-s3 -o jsonpath='{.data.secretKey}' | base64 --decode)
+
 if [ -n "${PGVS3_DB_SECRET:-}" ]; then
   # External PostgreSQL: the Secret contains the URL, not Helm values/history.
   "${kubectl[@]}" -n "$namespace" get secret "$PGVS3_DB_SECRET" >/dev/null
@@ -37,8 +47,11 @@ else
 fi
 # Both backends get the same three logical databases before Quickwit starts.
 bash deploy/kind/db.sh "$secret"
+allow_plaintext_db=false
+if [ "$secret" = postgres ]; then allow_plaintext_db=true; fi
 "${helm[@]}" upgrade --install pgvs3 deploy/charts/pgvs3 --namespace "$namespace" \
-  --reset-values --set "image=$image:latest" --set-string "urlSecretName=$secret"
+  --reset-values --set "image=$image:latest" --set-string "urlSecretName=$secret" \
+  --set allowHttp=true --set "allowPlaintextDb=$allow_plaintext_db"
 "${kubectl[@]}" -n "$namespace" rollout restart deployment/pgvs3
 "${kubectl[@]}" -n "$namespace" rollout status deployment/pgvs3 --timeout=300s
 "${kubectl[@]}" -n "$namespace" port-forward service/pgvs3 18016:8014 >/dev/null 2>&1 &

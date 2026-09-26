@@ -26,6 +26,12 @@ spec:
             - name: QW_METASTORE_URI
               valueFrom:
                 secretKeyRef: { name: {{ .Values.metastoreSecretName | quote }}, key: metastoreUrl }
+            - name: PGVS3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: accessKey }
+            - name: PGVS3_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: secretKey }
           ports:
             - { containerPort: 7280, name: rest }
             - { containerPort: 7281, name: grpc }

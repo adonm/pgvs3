@@ -19,9 +19,22 @@ spec:
               valueFrom:
                 secretKeyRef: { name: {{ .Values.urlSecretName | quote }}, key: url }
             - name: PGVS3_ACCESS_KEY
-              value: {{ .Values.accessKey | quote }}
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: accessKey }
             - name: PGVS3_SECRET_KEY
-              value: {{ .Values.secretKey | quote }}
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: secretKey }
+            {{- if .Values.allowHttp }}
+            - { name: PGVS3_ALLOW_HTTP, value: "true" }
+            {{- end }}
+            {{- if .Values.allowPlaintextDb }}
+            - { name: PGVS3_DB_ALLOW_PLAINTEXT, value: "true" }
+            {{- end }}
+            {{- if .Values.tlsSecretName }}
+            - { name: PGVS3_TLS_CERT, value: /etc/pgvs3/tls/tls.crt }
+            - { name: PGVS3_TLS_KEY, value: /etc/pgvs3/tls/tls.key }
+            {{- end }}
+            - { name: PGVS3_DB_CA_FILE, value: /etc/pgvs3/db-ca/caCert }
             - name: PGVS3_POOL_MAX
               value: {{ .Values.poolMax | quote }}
             - name: PGVS3_POOL_MIN
@@ -30,16 +43,30 @@ spec:
           # Starting a warm pool over TLS to Aurora can take longer than a
           # local kind connection. Do not apply liveness until it is serving.
           startupProbe:
-            httpGet: { path: /healthz, port: 8014 }
+            httpGet: { path: /healthz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
             periodSeconds: 5
             failureThreshold: 36
           readinessProbe:
-            httpGet: { path: /healthz, port: 8014 }
+            httpGet: { path: /healthz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
-            httpGet: { path: /healthz, port: 8014 }
+            httpGet: { path: /healthz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
             initialDelaySeconds: 10
             periodSeconds: 15
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - { name: db-ca, mountPath: /etc/pgvs3/db-ca, readOnly: true }
+          {{- if .Values.tlsSecretName }}
+            - { name: tls, mountPath: /etc/pgvs3/tls, readOnly: true }
+          {{- end }}
+      volumes:
+        - name: db-ca
+          secret:
+            secretName: {{ .Values.urlSecretName | quote }}
+            items: [{ key: caCert, path: caCert }]
+      {{- if .Values.tlsSecretName }}
+        - name: tls
+          secret: { secretName: {{ .Values.tlsSecretName | quote }} }
+      {{- end }}

@@ -6,11 +6,15 @@ CloudFormation parameters, Helm history or shell command arguments.
 """
 import json
 import sys
+from pathlib import Path
 from urllib.parse import quote
 
 
 def main() -> None:
     host = sys.argv[1]
+    ca_cert = Path(sys.argv[2]).read_text()
+    if "-----BEGIN CERTIFICATE-----" not in ca_cert:
+        raise SystemExit("missing Aurora CA certificate")
     source = json.load(sys.stdin)
     user = source["username"]
     password = source["password"]
@@ -23,7 +27,8 @@ def main() -> None:
         "metadata": {"name": "pgvs3-aurora", "namespace": "pgvs3"},
         "type": "Opaque",
         "stringData": {"host": host, "user": user, "password": password,
-                       "url": f"{base}/pgvs3?sslmode=require",
+                        "url": f"{base}/pgvs3?sslmode=require",
+                        "caCert": ca_cert,
                        "metastoreUrl": f"{base}/quickwit_metastore?sslmode=require",
                        "sslmode": "require"},
     }))

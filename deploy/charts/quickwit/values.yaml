@@ -2,6 +2,7 @@ image: quickwit/quickwit:0.9.1
 # Same PostgreSQL cluster as pgvs3 and DuckLake, third logical database.
 # The URI comes from a Secret; only immutable split files live on pgvs3.
 metastoreSecretName: postgres
+s3SecretName: pgvs3-s3
 indexRootUri: s3://quickwit/indexes
 storage:
   s3:
@@ -9,8 +10,8 @@ storage:
     region: us-east-1
     force_path_style_access: true
     flavor: minio
-    access_key_id: cachebench
-    secret_access_key: cachebench-local-only
+    access_key_id: ${PGVS3_ACCESS_KEY}
+    secret_access_key: ${PGVS3_SECRET_KEY}
 # One node runs the indexer/control plane and all services. The metastore can
 # safely be shared through PostgreSQL; scale read-only searchers separately
 # with direct pod discovery (never a ClusterIP seed).

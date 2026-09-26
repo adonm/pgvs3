@@ -21,13 +21,28 @@ fn signed_request(
     path: &str,
     headers: &[&str],
 ) -> Result<(u16, String)> {
+    signed_request_body(endpoint, method, path, headers, None)
+}
+
+fn signed_request_body(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+    body: Option<&str>,
+) -> Result<(u16, String)> {
     let mut cmd = std::process::Command::new("curl");
+    let user = format!(
+        "{}:{}",
+        std::env::var("PGVS3_ACCESS_KEY")?,
+        std::env::var("PGVS3_SECRET_KEY")?
+    );
     cmd.args([
         "-sS",
         "--aws-sigv4",
         "aws:amz:us-east-1:s3",
         "--user",
-        "cachebench:cachebench-local-only",
+        &user,
         "-X",
         method,
         "-w",
@@ -38,6 +53,9 @@ fn signed_request(
     }
     for header in headers {
         cmd.args(["-H", header]);
+    }
+    if let Some(body) = body {
+        cmd.args(["--data-binary", body]);
     }
     let output = cmd.arg(format!("{endpoint}/{path}")).output()?;
     ensure!(output.status.success(), "curl failed: {:?}", output.stderr);
@@ -53,8 +71,8 @@ fn store(endpoint: &str, bucket: &str) -> Result<AmazonS3> {
         .with_bucket_name(bucket)
         .with_region("us-east-1")
         .with_endpoint(endpoint)
-        .with_access_key_id("cachebench")
-        .with_secret_access_key("cachebench-local-only")
+        .with_access_key_id(std::env::var("PGVS3_ACCESS_KEY")?)
+        .with_secret_access_key(std::env::var("PGVS3_SECRET_KEY")?)
         .with_allow_http(true)
         .build()?)
 }
@@ -308,6 +326,24 @@ async fn overwrite_and_delete_are_visible_on_both_gateways() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires kind; run just kind-contract"]
+async fn zero_byte_cache_entry_not_used_after_remote_overwrite() -> Result<()> {
+    let (a, b) = endpoints()?;
+    let path = Path::from(format!("{}/zero-to-nonempty", prefix()));
+    let result: Result<()> = async {
+        a.put(&path, Bytes::new().into()).await?;
+        ensure!(b.get(&path).await?.bytes().await?.is_empty());
+        a.put(&path, Bytes::from_static(b"new bytes").into())
+            .await?;
+        ensure!(b.get(&path).await?.bytes().await? == b"new bytes"[..]);
+        Ok(())
+    }
+    .await;
+    let _ = a.delete(&path).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
 async fn conditional_puts_are_atomic_across_gateways() -> Result<()> {
     let (a, b) = endpoints()?;
     let path = Path::from(format!("{}/conditional", prefix()));
@@ -489,6 +525,115 @@ async fn multipart_completion_and_abort_manage_staged_rows() -> Result<()> {
     }
     .await;
 
+    let _ = a.delete(&path).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
+async fn missing_upload_cannot_complete_an_existing_object() -> Result<()> {
+    let (a, _) = endpoints()?;
+    let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
+    let path = Path::from(format!("{}/already-present", prefix()));
+    let result: Result<()> = async {
+        a.put(&path, Bytes::from_static(b"original").into()).await?;
+        let (status, body) = signed_request_body(
+            &endpoint,
+            "POST",
+            &format!("pgvs3-contract/{path}?uploadId=missing-upload"),
+            &["Content-Type: application/xml"],
+            Some("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"unknown\"</ETag></Part></CompleteMultipartUpload>"),
+        )?;
+        ensure!(status == 404 && body.contains("NoSuchUpload"), "{status}: {body}");
+        ensure!(a.get(&path).await?.bytes().await? == b"original"[..]);
+        Ok(())
+    }
+    .await;
+    let _ = a.delete(&path).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
+async fn concurrent_uploads_of_one_key_remain_independent() -> Result<()> {
+    let (a, b) = endpoints()?;
+    let path = Path::from(format!("{}/parallel-uploads", prefix()));
+    let mut first = a.put_multipart(&path).await?;
+    let mut second = b.put_multipart(&path).await?;
+    let result: Result<()> = async {
+        let conn = pool().await?.get().await?;
+        let count: i64 = conn
+            .query_typed_one(
+                "SELECT count(*) FROM s3p.uploads WHERE bucket = $1 AND key = $2",
+                &[
+                    (&"pgvs3-contract", Type::TEXT),
+                    (&path.as_ref(), Type::TEXT),
+                ],
+            )
+            .await?
+            .try_get(0)?;
+        ensure!(count == 2, "two Creates shared one upload ID");
+        first.put_part(Bytes::from_static(b"winner").into()).await?;
+        second.put_part(Bytes::from_static(b"loser").into()).await?;
+        first.complete().await?;
+        second.abort().await?;
+        ensure!(b.get(&path).await?.bytes().await? == b"winner"[..]);
+        Ok(())
+    }
+    .await;
+    let _ = first.abort().await;
+    let _ = second.abort().await;
+    let _ = a.delete(&path).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
+async fn completion_can_select_only_uploaded_parts() -> Result<()> {
+    let (a, _) = endpoints()?;
+    let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
+    let path = Path::from(format!("{}/selected-parts", prefix()));
+    let mut upload = a.put_multipart(&path).await?;
+    let result: Result<()> = async {
+        upload.put_part(Bytes::from_static(b"unused").into()).await?;
+        upload.put_part(Bytes::from_static(b"selected").into()).await?;
+        let conn = pool().await?.get().await?;
+        let rows = conn
+            .query_typed(
+                "SELECT u.upload_id, p.part_no, p.file_id, p.sha256 \
+                 FROM s3p.uploads u JOIN s3p.upload_parts p USING (upload_id) \
+                 WHERE u.bucket = $1 AND u.key = $2 ORDER BY p.part_no",
+                &[(&"pgvs3-contract", Type::TEXT), (&path.as_ref(), Type::TEXT)],
+            )
+            .await?;
+        ensure!(rows.len() == 2);
+        let id: String = rows[1].try_get(0)?;
+        let unused_id: i64 = rows[0].try_get(2)?;
+        let tag = pgvs3::db::hex(&rows[1].try_get::<_, Vec<u8>>(3)?);
+        let manifest = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>\"{tag}\"</ETag></Part></CompleteMultipartUpload>"
+        );
+        let (status, body) = signed_request_body(
+            &endpoint,
+            "POST",
+            &format!("pgvs3-contract/{path}?uploadId={id}"),
+            &["Content-Type: application/xml"],
+            Some(&manifest),
+        )?;
+        ensure!(status == 200, "{status}: {body}");
+        ensure!(a.get(&path).await?.bytes().await? == b"selected"[..]);
+        let count: i64 = conn
+            .query_typed_one(
+                "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+                &[(&unused_id, Type::INT8)],
+            )
+            .await?
+            .try_get(0)?;
+        ensure!(count == 0, "unselected part left orphaned chunks");
+        Ok(())
+    }
+    .await;
+    let _ = upload.abort().await;
     let _ = a.delete(&path).await;
     result
 }

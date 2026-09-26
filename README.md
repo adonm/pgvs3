@@ -13,6 +13,10 @@ the catalog sees the same tables and the same data.
 - No data cache: clients such as DuckDB cache what they read. A per-process
   metadata cache only removes the lookup round trip per GET.
 
+The performance figures below were measured before the consistent-snapshot
+change for multi-query GETs. Re-benchmark large reads before using them as
+current throughput claims.
+
 > Postgres is all you need. ;P — for durable bytes and metadata here; DuckDB
 > and Quickwit still do the actual analytics and search.
 
@@ -64,19 +68,20 @@ just dev-db   # PostgreSQL 18 in Docker, for running the gateway by hand
 just smoke    # the tests: kind cluster up, every workload once at smoke scale
 ```
 
-Run the gateway (SigV4 key `cachebench` / `cachebench-local-only` unless you
-pass `--access-key` / `--secret-key`; change them anywhere but localhost):
+Run the gateway with explicit SigV4 credentials (the example key is for
+loopback development only):
 
 ```sh
-./target/release/pgvs3 --url postgres://user:pass@host/db serve --addr 127.0.0.1:8014
+export PGVS3_ACCESS_KEY=cachebench PGVS3_SECRET_KEY=cachebench-local-only
+./target/release/pgvs3 --url 'postgres://user:pass@host/db?sslmode=require' serve --addr 127.0.0.1:8014
 ```
 
 Use it like any path-style S3:
 
 ```sh
-curl --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
+curl --aws-sigv4 aws:amz:us-east-1:s3 --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
      -X PUT http://127.0.0.1:8014/lake  # create the bucket once
-curl --aws-sigv4 aws:amz:us-east-1:s3 --user cachebench:cachebench-local-only \
+curl --aws-sigv4 aws:amz:us-east-1:s3 --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
      -H 'Range: bytes=0-1023' http://127.0.0.1:8014/lake/some-object
 ```
 
@@ -84,6 +89,10 @@ DuckDB: `SET s3_endpoint='127.0.0.1:8014'; SET s3_use_ssl=false; SET s3_url_styl
 
 Other subcommands: `seed` (load generator), `bench` (GET latency/throughput
 matrix plus the direct-PostgreSQL floor), `stat` (logical vs physical size).
+For `just micro` or other standalone benchmark commands, also export
+`AWS_ACCESS_KEY_ID=$PGVS3_ACCESS_KEY` and
+`AWS_SECRET_ACCESS_KEY=$PGVS3_SECRET_KEY`. The kind harness reads these from
+its generated Kubernetes Secret instead.
 
 ## How it works
 
@@ -102,9 +111,12 @@ file id, size, sha256 ETag and, for multipart objects, the list of part files;
   so concurrent creates cannot strand chunks. Unsupported conditional DELETEs
   fail instead of silently deleting. Acknowledged writes use synchronous commits.
 - **Reads** turn a byte range into a row range by arithmetic (row =
-  offset / 8120) and run one row-range query per 8 MiB. Bigger ranges run up
-  to 8 of those in parallel on separate connections. Rows go to the client as
-  they arrive.
+  offset / 8120) and run one row-range query per 8 MiB. Multi-query reads
+  (including multipart ranges) use one repeatable-read snapshot, so an
+  overwrite cannot remove later rows during a response. They use one
+  connection and fetch spans sequentially; measure the throughput trade-off
+  before relying on the older parallel-read benchmark numbers. Rows stream to
+  the client as they arrive.
 - **Maintenance** belongs to PostgreSQL: a bounded cleanup function reaps
   abandoned multipart parts after 24 hours (scheduled by `pg_cron` in kind
   and on Aurora), and per-partition autovacuum runs without a gateway janitor
@@ -115,10 +127,13 @@ file id, size, sha256 ETag and, for multipart objects, the list of part files;
   returns `BucketNotEmpty`. The kind harness provisions its three workload
   buckets through S3 at startup. The `seed` load generator creates its own
   bucket if absent.
-- **Layout version** (`s3p.layout`): a gateway refuses to run against a layout
-  it was not built for. The pre-release v3 bucket layout requires a fresh
-  database; `just kind-reset` or `just rig-reset` discards only that
-  environment's three disposable test databases and redeploys them.
+- **Layout version** (`s3p.layout`): a gateway refuses to run against an
+  unknown layout. v3 migrates to v4 on startup without discarding objects or
+  in-progress uploads; older layouts still need an explicit migration. v4
+  permits independent simultaneous multipart uploads to the same key. Drain
+  v3 gateways before the first v4 startup: v3's Create handler cannot use the
+  uploads table after its unique constraint is removed, so this one upgrade
+  needs a maintenance window rather than a mixed-version rolling rollout.
 
 Why 8120-byte rows (from the PostgreSQL 18 source, `heaptoast.c`,
 `heaptoast.h`, `reloptions.c`): PostgreSQL moves a value out of line only when
@@ -134,10 +149,14 @@ A flag overrides the same-named variable.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `--url` | `PGVS3_URL` | local dev DB | PostgreSQL URL. `sslmode=require` encrypts but does not verify the server certificate. |
+| `--url` | `PGVS3_URL` | local dev DB | PostgreSQL URL. Remote hosts require `sslmode=require`, which verifies certificate and hostname against system CAs (plus `PGVS3_DB_CA_FILE` if set). Loopback/local `prefer` can fall back to plaintext. |
 | `--addr` | `PGVS3_ADDR` | `127.0.0.1:8014` | Listen address; use `0.0.0.0:8014` in a container. |
-| `--access-key` | `PGVS3_ACCESS_KEY` | `cachebench` | SigV4 access key. |
-| `--secret-key` | `PGVS3_SECRET_KEY` | `cachebench-local-only` | SigV4 secret key. |
+| `--access-key` | `PGVS3_ACCESS_KEY` | required | SigV4 access key. |
+| `--secret-key` | `PGVS3_SECRET_KEY` | required | SigV4 secret key. |
+| `--tls-cert`, `--tls-key` | `PGVS3_TLS_CERT`, `PGVS3_TLS_KEY` | unset | PEM file paths for HTTPS on non-loopback addresses. Set both; mount the private key read-only. |
+| `--allow-http` | `PGVS3_ALLOW_HTTP` | false | Explicitly permit plaintext HTTP outside loopback for an isolated benchmark rig; do not expose that listener to untrusted clients. |
+| | `PGVS3_DB_CA_FILE` | unset | Path to additional PostgreSQL CA PEM bundle (Aurora rig mounts the RDS CA from a Secret). |
+| | `PGVS3_DB_ALLOW_PLAINTEXT` | false | Permit `prefer`/`disable` to remote PostgreSQL for an isolated test rig. Local kind sets this explicitly. |
 | | `PGVS3_POOL_MIN` | 64 | Connections opened at start and kept warm. Clamped to the max. |
 | | `PGVS3_POOL_MAX` | 64 | Connections open at once, per gateway. Include all replicas, rollout headroom and other clients in the local Postgres `maxConnections` or Aurora connection budget. |
 
@@ -166,6 +185,10 @@ Each is backed by a measurement on the AWS rig:
   staging, and Complete moves no data.
 
 ## Performance
+
+The following GET and analytics throughput numbers are historical: they
+predate the snapshot-protected multi-query read path. No new full-scale A/B
+has been run for that change.
 
 ### AWS rig, 2026-09-25
 
@@ -622,14 +645,16 @@ Before more tuning: run `just kind-contract` against the two gateway pods
 
 Published to GHCR on every push to `main` (amd64 and arm64, so AWS Graviton
 works), built by `just image` from a two-stage Dockerfile: `rust:alpine` builds
-a static musl binary, and the image is `scratch` — no shell, no libc, 14 MB.
-All config comes from the environment (see Configuration), so Kubernetes only
-needs a Deployment:
+a static musl binary, and the image is `scratch`. Supply a TLS certificate and
+key for any non-loopback listener; the kind rig alone opts into HTTP. Store S3
+credentials and certificates in Secrets, not Helm values or ConfigMaps:
 
 ```sh
 docker run -p 8014:8014 \
+  -v /path/to/tls:/tls:ro \
   -e PGVS3_URL="postgres://user:pass@host/db?sslmode=require" \
-  -e PGVS3_SECRET_KEY=change-me \
+  -e PGVS3_ACCESS_KEY=admin -e PGVS3_SECRET_KEY=change-me \
+  -e PGVS3_TLS_CERT=/tls/tls.crt -e PGVS3_TLS_KEY=/tls/tls.key \
   ghcr.io/adonm/pgvs3:latest
 ```
 
@@ -643,8 +668,15 @@ containers:
       - name: PGVS3_SECRET_KEY
         valueFrom: { secretKeyRef: { name: pgvs3, key: secret-key } }
       - name: PGVS3_ACCESS_KEY
-        value: admin
+        valueFrom: { secretKeyRef: { name: pgvs3, key: access-key } }
+      - { name: PGVS3_TLS_CERT, value: /tls/tls.crt }
+      - { name: PGVS3_TLS_KEY, value: /tls/tls.key }
+    volumeMounts:
+      - { name: tls, mountPath: /tls, readOnly: true }
     ports: [{ containerPort: 8014 }]
+volumes:
+  - name: tls
+    secret: { secretName: pgvs3-tls }
 ```
 
 ## Repo layout

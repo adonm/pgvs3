@@ -174,9 +174,13 @@ case ${1:-} in
     secret_arn=$("${aws[@]}" rds describe-db-clusters --db-cluster-identifier "$cluster" \
       --query 'DBClusters[0].MasterUserSecret.SecretArn' --output text)
     [ -n "$secret_arn" ] && [ "$secret_arn" != None ] || die "Aurora managed master secret not available"
+    # Verify the Aurora server hostname and chain against AWS's published RDS
+    # roots. The CA is public, but kept in the DB Secret alongside its URL.
+    curl -fsS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+      -o .tmp/pgvs3/rds-global-bundle.pem
     "${aws[@]}" secretsmanager get-secret-value --secret-id "$secret_arn" \
       --query SecretString --output text \
-      | python3 deploy/kind/rig-secret.py "$endpoint" \
+      | python3 deploy/kind/rig-secret.py "$endpoint" .tmp/pgvs3/rds-global-bundle.pem \
       | ssh_run 'cd pgvs3 && ~/.local/bin/mise exec -- kubectl --context kind-pgvs3 apply -f -'
     searchers=${QUICKWIT_SEARCHERS:-0}
     [[ "$searchers" =~ ^[0-9]+$ ]] || die 'QUICKWIT_SEARCHERS must be a non-negative integer'

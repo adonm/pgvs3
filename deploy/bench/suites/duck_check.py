@@ -20,8 +20,9 @@ for ext in ("postgres", "httpfs", "ducklake"):
 c.sql("SET s3_endpoint='pgvs3:8014'")
 c.sql("SET s3_use_ssl=false")
 c.sql("SET s3_url_style='path'")
-c.sql("SET s3_access_key_id='cachebench'")
-c.sql("SET s3_secret_access_key='cachebench-local-only'")
+for setting, key in (("s3_access_key_id", "AWS_ACCESS_KEY_ID"),
+                     ("s3_secret_access_key", "AWS_SECRET_ACCESS_KEY")):
+    c.sql(f"SET {setting}='{os.environ[key].replace(chr(39), chr(39) * 2)}'")
 c.sql(
     f"ATTACH 'ducklake:postgres:dbname=ducklake_catalog host={PG_HOST} "
     f"user={PG_USER} sslmode={os.environ.get('PGSSLMODE', 'prefer')}' AS lake "
