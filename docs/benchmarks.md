@@ -1,14 +1,32 @@
 # Benchmark history
 
-Dated measurements and comparisons from the pgvs3 README. These runs do not
-all use the current read path, cluster topology or DuckDB version; read each
-setup before comparing numbers.
+Dated measurements and comparisons. These runs do not all use the same read
+path, cluster topology or DuckDB version; read each setup before comparing
+numbers.
 
 The AWS and kind GET and analytics throughput numbers in the historical
 sections below predate the snapshot-protected multi-query read path. No new
 full-scale A/B has been run for that change.
 
 ## Current-path quick check
+
+### Full-scale analytics on EC2/Aurora, 2026-09-27
+
+Current snapshot-protected multi-query GETs, two gateways, Aurora PostgreSQL
+18.6, DuckDB `2.0.0.dev2609222040`, file caches on. Canonical ClickBench
+`hits.parquet` loaded 99,997,497 rows in 44.64 s; all 43 queries passed.
+SpatialBench SF10 loaded 60M trips and 454,710 zones in 20.83 s; AOI
+queries Q1–Q3 and Q6 passed. One load and two query passes per workload:
+
+| Workload | First pass | Warm pass |
+| --- | ---: | ---: |
+| ClickBench, 43 queries | 34.03 s | 29.21 s |
+| SpatialBench SF10, four AOI queries | 8.28 s | 4.35 s |
+
+The runs use the same rig shape as the previous full-scale measurements, but
+these are single runs after a fresh deployment and benchmark load, not a
+controlled repeated old-path-versus-new-path A/B. Results were copied to
+ignored `.tmp/pgvs3/rig-out/`.
 
 ### Quick current-path check, 2026-09-26
 

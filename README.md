@@ -13,11 +13,9 @@ the catalog sees the same tables and the same data.
 - No data cache: clients such as DuckDB cache what they read. A per-process
   metadata cache only removes the lookup round trip per GET.
 
-The full-scale performance figures below were measured before the
-consistent-snapshot change for multi-query GETs. A
-[quick current-path check](docs/benchmarks.md#quick-current-path-check-2026-09-26)
-covers GETs on local PostgreSQL, but does not revalidate the AWS or analytics
-figures.
+The full-scale ClickBench and SpatialBench figures below were re-measured on
+the snapshot-protected read path. Dated workloads, current-path GET checks and
+historical comparisons are in [benchmark history](docs/benchmarks.md).
 
 > Postgres is all you need. ;P — for durable bytes and metadata here; DuckDB
 > and Quickwit still do the actual analytics and search.
@@ -28,14 +26,13 @@ figures.
 | --- | --- | --- |
 | 8 / 16 MiB GET, one client | 1,292 / 1,306 MiB/s | Current snapshot read path, local Docker; not an Aurora result |
 | 8 / 16 / 64 MiB GET, one client | 454 / 454 / 449 MiB/s | Current snapshot read path, quick EC2/Aurora check; not a full-scale analytics result |
-| ClickBench, 100M rows, 43 queries | 35.35 s first / 30.13 s warm | Historical EC2/Aurora run before the snapshot read change |
-| SpatialBench SF10, four AOI queries | 7.85 s first / 4.54 s warm | Historical EC2/Aurora run before the snapshot read change |
+| ClickBench, 100M rows, 43 queries | 34.03 s first / 29.21 s warm | Current snapshot read path, one full-scale EC2/Aurora run |
+| SpatialBench SF10, four AOI queries | 8.28 s first / 4.35 s warm | Current snapshot read path, one full-scale EC2/Aurora run |
 | Quickwit, 100M logs, 8 clients | 52.04 ms search p95 | Historical OSB run |
 
 The methodology, caveats and dated runs are in
-[benchmark history](docs/benchmarks.md). The quick GET checks do not validate
-DuckLake performance; rerun those workloads before using the historical
-analytics numbers as current claims.
+[benchmark history](docs/benchmarks.md). These are single runs, not a
+controlled multi-run A/B; the Quickwit result is historical.
 
 ## Quick start
 
@@ -165,9 +162,9 @@ Each is backed by a measurement on the AWS rig:
 
 ## Performance
 
-Current-path quick checks and the full historical AWS/kind benchmark record
-are in [benchmark history](docs/benchmarks.md). The full-scale reads have not
-been re-measured since multi-query GETs gained a consistent snapshot.
+Current-path quick GET checks, full-scale analytics and historical AWS/kind
+measurements are in [benchmark history](docs/benchmarks.md). Large-read
+throughput has not had a controlled old-path-versus-snapshot A/B.
 
 ## Read-scaling topology
 
