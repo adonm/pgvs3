@@ -65,7 +65,7 @@ async fn round_trips_exact_ranges() -> Result<()> {
         row,
         row + 1,
         WRITE_BATCH + 5,
-        3 * 258 * row + 17,
+        3 * 1032 * row + 17,
     ]
     .into_iter()
     .enumerate()

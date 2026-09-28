@@ -153,23 +153,26 @@ def run_queries(con, queries: list[str], numbers: list[int], passes: int,
     return records, answers
 
 
-def run_fresh(args, stack: str, extensions: tuple, queries: list[str], numbers: list[int],
-              passes: int, timeout: float | None) -> list[dict]:
+def run_fresh(args, stacks: list[str], extensions: tuple, queries: list[str],
+              numbers: list[int], passes: int, timeout: float | None) -> dict[str, list[dict]]:
     """Each query on a brand-new DuckDB instance: no DuckDB cache, storage
-    connection already open. The per-query latency storage actually sets."""
+    connection already open. The per-query latency storage actually sets.
+    Stacks alternate run by run, so host drift (page cache, CPU clocks)
+    lands on both rather than reading as a storage difference."""
     tables = CLICK_TABLES if args.bench == "click" else SPATIAL_TABLES
-    records = [{"times": {}, "errors": {}} for _ in range(passes)]
+    records = {s: [{"times": {}, "errors": {}} for _ in range(passes)] for s in stacks}
     for n in numbers:
-        for record in records:
-            con = benchlib.connect(args, extensions, stack, fresh=True)
-            for t in tables:
-                con.sql(f"CREATE VIEW main.{t} AS SELECT * FROM lake.{t}")
-            benchlib.warm_storage(con, args, stack)
-            secs, err, _ = benchlib.run_sql(con, queries[n - 1], timeout)
-            con.close()
-            record["times"][f"Q{n}"] = secs
-            if err:
-                record["errors"][f"Q{n}"] = err
+        for p in range(passes):
+            for stack in stacks:
+                con = benchlib.connect(args, extensions, stack, fresh=True)
+                for t in tables:
+                    con.sql(f"CREATE VIEW main.{t} AS SELECT * FROM lake.{t}")
+                benchlib.warm_storage(con, args, stack)
+                secs, err, _ = benchlib.run_sql(con, queries[n - 1], timeout)
+                con.close()
+                records[stack][p]["times"][f"Q{n}"] = secs
+                if err:
+                    records[stack][p]["errors"][f"Q{n}"] = err
     return records
 
 
@@ -232,7 +235,7 @@ def main() -> None:
          else download_spatial(args.src_dir, args.sf))
 
     failed = False
-    checksums = {}
+    results = {}
     for stack in stacks:
         label = f"lake-{stack}"
         con = benchlib.connect(args, extensions, stack)
@@ -249,7 +252,6 @@ def main() -> None:
         elif args.load:
             record["load_s"], record["rows"] = load(con, bench, args.src_dir, args.sf, args.parts)
             print(f"[{label}] load: {record['load_s']:.1f}s rows={record['rows']}")
-
         # Every row, order-independent: the stacks must hold identical data.
         tables = CLICK_TABLES if bench == "click" else SPATIAL_TABLES
         record["checksum"] = {t: str(con.sql(f"SELECT bit_xor(hash(r)) FROM lake.{t} r").fetchone()[0])
@@ -258,10 +260,16 @@ def main() -> None:
             con, queries, numbers, args.passes, timeout)
         con.close()
         report(label, record["passes"])
-        record["fresh"] = run_fresh(args, stack, extensions, queries, numbers,
-                                    args.fresh_passes, timeout)
-        report(f"{label} fresh", record["fresh"])
+        results[stack] = record
+    if len({json.dumps(r["checksum"], sort_keys=True) for r in results.values()}) > 1:
+        raise SystemExit(f"{bench}: stacks hold different data: "
+                         f"{ {s: r['checksum'] for s, r in results.items()} }")
 
+    fresh = run_fresh(args, stacks, extensions, queries, numbers, args.fresh_passes, timeout)
+    for stack, record in results.items():
+        label = record["stack"]
+        record["fresh"] = fresh[stack]
+        report(f"{label} fresh", record["fresh"])
         out = args.out or f".tmp/pgvs3/{name}-{label}-sf{args.sf:g}.json"
         if len(stacks) > 1:
             out = out.replace(".json", f"-{stack}.json")
@@ -278,9 +286,6 @@ def main() -> None:
                           "fresh_s": [round(sum(p["times"].values()), 2) for p in record["fresh"]],
                           "answers": record["answers"]}, default=str))
         failed |= any(p["errors"] for p in record["passes"] + record["fresh"])
-        checksums[stack] = record["checksum"]
-    if len({json.dumps(c, sort_keys=True) for c in checksums.values()}) > 1:
-        raise SystemExit(f"{bench}: stacks hold different data: {checksums}")
     if failed:
         raise SystemExit(f"{bench}: queries failed (see results above)")
 

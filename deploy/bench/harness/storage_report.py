@@ -4,8 +4,8 @@
     storage_report.py .tmp/pgvs3/kind-bench.jsonl
 
 Columns per stack: first (pass 1, cold DuckDB cache, one connection), warm
-(best of later passes) and fresh (best fresh-instance run: new DuckDB, empty
-cache, storage connection already open).
+(best of later passes) and fresh (median fresh-instance run: new DuckDB,
+empty cache, storage connection already open; stacks interleaved run by run).
 """
 
 import json
@@ -16,6 +16,11 @@ import sys
 def best(passes: list[dict], q: str) -> float | None:
     times = [p["times"][q] for p in passes if q in p["times"] and q not in p["errors"]]
     return min(times) if times else None
+
+
+def median(passes: list[dict], q: str) -> float | None:
+    times = sorted(p["times"][q] for p in passes if q in p["times"] and q not in p["errors"])
+    return times[len(times) // 2] if times else None
 
 
 def geomean(values: list[float]) -> float:
@@ -32,7 +37,7 @@ for r in records:
     cols[r["stack"]] = {
         "first": {q: r["passes"][0]["times"].get(q) for q in queries},
         "warm": {q: best(r["passes"][1:], q) for q in queries} if len(r["passes"]) > 1 else {},
-        "fresh": {q: best(r["fresh"], q) for q in queries} if r["fresh"] else {},
+        "fresh": {q: median(r["fresh"], q) for q in queries} if r["fresh"] else {},
     }
 
 kinds = [k for k in ("first", "warm", "fresh") if all(cols[s][k] for s in stacks)]

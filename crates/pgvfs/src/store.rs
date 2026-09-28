@@ -10,17 +10,19 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::SinkExt;
+use futures::{SinkExt, TryStreamExt};
 use pgvs3::pg::{Options, Pool};
 use tokio::sync::mpsc;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{ToSql, Type};
 
 pub const SCHEMA: &str = include_str!("../schema.sql");
 pub const LAYOUT_VERSION: i32 = 1;
 
 pub const ROW_BYTES: i64 = 8120;
-/// Rows per parallel read piece (~2 MiB).
-const PIECE_ROWS: i64 = 258;
+/// Rows per parallel read piece: 8 MiB, the gateway's span. Measured on full
+/// ClickBench heavy scans, 2 MiB pieces were 3-4% slower (4x the range
+/// queries) and 32 MiB no faster.
+const PIECE_ROWS: i64 = 1032;
 /// Writers hand the COPY task whole rows in batches of about 4 MiB.
 pub const WRITE_BATCH: usize = 516 * ROW_BYTES as usize;
 
@@ -218,10 +220,13 @@ async fn read_piece(
     let mut conn = pool.get().await?;
     let stmt = conn.range().await?.clone();
     let (lo32, hi32) = (lo as i32, hi as i32);
-    let rows = conn.query(&stmt, &[&file_id, &lo32, &hi32]).await?;
+    // Streamed: each row is copied into `out` as it arrives, not buffered.
+    let params: [&(dyn ToSql + Sync); 3] = [&file_id, &lo32, &hi32];
+    let rows = conn.query_raw(&stmt, params).await?;
+    futures::pin_mut!(rows);
     let end = start + out.len() as i64;
     let mut filled = 0usize;
-    for row in &rows {
+    while let Some(row) = rows.try_next().await? {
         let no: i32 = row.try_get(0)?;
         let data: &[u8] = row.try_get(1)?;
         let row_start = no as i64 * ROW_BYTES;

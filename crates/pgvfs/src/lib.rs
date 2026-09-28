@@ -90,6 +90,17 @@ fn conn<'a>(c: *const PgvfsConn) -> &'a PgvfsConn {
     unsafe { &*c }
 }
 
+/// Tokio workers drive every pooled connection's protocol I/O and the COPY
+/// writers, for all of DuckDB's threads at once: one per core by default
+/// (PGVFS_IO_THREADS overrides).
+fn io_threads() -> usize {
+    std::env::var("PGVFS_IO_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
 /// Connect, create the pgvfs layout in a fresh database (or verify it), and
 /// start background reaping. NULL + `*err` on failure.
 #[no_mangle]
@@ -100,7 +111,7 @@ pub unsafe extern "C" fn pgvfs_connect(
     let run = || -> Result<PgvfsConn> {
         let url = text(url)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(io_threads())
             .thread_name("pgvfs")
             .enable_all()
             .build()?;

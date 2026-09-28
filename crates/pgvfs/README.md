@@ -23,7 +23,7 @@ PostgreSQL server in separate databases.
 Files are immutable. A write streams rows under a fresh `file_id` and
 publishes `(volume, path) → file_id` when the file is closed. That means:
 
-- **Reads** are one primary-key range query per ~2 MiB piece, with no
+- **Reads** are one primary-key range query per 8 MiB piece, with no
   overwrite guard, snapshot or metadata cache. The pieces of a large read are
   fetched in parallel on separate pooled connections, and rows are copied
   straight into DuckDB's buffer.
