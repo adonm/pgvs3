@@ -1,5 +1,5 @@
 {{- if .Values.suite }}
-{{- $needsDb := has .Values.suite (list "validate" "click" "spatial") }}
+{{- $needsDb := has .Values.suite (list "validate" "click" "spatial" "storage") }}
 apiVersion: batch/v1
 kind: Job
 metadata:

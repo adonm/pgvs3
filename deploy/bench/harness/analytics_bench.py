@@ -153,6 +153,35 @@ def run_queries(con, queries: list[str], numbers: list[int], passes: int,
     return records, answers
 
 
+def run_fresh(args, stack: str, extensions: tuple, queries: list[str], numbers: list[int],
+              passes: int, timeout: float | None) -> list[dict]:
+    """Each query on a brand-new DuckDB instance: no DuckDB cache, storage
+    connection already open. The per-query latency storage actually sets."""
+    tables = CLICK_TABLES if args.bench == "click" else SPATIAL_TABLES
+    records = [{"times": {}, "errors": {}} for _ in range(passes)]
+    for n in numbers:
+        for record in records:
+            con = benchlib.connect(args, extensions, stack, fresh=True)
+            for t in tables:
+                con.sql(f"CREATE VIEW main.{t} AS SELECT * FROM lake.{t}")
+            benchlib.warm_storage(con, args, stack)
+            secs, err, _ = benchlib.run_sql(con, queries[n - 1], timeout)
+            con.close()
+            record["times"][f"Q{n}"] = secs
+            if err:
+                record["errors"][f"Q{n}"] = err
+    return records
+
+
+def report(label: str, records: list[dict]) -> None:
+    for p, rec in enumerate(records):
+        times, errors = rec["times"], rec["errors"]
+        print(f"[{label}] pass {p + 1}: total {sum(times.values()):.1f}s")
+        print("  " + "  ".join(f"{k}={v:.2f}" for k, v in times.items()))
+        for k, v in errors.items():
+            print(f"  {k}: {v}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", choices=["click", "spatial"], required=True)
@@ -161,6 +190,8 @@ def main() -> None:
     ap.add_argument("--load", action="store_true", help="load source parquet before querying")
     ap.add_argument("--views-only", action="store_true", help="skip load; just make main views over lake")
     ap.add_argument("--passes", type=int, default=3)
+    ap.add_argument("--fresh-passes", type=int, default=0,
+                    help="extra passes with a new DuckDB instance per query")
     ap.add_argument("--parts", type=int, default=0,
                     help="clickbench fast loop: load N of the 100 1%% slices (0 = full hits.parquet)")
     ap.add_argument("--queries", default=None, help="query numbers/ranges like 1-3,6 (default: all)")
@@ -168,8 +199,12 @@ def main() -> None:
     ap.add_argument("--memory-limit", default=None, help="DuckDB memory_limit (default: DuckDB's 80%% of RAM)")
     ap.add_argument("--src-dir", default=None)
     ap.add_argument("--scratch-db", default=".tmp/pgvs3/scratch.duckdb")
-    ap.add_argument("--data-path", default=None)
-    ap.add_argument("--catalog", required=True, help="kind DuckLake catalog DSN")
+    ap.add_argument("--stacks", default="s3", help="comma list of s3 (pgvs3 gateway) and pgvfs")
+    ap.add_argument("--data-path", default=None, help="s3 stack DuckLake DATA_PATH")
+    ap.add_argument("--catalog", required=True, help="s3 stack DuckLake catalog DSN")
+    ap.add_argument("--pgvfs-data-path", default="pgvfs://lake/", help="pgvfs stack DATA_PATH")
+    ap.add_argument("--pgvfs-catalog", default=None, help="pgvfs stack DuckLake catalog DSN")
+    ap.add_argument("--metadata-schema", default=None, help="DuckLake METADATA_SCHEMA (both stacks)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -181,50 +216,72 @@ def main() -> None:
     ]:
         if getattr(args, attr) is None:
             setattr(args, attr, default)
+    stacks = args.stacks.split(",")
+    if not set(stacks) <= {"s3", "pgvfs"} or len(set(stacks)) != len(stacks):
+        raise SystemExit(f"invalid --stacks: {args.stacks}")
+    if "pgvfs" in stacks and not args.pgvfs_catalog:
+        raise SystemExit("--pgvfs-catalog is required for the pgvfs stack")
 
     queries = load_queries(bench)
     numbers = query_numbers(args.queries or f"1-{len(queries)}", len(queries))
+    timeout = args.query_timeout or None
+    extensions = ("spatial",) if bench == "spatial" else ()
 
     if args.download:
         (download_click(args.src_dir, args.parts) if bench == "click"
          else download_spatial(args.src_dir, args.sf))
 
-    con = benchlib.connect(args, extensions=("spatial",) if bench == "spatial" else ())
-    record = {"bench": bench, "stack": "lake-s3", "comparable": False,
-              "duckdb": duckdb.__version__, "queries": numbers, "passes": [], "answers": {}}
-    if bench == "spatial":
-        record["sf"] = args.sf
-    if args.views_only:
-        for t in (CLICK_TABLES if bench == "click" else SPATIAL_TABLES):
-            con.sql(f"CREATE OR REPLACE VIEW main.{t} AS SELECT * FROM lake.{t}")
-        record["rows"] = {t: con.sql(f"SELECT count(*) FROM lake.{t}").fetchone()[0]
-                          for t in (CLICK_TABLES if bench == "click" else SPATIAL_TABLES)}
-        record["reused"] = True
-    elif args.load:
-        record["load_s"], record["rows"] = load(con, bench, args.src_dir, args.sf, args.parts)
-        print(f"[lake-s3] load: {record['load_s']}s rows={record['rows']}")
+    failed = False
+    checksums = {}
+    for stack in stacks:
+        label = f"lake-{stack}"
+        con = benchlib.connect(args, extensions, stack)
+        record = {"bench": bench, "stack": label, "comparable": False,
+                  "duckdb": duckdb.__version__, "queries": numbers, "passes": [], "answers": {}}
+        if bench == "spatial":
+            record["sf"] = args.sf
+        if args.views_only:
+            for t in (CLICK_TABLES if bench == "click" else SPATIAL_TABLES):
+                con.sql(f"CREATE OR REPLACE VIEW main.{t} AS SELECT * FROM lake.{t}")
+            record["rows"] = {t: con.sql(f"SELECT count(*) FROM lake.{t}").fetchone()[0]
+                              for t in (CLICK_TABLES if bench == "click" else SPATIAL_TABLES)}
+            record["reused"] = True
+        elif args.load:
+            record["load_s"], record["rows"] = load(con, bench, args.src_dir, args.sf, args.parts)
+            print(f"[{label}] load: {record['load_s']:.1f}s rows={record['rows']}")
 
-    record["passes"], record["answers"] = run_queries(
-        con, queries, numbers, args.passes, args.query_timeout or None)
-    for p, rec in enumerate(record["passes"]):
-        times, errors = rec["times"], rec["errors"]
-        total = sum(times.values())
-        line = f"[lake-s3] pass {p + 1}: total {total:.1f}s"
-        print(line)
-        print("  " + "  ".join(f"{k}={v:.2f}" for k, v in times.items()))
-        for k, v in errors.items():
-            print(f"  {k}: {v}")
+        # Every row, order-independent: the stacks must hold identical data.
+        tables = CLICK_TABLES if bench == "click" else SPATIAL_TABLES
+        record["checksum"] = {t: str(con.sql(f"SELECT bit_xor(hash(r)) FROM lake.{t} r").fetchone()[0])
+                              for t in tables}
+        record["passes"], record["answers"] = run_queries(
+            con, queries, numbers, args.passes, timeout)
+        con.close()
+        report(label, record["passes"])
+        record["fresh"] = run_fresh(args, stack, extensions, queries, numbers,
+                                    args.fresh_passes, timeout)
+        report(f"{label} fresh", record["fresh"])
 
-    benchlib.write_record(record, args.out or f".tmp/pgvs3/{name}-lake-s3-sf{args.sf:g}.json")
-    # One compact line for the results JSONL (the pretty record goes to --out).
-    print(json.dumps({"suite": bench, "stack": "lake-s3", "comparable": False, "queries": numbers,
-                      "sf": record.get("sf"),
-                      "load_s": record.get("load_s"), "rows": record.get("rows"),
-                      "reused": record.get("reused", False),
-                      "duckdb": duckdb.__version__, "passes": record["passes"],
-                      "pass_s": [round(sum(p["times"].values()), 2) for p in record["passes"]],
-                      "answers": record["answers"]}, default=str))
-    if any(p["errors"] for p in record["passes"]):
+        out = args.out or f".tmp/pgvs3/{name}-{label}-sf{args.sf:g}.json"
+        if len(stacks) > 1:
+            out = out.replace(".json", f"-{stack}.json")
+        benchlib.write_record(record, out)
+        # One compact line for the results JSONL (the pretty record goes to --out).
+        print(json.dumps({"suite": bench, "stack": label, "comparable": False, "queries": numbers,
+                          "sf": record.get("sf"),
+                          "load_s": record.get("load_s"), "rows": record.get("rows"),
+                          "reused": record.get("reused", False),
+                          "checksum": record["checksum"],
+                          "duckdb": duckdb.__version__, "passes": record["passes"],
+                          "pass_s": [round(sum(p["times"].values()), 2) for p in record["passes"]],
+                          "fresh": record["fresh"],
+                          "fresh_s": [round(sum(p["times"].values()), 2) for p in record["fresh"]],
+                          "answers": record["answers"]}, default=str))
+        failed |= any(p["errors"] for p in record["passes"] + record["fresh"])
+        checksums[stack] = record["checksum"]
+    if len({json.dumps(c, sort_keys=True) for c in checksums.values()}) > 1:
+        raise SystemExit(f"{bench}: stacks hold different data: {checksums}")
+    if failed:
         raise SystemExit(f"{bench}: queries failed (see results above)")
 
 

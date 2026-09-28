@@ -29,13 +29,13 @@ spec:
                 if psql -v ON_ERROR_STOP=1 -d pgvs3 -tAc "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'" | grep -qx 1; then
                   psql -v ON_ERROR_STOP=1 -d pgvs3 -c "SELECT cron.unschedule(jobid) FROM cron.job WHERE jobname IN ('pgvs3-maintain', 'pgvs3-expire-uploads')"
                 fi
-                for db in ducklake_catalog pgvs3; do
+                for db in ducklake_catalog pgvs3 pgvfs; do
                   psql -v ON_ERROR_STOP=1 -d postgres -c "DROP DATABASE IF EXISTS $db WITH (FORCE)"
                   psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE $db"
                   echo "$db reset"
                 done
               elif [ "$PGVS3_DB_PHASE" = databases ]; then
-                for db in pgvs3 ducklake_catalog; do
+                for db in pgvs3 ducklake_catalog pgvfs; do
                   exists=$(psql -v ON_ERROR_STOP=1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$db'")
                   if [ "$exists" != 1 ]; then
                     psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE $db"
