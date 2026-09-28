@@ -1,4 +1,5 @@
 {{- if .Values.suite }}
+{{- $needsDb := has .Values.suite (list "validate" "click" "spatial") }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -17,37 +18,24 @@ spec:
           imagePullPolicy: IfNotPresent
           command: [bash, /bench/suites/run.sh, {{ .Values.suite | quote }}]
           env:
+            {{- if $needsDb }}
             - name: PG_HOST
               valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: host } }
             - name: PG_USER
               valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: user } }
             - name: PG_PASSWORD
               valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: password } }
-            - name: PG_URL
-              valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: url } }
-            - name: PGSSLMODE
-              valueFrom: { secretKeyRef: { name: {{ .Values.pgSecretName | quote }}, key: sslmode } }
             - name: AWS_ACCESS_KEY_ID
               valueFrom: { secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: accessKey } }
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom: { secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: secretKey } }
-            - { name: PGVS3_DB_CA_FILE, value: /etc/pgvs3/db-ca/caCert }
-            {{- if .Values.allowPlaintextDb }}
-            - { name: PGVS3_DB_ALLOW_PLAINTEXT, value: "true" }
             {{- end }}
-            - { name: QUICKWIT_URL, value: {{ .Values.quickwitUrl | quote }} }
-            - { name: QUICKWIT_INGEST_URL, value: {{ .Values.quickwitIngestUrl | quote }} }
+            {{- if $needsDb }}
             - { name: PGVS3_URL, value: {{ .Values.pgvs3Url | quote }} }
+            {{- end }}
             {{- range $k, $v := .Values.suiteEnv }}
             - { name: {{ $k }}, value: {{ $v | quote }} }
             {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          volumeMounts:
-            - { name: db-ca, mountPath: /etc/pgvs3/db-ca, readOnly: true }
-      volumes:
-        - name: db-ca
-          secret:
-            secretName: {{ .Values.pgSecretName | quote }}
-            items: [{ key: caCert, path: caCert }]
 {{- end }}

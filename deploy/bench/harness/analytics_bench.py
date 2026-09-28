@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["duckdb>=1.5.2"]
-# ///
-"""ClickBench and Sedona-SpatialBench on DuckLake over pgvs3.
+"""Upstream ClickBench and SpatialBench inputs on DuckLake over pgvs3 in kind.
 
-Same stack model as tpch_bench.py (see benchlib.connect):
-  lake-s3     DuckLake, catalog=PostgreSQL, DATA_PATH = s3:// via the pgvs3 gateway
-  lake-local  DuckLake, catalog=PostgreSQL, DATA_PATH = local directory (baseline)
-  plain       native tables in a local DuckDB file (engine ceiling)
-
-Benches:
+Suites:
   click    ClickBench `hits.parquet` + 43 queries (queries/clickbench.sql)
   spatial  apache-sedona/spatialbench parquet + 12 queries (queries/spatialbench.sql)
 
-Examples:
-  ./target/release/pgvs3 serve &                     # the gateway
-  python3 deploy/bench/harness/analytics_bench.py --bench click --stack lake-s3 --download --load --passes 3
-  python3 deploy/bench/harness/analytics_bench.py --bench spatial --sf 10 --stack lake-s3 --download --load
+This is the DuckLake-side runner: it loads upstream data into DuckLake on
+pgvs3 and times the pinned queries.
 """
 
 import argparse
+import datetime
+import decimal
 import json
 import os
 import subprocess
@@ -73,7 +64,7 @@ def download_click(src: str, parts: int) -> None:
         return
     os.makedirs(src, exist_ok=True)
     print(f"fetch {CLICK_URL} (13.8 GiB)")
-    subprocess.run(["curl", "-fL", "-C", "-", "-o", dest, CLICK_URL], check=True)
+    subprocess.run(["curl", "-fsSL", "-C", "-", "-o", dest, CLICK_URL], check=True)
     assert os.path.getsize(dest) == CLICK_BYTES, "truncated hits.parquet"
 
 
@@ -102,7 +93,7 @@ def src_glob(bench: str, src: str, sf: float, table: str, parts: int) -> str:
 
 # ClickBench's duckdb/load normalization (verbatim from ClickHouse/ClickBench
 # duckdb/load): hits.parquet stores packed ints and binary strings; the 43
-# queries expect the typed schema. Applied identically to every stack.
+# queries expect the typed schema.
 CLICK_SELECT = """* REPLACE (
     make_date(EventDate) AS EventDate,
     epoch_ms(EventTime * 1000) AS EventTime,
@@ -110,22 +101,21 @@ CLICK_SELECT = """* REPLACE (
     epoch_ms(LocalEventTime * 1000) AS LocalEventTime)"""
 
 
-def load(con, stack: str, bench: str, src: str, sf: float, parts: int) -> tuple[float, dict]:
+def load(con, bench: str, src: str, sf: float, parts: int) -> tuple[float, dict]:
     tables = CLICK_TABLES if bench == "click" else SPATIAL_TABLES
     t0 = __import__("time").perf_counter()
     rows = {}
     for t in tables:
-        dest = f"lake.{t}" if stack != "plain" else f"main.{t}"
+        dest = f"lake.{t}"
         sel = CLICK_SELECT if bench == "click" else "*"
         rd = (f"read_parquet('{src_glob(bench, src, sf, t, parts)}', binary_as_string=True)"
               if bench == "click" else f"read_parquet('{src_glob(bench, src, sf, t, parts)}')")
         con.sql(f"DROP TABLE IF EXISTS {dest}")
         con.sql(f"CREATE TABLE {dest} AS SELECT {sel} FROM {rd}")
         rows[t] = con.sql(f"SELECT count(*) FROM {dest}").fetchone()[0]
-    if stack != "plain":
-        con.sql("CALL ducklake_flush_inlined_data('lake')")  # force data into files on the data path
-        for t in tables:
-            con.sql(f"CREATE OR REPLACE VIEW main.{t} AS SELECT * FROM lake.{t}")
+    con.sql("CALL ducklake_flush_inlined_data('lake')")  # force data into files on the data path
+    for t in tables:
+        con.sql(f"CREATE OR REPLACE VIEW main.{t} AS SELECT * FROM lake.{t}")
     return __import__("time").perf_counter() - t0, rows
 
 
@@ -144,41 +134,42 @@ def query_numbers(spec: str, count: int) -> list[int]:
     return numbers
 
 
-def run_pass(con, queries: list[str], numbers: list[int], timeout: float) -> tuple[dict, dict]:
-    times, errors = {}, {}
+def run_queries(con, queries: list[str], numbers: list[int], passes: int,
+                timeout: float) -> tuple[list[dict], dict]:
+    # ClickBench runs each query three times consecutively; runs 2 and 3 are
+    # hot. These are not true cold runs (neither engine drops the OS page cache).
+    records = [{"times": {}, "errors": {}} for _ in range(passes)]
+    answers = {}
     for n in numbers:
-        secs, err = benchlib.run_sql(con, queries[n - 1], timeout)
-        times[f"Q{n}"] = secs
-        if err:
-            errors[f"Q{n}"] = err
-    return times, errors
+        for p, record in enumerate(records):
+            secs, err, rows = benchlib.run_sql(con, queries[n - 1], timeout)
+            record["times"][f"Q{n}"] = secs
+            if err:
+                record["errors"][f"Q{n}"] = err
+            elif p == 0:
+                answers[f"Q{n}"] = [[(value.hex() if isinstance(value, bytes) else str(value)
+                                       if isinstance(value, (datetime.date, datetime.timedelta, decimal.Decimal))
+                                       else value) for value in row] for row in rows]
+    return records, answers
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", choices=["click", "spatial"], required=True)
-    ap.add_argument("--stack", choices=["lake-s3", "lake-local", "plain"], required=True)
     ap.add_argument("--sf", type=float, default=10.0, help="spatialbench scale factor (0.1/1/10/100)")
     ap.add_argument("--download", action="store_true", help="fetch the source parquet first")
     ap.add_argument("--load", action="store_true", help="load source parquet before querying")
     ap.add_argument("--views-only", action="store_true", help="skip load; just make main views over lake")
-    ap.add_argument("--passes", type=int, default=2)
+    ap.add_argument("--passes", type=int, default=3)
     ap.add_argument("--parts", type=int, default=0,
                     help="clickbench fast loop: load N of the 100 1%% slices (0 = full hits.parquet)")
     ap.add_argument("--queries", default=None, help="query numbers/ranges like 1-3,6 (default: all)")
     ap.add_argument("--query-timeout", type=float, default=0, help="per-query seconds (0 = unlimited)")
     ap.add_argument("--memory-limit", default=None, help="DuckDB memory_limit (default: DuckDB's 80%% of RAM)")
-    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
-                    help="extra DuckDB setting, applied after the extensions load (A/B knobs)")
-    ap.add_argument("--no-file-cache", action="store_true",
-                    help="disable DuckDB's external file cache: every pass reads through the proxy")
     ap.add_argument("--src-dir", default=None)
-    ap.add_argument("--local-dir", default=None)
-    ap.add_argument("--plain-db", default=None)
     ap.add_argument("--scratch-db", default=".tmp/pgvs3/scratch.duckdb")
     ap.add_argument("--data-path", default=None)
-    ap.add_argument("--catalog", default=None,
-                    help="DuckLake catalog DSN (defaults: lake-s3 ducklake_catalog, lake-local ducklake_catalog_local)")
+    ap.add_argument("--catalog", required=True, help="kind DuckLake catalog DSN")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -186,8 +177,6 @@ def main() -> None:
     name = FILE[bench]
     for attr, default in [
         ("src_dir", f".tmp/pgvs3/data/{name}"),
-        ("local_dir", f".tmp/pgvs3/ducklake-{name}-local"),
-        ("plain_db", f".tmp/pgvs3/{name}-plain.duckdb"),
         ("data_path", f"s3://lake/{name}/"),
     ]:
         if getattr(args, attr) is None:
@@ -200,33 +189,41 @@ def main() -> None:
         (download_click(args.src_dir, args.parts) if bench == "click"
          else download_spatial(args.src_dir, args.sf))
 
-    con = benchlib.connect(args.stack, args, extensions=("spatial",) if bench == "spatial" else ())
-    record = {"bench": bench, "stack": args.stack, "duckdb": duckdb.__version__, "queries": numbers, "passes": []}
+    con = benchlib.connect(args, extensions=("spatial",) if bench == "spatial" else ())
+    record = {"bench": bench, "stack": "lake-s3", "comparable": False,
+              "duckdb": duckdb.__version__, "queries": numbers, "passes": [], "answers": {}}
     if bench == "spatial":
         record["sf"] = args.sf
     if args.views_only:
         for t in (CLICK_TABLES if bench == "click" else SPATIAL_TABLES):
             con.sql(f"CREATE OR REPLACE VIEW main.{t} AS SELECT * FROM lake.{t}")
+        record["rows"] = {t: con.sql(f"SELECT count(*) FROM lake.{t}").fetchone()[0]
+                          for t in (CLICK_TABLES if bench == "click" else SPATIAL_TABLES)}
+        record["reused"] = True
     elif args.load:
-        record["load_s"], record["rows"] = load(con, args.stack, bench, args.src_dir, args.sf, args.parts)
-        print(f"[{args.stack}] load: {record['load_s']}s rows={record['rows']}")
+        record["load_s"], record["rows"] = load(con, bench, args.src_dir, args.sf, args.parts)
+        print(f"[lake-s3] load: {record['load_s']}s rows={record['rows']}")
 
-    for p in range(args.passes):
-        times, errors = run_pass(con, queries, numbers, args.query_timeout or None)
+    record["passes"], record["answers"] = run_queries(
+        con, queries, numbers, args.passes, args.query_timeout or None)
+    for p, rec in enumerate(record["passes"]):
+        times, errors = rec["times"], rec["errors"]
         total = sum(times.values())
-        rec = {"times": times, "errors": errors}
-        line = f"[{args.stack}] pass {p + 1}: total {total:.1f}s"
-        record["passes"].append(rec)
+        line = f"[lake-s3] pass {p + 1}: total {total:.1f}s"
         print(line)
         print("  " + "  ".join(f"{k}={v:.2f}" for k, v in times.items()))
         for k, v in errors.items():
             print(f"  {k}: {v}")
 
-    benchlib.write_record(record, args.out or f".tmp/pgvs3/{name}-{args.stack}-sf{args.sf:g}.json")
+    benchlib.write_record(record, args.out or f".tmp/pgvs3/{name}-lake-s3-sf{args.sf:g}.json")
     # One compact line for the results JSONL (the pretty record goes to --out).
-    print(json.dumps({"suite": bench, "stack": args.stack, "queries": numbers,
+    print(json.dumps({"suite": bench, "stack": "lake-s3", "comparable": False, "queries": numbers,
+                      "sf": record.get("sf"),
                       "load_s": record.get("load_s"), "rows": record.get("rows"),
-                      "pass_s": [round(sum(p["times"].values()), 2) for p in record["passes"]]}))
+                      "reused": record.get("reused", False),
+                      "duckdb": duckdb.__version__, "passes": record["passes"],
+                      "pass_s": [round(sum(p["times"].values()), 2) for p in record["passes"]],
+                      "answers": record["answers"]}, default=str))
     if any(p["errors"] for p in record["passes"]):
         raise SystemExit(f"{bench}: queries failed (see results above)")
 

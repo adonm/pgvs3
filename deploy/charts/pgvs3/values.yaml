@@ -1,16 +1,16 @@
 replicas: 2
 image: ghcr.io/adonm/pgvs3:latest
-# Local kind uses the postgres chart's Secret; EC2 kind overrides this with
-# Aurora's Secret. The URL never enters Helm values or release history.
+# Secret with `url` (and `caCert`, possibly empty, for a private database CA).
+# The URL never enters Helm values or release history.
 urlSecretName: postgres
 s3SecretName: pgvs3-s3
 # Configure a TLS Secret for non-loopback deployments. Plaintext is an explicit
-# opt-in used only by the isolated kind benchmark rig.
+# opt-in used only by the isolated kind stack.
 tlsSecretName: ""
 allowHttp: false
 allowPlaintextDb: false
 # A per-replica ceiling: 2 x 64 gateway connections. Size the local Postgres
-# maxConnections (or external Aurora capacity) for the entire fleet.
+# maxConnections (or external database capacity) for the entire fleet.
 poolMax: 64
 poolMin: 64
 # pgvs3 is stateless (metadata cache is per-process, keyed by bucket/key), so

@@ -1,6 +1,0 @@
-apiVersion: v2
-name: quickwit
-description: Single-node Quickwit with a PostgreSQL metastore and splits on pgvs3's S3 endpoint
-type: application
-version: 0.1.0
-appVersion: "0.9.1"

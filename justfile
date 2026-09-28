@@ -1,6 +1,4 @@
-# pgvs3 tasks. Toolchain: `mise install`. Testing runs in kind.
-# The AWS rig recipes read their settings from .env (start from .env.example).
-set dotenv-load
+# pgvs3 tasks. Toolchain: `mise install`. Testing and benchmarks run in kind.
 
 URL := "postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench"
 # Local development database. Smoke and CI use the kind stack instead.
@@ -56,13 +54,13 @@ dev-db:
 dev-db-clean:
     docker rm -f pgvs3-pg || true
 
-# The tests, all on kind: cluster up, validate and every workload at smoke scale.
+# Kind QA: contract, service health, and upstream ClickBench/SpatialBench inputs at smoke scale.
 [group('kind')]
 smoke: kind-up
     #!/usr/bin/env bash
     set -euo pipefail
     {{ just_executable() }} kind-contract
-    QUICK=1 SUITES=validate,pgbench,tpch,click,spatial,search,stress {{ just_executable() }} kind-bench
+    QUICK=1 SUITES=validate,click,spatial {{ just_executable() }} kind-bench
 
 # Rust S3 contract against both kind gateway pods and its PostgreSQL storage.
 [group('kind')]
@@ -73,16 +71,6 @@ kind-contract:
 [group('kind')]
 kind-churn:
     bash deploy/kind/contract.sh churn
-
-# Load generator: 8 GiB of 64 MiB objects (a stable set for `just micro`).
-[group('bench')]
-seed:
-    ./target/release/pgvs3 seed --gigabytes 8 --object-mib 64 --tasks 16
-
-# GET latency/throughput matrix against the gateway on :8014.
-[group('bench')]
-micro:
-    ./target/release/pgvs3 bench --endpoint http://127.0.0.1:8014 --bucket lake --requests 2000
 
 # Image name for `just image` and the kind gateway chart. CI may override it.
 IMAGE := env("IMAGE", "ghcr.io/adonm/pgvs3")
@@ -107,7 +95,8 @@ ci:
     #!/usr/bin/env bash
     set -euo pipefail
     hk check --all
-    python3 -m unittest discover -s deploy/bench/suites -p 'test_osb_run.py'
+    python3 -m unittest discover -s deploy/bench/harness -p 'test_*.py'
+    python3 -m unittest discover -s deploy/bench/suites -p 'test_*.py'
     mbx build --release --locked
     mbx test --workspace
     just contract
@@ -118,11 +107,10 @@ ci:
 contract:
     bash deploy/bench/contract.sh
 
-# --- kind: Postgres 18 + pgvs3 + DuckLake + Quickwit on one disk -----------
-# One command per step. Full-scale `kind-bench` runs six suites with caches on;
-# `QUICK=1` keeps CI at smoke scale. Results: .tmp/pgvs3/kind-bench.jsonl.
+# --- kind: Postgres 18 + pgvs3 + DuckLake ------------------------------------
+# Select SUITES explicitly; QUICK=1 is smoke QA, never a full-scale score.
 
-# Stand up pgvs3, DuckLake and Quickwit in kind; PostgreSQL is local or external.
+# Stand up pgvs3 and DuckLake in kind with local PostgreSQL.
 [group('kind')]
 kind-up:
     bash deploy/kind/up.sh '{{ IMAGE }}'
@@ -132,96 +120,18 @@ kind-up:
 kind-validate:
     SUITES=validate {{ just_executable() }} kind-bench
 
-# Run selected suites sequentially; QUICK=1 is smoke scale.
+# Run selected upstream suites sequentially (SUITES); QUICK=1 is smoke QA.
 [group('kind')]
 kind-bench:
     bash deploy/kind/bench.sh
-
-# pgvs3 ceiling: concurrency sweep; reports aggregate MiB/s and req/s.
-[group('kind')]
-kind-stress concurrency="1,8,32,64" requests="4000":
-    SUITES=stress CONCURRENCY='{{ concurrency }}' REQUESTS='{{ requests }}' {{ just_executable() }} kind-bench
 
 # Tear down the kind cluster.
 [group('kind')]
 kind-down:
     kind delete cluster --name pgvs3
 
-# Pre-release test data only: replace three kind databases, not the cluster.
+# Pre-release test data only: replace the kind databases.
 [group('kind')]
-[confirm("Discard pgvs3, DuckLake and Quickwit data in this kind cluster?")]
+[confirm("Discard pgvs3 and DuckLake data in this kind cluster?")]
 kind-reset:
     bash deploy/kind/reset.sh
-
-# TPC-H on DuckLake through the gateway (extra = harness args).
-[group('bench')]
-tpch sf="10" stack="lake-s3" extra="":
-    uv run --with "duckdb==$DUCKDB_PY" python deploy/bench/harness/tpch_bench.py --stack {{ stack }} --sf {{ sf }} --load --passes 2 {{ extra }}
-
-# ClickBench (43 queries) on DuckLake through the gateway.
-[group('bench')]
-clickbench stack="lake-s3" passes="3" extra="":
-    uv run --with "duckdb==$DUCKDB_PY" python deploy/bench/harness/analytics_bench.py --bench click --stack {{ stack }} --download --load --passes {{ passes }} {{ extra }}
-
-# SpatialBench (12 queries) on DuckLake through the gateway.
-[group('bench')]
-spatialbench sf="10" stack="lake-s3" passes="3" extra="":
-    uv run --with "duckdb==$DUCKDB_PY" python deploy/bench/harness/analytics_bench.py --bench spatial --sf {{ sf }} --stack {{ stack }} --download --load --passes {{ passes }} {{ extra }}
-
-# Stand up an EC2 kind rig and Aurora Serverless v2 I/O-Optimized.
-[group('rig')]
-rig-up:
-    bash deploy/kind/rig.sh up
-
-# Ship this checkout, refresh the Aurora Secret and deploy the kind charts.
-[group('rig')]
-rig-sync:
-    bash deploy/kind/rig.sh sync
-
-# Run the same smoke gate as CI, but with Aurora outside kind.
-[group('rig')]
-rig-validate:
-    bash deploy/kind/rig.sh validate
-
-# Rust S3/DB contract against the Aurora-backed two-gateway rig.
-[group('rig')]
-rig-contract:
-    bash deploy/kind/rig.sh contract
-
-# Run kind-churn against Aurora; results are copied into .tmp/pgvs3/rig-out.
-[group('rig')]
-rig-churn:
-    bash deploy/kind/rig.sh churn
-
-# Run the kind benchmark suites on EC2; SUITES, QUICK, SF, DOCS, etc. work here too.
-[group('rig')]
-rig-bench:
-    bash deploy/kind/rig.sh bench
-
-# Inspect only this rig's stack and endpoints (no credentials).
-[group('rig')]
-rig-status:
-    bash deploy/kind/rig.sh status
-
-# Download the latest results even if a remote session disconnected.
-[group('rig')]
-rig-results:
-    bash deploy/kind/rig.sh results
-
-# Pre-release test data only: reset the three rig databases and redeploy.
-[group('rig')]
-[confirm("Discard all pgvs3, DuckLake and Quickwit data on the EC2/Aurora rig?")]
-rig-reset:
-    bash deploy/kind/rig.sh reset
-    bash deploy/kind/rig.sh sync
-
-# Open an SSH shell on the rig (restricted to the current operator IP).
-[group('rig')]
-rig-ssh:
-    bash deploy/kind/rig.sh ssh
-
-# Delete only this rig's stack and SSH key pair; stops ongoing AWS charges.
-[group('rig')]
-[confirm("Terminate the pgvs3 EC2 kind rig AND its Aurora Serverless cluster?")]
-rig-teardown:
-    bash deploy/kind/rig.sh teardown

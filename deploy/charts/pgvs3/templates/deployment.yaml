@@ -40,8 +40,8 @@ spec:
             - name: PGVS3_POOL_MIN
               value: {{ .Values.poolMin | quote }}
           ports: [{ containerPort: 8014, name: s3 }]
-          # Starting a warm pool over TLS to Aurora can take longer than a
-          # local kind connection. Do not apply liveness until it is serving.
+          # Opening a warm pool over TLS to a remote database can be slow.
+          # Do not apply liveness until it is serving.
           startupProbe:
             httpGet: { path: /healthz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
             periodSeconds: 5

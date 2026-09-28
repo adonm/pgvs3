@@ -5,11 +5,8 @@ storage: 20Gi
 resources:
   requests: { cpu: 250m, memory: 1Gi }
   limits: { memory: 8Gi }
-# The kind setup creates pgvs3, ducklake_catalog and quickwit_metastore with
-# one idempotent Job, locally and against Aurora on EC2.
-# CI/local kind only. Two normal gateway pools (2 x 64) can briefly become
-# four warm pools during a rolling update (64 x 4 = 256), while pgbench,
-# DuckLake, Quickwit metastore and the smoke seed still need connections.
-# headroom. Aurora-backed EC2 kind does not install this StatefulSet.
+# kind-up creates pgvs3 and ducklake_catalog with one idempotent Job. Two
+# gateway pools (2 x 64) can briefly become four during a rolling update
+# (64 x 4 = 256), while DuckLake and benchmark Jobs still need connections.
 maxConnections: 384
 sharedBuffers: 1GB

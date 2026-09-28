@@ -1,5 +1,6 @@
 -- Sedona-SpatialBench queries, DuckDB dialect: vendored from
--- apache/sedona-spatialbench spatialbench-queries/print_queries.py
+-- apache/sedona-spatialbench spatialbench-queries/print_queries.py,
+-- pinned to commit 8e44bddd7c9cc2822480d5791e26ff6684e52e54.
 -- (class DuckDBSpatialBenchBenchmark). Queries are marked `-- @qN`; the
 -- harness splits on those markers.
 -- @q1

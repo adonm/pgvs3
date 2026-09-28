@@ -1,7 +1,6 @@
 .git
 .tmp
 target
-.env
 *.pem
 mise-oci
 **/__pycache__

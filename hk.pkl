@@ -19,7 +19,7 @@ steps {
   }
   ["helm-lint"] {
     glob = "deploy/charts/**/*.yaml"
-    check = "for chart in postgres pgvs3 quickwit kind-bench; do helm lint deploy/charts/$chart >/dev/null || exit 1; done"
+    check = "for chart in postgres pgvs3 kind-bench; do helm lint deploy/charts/$chart >/dev/null || exit 1; done"
   }
   ["just-syntax"] {
     glob = "justfile"
