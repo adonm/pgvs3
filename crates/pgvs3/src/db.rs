@@ -15,12 +15,15 @@ use std::time::SystemTime;
 use anyhow::{Context as _, Result};
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, Stream, StreamExt, TryStreamExt};
+use md5::Md5;
 use sha2::{Digest, Sha256};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
 
 use crate::cache::{epoch, meta_get, meta_invalidate, meta_put, Meta};
-use crate::ingest::{IngestMsg, IngestResult, RowFramer, COPY_HEADER, COPY_SQL, SEND_BATCH};
+use crate::ingest::{
+    Digests, IngestMsg, IngestResult, Published, RowFramer, COPY_HEADER, COPY_SQL, SEND_BATCH,
+};
 pub use crate::pg::Pool;
 
 pub const SCHEMA: &str = include_str!("../schema.sql");
@@ -33,7 +36,9 @@ const SMALL_MAX: usize = 8 << 20;
 /// Whole rows for a contiguous `no` range (cheaper than `= ANY` on Aurora:
 /// 1.74 vs 2.02 ms server time per warm 8 MiB span).
 const GET_RANGE_SQL: &str =
-    "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3";
+    "SELECT c.no, c.data FROM s3p.chunks c WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3 \
+     AND EXISTS (SELECT 1 FROM s3p.objects o WHERE o.bucket = $4 AND o.key = $5 \
+                 AND o.file_id = $6)";
 
 /// Rows per part: any span up to SMALL_MAX (it may start mid-row) fits one;
 /// longer reads are split into snapshot-protected queries.
@@ -58,12 +63,19 @@ pub async fn connect(url: &str) -> Result<Pool> {
             min: pool_min().min(pool_max()),
             // The budget the cluster really has, not its ceiling: 64 covers a
             // DuckDB worker's burst (measured wait-free), and the same default
-            // must fit a small shared Postgres alongside Quickwit and
-            // DuckLake. `PGVS3_POOL_MAX=256` where the cluster allows it.
+            // must fit a small shared Postgres alongside DuckLake.
+            // `PGVS3_POOL_MAX=256` where the cluster allows it.
             max: pool_max(),
             session,
             range_sql: GET_RANGE_SQL,
-            range_types: &[Type::INT8, Type::INT4, Type::INT4],
+            range_types: &[
+                Type::INT8,
+                Type::INT4,
+                Type::INT4,
+                Type::TEXT,
+                Type::TEXT,
+                Type::INT8,
+            ],
         },
     )
     .await
@@ -71,7 +83,18 @@ pub async fn connect(url: &str) -> Result<Pool> {
 
 /// Storage layout this binary reads and writes (schema.sql); bumped only by
 /// breaking layout changes.
-pub const LAYOUT_VERSION: i32 = 4;
+pub const LAYOUT_VERSION: i32 = 7;
+
+/// S3 ETag: the MD5, or for multipart the MD5 of the part MD5s plus "-count".
+fn s3_etag(md5: &[u8], parts: Option<usize>) -> String {
+    match parts {
+        Some(n) => format!("{}-{n}", hex(md5)),
+        None => hex(md5),
+    }
+}
+
+/// Multipart checksum algorithms (S3 composite); stored as S3 spells them.
+pub const CHECKSUM_ALGORITHMS: [&str; 5] = ["CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256"];
 
 /// Create the layout if absent, and fail closed on any other version rather
 /// than misread it. Serialized across gateways by an advisory lock, so
@@ -89,6 +112,12 @@ pub async fn init(pool: &Pool) -> Result<()> {
 }
 
 async fn init_locked(client: &mut Client) -> Result<()> {
+    let version: i32 = client
+        .query_one("SHOW server_version_num", &[])
+        .await?
+        .try_get::<_, String>(0)?
+        .parse()?;
+    anyhow::ensure!(version >= 180000, "pgvs3 requires PostgreSQL 18 or later");
     let tx = client.transaction().await?;
     let chunks: bool = tx
         .query_typed_one("SELECT to_regclass('s3p.chunks') IS NOT NULL", &[])
@@ -112,6 +141,8 @@ async fn init_locked(client: &mut Client) -> Result<()> {
             "s3p holds storage layout {found:?}; this pgvs3 reads v{LAYOUT_VERSION} \
              (migrate the data explicitly, or point it at a fresh database)"
         );
+        tx.commit().await?;
+        return Ok(());
     } else {
         let marked: bool = tx
             .query_typed_one("SELECT to_regclass('s3p.layout') IS NOT NULL", &[])
@@ -128,13 +159,24 @@ async fn init_locked(client: &mut Client) -> Result<()> {
         &[(&LAYOUT_VERSION, Type::INT4)],
     )
     .await?;
+    tx.query_typed_one(
+        "SELECT cron.schedule($1, $2, $3)",
+        &[
+            (&"pgvs3-maintain", Type::TEXT),
+            (&"* * * * *", Type::TEXT),
+            (&"SELECT s3p.maintain()", Type::TEXT),
+        ],
+    )
+    .await
+    .context("scheduling pgvs3 maintenance on the new layout")?;
     tx.commit().await?;
     Ok(())
 }
 
 /// A serving gateway must not accumulate abandoned multipart bytes silently.
 /// The schema is installed by `init`; pg_cron is a database prerequisite and
-/// this check installs (or refreshes) the bounded cleanup job before listening.
+/// this check verifies the cleanup job before listening. Startup never alters
+/// an existing schema or cron job; the first init schedules it transactionally.
 pub async fn ensure_maintenance(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
     let cron_installed: bool = conn
@@ -175,27 +217,31 @@ pub async fn ensure_maintenance(pool: &Pool) -> Result<()> {
         partitions == 32,
         "s3p.chunks must have 32 partitions with the expected inline storage and autovacuum settings (found {partitions})"
     );
-    conn.query_typed_one(
-        "SELECT cron.schedule($1, $2, $3)",
-        &[
-            (&"pgvs3-expire-uploads", Type::TEXT),
-            (&"* * * * *", Type::TEXT),
-            (&"SELECT s3p.expire_uploads()", Type::TEXT),
-        ],
-    )
-    .await
-    .context("scheduling multipart cleanup with pg_cron")?;
+    for relation in [
+        "s3p.garbage",
+        "s3p.objects_parts_idx",
+        "s3p.upload_parts_file_id_key",
+    ] {
+        let exists: bool = conn
+            .query_typed_one(
+                "SELECT to_regclass($1) IS NOT NULL",
+                &[(&relation, Type::TEXT)],
+            )
+            .await?
+            .try_get(0)?;
+        anyhow::ensure!(exists, "required layout relation {relation} is missing");
+    }
     let jobs: i64 = conn
         .query_typed_one(
-            "SELECT count(*) FROM cron.job WHERE jobname = 'pgvs3-expire-uploads' \
+            "SELECT count(*) FROM cron.job WHERE jobname = 'pgvs3-maintain' \
              AND database = current_database() AND username = current_user \
-             AND schedule = '* * * * *' AND command = 'SELECT s3p.expire_uploads()' AND active",
+              AND schedule = '* * * * *' AND command = 'SELECT s3p.maintain()' AND active",
             &[],
         )
         .await
         .context("checking pg_cron multipart cleanup job")?
         .try_get(0)?;
-    anyhow::ensure!(jobs == 1, "pg_cron multipart cleanup job is not active");
+    anyhow::ensure!(jobs == 1, "pg_cron maintenance job is not active");
     Ok(())
 }
 
@@ -222,7 +268,10 @@ fn pool_max() -> usize {
 /// Everything but the body of a served range: `[start, end]` inclusive.
 pub struct SliceMeta {
     pub size: i64,
-    pub etag: Vec<u8>,
+    pub sha256: Vec<u8>,
+    pub etag: String,
+    pub user_metadata: Vec<String>,
+    pub content_type: String,
     pub created_at: SystemTime,
     pub file_id: i64,
     pub start: i64,
@@ -282,7 +331,8 @@ pub async fn meta_fresh(pool: &Pool, bucket: &str, key: &str) -> Result<Option<M
         .get()
         .await?
         .query_typed_opt(
-            "SELECT file_id, size, etag, EXTRACT(EPOCH FROM created_at)::float8, parts, part_ends \
+            "SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8, parts, part_ends, \
+                    etag, user_metadata, content_type \
              FROM s3p.objects WHERE bucket = $1 AND key = $2",
             &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
         )
@@ -294,7 +344,10 @@ pub async fn meta_fresh(pool: &Pool, bucket: &str, key: &str) -> Result<Option<M
     let meta = Meta {
         file_id: r.try_get(0)?,
         size: r.try_get(1)?,
-        etag: r.try_get(2)?,
+        sha256: r.try_get(2)?,
+        etag: r.try_get(6)?,
+        user_metadata: r.try_get(7)?,
+        content_type: r.try_get(8)?,
         created_at: epoch(r.try_get(3)?),
         parts: r.try_get(4)?,
         part_ends: r.try_get(5)?,
@@ -317,12 +370,10 @@ pub async fn get_body(
     last: i64,
     suffix: i64,
 ) -> Result<Option<(SliceMeta, PieceBody)>> {
-    // A stale meta-cache entry (the object replaced through another gateway,
-    // or behind all of them) shows up as missing rows — an overwrite reaps
-    // the old file's rows in the same transaction, so a stale entry can never
-    // quietly serve old bytes — or as a bogus 416, because range clamping
-    // uses the old size. Before any byte has gone out, retry once with the
-    // metadata looked up again: the client should never see either.
+    // A stale meta-cache entry (replaced through another gateway) cannot
+    // serve queued old bytes: the range query checks the current object file
+    // ID, so it produces missing rows. A stale size can also give a bogus 416.
+    // Before any byte has gone out, retry once with fresh metadata.
     for attempt in 0..2 {
         let Some(m) = meta(&pool, &bucket, &key).await? else {
             return Ok(None);
@@ -334,7 +385,10 @@ pub async fn get_body(
         }
         let smeta = SliceMeta {
             size: m.size,
+            sha256: m.sha256.clone(),
             etag: m.etag.clone(),
+            user_metadata: m.user_metadata.clone(),
+            content_type: m.content_type.clone(),
             created_at: m.created_at,
             file_id: m.file_id,
             start,
@@ -352,8 +406,10 @@ pub async fn get_body(
         // ~8 MiB of chunks queue for the response; parts buffer their own rows.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
         let pool_c = pool.clone();
+        let bucket_c = bucket.clone();
+        let key_c = key.clone();
         tokio::spawn(async move {
-            if let Err(e) = stream_span(&pool_c, &m, start, end, &tx).await {
+            if let Err(e) = stream_span(&pool_c, &bucket_c, &key_c, &m, start, end, &tx).await {
                 let _ = tx.send(Err(io_err(e))).await;
             }
         });
@@ -406,9 +462,9 @@ struct Piece {
 
 /// Pieces covering object bytes `[start, end]` across the object's segments
 /// (one file, or its part files), in order, at most `step` rows each.
-fn plan(m: &Meta, start: i64, end: i64, step: usize) -> Vec<Piece> {
+fn plan(m: &Meta, start: i64, end: i64, step: usize) -> Result<Vec<Piece>> {
     let mut out = Vec::new();
-    for (file_id, base, len) in m.segments() {
+    for (file_id, base, len) in m.segments()? {
         if len <= 0 || base + len - 1 < start || base > end {
             continue;
         }
@@ -421,7 +477,7 @@ fn plan(m: &Meta, start: i64, end: i64, step: usize) -> Vec<Piece> {
             hi,
         }));
     }
-    out
+    Ok(out)
 }
 
 /// The part of row `no` of a segment at `base` inside object bytes `[start, end]`.
@@ -445,20 +501,23 @@ fn part_ranges(first_row: i32, last_row: i32, step: usize) -> impl Iterator<Item
 /// transaction, so concurrent overwrites cannot remove later rows mid-GET.
 async fn stream_span(
     pool: &Pool,
+    bucket: &str,
+    key: &str,
     m: &Meta,
     start: i64,
     end: i64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<()> {
-    let pieces = plan(m, start, end, PART_ROWS);
-    let mut snapshot = (pieces.len() > 1).then(|| spawn_snapshot_span(pool, pieces.clone()));
+    let pieces = plan(m, start, end, PART_ROWS)?;
+    let mut snapshot = (pieces.len() > 1)
+        .then(|| spawn_snapshot_span(pool, bucket, key, m.file_id, pieces.clone()));
     let mut chunk = BytesMut::with_capacity(CHUNK + ROW_BYTES as usize);
     let mut sent = 0i64;
     for p in pieces {
         let mut single = None;
         let rows = match &mut snapshot {
             Some(rows) => rows,
-            None => single.get_or_insert_with(|| spawn_part(pool, p)),
+            None => single.get_or_insert_with(|| spawn_part(pool, bucket, key, m.file_id, p)),
         };
         // Bitmap heap scans return TID order: hold any row that runs ahead.
         let mut early: BTreeMap<i32, Row> = BTreeMap::new();
@@ -520,11 +579,19 @@ fn put_row(
 }
 
 /// A one-query GET streams without opening an explicit transaction.
-fn spawn_part(pool: &Pool, p: Piece) -> tokio::sync::mpsc::Receiver<Result<Option<Row>>> {
+fn spawn_part(
+    pool: &Pool,
+    bucket: &str,
+    key: &str,
+    root_id: i64,
+    p: Piece,
+) -> tokio::sync::mpsc::Receiver<Result<Option<Row>>> {
     let (tx, rx) = tokio::sync::mpsc::channel((p.hi - p.lo + 2) as usize);
     let pool = pool.clone();
+    let bucket = bucket.to_owned();
+    let key = key.to_owned();
     tokio::spawn(async move {
-        if let Err(e) = fetch_part(&pool, p, &tx).await {
+        if let Err(e) = fetch_part(&pool, &bucket, &key, root_id, p, &tx).await {
             let _ = tx.send(Err(e)).await;
         }
     });
@@ -535,12 +602,17 @@ fn spawn_part(pool: &Pool, p: Piece) -> tokio::sync::mpsc::Receiver<Result<Optio
 /// bounded channel backpressures PostgreSQL when the HTTP client is slow.
 fn spawn_snapshot_span(
     pool: &Pool,
+    bucket: &str,
+    key: &str,
+    root_id: i64,
     pieces: Vec<Piece>,
 ) -> tokio::sync::mpsc::Receiver<Result<Option<Row>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let pool = pool.clone();
+    let bucket = bucket.to_owned();
+    let key = key.to_owned();
     tokio::spawn(async move {
-        if let Err(e) = fetch_snapshot_span(&pool, pieces, &tx).await {
+        if let Err(e) = fetch_snapshot_span(&pool, &bucket, &key, root_id, pieces, &tx).await {
             let _ = tx.send(Err(e)).await;
         }
     });
@@ -549,6 +621,9 @@ fn spawn_snapshot_span(
 
 async fn fetch_snapshot_span(
     pool: &Pool,
+    bucket: &str,
+    key: &str,
+    root_id: i64,
     pieces: Vec<Piece>,
     tx: &tokio::sync::mpsc::Sender<Result<Option<Row>>>,
 ) -> Result<()> {
@@ -561,7 +636,7 @@ async fn fetch_snapshot_span(
         .start()
         .await?;
     for p in pieces {
-        let params: [&(dyn ToSql + Sync); 3] = [&p.file_id, &p.lo, &p.hi];
+        let params: [&(dyn ToSql + Sync); 6] = [&p.file_id, &p.lo, &p.hi, &bucket, &key, &root_id];
         let mut rows = std::pin::pin!(snapshot.query_raw(&range, params).await?);
         while let Some(row) = rows.try_next().await? {
             if tx.send(Ok(Some(row))).await.is_err() {
@@ -581,11 +656,14 @@ async fn fetch_snapshot_span(
 /// the connection's receive buffer until copied into a response chunk.
 async fn fetch_part(
     pool: &Pool,
+    bucket: &str,
+    key: &str,
+    root_id: i64,
     p: Piece,
     tx: &tokio::sync::mpsc::Sender<Result<Option<Row>>>,
 ) -> Result<()> {
     let mut conn = pool.get().await?;
-    let params: [&(dyn ToSql + Sync); 3] = [&p.file_id, &p.lo, &p.hi];
+    let params: [&(dyn ToSql + Sync); 6] = [&p.file_id, &p.lo, &p.hi, &bucket, &key, &root_id];
     let range = conn.range().await?.clone();
     let mut rows = std::pin::pin!(conn.query_raw(&range, params).await?);
     while let Some(row) = rows.try_next().await? {
@@ -612,7 +690,7 @@ fn eff_range(size: i64, first: i64, last: i64, suffix: i64) -> (i64, i64) {
     }
 }
 
-/// Buffered variant (tests, bench floor).
+/// Buffered variant for contract tests.
 pub async fn get(
     pool: &Pool,
     bucket: &str,
@@ -646,7 +724,7 @@ pub async fn get(
     };
     Ok(Some(Slice {
         size: meta.size,
-        etag: meta.etag,
+        sha256: meta.sha256,
         created_at: meta.created_at,
         start: meta.start,
         end: meta.end,
@@ -657,7 +735,7 @@ pub async fn get(
 /// A served byte range, fully buffered.
 pub struct Slice {
     pub size: i64,
-    pub etag: Vec<u8>,
+    pub sha256: Vec<u8>,
     pub created_at: SystemTime,
     pub start: i64,
     pub end: i64,
@@ -672,7 +750,7 @@ pub async fn put(pool: &Pool, bucket: &str, key: &str, data: &[u8]) -> Result<()
     for chunk in data.chunks(SEND_BATCH) {
         writer.push(Bytes::copy_from_slice(chunk)).await?;
     }
-    writer.finish().await?;
+    writer.finish(Vec::new()).await?;
     Ok(())
 }
 
@@ -681,6 +759,8 @@ enum WriterTarget {
         bucket: String,
         key: String,
         condition: PutCondition,
+        user_metadata: Vec<String>,
+        content_type: String,
     },
     Part {
         upload_id: String,
@@ -721,6 +801,18 @@ impl std::fmt::Display for MissingResource {
 
 impl std::error::Error for MissingResource {}
 
+/// A part of a checksummed multipart upload arrived without that checksum.
+#[derive(Debug)]
+pub struct MissingChecksum;
+
+impl std::fmt::Display for MissingChecksum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("part lacks the upload's checksum")
+    }
+}
+
+impl std::error::Error for MissingChecksum {}
+
 /// Streaming ingest: bytes flow into one open binary COPY stream through
 /// `push` (rows cut across pushes through a single cursor). Every ingest has
 /// its own connection and COPY, so PUTs and multipart parts write in parallel.
@@ -731,7 +823,14 @@ pub struct ChunkWriter {
 
 impl ChunkWriter {
     pub fn start_object(pool: Pool, bucket: String, key: String) -> Self {
-        Self::start_object_if(pool, bucket, key, PutCondition::Unconditional)
+        Self::start_object_if(
+            pool,
+            bucket,
+            key,
+            PutCondition::Unconditional,
+            Vec::new(),
+            "application/octet-stream".to_owned(),
+        )
     }
 
     pub fn start_object_if(
@@ -739,6 +838,8 @@ impl ChunkWriter {
         bucket: String,
         key: String,
         condition: PutCondition,
+        user_metadata: Vec<String>,
+        content_type: String,
     ) -> Self {
         Self::begin(
             pool,
@@ -746,6 +847,8 @@ impl ChunkWriter {
                 bucket,
                 key,
                 condition,
+                user_metadata,
+                content_type,
             },
         )
     }
@@ -788,9 +891,20 @@ impl ChunkWriter {
             .map_err(|_| anyhow::anyhow!("ingest writer gone"))
     }
 
-    /// Close the stream and wait for the COPY to land. Returns `(size, sha256)`.
-    pub async fn finish(mut self) -> Result<(i64, Vec<u8>)> {
-        self.tx.take();
+    /// Only an explicit Finish may publish a COPY; dropping a request rolls it back.
+    /// `checksums` are the request's verified `(x-amz-checksum-*, value)` pairs.
+    pub async fn finish(mut self, checksums: Vec<(String, String)>) -> Result<Published> {
+        let send = self
+            .tx
+            .take()
+            .expect("writer open")
+            .send(IngestMsg::Finish(checksums))
+            .await;
+        // If the reader closed first, join it to report the original database
+        // error (e.g. NoSuchBucket), not a generic channel failure.
+        if send.is_err() {
+            return self.done.take().expect("writer joined").await?;
+        }
         self.done.take().expect("writer joined").await?
     }
 
@@ -806,62 +920,47 @@ impl ChunkWriter {
     }
 }
 
-/// Stream a request body into a writer and finish it. A body error rolls the
-/// ingest back; a writer failure surfaces through `finish`.
-pub async fn ingest_body<S, E>(writer: ChunkWriter, mut body: S) -> Result<(i64, Vec<u8>)>
-where
-    S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
-    E: std::fmt::Display,
-{
-    while let Some(chunk) = body.next().await {
-        match chunk {
-            Ok(c) => {
-                if writer.push(c).await.is_err() {
-                    break; // the writer failed: finish() reports why
-                }
-            }
-            Err(e) => {
-                writer.abort().await;
-                anyhow::bail!("request body: {e}");
-            }
-        }
-    }
-    writer.finish().await
-}
-
 async fn ingest_writer(
     pool: Pool,
     target: WriterTarget,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
-) -> Result<(i64, Vec<u8>)> {
+) -> IngestResult {
     // No global write lock: each ingest owns a connection and a COPY, and the
     // bounded channel backpressures the request body at COPY speed.
     let t0 = std::time::Instant::now();
 
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
-    match &target {
+    let algorithm: Option<String> = match &target {
         WriterTarget::Object { bucket, .. } => {
-            if tx.query_typed_opt(
-                "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE",
-                &[(&bucket, Type::TEXT)],
-            )
-            .await?
-            .is_none() {
+            if tx
+                .query_typed_opt(
+                    "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE",
+                    &[(&bucket, Type::TEXT)],
+                )
+                .await?
+                .is_none()
+            {
                 return Err(MissingResource::Bucket.into());
             }
+            None
         }
-        WriterTarget::Part { upload_id, bucket, key, .. } => {
-            if tx.query_typed_opt(
-                "SELECT 1 FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3 FOR KEY SHARE",
+        WriterTarget::Part {
+            upload_id,
+            bucket,
+            key,
+            ..
+        } => {
+            let Some(row) = tx.query_typed_opt(
+                "SELECT checksum_algorithm FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3 FOR KEY SHARE",
                 &[(&upload_id, Type::TEXT), (&bucket, Type::TEXT), (&key, Type::TEXT)],
             )
-            .await?
-            .is_none() {
+            .await? else {
                 return Err(MissingResource::Upload.into());
-            }
+            };
+            row.try_get(0)?
         }
-    }
+    };
     let file_id: i64 = tx
         .query_typed_one(
             "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))",
@@ -873,17 +972,31 @@ async fn ingest_writer(
     sink.send(Bytes::from_static(COPY_HEADER)).await?;
 
     let mut framer = RowFramer::new(file_id);
-    while let Some(msg) = rx.recv().await {
+    let checksums = loop {
+        let msg = rx.recv().await.context("upload ended without Finish")?;
         match msg {
             IngestMsg::Data(b) => {
-                if let Some(buf) = framer.push(&b) {
+                if let Some(buf) = framer.push(&b)? {
                     sink.send(buf).await?;
                 }
             }
+            IngestMsg::Finish(checksums) => break checksums,
             IngestMsg::Abort => anyhow::bail!("ingest aborted"),
         }
-    }
-    let (last, (total, sum)) = framer.finish();
+    };
+    // A part of a checksummed upload must carry that checksum (already verified).
+    let checksum = match algorithm {
+        None => None,
+        Some(algorithm) => {
+            let header = format!("x-amz-checksum-{}", algorithm.to_ascii_lowercase());
+            let Some((_, value)) = checksums.into_iter().find(|(name, _)| *name == header) else {
+                return Err(MissingChecksum.into());
+            };
+            Some((algorithm, value))
+        }
+    };
+    let (last, (total, digests)) = framer.finish();
+    let etag = s3_etag(&digests.md5, None);
     sink.send(last).await?;
     sink.as_mut().finish().await?;
     match &target {
@@ -891,6 +1004,8 @@ async fn ingest_writer(
             bucket,
             key,
             condition,
+            user_metadata,
+            content_type,
         } => {
             swap_object(
                 &tx,
@@ -899,7 +1014,10 @@ async fn ingest_writer(
                 ObjectWrite {
                     file_id,
                     size: total,
-                    etag: &sum,
+                    sha256: &digests.sha256,
+                    etag: &etag,
+                    user_metadata,
+                    content_type,
                     parts: None,
                     condition,
                 },
@@ -909,19 +1027,45 @@ async fn ingest_writer(
         WriterTarget::Part {
             upload_id, part_no, ..
         } => {
-            commit_part(&tx, upload_id, *part_no, file_id, total, &sum).await?;
+            let value = checksum.as_ref().map(|(_, value)| value.as_str());
+            commit_part(&tx, upload_id, *part_no, file_id, total, &digests, value).await?;
         }
     }
     tx.commit().await?;
-    if let WriterTarget::Object { bucket, key, .. } = target {
-        publish_cache(&bucket, &key, file_id, total, &sum, None);
+    if let WriterTarget::Object {
+        bucket,
+        key,
+        user_metadata,
+        content_type,
+        ..
+    } = target
+    {
+        meta_put(
+            &bucket,
+            &key,
+            Meta {
+                size: total,
+                sha256: digests.sha256.clone(),
+                etag: etag.clone(),
+                user_metadata,
+                content_type,
+                created_at: SystemTime::now(),
+                file_id,
+                parts: None,
+                part_ends: None,
+            },
+        );
     }
     eprintln!(
         "pgvs3: ingest {:.1} MiB at {:.0} MiB/s",
         total as f64 / 1024.0 / 1024.0,
         total as f64 / 1024.0 / 1024.0 / t0.elapsed().as_secs_f64().max(1e-9)
     );
-    Ok((total, sum))
+    Ok(Published {
+        size: total,
+        etag,
+        checksum,
+    })
 }
 
 /// Record a multipart part in the same transaction as its rows; a re-sent
@@ -933,7 +1077,8 @@ async fn commit_part(
     part_no: i32,
     file_id: i64,
     total: i64,
-    sum: &[u8],
+    digests: &Digests,
+    checksum: Option<&str>,
 ) -> Result<()> {
     let old = tx
         .query_typed_opt(
@@ -944,31 +1089,37 @@ async fn commit_part(
     if let Some(old) = old {
         let old: i64 = old.try_get(0)?;
         tx.query_typed(
-            "DELETE FROM s3p.chunks WHERE file_id = $1",
+            "INSERT INTO s3p.garbage (file_id) VALUES ($1) ON CONFLICT DO NOTHING",
             &[(&old, Type::INT8)],
         )
         .await?;
     }
     tx.query_typed(
-        "INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256) VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256, md5, checksum) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
         &[
             (&upload_id, Type::TEXT),
             (&part_no, Type::INT4),
             (&file_id, Type::INT8),
             (&total, Type::INT8),
-            (&sum, Type::BYTEA),
+            (&digests.sha256, Type::BYTEA),
+            (&digests.md5, Type::BYTEA),
+            (&checksum, Type::TEXT),
         ],
     )
     .await?;
     Ok(())
 }
 
-/// Point (bucket, key) at new storage inside `tx` and reap the storage of any
+/// Point (bucket, key) at new storage inside `tx` and queue the storage of any
 /// object it replaces (all of its files: the single file or every part).
 struct ObjectWrite<'a> {
     file_id: i64,
     size: i64,
-    etag: &'a [u8],
+    sha256: &'a [u8],
+    etag: &'a str,
+    user_metadata: &'a [String],
+    content_type: &'a str,
     parts: Option<(&'a [i64], &'a [i64])>,
     condition: &'a PutCondition,
 }
@@ -990,7 +1141,7 @@ async fn swap_object(
         PutCondition::Unconditional => true,
         PutCondition::IfAbsent => old.is_none(),
         PutCondition::IfMatch(want) => match &old {
-            Some(row) => hex(&row.try_get::<_, Vec<u8>>(2)?) == *want,
+            Some(row) => row.try_get::<_, String>(2)? == *want,
             None => false,
         },
     };
@@ -999,23 +1150,28 @@ async fn swap_object(
     }
     let (ids, ends) = write.parts.unzip();
     tx.query_typed(
-        "INSERT INTO s3p.objects (bucket, key, file_id, size, etag, parts, part_ends) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+        "INSERT INTO s3p.objects (bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (bucket, key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size, \
-           etag = EXCLUDED.etag, parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends, created_at = now()",
+           sha256 = EXCLUDED.sha256, etag = EXCLUDED.etag, \
+           user_metadata = EXCLUDED.user_metadata, content_type = EXCLUDED.content_type, \
+           parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends, created_at = now()",
         &[
             (&bucket, Type::TEXT),
             (&key, Type::TEXT),
             (&write.file_id, Type::INT8),
             (&write.size, Type::INT8),
-            (&write.etag, Type::BYTEA),
+            (&write.sha256, Type::BYTEA),
+            (&write.etag, Type::TEXT),
+            (&write.user_metadata, Type::TEXT_ARRAY),
+            (&write.content_type, Type::TEXT),
             (&ids, Type::INT8_ARRAY),
             (&ends, Type::INT8_ARRAY),
         ],
     )
     .await?;
     if let Some(r) = old {
-        reap(tx, r.try_get(0)?, r.try_get(1)?).await?;
+        queue_files(tx, r.try_get(0)?, r.try_get(1)?).await?;
     }
     Ok(())
 }
@@ -1031,39 +1187,16 @@ async fn lock_object_key(tx: &Transaction<'_>, bucket: &str, key: &str) -> Resul
     Ok(())
 }
 
-/// Delete every chunk row of an unpublished object's files.
-async fn reap(tx: &Transaction<'_>, file_id: i64, parts: Option<Vec<i64>>) -> Result<()> {
+/// Atomically remove a file's final reference and enqueue its chunks for GC.
+async fn queue_files(tx: &Transaction<'_>, file_id: i64, parts: Option<Vec<i64>>) -> Result<()> {
     let mut dead = parts.unwrap_or_default();
     dead.push(file_id);
     tx.query_typed(
-        "DELETE FROM s3p.chunks WHERE file_id = ANY($1)",
+        "INSERT INTO s3p.garbage (file_id) SELECT DISTINCT unnest($1::int8[]) ON CONFLICT DO NOTHING",
         &[(&dead, Type::INT8_ARRAY)],
     )
     .await?;
     Ok(())
-}
-
-fn publish_cache(
-    bucket: &str,
-    key: &str,
-    file_id: i64,
-    size: i64,
-    etag: &[u8],
-    parts: Option<(Vec<i64>, Vec<i64>)>,
-) {
-    let (parts, part_ends) = parts.unzip();
-    meta_put(
-        bucket,
-        key,
-        Meta {
-            size,
-            etag: etag.to_vec(),
-            created_at: SystemTime::now(),
-            file_id,
-            parts,
-            part_ends,
-        },
-    );
 }
 
 pub async fn delete(pool: &Pool, bucket: &str, key: &str) -> Result<bool> {
@@ -1078,13 +1211,14 @@ pub async fn delete(pool: &Pool, bucket: &str, key: &str) -> Result<bool> {
         .await?;
     let found = old.is_some();
     if let Some(r) = old {
-        reap(&tx, r.try_get(0)?, r.try_get(1)?).await?;
+        queue_files(&tx, r.try_get(0)?, r.try_get(1)?).await?;
     }
     tx.commit().await?;
     meta_invalidate(bucket, key);
     Ok(found)
 }
 
+/// Idempotent: creating an existing bucket succeeds (S3 BucketAlreadyOwnedByYou).
 pub async fn create_bucket(pool: &Pool, name: &str) -> Result<()> {
     pool.get()
         .await?
@@ -1148,56 +1282,63 @@ pub async fn delete_bucket(pool: &Pool, name: &str) -> Result<BucketDeletion> {
 }
 
 /// Each Create has its own upload ID, even for the same key.
-pub async fn create_upload(pool: &Pool, bucket: &str, key: &str) -> Result<Option<String>> {
-    let mut conn = pool.get().await?;
-    let tx = conn.transaction().await?;
-    if tx
+pub async fn create_upload(
+    pool: &Pool,
+    bucket: &str,
+    key: &str,
+    user_metadata: Vec<String>,
+    content_type: String,
+    checksum_algorithm: Option<&str>,
+) -> Result<Option<String>> {
+    let row = pool
+        .get()
+        .await?
         .query_typed_opt(
-            "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE",
-            &[(&bucket, Type::TEXT)],
+            "INSERT INTO s3p.uploads (upload_id, bucket, key, checksum_algorithm, user_metadata, content_type) \
+             SELECT gen_random_uuid()::text, name, $2, $3, $4, $5 FROM s3p.buckets WHERE name = $1 \
+             RETURNING upload_id",
+            &[(&bucket, Type::TEXT), (&key, Type::TEXT), (&checksum_algorithm, Type::TEXT),
+              (&user_metadata, Type::TEXT_ARRAY), (&content_type, Type::TEXT)],
         )
-        .await?
-        .is_none()
-    {
-        return Ok(None);
-    }
-    let id = tx
-        .query_typed_one(
-            "INSERT INTO s3p.uploads (upload_id, bucket, key) VALUES (gen_random_uuid()::text, $1, $2) RETURNING upload_id",
-            &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
-        )
-        .await?
-        .try_get(0)?;
-    tx.commit().await?;
-    Ok(Some(id))
+        .await?;
+    row.map(|r| r.try_get(0)).transpose().map_err(Into::into)
+}
+
+/// A part listed in CompleteMultipartUpload: number, ETag and any checksum
+/// as `(algorithm, base64 value)`.
+pub struct ListedPart {
+    pub part_no: i32,
+    pub etag: String,
+    pub checksum: Option<(String, String)>,
 }
 
 pub enum Completed {
     Done {
         bucket: String,
         key: String,
-        etag: Vec<u8>,
+        etag: String,
         size: i64,
     },
     InvalidPart,
     NoSuchUpload,
 }
 
-/// Complete: listed parts must be ascending and have matching ETags. Unlisted
-/// uploaded parts are discarded in the publication transaction. No selected
-/// data moves. ETag = sha256 over the selected part sha256s.
+/// Complete: listed parts must be ascending with matching ETags and, for a
+/// checksummed upload, matching part checksums. Unlisted uploaded parts are
+/// discarded in the publication transaction. No selected data moves.
 pub async fn complete_upload(
     pool: &Pool,
     upload_id: &str,
     request_bucket: &str,
     request_key: &str,
-    listed: &[(i32, String)],
+    listed: &[ListedPart],
 ) -> Result<Completed> {
     let mut conn = pool.get().await?;
     let tx = conn.transaction().await?;
     let Some(up) = tx
         .query_typed_opt(
-            "SELECT bucket, key FROM s3p.uploads WHERE upload_id = $1 FOR UPDATE",
+            "SELECT bucket, key, checksum_algorithm, user_metadata, content_type \
+             FROM s3p.uploads WHERE upload_id = $1 FOR UPDATE",
             &[(&upload_id, Type::TEXT)],
         )
         .await?
@@ -1205,18 +1346,24 @@ pub async fn complete_upload(
         return Ok(Completed::NoSuchUpload);
     };
     let (bucket, key): (String, String) = (up.try_get(0)?, up.try_get(1)?);
+    let algorithm: Option<String> = up.try_get(2)?;
+    let user_metadata: Vec<String> = up.try_get(3)?;
+    let content_type: String = up.try_get(4)?;
     if bucket != request_bucket || key != request_key {
         return Ok(Completed::NoSuchUpload);
     }
     let rows = tx
         .query_typed(
-            "SELECT part_no, file_id, size, sha256 FROM s3p.upload_parts WHERE upload_id = $1 ORDER BY part_no",
+            "SELECT part_no, file_id, size, sha256, md5, checksum FROM s3p.upload_parts \
+             WHERE upload_id = $1 ORDER BY part_no",
             &[(&upload_id, Type::TEXT)],
         )
         .await?;
     if listed.is_empty()
-        || listed.iter().any(|(no, _)| !(1..=10_000).contains(no))
-        || listed.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        || listed.iter().any(|p| !(1..=10_000).contains(&p.part_no))
+        || listed
+            .windows(2)
+            .any(|pair| pair[0].part_no >= pair[1].part_no)
     {
         return Ok(Completed::InvalidPart);
     }
@@ -1228,27 +1375,44 @@ pub async fn complete_upload(
     );
     let mut unused = Vec::new();
     let mut hasher = Sha256::new();
+    let mut md5_hasher = Md5::new();
     for r in &rows {
         let no: i32 = r.try_get(0)?;
         let id: i64 = r.try_get(1)?;
-        if want.peek().is_none_or(|p| p.0 != no) {
+        if want.peek().is_none_or(|p| p.part_no != no) {
             unused.push(id);
             continue;
         }
         let p = want.next().expect("matched part");
         let sha: Vec<u8> = r.try_get(3)?;
-        if p.1 != hex(&sha) {
+        let md5: Vec<u8> = r.try_get(4)?;
+        let stored: Option<String> = r.try_get(5)?;
+        let checksum_ok = match (&algorithm, &p.checksum) {
+            (None, None) => true,
+            (Some(want), Some((given, value))) => {
+                want == given && stored.as_deref() == Some(value.as_str())
+            }
+            _ => false,
+        };
+        if p.etag != hex(&md5) || !checksum_ok {
             return Ok(Completed::InvalidPart);
         }
         hasher.update(&sha);
-        size += r.try_get::<_, i64>(2)?;
+        md5_hasher.update(&md5);
+        size = size
+            .checked_add(r.try_get::<_, i64>(2)?)
+            .context("multipart object exceeds maximum size")?;
         ids.push(id);
         ends.push(size);
     }
     if want.next().is_some() {
         return Ok(Completed::InvalidPart);
     }
-    let etag = hasher.finalize().to_vec();
+    let digests = Digests {
+        sha256: hasher.finalize().to_vec(),
+        md5: md5_hasher.finalize().to_vec(),
+    };
+    let etag = s3_etag(&digests.md5, Some(ids.len()));
     swap_object(
         &tx,
         &bucket,
@@ -1256,7 +1420,10 @@ pub async fn complete_upload(
         ObjectWrite {
             file_id: ids[0],
             size,
+            sha256: &digests.sha256,
             etag: &etag,
+            user_metadata: &user_metadata,
+            content_type: &content_type,
             parts: Some((&ids, &ends)),
             condition: &PutCondition::Unconditional,
         },
@@ -1264,7 +1431,7 @@ pub async fn complete_upload(
     .await?;
     if !unused.is_empty() {
         tx.query_typed(
-            "DELETE FROM s3p.chunks WHERE file_id = ANY($1)",
+            "INSERT INTO s3p.garbage (file_id) SELECT unnest($1::int8[]) ON CONFLICT DO NOTHING",
             &[(&unused, Type::INT8_ARRAY)],
         )
         .await?;
@@ -1275,7 +1442,21 @@ pub async fn complete_upload(
     )
     .await?;
     tx.commit().await?;
-    publish_cache(&bucket, &key, ids[0], size, &etag, Some((ids, ends)));
+    meta_put(
+        &bucket,
+        &key,
+        Meta {
+            size,
+            sha256: digests.sha256,
+            etag: etag.clone(),
+            user_metadata,
+            content_type,
+            created_at: SystemTime::now(),
+            file_id: ids[0],
+            parts: Some(ids),
+            part_ends: Some(ends),
+        },
+    );
     Ok(Completed::Done {
         bucket,
         key,
@@ -1318,7 +1499,7 @@ pub async fn abort_upload(pool: &Pool, upload_id: &str, bucket: &str, key: &str)
     )
     .await?;
     tx.query_typed(
-        "DELETE FROM s3p.chunks WHERE file_id = ANY($1)",
+        "INSERT INTO s3p.garbage (file_id) SELECT unnest($1::int8[]) ON CONFLICT DO NOTHING",
         &[(&ids, Type::INT8_ARRAY)],
     )
     .await?;
@@ -1330,7 +1511,7 @@ pub async fn abort_upload(pool: &Pool, upload_id: &str, bucket: &str, key: &str)
 pub struct Listed {
     pub key: String,
     pub size: i64,
-    pub etag: Vec<u8>,
+    pub etag: String,
     pub created_at: SystemTime,
 }
 
@@ -1408,20 +1589,24 @@ pub async fn sizes(pool: &Pool) -> Result<(i64, i64)> {
                          FROM pg_partition_tree('s3p.chunks')), \
                     (SELECT count(*) FROM s3p.objects), \
                     (SELECT count(*) FROM s3p.chunks), \
-                    pg_database_size(current_database())",
+                     pg_database_size(current_database()), \
+                     (SELECT count(*) FROM s3p.garbage), \
+                     (SELECT EXTRACT(EPOCH FROM now() - min(queued_at))::int8 FROM s3p.garbage)",
             &[],
         )
         .await?;
     let logical: i64 = row.try_get(0)?;
     let physical: i64 = row.try_get(1)?;
     println!(
-        "objects={} chunks={} logical={} MiB physical={} MiB db={} MiB overhead={:.2}%",
+        "objects={} chunks={} logical={} MiB physical={} MiB db={} MiB overhead={:.2}% garbage_files={} oldest_garbage_s={:?}",
         row.try_get::<_, i64>(2)?,
         row.try_get::<_, i64>(3)?,
         logical / 1024 / 1024,
         physical / 1024 / 1024,
         row.try_get::<_, i64>(4)? / 1024 / 1024,
         (physical as f64 / logical.max(1) as f64 - 1.0) * 100.0,
+        row.try_get::<_, i64>(5)?,
+        row.try_get::<_, Option<i64>>(6)?,
     );
     Ok((logical, physical))
 }
@@ -1448,6 +1633,30 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires kind; run just kind-contract"]
+    async fn starting_again_does_not_rewrite_existing_layout() -> Result<()> {
+        let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
+        let sql =
+            "SELECT xmin::text FROM pg_proc WHERE oid = 's3p.reap_garbage(integer)'::regprocedure";
+        let before: String = pool
+            .get()
+            .await?
+            .query_typed_one(sql, &[])
+            .await?
+            .try_get(0)?;
+        init(&pool).await?;
+        ensure_maintenance(&pool).await?;
+        let after: String = pool
+            .get()
+            .await?
+            .query_typed_one(sql, &[])
+            .await?
+            .try_get(0)?;
+        anyhow::ensure!(before == after, "startup rewrote an existing SQL function");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires kind; run just kind-contract"]
     async fn large_get_survives_overwrite_after_first_chunk() -> Result<()> {
         let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
         let bucket = "pgvs3-contract";
@@ -1455,6 +1664,7 @@ mod tests {
         let old = vec![0x5a; SMALL_MAX * 2 + 8120];
         let result: Result<()> = async {
             put(&pool, bucket, &key, &old).await?;
+            let old_id = last_file_id(&pool).await?;
             let (_, body) = get_body(pool.clone(), bucket.into(), key.clone(), 0, -1, -1)
                 .await?
                 .context("missing object")?;
@@ -1469,6 +1679,7 @@ mod tests {
                         put(&writer_pool, bucket, &writer_key, b"replacement").await
                     });
                     let mut read_after_overwrite = false;
+                    let mut gc_during_read = false;
                     while let Some(bytes) =
                         tokio::time::timeout(std::time::Duration::from_secs(15), stream.next())
                             .await
@@ -1476,12 +1687,28 @@ mod tests {
                     {
                         got.extend_from_slice(&bytes?);
                         read_after_overwrite |= overwrite.is_finished();
+                        if overwrite.is_finished() && !gc_during_read {
+                            let conn = pool.get().await?;
+                            for _ in 0..8 {
+                                conn.query_typed_one("SELECT s3p.reap_garbage()", &[])
+                                    .await?;
+                                let queued: bool = conn.query_typed_one(
+                                    "SELECT EXISTS (SELECT 1 FROM s3p.garbage WHERE file_id = $1)",
+                                    &[(&old_id, Type::INT8)],
+                                ).await?.try_get(0)?;
+                                if !queued {
+                                    gc_during_read = true;
+                                    break;
+                                }
+                            }
+                        }
                         // Keep consuming: a paused 8+ MiB result fills the
                         // kubectl port-forward tunnel and stalls the writer.
                         tokio::time::sleep(std::time::Duration::from_millis(4)).await;
                     }
                     overwrite.await??;
                     anyhow::ensure!(read_after_overwrite, "overwrite did not overlap GET");
+                    anyhow::ensure!(gc_during_read, "old rows were not reaped during GET");
                 }
             }
             anyhow::ensure!(got == old, "concurrent overwrite interrupted GET");
@@ -1504,6 +1731,7 @@ mod tests {
             ROW_BYTES as usize + 19
         ])))
         .await?;
+        tx.send(IngestMsg::Finish(Vec::new())).await?;
         drop(tx);
 
         // The precondition fails after COPY has received its rows.
@@ -1513,6 +1741,8 @@ mod tests {
                 bucket: "pgvs3-contract".to_owned(),
                 key: format!("contract/failed-publish-{}", std::process::id()),
                 condition: PutCondition::IfMatch("\"missing\"".to_owned()),
+                user_metadata: Vec::new(),
+                content_type: "application/octet-stream".to_owned(),
             },
             rx,
         )
@@ -1567,6 +1797,7 @@ mod tests {
                     ROW_BYTES as usize + 1
                 ])))
                 .await?;
+                tx.send(IngestMsg::Finish(Vec::new())).await?;
                 drop(tx);
                 writers.push(ingest_writer(
                     pool.clone(),
@@ -1574,6 +1805,8 @@ mod tests {
                         bucket: "pgvs3-contract".to_owned(),
                         key: key.clone(),
                         condition: PutCondition::IfAbsent,
+                        user_metadata: Vec::new(),
+                        content_type: "application/octet-stream".to_owned(),
                     },
                     rx,
                 ));
@@ -1616,5 +1849,48 @@ mod tests {
         result?;
         cleanup?;
         Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires kind; run just kind-contract"]
+    async fn abandoned_writer_never_publishes_partial_bytes() -> Result<()> {
+        let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
+        let bucket = "pgvs3-contract";
+        let key = format!("contract/abandoned-{}", std::process::id());
+        put(&pool, bucket, &key, b"intact").await?;
+        let before = last_file_id(&pool).await?;
+        let result: Result<()> = async {
+            let mut writer = ChunkWriter::start_object(pool.clone(), bucket.into(), key.clone());
+            writer
+                .push(Bytes::from(vec![42; ROW_BYTES as usize + 1]))
+                .await?;
+            let done = writer.done.take().context("missing writer task")?;
+            drop(writer); // no Finish, as on cancellation mid-body
+            let error = done.await?.expect_err("cancelled writer committed");
+            anyhow::ensure!(error.to_string().contains("without Finish"), "{error}");
+            let new_id = last_file_id(&pool).await?;
+            anyhow::ensure!(new_id == before + 1, "writer didn't allocate a file");
+            let count: i64 = pool
+                .get()
+                .await?
+                .query_typed_one(
+                    "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+                    &[(&new_id, Type::INT8)],
+                )
+                .await?
+                .try_get(0)?;
+            anyhow::ensure!(count == 0, "cancelled COPY left rows");
+            let old = get(&pool, bucket, &key, 0, -1, -1)
+                .await?
+                .context("lost object")?;
+            anyhow::ensure!(
+                old.bytes == "intact",
+                "cancelled writer replaced the object"
+            );
+            Ok(())
+        }
+        .await;
+        let _ = delete(&pool, bucket, &key).await;
+        result
     }
 }

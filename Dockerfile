@@ -1,13 +1,11 @@
 # Static musl binary on scratch: no shell, no libc, no CVE surface. TLS is
 # rustls + ring (bundled assembly), so nothing links against OpenSSL; the
 # PostgreSQL verifies certificates and hostnames against this CA bundle (and
-# optionally PGVS3_DB_CA_FILE for a private CA such as Amazon RDS).
+# optionally PGVS3_DB_CA_FILE for a private database CA).
 #
 # Build both architectures with `just image` (docker buildx). The builder
 # image's Rust version should match or exceed mise.toml's; CI builds and tests
 # natively first, so drift shows up as a failed check before the image builds.
-# The Rust version here must be >= mise.toml's; CI runs `just ci` first, so
-# drift shows up as a failed check, not a broken image.
 FROM rust:alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src

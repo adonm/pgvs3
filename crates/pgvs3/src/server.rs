@@ -2,16 +2,19 @@
 //! Only HEAD, GET(+Range), PUT, DELETE, multipart and bucket operations are
 //! implemented; everything else stays `NotImplemented` (s3s trait defaults).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use futures::StreamExt;
 use hyper::service::Service as HyperService;
 use hyper::{Request, Response};
 use s3s::auth::SimpleAuth;
+use s3s::checksum::ChecksumHasher;
+use s3s::crypto::Checksum as _;
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketOutput,
@@ -27,24 +30,294 @@ use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 
 use crate::db;
 
-/// Stateless over Aurora: multipart upload state lives in `s3p.uploads`, so
+/// Stateless over PostgreSQL: multipart upload state lives in `s3p.uploads`, so
 /// any gateway instance can serve any request of any upload.
 #[derive(Clone)]
 pub struct PgS3 {
     pool: db::Pool,
 }
 
-fn etag(raw: &[u8]) -> Option<ETag> {
-    format!("\"{}\"", db::hex(raw)).parse().ok()
+fn etag(value: &str) -> Option<ETag> {
+    format!("\"{value}\"").parse().ok()
 }
 
 fn valid_etag(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+    let (digest, count) = value.split_once('-').unwrap_or((value, ""));
+    digest.len() == 32
+        && (count.is_empty()
+            || count
+                .parse::<u16>()
+                .is_ok_and(|n| (1..=10_000).contains(&n)))
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The one checksum a CompletedPart may carry, as `(algorithm, value)`.
+fn part_checksum(part: &s3s::dto::CompletedPart) -> S3Result<Option<(String, String)>> {
+    if part.checksum_md5.is_some()
+        || part.checksum_sha512.is_some()
+        || part.checksum_xxhash64.is_some()
+        || part.checksum_xxhash3.is_some()
+        || part.checksum_xxhash128.is_some()
+    {
+        return Err(s3_error!(NotImplemented));
+    }
+    let given: Vec<_> = [
+        ("CRC32", &part.checksum_crc32),
+        ("CRC32C", &part.checksum_crc32c),
+        ("CRC64NVME", &part.checksum_crc64nvme),
+        ("SHA1", &part.checksum_sha1),
+        ("SHA256", &part.checksum_sha256),
+    ]
+    .into_iter()
+    .filter_map(|(algorithm, value)| value.clone().map(|v| (algorithm.to_owned(), v)))
+    .collect();
+    match given.len() {
+        0 => Ok(None),
+        1 => Ok(given.into_iter().next()),
+        _ => Err(s3_error!(InvalidRequest)),
+    }
+}
+
+/// Custom S3 metadata is bounded and preserved atomically with its object.
+fn validated_metadata(meta: Option<HashMap<String, String>>) -> S3Result<Vec<String>> {
+    let mut sorted = Vec::new();
+    let mut total = 0;
+    for (name, value) in meta.unwrap_or_default() {
+        let name = name.to_ascii_lowercase();
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || value.bytes().any(|b| b < 0x20 || b == 0x7f)
+        {
+            return Err(s3_error!(InvalidRequest));
+        }
+        total += name.len() + value.len();
+        if total > 2048 || sorted.len() >= 64 {
+            return Err(s3_error!(InvalidRequest));
+        }
+        sorted.push((name, value));
+    }
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    if sorted.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(s3_error!(InvalidRequest));
+    }
+    Ok(sorted
+        .into_iter()
+        .flat_map(|(key, value)| [key, value])
+        .collect())
+}
+
+fn metadata_map(meta: &[String]) -> Option<HashMap<String, String>> {
+    (!meta.is_empty()).then(|| {
+        meta.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[name, value]| (name.clone(), value.clone()))
+            .collect()
+    })
+}
+
+fn validated_content_type(value: Option<String>) -> S3Result<String> {
+    let value = value.unwrap_or_else(|| "application/octet-stream".to_owned());
+    if value.is_empty() || value.len() > 1024 || value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(s3_error!(InvalidRequest));
+    }
+    Ok(value)
+}
+
+fn validate_key(key: &str) -> S3Result<()> {
+    if key.is_empty() || key.len() > 1024 {
+        return Err(s3_error!(InvalidRequest));
+    }
+    Ok(())
 }
 
 fn internal(e: impl std::fmt::Display) -> s3s::S3Error {
     eprintln!("pgvs3 internal error: {e}");
     s3_error!(InternalError)
+}
+
+/// Only compute extra digests the client actually supplied. s3s verifies
+/// signed chunks, but exposes unsigned checksum trailers without checking them.
+struct UploadIntegrity {
+    expected: Vec<(String, String)>,
+    trailing: Vec<String>,
+    handle: Option<s3s::TrailingHeaders>,
+    hasher: ChecksumHasher,
+}
+
+impl UploadIntegrity {
+    fn new<T>(req: &S3Request<T>) -> S3Result<Self> {
+        let mut expected = Vec::new();
+        let mut trailing = Vec::new();
+        for (name, value) in &req.headers {
+            let name = name.as_str();
+            if name == "content-md5"
+                || (name.starts_with("x-amz-checksum-") && name != "x-amz-checksum-algorithm")
+            {
+                if !Self::supported(name) {
+                    return Err(s3_error!(NotImplemented));
+                }
+                expected.push((
+                    name.to_owned(),
+                    value
+                        .to_str()
+                        .map_err(|_| s3_error!(InvalidRequest))?
+                        .to_owned(),
+                ));
+            }
+        }
+        if let Some(declared) = req.headers.get("x-amz-trailer") {
+            for name in declared
+                .to_str()
+                .map_err(|_| s3_error!(InvalidRequest))?
+                .split(',')
+            {
+                let name = name.trim().to_ascii_lowercase();
+                if !Self::supported(&name) || name == "content-md5" {
+                    return Err(s3_error!(NotImplemented));
+                }
+                trailing.push(name);
+            }
+            if req.trailing_headers.is_none() || trailing.is_empty() {
+                return Err(s3_error!(InvalidRequest));
+            }
+        }
+        for algo in ["x-amz-sdk-checksum-algorithm", "x-amz-checksum-algorithm"] {
+            let Some(algo) = req.headers.get(algo) else {
+                continue;
+            };
+            let name = format!(
+                "x-amz-checksum-{}",
+                algo.to_str()
+                    .map_err(|_| s3_error!(InvalidRequest))?
+                    .to_ascii_lowercase()
+            );
+            if !expected.iter().any(|(n, _)| n == &name) && !trailing.contains(&name) {
+                return Err(s3_error!(InvalidRequest));
+            }
+        }
+        let mut hasher = ChecksumHasher::default();
+        for name in expected.iter().map(|(n, _)| n).chain(trailing.iter()) {
+            match name.as_str() {
+                "content-md5" | "x-amz-checksum-md5" => hasher.md5 = Some(s3s::crypto::Md5::new()),
+                "x-amz-checksum-crc32" => hasher.crc32 = Some(s3s::crypto::Crc32::new()),
+                "x-amz-checksum-crc32c" => hasher.crc32c = Some(s3s::crypto::Crc32c::new()),
+                "x-amz-checksum-crc64nvme" => {
+                    hasher.crc64nvme = Some(s3s::crypto::Crc64Nvme::new())
+                }
+                "x-amz-checksum-sha1" => hasher.sha1 = Some(s3s::crypto::Sha1::new()),
+                "x-amz-checksum-sha256" => hasher.sha256 = Some(s3s::crypto::Sha256::new()),
+                "x-amz-checksum-sha512" => hasher.sha512 = Some(s3s::crypto::Sha512::new()),
+                "x-amz-checksum-xxhash64" => hasher.xxhash64 = Some(s3s::crypto::XxHash64::new()),
+                "x-amz-checksum-xxhash3" => hasher.xxhash3 = Some(s3s::crypto::XxHash3::new()),
+                "x-amz-checksum-xxhash128" => {
+                    hasher.xxhash128 = Some(s3s::crypto::XxHash128::new())
+                }
+                _ => unreachable!("validated checksum name"),
+            }
+        }
+        Ok(Self {
+            expected,
+            trailing,
+            handle: req.trailing_headers.clone(),
+            hasher,
+        })
+    }
+
+    fn supported(name: &str) -> bool {
+        matches!(
+            name,
+            "content-md5"
+                | "x-amz-checksum-md5"
+                | "x-amz-checksum-crc32"
+                | "x-amz-checksum-crc32c"
+                | "x-amz-checksum-crc64nvme"
+                | "x-amz-checksum-sha1"
+                | "x-amz-checksum-sha256"
+                | "x-amz-checksum-sha512"
+                | "x-amz-checksum-xxhash64"
+                | "x-amz-checksum-xxhash3"
+                | "x-amz-checksum-xxhash128"
+        )
+    }
+
+    /// The verified `(name, value)` checksums, or None on any mismatch.
+    fn verify(mut self) -> Option<Vec<(String, String)>> {
+        if let Some(handle) = self.handle.take() {
+            let Some(headers) = handle.take() else {
+                return (self.trailing.is_empty() && self.matches_computed())
+                    .then_some(self.expected);
+            };
+            if !self.trailing.is_empty() {
+                for name in &self.trailing {
+                    let value = headers.get(name).and_then(|v| v.to_str().ok())?;
+                    self.expected.push((name.clone(), value.to_owned()));
+                }
+            }
+            // Do not silently ignore any undeclared checksum trailer.
+            if headers.keys().any(|h| {
+                h.as_str().starts_with("x-amz-checksum-")
+                    && !self.trailing.iter().any(|n| n == h.as_str())
+            }) {
+                return None;
+            }
+        }
+        self.matches_computed().then_some(self.expected)
+    }
+
+    fn matches_computed(&mut self) -> bool {
+        let computed = std::mem::take(&mut self.hasher).finalize();
+        self.expected.iter().all(|(name, want)| {
+            let actual = match name.as_str() {
+                "content-md5" | "x-amz-checksum-md5" => computed.checksum_md5.as_deref(),
+                "x-amz-checksum-crc32" => computed.checksum_crc32.as_deref(),
+                "x-amz-checksum-crc32c" => computed.checksum_crc32c.as_deref(),
+                "x-amz-checksum-crc64nvme" => computed.checksum_crc64nvme.as_deref(),
+                "x-amz-checksum-sha1" => computed.checksum_sha1.as_deref(),
+                "x-amz-checksum-sha256" => computed.checksum_sha256.as_deref(),
+                "x-amz-checksum-sha512" => computed.checksum_sha512.as_deref(),
+                "x-amz-checksum-xxhash64" => computed.checksum_xxhash64.as_deref(),
+                "x-amz-checksum-xxhash3" => computed.checksum_xxhash3.as_deref(),
+                "x-amz-checksum-xxhash128" => computed.checksum_xxhash128.as_deref(),
+                _ => None,
+            };
+            actual == Some(want.as_str())
+        })
+    }
+}
+
+enum UploadError {
+    BadDigest,
+    Failed(anyhow::Error),
+}
+
+async fn ingest_verified(
+    writer: db::ChunkWriter,
+    mut body: StreamingBlob,
+    mut integrity: UploadIntegrity,
+) -> std::result::Result<crate::ingest::Published, UploadError> {
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(bytes) => {
+                integrity.hasher.update(&bytes);
+                if writer.push(bytes).await.is_err() {
+                    return writer.finish(Vec::new()).await.map_err(UploadError::Failed);
+                }
+            }
+            Err(e) => {
+                writer.abort().await;
+                return Err(UploadError::Failed(anyhow::anyhow!("request body: {e}")));
+            }
+        }
+    }
+    let Some(checksums) = integrity.verify() else {
+        writer.abort().await;
+        return Err(UploadError::BadDigest);
+    };
+    writer.finish(checksums).await.map_err(UploadError::Failed)
 }
 
 /// Upper bound (exclusive) for `key LIKE prefix%` as a range scan bound.
@@ -134,6 +407,8 @@ impl S3 for PgS3 {
             accept_ranges: Some("bytes".to_owned()),
             content_length: Some(meta.size),
             e_tag: etag(&meta.etag),
+            metadata: metadata_map(&meta.user_metadata),
+            content_type: Some(meta.content_type),
             last_modified: Some(Timestamp::from(meta.created_at)),
             ..Default::default()
         };
@@ -184,8 +459,9 @@ impl S3 for PgS3 {
             content_length: Some(body_len),
             content_range: ranged
                 .then(|| format!("bytes {}-{}/{}", meta.start, meta.end, meta.size)),
-            content_type: Some("application/octet-stream".to_owned()),
+            content_type: Some(meta.content_type),
             e_tag: etag(&meta.etag),
+            metadata: metadata_map(&meta.user_metadata),
             last_modified: Some(Timestamp::from(meta.created_at)),
             ..Default::default()
         };
@@ -196,7 +472,19 @@ impl S3 for PgS3 {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        let integrity = UploadIntegrity::new(&req)?;
         let mut input = req.input;
+        validate_key(&input.key)?;
+        if input.content_encoding.is_some()
+            || input.sse_customer_algorithm.is_some()
+            || input.sse_customer_key.is_some()
+            || input.sse_customer_key_md5.is_some()
+            || input.server_side_encryption.is_some()
+        {
+            return Err(s3_error!(NotImplemented));
+        }
+        let user_metadata = validated_metadata(input.metadata.take())?;
+        let content_type = validated_content_type(input.content_type.take())?;
         let condition = match (input.if_match.as_ref(), input.if_none_match.as_ref()) {
             (None, None) => db::PutCondition::Unconditional,
             (None, Some(ETagCondition::Any)) => db::PutCondition::IfAbsent,
@@ -215,10 +503,13 @@ impl S3 for PgS3 {
             input.bucket.clone(),
             input.key,
             condition,
+            user_metadata,
+            content_type,
         );
-        let (_size, sum) = match db::ingest_body(writer, body).await {
+        let published = match ingest_verified(writer, body, integrity).await {
             Ok(done) => done,
-            Err(e) => {
+            Err(UploadError::BadDigest) => return Err(s3_error!(BadDigest)),
+            Err(UploadError::Failed(e)) => {
                 if e.downcast_ref::<db::PreconditionFailed>().is_some() {
                     return Err(s3_error!(PreconditionFailed));
                 }
@@ -232,7 +523,7 @@ impl S3 for PgS3 {
             }
         };
         Ok(S3Response::new(PutObjectOutput {
-            e_tag: etag(&sum),
+            e_tag: etag(&published.etag),
             ..Default::default()
         }))
     }
@@ -310,16 +601,40 @@ impl S3 for PgS3 {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
+        validate_key(&input.key)?;
+        let algorithm = input.checksum_algorithm.as_ref().map(|a| a.as_str());
+        if algorithm.is_some_and(|a| !db::CHECKSUM_ALGORITHMS.contains(&a))
+            || input
+                .checksum_type
+                .as_ref()
+                .is_some_and(|t| algorithm.is_none() || t.as_str() != "COMPOSITE")
+            || input.content_encoding.is_some()
+            || input.sse_customer_algorithm.is_some()
+            || input.sse_customer_key.is_some()
+            || input.server_side_encryption.is_some()
+        {
+            return Err(s3_error!(NotImplemented));
+        }
+        let user_metadata = validated_metadata(input.metadata)?;
+        let content_type = validated_content_type(input.content_type)?;
         // Each Create starts an independent upload, including for a key that
         // already has another active upload.
-        let id = db::create_upload(&self.pool, &input.bucket, &input.key)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| s3_error!(NoSuchBucket))?;
+        let id = db::create_upload(
+            &self.pool,
+            &input.bucket,
+            &input.key,
+            user_metadata,
+            content_type,
+            algorithm,
+        )
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| s3_error!(NoSuchBucket))?;
         Ok(S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(input.bucket),
             key: Some(input.key),
             upload_id: Some(id),
+            checksum_algorithm: input.checksum_algorithm,
             ..Default::default()
         }))
     }
@@ -328,7 +643,15 @@ impl S3 for PgS3 {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        let integrity = UploadIntegrity::new(&req)?;
         let mut input = req.input;
+        validate_key(&input.key)?;
+        if input.sse_customer_algorithm.is_some()
+            || input.sse_customer_key.is_some()
+            || input.sse_customer_key_md5.is_some()
+        {
+            return Err(s3_error!(NotImplemented));
+        }
         if !(1..=10_000).contains(&input.part_number) {
             return Err(s3_error!(InvalidPart));
         }
@@ -346,24 +669,45 @@ impl S3 for PgS3 {
             .body
             .take()
             .unwrap_or_else(|| StreamingBlob::from_bytes(bytes::Bytes::new()));
-        let (size, sum) = db::ingest_body(writer, body).await.map_err(|e| {
-            if matches!(
-                e.downcast_ref::<db::MissingResource>(),
-                Some(db::MissingResource::Upload)
-            ) {
-                s3_error!(NoSuchUpload)
-            } else {
-                internal(e)
-            }
-        })?;
+        let published = ingest_verified(writer, body, integrity)
+            .await
+            .map_err(|e| match e {
+                UploadError::BadDigest => s3_error!(BadDigest),
+                UploadError::Failed(e) if e.downcast_ref::<db::MissingChecksum>().is_some() => {
+                    s3_error!(InvalidRequest)
+                }
+                UploadError::Failed(e)
+                    if matches!(
+                        e.downcast_ref::<db::MissingResource>(),
+                        Some(db::MissingResource::Upload)
+                    ) =>
+                {
+                    s3_error!(NoSuchUpload)
+                }
+                UploadError::Failed(e) => internal(e),
+            })?;
         eprintln!(
             "pgvs3: upload_part {} no={} {size} bytes",
-            input.upload_id, input.part_number
+            input.upload_id,
+            input.part_number,
+            size = published.size
         );
-        Ok(S3Response::new(UploadPartOutput {
-            e_tag: etag(&sum),
+        let mut out = UploadPartOutput {
+            e_tag: etag(&published.etag),
             ..Default::default()
-        }))
+        };
+        if let Some((algorithm, value)) = published.checksum {
+            let field = match algorithm.as_str() {
+                "CRC32" => &mut out.checksum_crc32,
+                "CRC32C" => &mut out.checksum_crc32c,
+                "CRC64NVME" => &mut out.checksum_crc64nvme,
+                "SHA1" => &mut out.checksum_sha1,
+                "SHA256" => &mut out.checksum_sha256,
+                _ => return Err(internal(format!("stored checksum algorithm {algorithm}"))),
+            };
+            *field = Some(value);
+        }
+        Ok(S3Response::new(out))
     }
 
     async fn complete_multipart_upload(
@@ -371,6 +715,26 @@ impl S3 for PgS3 {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let input = req.input;
+        validate_key(&input.key)?;
+        if input.checksum_crc32.is_some()
+            || input.checksum_crc32c.is_some()
+            || input.checksum_crc64nvme.is_some()
+            || input.checksum_md5.is_some()
+            || input.checksum_sha1.is_some()
+            || input.checksum_sha256.is_some()
+            || input.checksum_sha512.is_some()
+            || input
+                .checksum_type
+                .as_ref()
+                .is_some_and(|t| t.as_str() != "COMPOSITE")
+            || input.checksum_xxhash64.is_some()
+            || input.checksum_xxhash3.is_some()
+            || input.checksum_xxhash128.is_some()
+            || input.if_match.is_some()
+            || input.if_none_match.is_some()
+        {
+            return Err(s3_error!(NotImplemented));
+        }
         let listed = input
             .multipart_upload
             .as_ref()
@@ -378,16 +742,17 @@ impl S3 for PgS3 {
             .unwrap_or_default();
         let mut parts = Vec::with_capacity(listed.len());
         for cp in &listed {
-            let no = cp.part_number.ok_or_else(|| s3_error!(InvalidPart))?;
-            parts.push((
-                no,
-                cp.e_tag
+            parts.push(db::ListedPart {
+                part_no: cp.part_number.ok_or_else(|| s3_error!(InvalidPart))?,
+                etag: cp
+                    .e_tag
                     .as_ref()
                     .map(|e| e.value().to_owned())
                     .unwrap_or_default(),
-            ));
+                checksum: part_checksum(cp)?,
+            });
         }
-        // Parts are already rows in Aurora: Complete validates and publishes,
+        // Parts are already rows in PostgreSQL: Complete validates and publishes,
         // moving no data (so no long response window to lose).
         match db::complete_upload(
             &self.pool,
@@ -402,7 +767,7 @@ impl S3 for PgS3 {
             db::Completed::Done {
                 bucket,
                 key,
-                etag: sum,
+                etag: object_etag,
                 size,
             } => {
                 eprintln!(
@@ -413,7 +778,7 @@ impl S3 for PgS3 {
                     location: Some(format!("/{bucket}/{key}")),
                     bucket: Some(bucket),
                     key: Some(key),
-                    e_tag: etag(&sum),
+                    e_tag: etag(&object_etag),
                     ..Default::default()
                 }))
             }

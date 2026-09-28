@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use pgvs3::{bench, db, seed, server};
+use pgvs3::{db, server};
 
 #[derive(Parser)]
 #[command(
@@ -42,40 +42,6 @@ enum Cmd {
         #[arg(long, env = "PGVS3_ALLOW_HTTP", default_value_t = false)]
         allow_http: bool,
     },
-    /// Seed deterministic incompressible objects.
-    Seed {
-        #[arg(long, default_value = "lake")]
-        bucket: String,
-        #[arg(long, default_value_t = 8.0)]
-        gigabytes: f64,
-        #[arg(long, default_value_t = 64)]
-        object_mib: usize,
-        #[arg(long, default_value_t = 16)]
-        tasks: usize,
-    },
-    /// Latency/throughput bench against a running gateway.
-    Bench {
-        #[arg(long, default_value = "http://127.0.0.1:8014")]
-        endpoint: String,
-        #[arg(long, default_value = "lake")]
-        bucket: String,
-        #[arg(long, env = "AWS_ACCESS_KEY_ID")]
-        access_key: String,
-        #[arg(long, env = "AWS_SECRET_ACCESS_KEY")]
-        secret_key: String,
-        #[arg(
-            long,
-            value_delimiter = ',',
-            default_value = "4096,65536,262144,1048576,8388608"
-        )]
-        sizes: Vec<usize>,
-        #[arg(long, value_delimiter = ',', default_value = "1,16")]
-        concurrency: Vec<usize>,
-        #[arg(long, default_value_t = 2000)]
-        requests: usize,
-        #[arg(long, default_value_t = 64)]
-        sample: usize,
-    },
     /// Storage overhead summary (logical vs physical).
     Stat,
 }
@@ -106,47 +72,6 @@ async fn main() -> Result<()> {
                     allow_http,
                 },
             )
-            .await
-        }
-        Cmd::Seed {
-            bucket,
-            gigabytes,
-            object_mib,
-            tasks,
-        } => {
-            let pool = db::connect(&cli.url).await?;
-            seed::run(
-                &pool,
-                seed::SeedConfig {
-                    bucket,
-                    gigabytes,
-                    object_mib,
-                    tasks,
-                },
-            )
-            .await
-        }
-        Cmd::Bench {
-            endpoint,
-            bucket,
-            access_key,
-            secret_key,
-            sizes,
-            concurrency,
-            requests,
-            sample,
-        } => {
-            bench::run(bench::BenchConfig {
-                endpoint,
-                bucket,
-                access_key,
-                secret_key,
-                sizes,
-                concurrency,
-                requests,
-                pg_url: cli.url,
-                sample,
-            })
             .await
         }
         Cmd::Stat => {

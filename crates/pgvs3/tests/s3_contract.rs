@@ -72,6 +72,59 @@ fn signed_request_body(
     Ok((code.parse()?, body.to_owned()))
 }
 
+fn signed_headers(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+    body: Option<&str>,
+) -> Result<(u16, String)> {
+    let user = format!(
+        "{}:{}",
+        std::env::var("PGVS3_ACCESS_KEY")?,
+        std::env::var("PGVS3_SECRET_KEY")?
+    );
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-sS",
+        "--aws-sigv4",
+        "aws:amz:us-east-1:s3",
+        "--user",
+        &user,
+        "-X",
+        method,
+        "-D",
+        "-",
+        "-o",
+        "/dev/null",
+        "-w",
+        "\n%{http_code}",
+    ]);
+    if method == "HEAD" {
+        cmd.arg("--head");
+    }
+    for header in headers {
+        cmd.args(["-H", header]);
+    }
+    if let Some(body) = body {
+        cmd.args(["--data-binary", body]);
+    }
+    let output = cmd.arg(format!("{endpoint}/{path}")).output()?;
+    ensure!(output.status.success(), "curl failed: {:?}", output.stderr);
+    let text = String::from_utf8(output.stdout)?;
+    let (headers, code) = text
+        .rsplit_once('\n')
+        .ok_or_else(|| anyhow::anyhow!("no status"))?;
+    Ok((code.parse()?, headers.to_owned()))
+}
+
+fn header_value<'a>(headers: &'a str, key: &str) -> Option<&'a str> {
+    headers.lines().rev().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case(key).then_some(value.trim())
+    })
+}
+
 fn store(endpoint: &str, bucket: &str) -> Result<AmazonS3> {
     Ok(AmazonS3Builder::new()
         .with_bucket_name(bucket)
@@ -104,11 +157,6 @@ async fn pool() -> Result<pgvs3::db::Pool> {
     pgvs3::db::connect(&url).await
 }
 
-fn p95(samples: &mut [u128]) -> u128 {
-    samples.sort_unstable();
-    samples[((samples.len() * 95).div_ceil(100) - 1).min(samples.len() - 1)]
-}
-
 async fn chunk_maintenance(pool: &pgvs3::db::Pool) -> Result<(i64, i64, i64)> {
     let row = pool
         .get()
@@ -122,6 +170,42 @@ async fn chunk_maintenance(pool: &pgvs3::db::Pool) -> Result<(i64, i64, i64)> {
         )
         .await?;
     Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))
+}
+
+async fn queued_then_reaped(pool: &pgvs3::db::Pool, file_id: i64) -> Result<()> {
+    let conn = pool.get().await?;
+    let queued: bool = conn
+        .query_typed_one(
+            "SELECT EXISTS (SELECT 1 FROM s3p.garbage WHERE file_id = $1)",
+            &[(&file_id, Type::INT8)],
+        )
+        .await?
+        .try_get(0)?;
+    // pg_cron may have already drained this file between the S3 response and
+    // this assertion. If so, the absence of both queue entry and rows is fine.
+    for _ in 0..64 {
+        conn.query_typed_one("SELECT s3p.reap_garbage(65536)", &[])
+            .await?;
+        let queued: bool = conn
+            .query_typed_one(
+                "SELECT EXISTS (SELECT 1 FROM s3p.garbage WHERE file_id = $1)",
+                &[(&file_id, Type::INT8)],
+            )
+            .await?
+            .try_get(0)?;
+        if !queued {
+            let count: i64 = conn
+                .query_typed_one(
+                    "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+                    &[(&file_id, Type::INT8)],
+                )
+                .await?
+                .try_get(0)?;
+            ensure!(count == 0, "garbage file {file_id} still has rows");
+            return Ok(());
+        }
+    }
+    anyhow::bail!("garbage file {file_id} did not drain (initially queued: {queued})")
 }
 
 #[tokio::test]
@@ -303,15 +387,12 @@ async fn database_maintenance_is_automatic() -> Result<()> {
     let cron_jobs: i64 = conn
         .query_typed_one(
             "SELECT count(*) FROM cron.job \
-             WHERE jobname = 'pgvs3-expire-uploads' AND database = current_database() AND active",
+             WHERE jobname = 'pgvs3-maintain' AND database = current_database() AND active",
             &[],
         )
         .await?
         .try_get(0)?;
-    ensure!(
-        cron_jobs == 1,
-        "multipart expiry is not scheduled in PostgreSQL"
-    );
+    ensure!(cron_jobs == 1, "maintenance is not scheduled in PostgreSQL");
     let configured_partitions: i64 = conn
         .query_typed_one(
             "SELECT count(*) FROM pg_partition_tree('s3p.chunks') p \
@@ -395,14 +476,7 @@ async fn overwrite_and_delete_are_visible_on_both_gateways() -> Result<()> {
                 .is_empty(),
             "LIST still exposes a deleted object"
         );
-        let count: i64 = conn
-            .query_typed_one(
-                "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
-                &[(&file_id, Type::INT8)],
-            )
-            .await?
-            .try_get(0)?;
-        ensure!(count == 0, "DELETE left chunk rows for the object");
+        queued_then_reaped(&pool().await?, file_id).await?;
         Ok(())
     }
     .await;
@@ -571,6 +645,387 @@ async fn conditional_puts_are_atomic_across_gateways() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires kind; run just kind-contract"]
+async fn s3_etags_metadata_and_multipart_checksums() -> Result<()> {
+    use md5::{Digest as _, Md5};
+    use sha2::Sha256;
+
+    let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
+    let other = std::env::var("PGVS3_TEST_ENDPOINT_B")?;
+    let bucket = format!("pgvs3-md5-{}", prefix().replace('/', "-"));
+    let (status, body) = signed_request(&endpoint, "PUT", &bucket, &[])?;
+    ensure!(status == 200, "bucket creation failed: {status}: {body}");
+    let (status, body) = signed_request(&other, "PUT", &bucket, &[])?;
+    ensure!(
+        status == 200,
+        "bucket re-creation is not idempotent: {status}: {body}"
+    );
+
+    let key = "single";
+    let payload = "metadata survives an overwrite";
+    let expected_md5 = pgvs3::db::hex(&Md5::digest(payload.as_bytes()));
+    let (status, headers) = signed_headers(
+        &endpoint,
+        "PUT",
+        &format!("{bucket}/{key}"),
+        &[
+            "x-amz-meta-ckp-data: checkpoint-1",
+            "Content-Type: text/plain",
+        ],
+        Some(payload),
+    )?;
+    ensure!(status == 200, "PUT failed: {status}: {headers}");
+    ensure!(header_value(&headers, "ETag") == Some(format!("\"{expected_md5}\"").as_str()));
+    let (status, headers) = signed_headers(&other, "HEAD", &format!("{bucket}/{key}"), &[], None)?;
+    ensure!(status == 200, "HEAD failed: {status}: {headers}");
+    ensure!(header_value(&headers, "ETag") == Some(format!("\"{expected_md5}\"").as_str()));
+    ensure!(header_value(&headers, "x-amz-meta-ckp-data") == Some("checkpoint-1"));
+    ensure!(header_value(&headers, "Content-Type") == Some("text/plain"));
+    let conn = pool().await?.get().await?;
+    let row = conn
+        .query_typed_one(
+            "SELECT sha256, etag, user_metadata FROM s3p.objects WHERE bucket = $1 AND key = $2",
+            &[(&bucket, Type::TEXT), (&key, Type::TEXT)],
+        )
+        .await?;
+    ensure!(row.try_get::<_, Vec<u8>>(0)? == Sha256::digest(payload.as_bytes()).to_vec());
+    ensure!(row.try_get::<_, String>(1)? == expected_md5);
+    ensure!(row.try_get::<_, Vec<String>>(2)? == ["ckp-data", "checkpoint-1"]);
+    let (status, body) = signed_request_body(
+        &other,
+        "PUT",
+        &format!("{bucket}/{key}"),
+        &[
+            "Content-MD5: AAAAAAAAAAAAAAAAAAAAAA==",
+            "x-amz-meta-ckp-data: changed",
+        ],
+        Some("corrupt replacement"),
+    )?;
+    ensure!(
+        status == 400 && body.contains("BadDigest"),
+        "{status}: {body}"
+    );
+    let (status, headers) =
+        signed_headers(&endpoint, "HEAD", &format!("{bucket}/{key}"), &[], None)?;
+    ensure!(status == 200 && header_value(&headers, "x-amz-meta-ckp-data") == Some("checkpoint-1"));
+    ensure!(header_value(&headers, "ETag") == Some(format!("\"{expected_md5}\"").as_str()));
+    let next = "conditional replacement";
+    let next_md5 = pgvs3::db::hex(&Md5::digest(next.as_bytes()));
+    let (status, headers) = signed_headers(
+        &other,
+        "PUT",
+        &format!("{bucket}/{key}"),
+        &[
+            &format!("If-Match: \"{expected_md5}\""),
+            "x-amz-meta-ckp-data: checkpoint-3",
+        ],
+        Some(next),
+    )?;
+    ensure!(
+        status == 200 && header_value(&headers, "ETag") == Some(format!("\"{next_md5}\"").as_str()),
+        "MD5 conditional PUT failed: {status}: {headers}"
+    );
+    let (status, headers) =
+        signed_headers(&endpoint, "GET", &format!("{bucket}/{key}"), &[], None)?;
+    ensure!(status == 200 && header_value(&headers, "x-amz-meta-ckp-data") == Some("checkpoint-3"));
+    ensure!(
+        store(&endpoint, &bucket)?
+            .get(&Path::from(key))
+            .await?
+            .bytes()
+            .await?
+            == next.as_bytes()
+    );
+
+    let path = format!("{bucket}/multipart");
+    let (status, xml) = signed_request(
+        &endpoint,
+        "POST",
+        &format!("{path}?uploads"),
+        &[
+            "x-amz-meta-ckp-data: checkpoint-2",
+            "Content-Type: text/plain",
+        ],
+    )?;
+    ensure!(
+        status == 200,
+        "CreateMultipartUpload failed: {status}: {xml}"
+    );
+    let upload_id = xml_tag(&xml, "UploadId").ok_or_else(|| anyhow::anyhow!("no upload ID"))?;
+    let mut tags = Vec::new();
+    for (n, text) in [(1, "alpha"), (2, "beta")] {
+        let (status, headers) = signed_headers(
+            &other,
+            "PUT",
+            &format!("{path}?partNumber={n}&uploadId={upload_id}"),
+            &[],
+            Some(text),
+        )?;
+        ensure!(status == 200, "UploadPart failed: {status}: {headers}");
+        let tag = header_value(&headers, "ETag")
+            .ok_or_else(|| anyhow::anyhow!("part {n} has no ETag"))?;
+        let want = pgvs3::db::hex(&Md5::digest(text.as_bytes()));
+        ensure!(tag == format!("\"{want}\""), "unexpected part ETag: {tag}");
+        tags.push(tag.to_owned());
+    }
+    let manifest = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>", tags[0], tags[1]);
+    let mut md5_of_parts = Md5::new();
+    md5_of_parts.update(Md5::digest(b"alpha"));
+    md5_of_parts.update(Md5::digest(b"beta"));
+    let final_tag = format!("{}-2", pgvs3::db::hex(&md5_of_parts.finalize()));
+    let (status, body) = signed_request_body(
+        &endpoint,
+        "POST",
+        &format!("{path}?uploadId={upload_id}"),
+        &["Content-Type: application/xml"],
+        Some(&manifest),
+    )?;
+    ensure!(
+        status == 200 && xml_tag(&body, "ETag") == Some(format!("\"{final_tag}\"").as_str()),
+        "CompleteMultipartUpload failed: {status}: {body}"
+    );
+    let (status, headers) = signed_headers(&other, "HEAD", &path, &[], None)?;
+    ensure!(
+        status == 200
+            && header_value(&headers, "ETag") == Some(format!("\"{final_tag}\"").as_str()),
+        "multipart HEAD failed: {status}: {headers}"
+    );
+    ensure!(header_value(&headers, "x-amz-meta-ckp-data") == Some("checkpoint-2"));
+    ensure!(
+        store(&other, &bucket)?
+            .get(&Path::from("multipart"))
+            .await?
+            .bytes()
+            .await?
+            == b"alphabeta"[..]
+    );
+
+    // S3 multipart integrity path: CRC32 declared at Create, echoed by every
+    // UploadPart response and repeated per part at Complete.
+    use s3s::checksum::ChecksumHasher;
+    use s3s::crypto::{Checksum as _, Crc32};
+    let crc = |text: &str| {
+        let mut hasher = ChecksumHasher {
+            crc32: Some(Crc32::new()),
+            ..Default::default()
+        };
+        hasher.update(text.as_bytes());
+        hasher.finalize().checksum_crc32.unwrap()
+    };
+    let path = format!("{bucket}/checksummed");
+    let (status, xml) = signed_request(
+        &endpoint,
+        "POST",
+        &format!("{path}?uploads"),
+        &["x-amz-checksum-algorithm: CRC32"],
+    )?;
+    ensure!(status == 200, "checksummed Create failed: {status}: {xml}");
+    let upload_id = xml_tag(&xml, "UploadId").ok_or_else(|| anyhow::anyhow!("no upload ID"))?;
+    let (status, body) = signed_request_body(
+        &other,
+        "PUT",
+        &format!("{path}?partNumber=1&uploadId={upload_id}"),
+        &[],
+        Some("gamma"),
+    )?;
+    ensure!(
+        status == 400 && body.contains("InvalidRequest"),
+        "part without the upload's checksum was accepted: {status}: {body}"
+    );
+    let mut parts = Vec::new();
+    for (n, text) in [(1, "gamma"), (2, "delta")] {
+        let sum = crc(text);
+        let (status, headers) = signed_headers(
+            &other,
+            "PUT",
+            &format!("{path}?partNumber={n}&uploadId={upload_id}"),
+            &[&format!("x-amz-checksum-crc32: {sum}")],
+            Some(text),
+        )?;
+        ensure!(
+            status == 200,
+            "checksummed UploadPart failed: {status}: {headers}"
+        );
+        ensure!(
+            header_value(&headers, "x-amz-checksum-crc32") == Some(sum.as_str()),
+            "UploadPart did not echo its CRC32: {headers}"
+        );
+        let tag = header_value(&headers, "ETag")
+            .unwrap_or_default()
+            .to_owned();
+        parts.push((n, tag, sum));
+    }
+    let manifest = |sums: &[&str]| {
+        let body: String = parts
+            .iter()
+            .zip(sums)
+            .map(|((n, tag, _), sum)| {
+                let sum = if sum.is_empty() {
+                    String::new()
+                } else {
+                    format!("<ChecksumCRC32>{sum}</ChecksumCRC32>")
+                };
+                format!("<Part><PartNumber>{n}</PartNumber><ETag>{tag}</ETag>{sum}</Part>")
+            })
+            .collect();
+        format!("<CompleteMultipartUpload>{body}</CompleteMultipartUpload>")
+    };
+    for (sums, what) in [
+        (["", ""], "missing"),
+        ([parts[1].2.as_str(), parts[0].2.as_str()], "swapped"),
+    ] {
+        let (status, body) = signed_request_body(
+            &endpoint,
+            "POST",
+            &format!("{path}?uploadId={upload_id}"),
+            &["Content-Type: application/xml"],
+            Some(&manifest(&sums)),
+        )?;
+        ensure!(
+            status == 400 && body.contains("InvalidPart"),
+            "{what} part checksums completed: {status}: {body}"
+        );
+    }
+    let (status, body) = signed_request_body(
+        &endpoint,
+        "POST",
+        &format!("{path}?uploadId={upload_id}"),
+        &["Content-Type: application/xml"],
+        Some(&manifest(&[parts[0].2.as_str(), parts[1].2.as_str()])),
+    )?;
+    ensure!(
+        status == 200,
+        "checksummed Complete failed: {status}: {body}"
+    );
+    ensure!(
+        store(&other, &bucket)?
+            .get(&Path::from("checksummed"))
+            .await?
+            .bytes()
+            .await?
+            == b"gammadelta"[..]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
+async fn supplied_checksums_are_verified_before_publication() -> Result<()> {
+    use s3s::checksum::ChecksumHasher;
+    use s3s::crypto::{Checksum as _, Crc32, Md5};
+
+    let (store, _) = endpoints()?;
+    let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
+    let key = format!("{}/checksums", prefix());
+    let path = Path::from(key.clone());
+    let result: Result<()> = async {
+        store
+            .put(&path, Bytes::from_static(b"original").into())
+            .await?;
+        let bad = ["Content-MD5: AAAAAAAAAAAAAAAAAAAAAA=="];
+        let (status, body) = signed_request_body(
+            &endpoint,
+            "PUT",
+            &format!("pgvs3-contract/{key}"),
+            &bad,
+            Some("replacement"),
+        )?;
+        ensure!(
+            status == 400 && body.contains("BadDigest"),
+            "{status}: {body}"
+        );
+        ensure!(store.get(&path).await?.bytes().await? == b"original"[..]);
+        let (status, body) = signed_request_body(
+            &endpoint,
+            "PUT",
+            &format!("pgvs3-contract/{key}"),
+            &["Content-Encoding: gzip"],
+            Some("replacement"),
+        )?;
+        ensure!(
+            status == 501 && body.contains("NotImplemented"),
+            "{status}: {body}"
+        );
+        ensure!(store.get(&path).await?.bytes().await? == b"original"[..]);
+
+        let mut hasher = ChecksumHasher {
+            md5: Some(Md5::new()),
+            crc32: Some(Crc32::new()),
+            ..Default::default()
+        };
+        hasher.update(b"replacement");
+        let sums = hasher.finalize();
+        let headers = [
+            format!("Content-MD5: {}", sums.checksum_md5.unwrap()),
+            format!("x-amz-checksum-crc32: {}", sums.checksum_crc32.unwrap()),
+        ];
+        let (status, body) = signed_request_body(
+            &endpoint,
+            "PUT",
+            &format!("pgvs3-contract/{key}"),
+            &[&headers[0], &headers[1]],
+            Some("replacement"),
+        )?;
+        ensure!(status == 200, "{status}: {body}");
+        ensure!(store.get(&path).await?.bytes().await? == b"replacement"[..]);
+
+        let mut upload = store.put_multipart(&path).await?;
+        let check_part: Result<()> = async {
+            let conn = pool().await?.get().await?;
+            let upload_id: String = conn
+                .query_typed_one(
+                    "SELECT upload_id FROM s3p.uploads WHERE bucket = $1 AND key = $2",
+                    &[(&"pgvs3-contract", Type::TEXT), (&key, Type::TEXT)],
+                )
+                .await?
+                .try_get(0)?;
+            let (status, body) = signed_request_body(
+                &endpoint,
+                "PUT",
+                &format!("pgvs3-contract/{key}?partNumber=1&uploadId={upload_id}"),
+                &["x-amz-checksum-crc32: AAAAAA=="],
+                Some("part-data"),
+            )?;
+            ensure!(
+                status == 400 && body.contains("BadDigest"),
+                "{status}: {body}"
+            );
+            let staged: i64 = conn
+                .query_typed_one(
+                    "SELECT count(*) FROM s3p.upload_parts WHERE upload_id = $1",
+                    &[(&upload_id, Type::TEXT)],
+                )
+                .await?
+                .try_get(0)?;
+            ensure!(staged == 0, "bad multipart checksum published a part");
+            let (status, body) = signed_request_body(
+                &endpoint,
+                "POST",
+                &format!("pgvs3-contract/{key}?uploadId={upload_id}"),
+                &[
+                    "Content-Type: application/xml",
+                    "x-amz-checksum-sha256: AAAAAA==",
+                ],
+                Some("<CompleteMultipartUpload/>"),
+            )?;
+            ensure!(
+                status == 501 && body.contains("NotImplemented"),
+                "{status}: {body}"
+            );
+            Ok(())
+        }
+        .await;
+        let aborted = upload.abort().await;
+        check_part?;
+        aborted?;
+        Ok(())
+    }
+    .await;
+    let _ = store.delete(&path).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires kind; run just kind-contract"]
 async fn multipart_completion_and_abort_manage_staged_rows() -> Result<()> {
     let (a, b) = endpoints()?;
     let key = format!("{}/multipart", prefix());
@@ -611,14 +1066,7 @@ async fn multipart_completion_and_abort_manage_staged_rows() -> Result<()> {
         );
         a.delete(&path).await?;
         for id in parts {
-            let count: i64 = conn
-                .query_typed_one(
-                    "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
-                    &[(&id, Type::INT8)],
-                )
-                .await?
-                .try_get(0)?;
-            ensure!(count == 0, "DELETE left chunk rows for a multipart part");
+            queued_then_reaped(&pool().await?, id).await?;
         }
 
         let mut abandoned = a.put_multipart(&path).await?;
@@ -632,14 +1080,7 @@ async fn multipart_completion_and_abort_manage_staged_rows() -> Result<()> {
             .await?;
         let staged_id: i64 = row.try_get(0)?;
         abandoned.abort().await?;
-        let count: i64 = conn
-            .query_typed_one(
-                "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
-                &[(&staged_id, Type::INT8)],
-            )
-            .await?
-            .try_get(0)?;
-        ensure!(count == 0, "Abort left staged chunk rows");
+        queued_then_reaped(&pool().await?, staged_id).await?;
         Ok(())
     }
     .await;
@@ -727,7 +1168,7 @@ async fn completion_can_select_only_uploaded_parts() -> Result<()> {
         let conn = pool().await?.get().await?;
         let rows = conn
             .query_typed(
-                "SELECT u.upload_id, p.part_no, p.file_id, p.sha256 \
+                "SELECT u.upload_id, p.part_no, p.file_id, p.md5 \
                  FROM s3p.uploads u JOIN s3p.upload_parts p USING (upload_id) \
                  WHERE u.bucket = $1 AND u.key = $2 ORDER BY p.part_no",
                 &[(&"pgvs3-contract", Type::TEXT), (&path.as_ref(), Type::TEXT)],
@@ -749,14 +1190,7 @@ async fn completion_can_select_only_uploaded_parts() -> Result<()> {
         )?;
         ensure!(status == 200, "{status}: {body}");
         ensure!(a.get(&path).await?.bytes().await? == b"selected"[..]);
-        let count: i64 = conn
-            .query_typed_one(
-                "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
-                &[(&unused_id, Type::INT8)],
-            )
-            .await?
-            .try_get(0)?;
-        ensure!(count == 0, "unselected part left orphaned chunks");
+        queued_then_reaped(&pool().await?, unused_id).await?;
         Ok(())
     }
     .await;
@@ -767,7 +1201,7 @@ async fn completion_can_select_only_uploaded_parts() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires kind; run just kind-contract"]
-async fn expired_upload_cleanup_is_bounded_and_s3_visible() -> Result<()> {
+async fn expired_upload_is_atomically_unavailable_and_reaped() -> Result<()> {
     let (store, other_gateway) = endpoints()?;
     let key = format!("{}/expired", prefix());
     let path = Path::from(key.clone());
@@ -795,45 +1229,32 @@ async fn expired_upload_cleanup_is_bounded_and_s3_visible() -> Result<()> {
             )
             .await?
             .try_get(0)?;
-        ensure!(
-            original_rows > 32,
-            "the test needs more than one cleanup batch"
-        );
-
-        let mut completed = false;
-        for _ in 0..40 {
-            let removed: i32 = conn
-                .query_typed_one(
-                    "SELECT s3p.expire_uploads(interval '0 seconds', $1, $2)",
-                    &[(&32i32, Type::INT4), (&"pgvs3-contract", Type::TEXT)],
-                )
-                .await?
-                .try_get(0)?;
-            ensure!(
-                (0..=32).contains(&removed),
-                "cleanup exceeded its row budget"
-            );
-            let remaining: i64 = conn
-                .query_typed_one(
-                    "SELECT count(*) FROM s3p.uploads WHERE upload_id = $1",
-                    &[(&upload_id, Type::TEXT)],
-                )
-                .await?
-                .try_get(0)?;
-            if remaining == 0 {
-                completed = true;
-                break;
-            }
-        }
-        ensure!(completed, "the abandoned upload never expired");
-        let chunks: i64 = conn
-            .query_typed_one(
-                "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
-                &[(&file_id, Type::INT8)],
-            )
-            .await?
-            .try_get(0)?;
-        ensure!(chunks == 0, "expired upload left hidden chunk rows");
+        ensure!(original_rows > 32, "the test needs several GC batches");
+        let removed: i32 = conn.query_typed_one(
+            "SELECT s3p.expire_uploads(interval '0 seconds', $1, $2)",
+            &[(&1i32, Type::INT4), (&"pgvs3-contract", Type::TEXT)],
+        ).await?.try_get(0)?;
+        ensure!(removed == 1, "expired upload not removed in one transaction");
+        let still_queued: bool = conn.query_typed_one(
+            "SELECT EXISTS (SELECT 1 FROM s3p.garbage WHERE file_id = $1)",
+            &[(&file_id, Type::INT8)],
+        ).await?.try_get(0)?;
+        ensure!(still_queued, "expired part wasn't enqueued");
+        let remaining: i64 = conn.query_typed_one(
+            "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+            &[(&file_id, Type::INT8)],
+        ).await?.try_get(0)?;
+        ensure!(remaining == original_rows, "expiry deleted rows outside garbage collector");
+        let reaped: i32 = conn.query_typed_one("SELECT s3p.reap_garbage(32)", &[]).await?.try_get(0)?;
+        ensure!(reaped <= 32, "garbage collector exceeded its row budget");
+        let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
+        let (status, body) = signed_request_body(
+            &endpoint, "POST", &format!("pgvs3-contract/{key}?uploadId={upload_id}"),
+            &["Content-Type: application/xml"],
+            Some("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"old\"</ETag></Part></CompleteMultipartUpload>"),
+        )?;
+        ensure!(status == 404 && body.contains("NoSuchUpload"), "Complete after expiry: {body}");
+        queued_then_reaped(&pool().await?, file_id).await?;
         ensure!(
             matches!(
                 other_gateway.head(&path).await,
@@ -887,7 +1308,47 @@ async fn scheduled_expiry_removes_old_empty_uploads() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "opt-in large-object churn; run just kind-churn or just rig-churn"]
+#[ignore = "requires kind; run just kind-contract"]
+async fn garbage_collector_refuses_a_live_file() -> Result<()> {
+    let (store, _) = endpoints()?;
+    let key = format!("{}/live-gc", prefix());
+    let path = Path::from(key.clone());
+    let result: Result<()> = async {
+        store
+            .put(&path, Bytes::from_static(b"still-live").into())
+            .await?;
+        let pool = pool().await?;
+        let mut conn = pool.get().await?;
+        let tx = conn.transaction().await?;
+        let id: i64 = tx
+            .query_typed_one(
+                "SELECT file_id FROM s3p.objects WHERE bucket = $1 AND key = $2",
+                &[(&"pgvs3-contract", Type::TEXT), (&key, Type::TEXT)],
+            )
+            .await?
+            .try_get(0)?;
+        tx.query_typed(
+            "INSERT INTO s3p.garbage (file_id, queued_at) VALUES ($1, now() - interval '100 years')",
+            &[(&id, Type::INT8)],
+        )
+        .await?;
+        ensure!(
+            tx.query_typed_one("SELECT s3p.reap_garbage(1)", &[])
+                .await
+                .is_err(),
+            "garbage collector deleted a referenced file"
+        );
+        drop(tx); // roll back the artificial queue entry
+        ensure!(store.get(&path).await?.bytes().await? == b"still-live"[..]);
+        Ok(())
+    }
+    .await;
+    let _ = store.delete(&path).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "opt-in large-object churn; run just kind-churn"]
 async fn sustained_churn_and_db_reclaim() -> Result<()> {
     let rounds: usize = std::env::var("PGVS3_CHURN_ROUNDS")
         .unwrap_or_else(|_| "64".to_owned())
@@ -903,40 +1364,33 @@ async fn sustained_churn_and_db_reclaim() -> Result<()> {
     let stable = Path::from(format!("{run}/stable"));
     let partial = Path::from(format!("{run}/partial"));
     let mut bytes = vec![0; mib * 1024 * 1024];
-    pgvs3::seed::Filler::new(0x5EED).fill(&mut bytes);
+    let mut state = 0x5EEDu64;
+    for chunk in bytes.chunks_mut(8) {
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut value = state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
+        let value = (value ^ (value >> 31)).to_le_bytes();
+        chunk.copy_from_slice(&value[..chunk.len()]);
+    }
     let stable_body = Bytes::from(vec![0xa5; 1024 * 1024]);
     a.put(&stable, stable_body.clone().into()).await?;
-    let baseline: Result<(u128, Vec<u128>)> = async {
-        let mut baseline = Vec::new();
-        for _ in 0..100 {
-            let t0 = std::time::Instant::now();
-            let got = b.get_range(&stable, 0..256 * 1024).await?;
-            ensure!(got.as_ref() == &stable_body[..256 * 1024]);
-            baseline.push(t0.elapsed().as_micros());
-        }
-        Ok((p95(&mut baseline), baseline))
-    }
-    .await;
-    let (baseline_p95, _) = baseline?;
     let before = chunk_maintenance(&pool).await?;
     let running = Arc::new(AtomicBool::new(true));
     let reading = running.clone();
     let reader_path = stable.clone();
     let reader = tokio::spawn(async move {
-        let mut samples = Vec::new();
+        let mut reads = 0usize;
         while reading.load(Ordering::Relaxed) {
-            let t0 = std::time::Instant::now();
             let got = b.get_range(&reader_path, 0..256 * 1024).await?;
             ensure!(got.as_ref() == &stable_body[..256 * 1024]);
-            samples.push(t0.elapsed().as_micros());
+            reads += 1;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        Ok::<_, anyhow::Error>(samples)
+        Ok::<_, anyhow::Error>(reads)
     });
 
-    let work: Result<(Vec<u128>, Vec<u128>)> = async {
-        let mut puts = Vec::new();
-        let mut deletes = Vec::new();
+    let work: Result<()> = async {
         for round in 0..rounds {
             let conn = pool.get().await?;
             let old = conn.query_typed_opt(
@@ -944,21 +1398,21 @@ async fn sustained_churn_and_db_reclaim() -> Result<()> {
                 &[(&"pgvs3-contract", Type::TEXT), (&hot.as_ref(), Type::TEXT)],
             ).await?.map(|r| r.try_get::<_, i64>(0)).transpose()?;
             if round % 8 == 7 {
-                let t0 = std::time::Instant::now();
                 a.delete(&hot).await?;
-                deletes.push(t0.elapsed().as_micros());
             }
             bytes[0] = round as u8;
-            let t0 = std::time::Instant::now();
             a.put(&hot, Bytes::copy_from_slice(&bytes).into()).await?;
-            puts.push(t0.elapsed().as_micros());
             ensure!(a.head(&hot).await?.size == bytes.len() as u64);
             if let Some(id) = old {
                 let count: i64 = conn.query_typed_one(
                     "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
                     &[(&id, Type::INT8)],
                 ).await?.try_get(0)?;
-                ensure!(count == 0, "overwrite/delete left {count} unreferenced rows for {id}");
+                let queued: bool = conn.query_typed_one(
+                    "SELECT EXISTS (SELECT 1 FROM s3p.garbage WHERE file_id = $1)",
+                    &[(&id, Type::INT8)],
+                ).await?.try_get(0)?;
+                ensure!(queued || count == 0, "overwrite/delete left {count} unqueued rows for {id}");
             }
             if round % 8 == 7 {
                 let mut upload = a.put_multipart(&partial).await?;
@@ -973,30 +1427,48 @@ async fn sustained_churn_and_db_reclaim() -> Result<()> {
                 let aborted = upload.abort().await;
                 let id = part?;
                 aborted?;
-                let rows: i64 = conn.query_typed_one(
-                    "SELECT count(*) FROM s3p.chunks WHERE file_id = $1",
+                let queued: bool = conn.query_typed_one(
+                    "SELECT EXISTS (SELECT 1 FROM s3p.garbage WHERE file_id = $1)",
                     &[(&id, Type::INT8)],
                 ).await?.try_get(0)?;
-                ensure!(rows == 0, "aborted part left {rows} hidden rows");
+                ensure!(queued, "aborted part was not queued");
             }
         }
-        Ok((puts, deletes))
+        Ok(())
     }.await;
     running.store(false, Ordering::Relaxed);
     let read_result = reader.await;
     let _ = a.delete(&hot).await;
     let _ = a.delete(&stable).await;
     let _ = a.delete(&partial).await;
-    let (mut puts, mut deletes) = work?;
-    let mut reads = read_result??;
-    ensure!(!reads.is_empty() && !puts.is_empty());
+    work?;
+    let reads = read_result??;
+    ensure!(reads > 0, "no reads overlapped churn");
     let after = chunk_maintenance(&pool).await?;
+    // Draining checks physical reclamation, not throughput under churn.
+    for _ in 0..256 {
+        let conn = pool.get().await?;
+        let pending: i64 = conn
+            .query_typed_one("SELECT count(*) FROM s3p.garbage", &[])
+            .await?
+            .try_get(0)?;
+        if pending == 0 {
+            break;
+        }
+        conn.query_typed_one("SELECT s3p.reap_garbage()", &[])
+            .await?;
+    }
+    let pending: i64 = pool
+        .get()
+        .await?
+        .query_typed_one("SELECT count(*) FROM s3p.garbage", &[])
+        .await?
+        .try_get(0)?;
+    ensure!(pending == 0, "churn left {pending} queued files");
     tokio::time::sleep(std::time::Duration::from_secs(90)).await;
     let settled = chunk_maintenance(&pool).await?;
     println!(
-        "{{\"suite\":\"churn\",\"rounds\":{rounds},\"object_mib\":{mib},\"reads\":{},\"baseline_read_p95_us\":{baseline_p95},\"churn_read_p95_us\":{},\"put_p95_ms\":{:.1},\"delete_p95_ms\":{:.1},\"dead_before\":{},\"dead_after\":{},\"dead_settled\":{},\"autovac_before\":{},\"autovac_settled\":{},\"partition_mib_before\":{},\"partition_mib_settled\":{}}}",
-        reads.len(), p95(&mut reads), p95(&mut puts) as f64 / 1000.0,
-        if deletes.is_empty() { 0.0 } else { p95(&mut deletes) as f64 / 1000.0 },
+        "{{\"qa\":\"churn\",\"rounds\":{rounds},\"object_mib\":{mib},\"reads_verified\":{reads},\"dead_before\":{},\"dead_after\":{},\"dead_settled\":{},\"autovac_before\":{},\"autovac_settled\":{},\"partition_mib_before\":{},\"partition_mib_settled\":{}}}",
         before.0, after.0, settled.0, before.1, settled.1,
         before.2 / (1024 * 1024), settled.2 / (1024 * 1024),
     );

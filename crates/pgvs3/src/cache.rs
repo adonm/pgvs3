@@ -14,7 +14,10 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct Meta {
     pub size: i64,
-    pub etag: Vec<u8>,
+    pub sha256: Vec<u8>,
+    pub etag: String,
+    pub user_metadata: Vec<String>,
+    pub content_type: String,
     pub created_at: SystemTime,
     pub file_id: i64,
     /// Multipart objects: part file_ids in order and cumulative end offsets.
@@ -25,20 +28,32 @@ pub struct Meta {
 
 impl Meta {
     /// `(file_id, object byte offset, length)` of each stored segment.
-    pub fn segments(&self) -> Vec<(i64, i64, i64)> {
+    pub fn segments(&self) -> anyhow::Result<Vec<(i64, i64, i64)>> {
         match (&self.parts, &self.part_ends) {
-            (Some(ids), Some(ends)) if ids.len() == ends.len() => {
+            (Some(ids), Some(ends)) => {
+                anyhow::ensure!(
+                    !ids.is_empty()
+                        && ids.len() == ends.len()
+                        && ids[0] == self.file_id
+                        && ends.last() == Some(&self.size)
+                        && ends[0] >= 0
+                        && ends.windows(2).all(|w| w[0] <= w[1]),
+                    "invalid multipart manifest"
+                );
                 let mut prev = 0;
-                ids.iter()
+                let segments = ids
+                    .iter()
                     .zip(ends)
                     .map(|(&id, &end)| {
                         let seg = (id, prev, end - prev);
                         prev = end;
                         seg
                     })
-                    .collect()
+                    .collect();
+                Ok(segments)
             }
-            _ => vec![(self.file_id, 0, self.size)],
+            (None, None) => Ok(vec![(self.file_id, 0, self.size)]),
+            _ => anyhow::bail!("incomplete multipart manifest"),
         }
     }
 }
@@ -100,7 +115,10 @@ mod tests {
                 key,
                 Meta {
                     size: 0,
-                    etag: Vec::new(),
+                    sha256: Vec::new(),
+                    etag: String::new(),
+                    user_metadata: Vec::new(),
+                    content_type: "application/octet-stream".to_owned(),
                     created_at: SystemTime::UNIX_EPOCH,
                     file_id: 0,
                     parts: None,
@@ -112,5 +130,27 @@ mod tests {
         let c = cache().lock().unwrap();
         let k = (bucket.to_owned(), key.to_owned());
         assert!(!c.map.contains_key(&k));
+    }
+
+    #[test]
+    fn invalid_multipart_offsets_fail_closed() {
+        let meta = Meta {
+            size: 5,
+            sha256: vec![0; 32],
+            etag: "0".repeat(32),
+            user_metadata: Vec::new(),
+            content_type: "application/octet-stream".to_owned(),
+            created_at: SystemTime::UNIX_EPOCH,
+            file_id: 1,
+            parts: Some(vec![1, 2]),
+            part_ends: Some(vec![10, 5]),
+        };
+        assert!(meta.segments().is_err());
+        assert!(Meta {
+            part_ends: None,
+            ..meta
+        }
+        .segments()
+        .is_err());
     }
 }

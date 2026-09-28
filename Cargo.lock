@@ -1241,6 +1241,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-util",
+ "md-5 0.10.6",
  "object_store",
  "rustls",
  "rustls-native-certs",
