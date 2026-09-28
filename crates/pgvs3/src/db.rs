@@ -119,6 +119,14 @@ async fn init_locked(client: &mut Client) -> Result<()> {
         .parse()?;
     anyhow::ensure!(version >= 180000, "pgvs3 requires PostgreSQL 18 or later");
     let tx = client.transaction().await?;
+    let pgvfs: bool = tx
+        .query_typed_one("SELECT to_regclass('pgvfs.chunks') IS NOT NULL", &[])
+        .await?
+        .try_get(0)?;
+    anyhow::ensure!(
+        !pgvfs,
+        "this database holds the pgvfs DuckDB filesystem layout; the S3 gateway needs its own database"
+    );
     let chunks: bool = tx
         .query_typed_one("SELECT to_regclass('s3p.chunks') IS NOT NULL", &[])
         .await?

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pgvs3"]
+members = ["crates/pgvs3", "crates/pgvfs"]
 
 # pgvs3: lowest-overhead S3-compatible service backed by PostgreSQL byte rows.
 

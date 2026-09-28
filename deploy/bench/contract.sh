@@ -70,3 +70,11 @@ mbx test -p pgvs3 --test s3_contract -- --ignored \
   --skip clean_failed_prior_contract_objects --skip scheduled_expiry_removes_old_empty_uploads \
   --skip sustained_churn_and_db_reclaim --test-threads=1
 mbx test -p pgvs3 --lib -- --ignored --test-threads=1
+
+# pgvfs gets its own database; the gateway's must be refused.
+docker exec "$container" psql -U postgres -v ON_ERROR_STOP=1 \
+  -c 'CREATE DATABASE pgvfs_contract' >/dev/null
+db_port=$(docker port "$container" 5432/tcp)
+PGVFS_TEST_DB_URL="postgres://postgres:postgres@$db_port/pgvfs_contract" \
+  PGVFS_TEST_S3_DB_URL="$PGVS3_TEST_DB_URL" PGVFS_POOL_MIN=1 PGVFS_POOL_MAX=8 \
+  mbx test -p pgvfs --test store_contract -- --include-ignored

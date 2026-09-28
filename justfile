@@ -102,6 +102,12 @@ ci:
     just contract
     just smoke
 
+# The pgvfs:// DuckDB extension, built in a container -> target/pgvfs/.
+[group('dev')]
+pgvfs-ext:
+    docker buildx build -f crates/pgvfs/extension/Containerfile \
+      --output type=local,dest=target/pgvfs .
+
 # S3/DB tests against a temporary local PostgreSQL; no kind cluster required.
 [group('dev')]
 contract:

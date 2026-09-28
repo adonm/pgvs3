@@ -16,6 +16,9 @@ COPY .cargo/ .cargo/
 COPY crates/pgvs3/Cargo.toml crates/pgvs3/Cargo.toml
 COPY crates/pgvs3/schema.sql crates/pgvs3/schema.sql
 COPY crates/pgvs3/src/ crates/pgvs3/src/
+# Workspace member: cargo loads every member's manifest and targets.
+COPY crates/pgvfs/Cargo.toml crates/pgvfs/schema.sql crates/pgvfs/
+COPY crates/pgvfs/src/ crates/pgvfs/src/
 RUN cargo build --release --locked --manifest-path crates/pgvs3/Cargo.toml \
  && cp target/release/pgvs3 /pgvs3
 
