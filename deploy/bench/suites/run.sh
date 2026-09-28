@@ -64,7 +64,6 @@ storage)
   # Same data, DuckDB and queries on both storage paths: DuckLake over the
   # pgvs3 S3 gateway, and over pgvfs in its own database (never shared with
   # the gateway's). Fresh passes time each query on a new DuckDB instance.
-  export PGVFS_URL="postgres://$PG_USER:$PG_PASSWORD@$PG_HOST:5432/pgvfs"
   export PGVS3_DB_ALLOW_PLAINTEXT=true  # isolated kind network
   schema=${STORAGE_SCHEMA:-ab}
   python3 /bench/harness/analytics_bench.py --bench click "${load_flags[@]}" \
@@ -73,7 +72,7 @@ storage)
     --memory-limit "${DUCKDB_MEMORY_LIMIT:-6GiB}" \
     --catalog "dbname=ducklake_catalog host=$PG_HOST user=$PG_USER" \
     --data-path "s3://lake/$schema/" \
-    --pgvfs-catalog "dbname=pgvfs host=$PG_HOST user=$PG_USER" \
+    --pgvfs-database pgvfs \
     --pgvfs-data-path "pgvfs://lake/$schema/" \
     --metadata-schema "$schema" --out "$OUT/storage.json"
   ;;

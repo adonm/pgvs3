@@ -1,28 +1,41 @@
 """End-to-end: DuckDB + the pgvfs extension against a real PostgreSQL.
 
-    PGVFS_URL=postgres://... python e2e.py path/to/pgvfs.duckdb_extension
+    PGVFS_TEST_URL=postgres://... python e2e.py path/to/pgvfs.duckdb_extension
 
-PGVFS_URL must name a database the S3 gateway never uses. The DuckLake
-catalog lives in the same database (its own tables; no s3p schema).
-Each run uses a fresh volume, so reruns never collide.
+PGVFS_TEST_URL must name a database the S3 gateway never uses. It becomes
+one default postgres secret that serves both pgvfs and the DuckLake catalog
+(its own tables in the same database; no s3p schema). Each run uses a fresh
+volume, so reruns never collide.
 """
 
 import os
 import sys
 import time
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import duckdb
 
 ext = sys.argv[1]
-url = os.environ["PGVFS_URL"]
+url = urlsplit(os.environ["PGVFS_TEST_URL"])
+os.environ.pop("PGVFS_URL", None)  # exercise the secret, not the env fallback
 vol = f"e2e-{os.getpid()}-{int(time.time())}"
 root = f"pgvfs://{vol}"
+
+
+def sql_text(value):
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def connect():
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{ext}'")
+    con.execute("INSTALL postgres")
+    con.execute("LOAD postgres")
+    con.execute(
+        f"CREATE SECRET (TYPE postgres, HOST {sql_text(url.hostname)}, PORT {url.port or 5432}, "
+        f"USER {sql_text(unquote(url.username))}, PASSWORD {sql_text(unquote(url.password))}, "
+        f"DATABASE {sql_text(url.path.lstrip('/'))})"
+    )
     return con
 
 
@@ -59,15 +72,9 @@ except duckdb.IOException:
 
 # DuckLake with its data on pgvfs.
 con.execute("INSTALL ducklake")
-con.execute("INSTALL postgres")
-u = urlsplit(url)
-libpq = (
-    f"host={u.hostname} port={u.port or 5432} user={u.username} "
-    f"password={u.password} dbname={u.path.lstrip('/')}"
-)
 schema = "dl_" + vol.replace("-", "_")
 con.execute(
-    f"ATTACH 'ducklake:postgres:{libpq}' AS lake "
+    f"ATTACH 'ducklake:postgres:' AS lake "
     f"(DATA_PATH '{root}/lake/', METADATA_SCHEMA '{schema}')"
 )
 con.execute("CREATE TABLE lake.t AS SELECT i, i % 7 AS k FROM range(100000) t(i)")
@@ -96,7 +103,7 @@ assert one(con, "SELECT count(*) FROM lake.t") == (
 # A second process-level connection reads the lake through the cache path.
 con2 = connect()
 con2.execute(
-    f"ATTACH 'ducklake:postgres:{libpq}' AS lake "
+    f"ATTACH 'ducklake:postgres:' AS lake "
     f"(METADATA_SCHEMA '{schema}')"
 )
 assert one(con2, "SELECT count(*) FROM lake.t") == one(con, "SELECT count(*) FROM lake.t")

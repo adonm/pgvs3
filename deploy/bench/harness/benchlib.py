@@ -39,8 +39,13 @@ def connect(args, extensions: tuple = (), stack: str = "s3",
         con.sql(f"LOAD {ext}")
     if stack == "pgvfs":
         con.sql(f"LOAD '{PGVFS_EXT}'")
-        con.sql(f"SET pgvfs_url='{os.environ['PGVFS_URL']}'")
-        catalog, data_path = args.pgvfs_catalog, args.pgvfs_data_path
+        # One postgres secret serves DuckLake's catalog and pgvfs's data,
+        # both in the pgvfs database.
+        q = lambda v: v.replace("'", "''")  # noqa: E731
+        con.sql(f"CREATE SECRET (TYPE postgres, HOST '{q(os.environ['PG_HOST'])}', "
+                f"USER '{q(os.environ['PG_USER'])}', PASSWORD '{q(os.environ['PG_PASSWORD'])}', "
+                f"DATABASE '{q(args.pgvfs_database)}')")
+        catalog, data_path = "", args.pgvfs_data_path
     else:
         con.sql("INSTALL httpfs")
         con.sql("LOAD httpfs")

@@ -206,7 +206,8 @@ def main() -> None:
     ap.add_argument("--data-path", default=None, help="s3 stack DuckLake DATA_PATH")
     ap.add_argument("--catalog", required=True, help="s3 stack DuckLake catalog DSN")
     ap.add_argument("--pgvfs-data-path", default="pgvfs://lake/", help="pgvfs stack DATA_PATH")
-    ap.add_argument("--pgvfs-catalog", default=None, help="pgvfs stack DuckLake catalog DSN")
+    ap.add_argument("--pgvfs-database", default="pgvfs",
+                    help="pgvfs stack database (DuckLake catalog and data; PG_HOST/PG_USER/PG_PASSWORD)")
     ap.add_argument("--metadata-schema", default=None, help="DuckLake METADATA_SCHEMA (both stacks)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -222,8 +223,6 @@ def main() -> None:
     stacks = args.stacks.split(",")
     if not set(stacks) <= {"s3", "pgvfs"} or len(set(stacks)) != len(stacks):
         raise SystemExit(f"invalid --stacks: {args.stacks}")
-    if "pgvfs" in stacks and not args.pgvfs_catalog:
-        raise SystemExit("--pgvfs-catalog is required for the pgvfs stack")
 
     queries = load_queries(bench)
     numbers = query_numbers(args.queries or f"1-{len(queries)}", len(queries))

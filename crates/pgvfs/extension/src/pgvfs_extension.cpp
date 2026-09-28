@@ -13,7 +13,10 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/secret/secret.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include <cstdlib>
@@ -400,46 +403,107 @@ private:
 		return keys;
 	}
 
-	// One connection pool per database, opened on first use from the
-	// pgvfs_url setting, else the PGVFS_URL environment variable.
+	// One connection pool per database, opened on first use. Credentials
+	// resolve like the postgres extension's, so one secret can serve both
+	// DuckLake's catalog and pgvfs: the postgres secret named by pgvfs_secret,
+	// else $PGVFS_URL, else the unnamed default postgres secret.
 	PgvfsConn *Conn(optional_ptr<FileOpener> opener) {
-		string url;
-		Value setting;
-		if (FileOpener::TryGetCurrentSetting(opener, "pgvfs_url", setting) && !setting.IsNull()) {
-			url = setting.ToString();
-		}
-		if (url.empty()) {
-			auto env = std::getenv("PGVFS_URL");
-			url = env ? env : "";
-		}
+		auto target = ConnectionString(opener);
 		std::lock_guard<std::mutex> guard(lock);
 		if (conn) {
-			if (!url.empty() && url != conn_url) {
+			if (!target.empty() && target != conn_target) {
 				throw InvalidInputException("pgvfs is already connected to another database in this process");
 			}
 			return conn;
 		}
-		if (url.empty()) {
-			throw InvalidInputException("pgvfs needs a PostgreSQL URL: SET pgvfs_url = '...' or PGVFS_URL");
+		if (target.empty()) {
+			throw InvalidInputException(
+			    "pgvfs needs PostgreSQL credentials: CREATE SECRET (TYPE postgres, ...), SET pgvfs_secret, "
+			    "or PGVFS_URL");
 		}
 		char *err = nullptr;
-		conn = pgvfs_connect(url.c_str(), &err);
+		conn = pgvfs_connect(target.c_str(), &err);
 		if (!conn) {
-			Fail("connect", "", err);
+			Fail("connect to", "PostgreSQL", err);
 		}
-		conn_url = url;
+		conn_target = target;
 		return conn;
+	}
+
+	static string ConnectionString(optional_ptr<FileOpener> opener) {
+		string name;
+		Value setting;
+		if (FileOpener::TryGetCurrentSetting(opener, "pgvfs_secret", setting) && !setting.IsNull()) {
+			name = setting.ToString();
+		}
+		bool explicit_secret = !name.empty();
+		if (!explicit_secret) {
+			auto env = std::getenv("PGVFS_URL");
+			if (env && *env) {
+				return env;
+			}
+			name = "__default_postgres";
+		}
+		auto context = FileOpener::TryGetClientContext(opener);
+		if (!context) {
+			return "";
+		}
+		auto &secrets = SecretManager::Get(*context);
+		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*context);
+		auto entry = secrets.GetSecretByName(transaction, name);
+		if (!entry) {
+			entry = secrets.GetSecretByName(transaction, name, "local_file");
+		}
+		if (!entry) {
+			if (explicit_secret) {
+				throw InvalidInputException("pgvfs_secret: no secret named \"%s\"", name);
+			}
+			return "";
+		}
+		if (entry->secret->GetType() != "postgres") {
+			throw InvalidInputException("pgvfs_secret \"%s\" is a %s secret, not postgres", name,
+			                            entry->secret->GetType());
+		}
+		return SecretToConnectionString(dynamic_cast<const KeyValueSecret &>(*entry->secret));
+	}
+
+	// A postgres secret as a key='value' connection string (tokio-postgres
+	// rejects options it does not support, e.g. passfile or sslrootcert).
+	static string SecretToConnectionString(const KeyValueSecret &secret) {
+		auto uri = secret.TryGetValue("uri");
+		if (!uri.IsNull()) {
+			return uri.ToString();
+		}
+		if (!secret.TryGetValue("aws_rds_secret").IsNull()) {
+			throw NotImplementedException("pgvfs does not support RDS IAM (aws_rds_secret) postgres secrets");
+		}
+		string out;
+		for (auto &entry : secret.secret_map) {
+			if (entry.second.IsNull()) {
+				continue;
+			}
+			string value;
+			for (char c : entry.second.ToString()) {
+				if (c == '\\' || c == '\'') {
+					value += '\\';
+				}
+				value += c;
+			}
+			out += (out.empty() ? "" : " ") + entry.first + "='" + value + "'";
+		}
+		return out;
 	}
 
 	std::mutex lock;
 	PgvfsConn *conn = nullptr;
-	string conn_url;
+	string conn_target;
 };
 
 void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
-	config.AddExtensionOption("pgvfs_url", "PostgreSQL connection string for pgvfs:// (else $PGVFS_URL)",
+	config.AddExtensionOption("pgvfs_secret",
+	                          "postgres secret for pgvfs:// (else $PGVFS_URL, else the default postgres secret)",
 	                          LogicalType::VARCHAR);
 	db.GetFileSystem().RegisterSubSystem(make_uniq<PgvfsFileSystem>());
 }

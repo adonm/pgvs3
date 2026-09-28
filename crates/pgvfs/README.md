@@ -5,12 +5,37 @@ gateway or HTTP in between. It is built for DuckLake data files:
 
 ```sql
 LOAD 'pgvfs.duckdb_extension';            -- allow_unsigned_extensions
-SET pgvfs_url = 'postgres://user:pass@host/lakefs';   -- or $PGVFS_URL
-ATTACH 'ducklake:postgres:dbname=lakefs host=...' AS lake (DATA_PATH 'pgvfs://lake/');
+-- One secret for both the DuckLake catalog and the pgvfs data:
+CREATE SECRET (TYPE postgres, HOST 'db', USER 'lake', PASSWORD '...', DATABASE 'lakefs');
+ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 'pgvfs://lake/');
 ```
 
 Paths are `pgvfs://<volume>/<path>`. A volume is a namespace inside one
 database (`[a-z0-9][a-z0-9._-]{0,62}`), so a single database can hold several lakes.
+
+## Credentials
+
+pgvfs finds its PostgreSQL credentials the same way DuckDB's `postgres`
+extension does, and so the same way DuckLake's catalog does. One secret can
+therefore serve both. In order:
+
+1. The `postgres` secret named by `SET pgvfs_secret = 'name'`. Pair it with
+   `ATTACH 'ducklake:postgres:' AS lake (..., META_SECRET 'name')`.
+2. Otherwise the `PGVFS_URL` environment variable (a URL or `key=value` string).
+3. Otherwise the unnamed default `postgres` secret, which is also
+   DuckLake's default.
+
+Secrets redact the password, and no setting holds one. Persistent secrets
+(`CREATE PERSISTENT SECRET`) work too. Connection options come from the
+secret; the ones pgvfs's client does not support (`passfile`, `sslrootcert`,
+`service`, RDS IAM) are rejected rather than ignored. For a private CA, use
+`PGVS3_DB_CA_FILE`.
+
+The first credentials used in a DuckDB database open its connection pool.
+Later, different credentials are refused rather than silently switching
+databases. Every pgvfs client talks to PostgreSQL directly, so grant roles
+accordingly: readers need `SELECT` on `pgvfs.files` and `pgvfs.chunks`. The
+first connection to a new database also needs `CREATE`, to install the schema.
 
 ## One mode per database
 
@@ -53,7 +78,7 @@ The chunk layout is the gateway's: 8120-byte inline rows, one per 8 KB page,
 ```sh
 just pgvfs-ext                  # container build -> target/pgvfs/pgvfs.duckdb_extension
 just contract                   # includes tests/store_contract.rs
-PGVFS_URL=postgres://... python crates/pgvfs/extension/test/e2e.py target/pgvfs/pgvfs.duckdb_extension
+PGVFS_TEST_URL=postgres://... python crates/pgvfs/extension/test/e2e.py target/pgvfs/pgvfs.duckdb_extension
 ```
 
 The extension is statically linked against `duckdb_static` of the exact
