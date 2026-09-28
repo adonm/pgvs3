@@ -32,8 +32,11 @@ PGVS3_SECRET_KEY=$("${kubectl[@]}" -n "$namespace" get secret pgvs3-s3 -o jsonpa
 
 docker build -q -t pgvs3-postgres:18-cron deploy/postgres
 kind load docker-image pgvs3-postgres:18-cron --name "$cluster"
+# volumeClaimTemplates are immutable: keep an existing claim size and fall back
+# to PG_STORAGE (20Gi default) on first creation.
+storage=$("${kubectl[@]}" -n "$namespace" get pvc data-postgres-0 -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null || true)
 "${helm[@]}" upgrade --install postgres deploy/charts/postgres --namespace "$namespace" \
-  --reset-values --set "storage=${PG_STORAGE:-20Gi}"
+  --reset-values --set "storage=${storage:-${PG_STORAGE:-20Gi}}"
 "${kubectl[@]}" -n "$namespace" rollout status statefulset/postgres --timeout=300s
 bash deploy/kind/db.sh
 "${helm[@]}" upgrade --install pgvs3 deploy/charts/pgvs3 --namespace "$namespace" \
