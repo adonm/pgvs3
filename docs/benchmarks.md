@@ -47,51 +47,16 @@ Q1/Q2 reported; Q3–Q12 excluded (no validated dialect).
 
 Load timer: 15.26 s after source download.
 
-## Storage: S3 gateway vs pgvfs
+## DuckDB-native storage: pgvfs
 
-The same DuckLake workload over its two storage modes, each with its own
-database on the same PostgreSQL:
-
-- **S3:** DuckDB httpfs → pgvs3 gateways → PostgreSQL.
-- **pgvfs:** the `pgvfs://` extension in DuckDB → PostgreSQL
-  ([crates/pgvfs](../crates/pgvfs/README.md)).
-
-The `storage` suite runs both from one Job: same download, same DuckDB
-(**1.5.6** stable, which the extension is built for), same full ClickBench
-data. The two stacks must have identical whole-table checksums, or the run
-fails. The run used commit `abcdb09`; records are in
-[`results/storage.jsonl`](results/storage.jsonl).
-
-It times three things:
-
-- **Pass 1 / warm:** the usual consecutive passes on one connection.
-- **Fresh:** a new DuckDB instance per query, with an empty DuckDB cache and
-  the storage connection already open. This is the latency storage actually
-  sets. Stacks alternate run by run (5 runs, median), so host drift such as
-  the page cache and CPU clocks affects both equally.
-
-| All 43 queries | S3 | pgvfs | pgvfs/S3 |
-| --- | ---: | ---: | ---: |
-| Fresh, geomean | 430 ms | 371 ms | **0.86** |
-| Fresh, total | 49.4 s | 46.4 s | 0.94 |
-| Warm (best of passes 2–3), geomean | 229 ms | 229 ms | 1.00 |
-| Pass 1, geomean | 260 ms | 253 ms | 0.97 |
-| Load, 100M rows (earlier build) | 51.9 s | 58.5 s | 1.13 |
-
-- **Short and medium queries gain most** with a cold cache. Q20 (152 → 106 ms),
-  Q11/Q12 (0.63) and Q3 (0.67) lose the HTTP hop and HEAD revalidation.
-- **Warm queries are identical.** DuckDB's external file cache serves both
-  stacks, and pgvfs's version tag (`file_id`) keeps that cache valid.
-- **The heaviest string scans are 2–7% slower** on pgvfs: Q21, Q22, Q28, Q34
-  and Q35. The read pattern is identical to httpfs (Q21: 840 reads, 2.49 GB,
-  no overlap). 8 MiB read pieces closed about half the original gap.
-- Load was measured before the read-path change (2 I/O threads) and not
-  re-run.
+DuckLake can also keep its data files in PostgreSQL through a DuckDB
+filesystem extension, with no gateway: [pgvfs](https://github.com/adonm/pgvfs),
+split out of this repository. On full ClickBench (DuckDB 1.5.6, local kind),
+fresh-instance geomean latency was 0.86× the gateway's (430 → 371 ms), and warm
+queries were identical. The records and method are in that repository. The two
+never share a database: this gateway refuses one that holds the pgvfs layout.
 
 ## Refresh
-
-Storage comparison: `DUCKDB_PY=1.5.6 SUITES=storage FRESH_PASSES=5 just kind-bench`, then
-`python3 deploy/bench/harness/storage_report.py .tmp/pgvs3/kind-bench.jsonl`.
 
 `just smoke` covers the two-gateway contract, service wiring and smoke-scale
 ClickBench and SpatialBench inputs. Full runs: `QUICK=0 SUITES=click` and

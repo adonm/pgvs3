@@ -24,7 +24,5 @@ RUN test -n "$DUCKDB_PY" \
  && pip install --no-cache-dir "duckdb==$DUCKDB_PY"
 
 WORKDIR /bench
-# Built by bench.sh for the same DuckDB release (crates/pgvfs/extension).
-COPY --from=pgvfs pgvfs.duckdb_extension /bench/pgvfs.duckdb_extension
 COPY deploy/bench/suites/ /bench/suites/
 COPY deploy/bench/harness/ /bench/harness/

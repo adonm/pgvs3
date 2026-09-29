@@ -125,7 +125,7 @@ async fn init_locked(client: &mut Client) -> Result<()> {
         .try_get(0)?;
     anyhow::ensure!(
         !pgvfs,
-        "this database holds the pgvfs DuckDB filesystem layout; the S3 gateway needs its own database"
+        "this database holds the pgvfs layout (github.com/adonm/pgvfs); the S3 gateway needs its own database"
     );
     let chunks: bool = tx
         .query_typed_one("SELECT to_regclass('s3p.chunks') IS NOT NULL", &[])

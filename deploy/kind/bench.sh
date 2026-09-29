@@ -10,11 +10,7 @@ kubectl=(kubectl --context "kind-$cluster" -n "$namespace")
 helm=(helm --kube-context "kind-$cluster")
 "${kubectl[@]}" get namespace "$namespace" >/dev/null
 
-# The pgvfs extension must match the image's DuckDB (the storage suite loads it).
-docker buildx build -q -f crates/pgvfs/extension/Containerfile \
-  --output type=local,dest=target/pgvfs . >/dev/null
-docker build -q -t kind-bench:latest --build-arg "DUCKDB_PY=${DUCKDB_PY:?run with mise}" \
-  --build-context pgvfs=target/pgvfs -f deploy/bench/Dockerfile .
+docker build -q -t kind-bench:latest --build-arg "DUCKDB_PY=${DUCKDB_PY:?run with mise}" -f deploy/bench/Dockerfile .
 kind load docker-image kind-bench:latest --name "$cluster"
 
 suites=${SUITES:-click,spatial}
@@ -24,8 +20,8 @@ if [[ "${QUICK:-0}" != 1 && "${QUICK:-0}" != true ]]; then
   full=1
   DUCKDB_MEMORY_LIMIT=${DUCKDB_MEMORY_LIMIT:-16GiB}
 fi
-for key in QUICK BENCH_REUSE PASSES FRESH_PASSES PARTS STACKS STORAGE_SCHEMA SPATIAL_SF \
-           SPATIAL_QUERIES SPATIAL_QUERY_TIMEOUT DUCKDB_MEMORY_LIMIT; do
+for key in QUICK BENCH_REUSE PASSES PARTS SPATIAL_SF SPATIAL_QUERIES \
+           SPATIAL_QUERY_TIMEOUT DUCKDB_MEMORY_LIMIT; do
   if [ -n "${!key:-}" ]; then
     value=${!key}
     # Helm's --set-string treats unescaped commas as value separators.
@@ -46,7 +42,7 @@ fi
 
 for suite in ${suites//,/ }; do
   case "$suite" in
-    validate|click|spatial|storage) ;;
+    validate|click|spatial) ;;
     *) echo "unknown suite: $suite" >&2; exit 2 ;;
   esac
 done
