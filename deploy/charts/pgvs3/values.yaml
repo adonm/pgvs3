@@ -2,25 +2,23 @@ replicas: 2
 image: ghcr.io/adonm/pgvs3:latest
 # Secret with `url` (and `caCert`, possibly empty, for a private database CA).
 # The URL never enters Helm values or release history.
-urlSecretName: postgres
+urlSecretName: pgvs3-db
 s3SecretName: pgvs3-s3
 # Configure a TLS Secret for non-loopback deployments. Plaintext is an explicit
-# opt-in used only by the isolated kind stack.
+# opt-in for isolated test clusters only.
 tlsSecretName: ""
 allowHttp: false
 allowPlaintextDb: false
-# A per-replica ceiling: 2 x 64 gateway connections. Size the local Postgres
-# maxConnections (or external database capacity) for the entire fleet.
+# A per-replica ceiling: 2 x 64 gateway connections. Size PostgreSQL
+# max_connections for the entire fleet, including rollout headroom.
 poolMax: 64
 poolMin: 64
 # pgvs3 is stateless (metadata cache is per-process, keyed by bucket/key), so
-# replicas scale reads linearly; writes are serialized in PostgreSQL. Requests
-# are small so the stack schedules on a 16 GiB CI runner.
+# replicas scale reads linearly; writes are serialized in PostgreSQL.
 resources:
   requests: { cpu: 250m, memory: 256Mi }
   limits: { memory: 4Gi }
-# Optional HPA; requires metrics-server (not installed in kind). Stress tests
-# use fixed replicas so the concurrency sweep is repeatable.
+# Optional HPA; requires metrics-server.
 autoscaling:
   enabled: false
   minReplicas: 2

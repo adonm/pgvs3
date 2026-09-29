@@ -1,8 +1,7 @@
-# pgvs3 tasks. Toolchain: `mise install`. Testing and benchmarks run in kind.
+# pgvs3 tasks. Toolchain: `mise install`. Tests and benchmarks start their own
+# disposable PostgreSQL in Docker and two local gateways (deploy/bench/stack.sh).
 
 URL := "postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench"
-# Local development database. Smoke and CI use the kind stack instead.
-PG_URL := env("PG_URL", URL)
 
 # List the recipes.
 default:
@@ -13,17 +12,13 @@ default:
 setup:
     mise install
     cargo fetch
-    @echo "ready. next: just smoke (or just dev-db for local development)"
+    @echo "ready. next: just contract && just ducklake"
 
-# PostgreSQL 18 + pg_cron in Docker (external DBs need pg_cron too: set PG_URL).
+# PostgreSQL 18 + pg_cron in Docker on :5432 for running a gateway by hand.
 [group('dev')]
 dev-db:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -n "${PG_URL:-}" ] && [ "${PG_URL:-}" != "{{ URL }}" ]; then
-      echo "using PG_URL=$PG_URL"
-      exit 0
-    fi
     if (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null; then
       echo "postgres already listening on :5432"
     elif docker inspect pgvs3-pg >/dev/null 2>&1; then
@@ -39,7 +34,7 @@ dev-db:
       [ "$i" = 30 ] && { echo "postgres did not come up; try: just dev-db-clean && just dev-db"; docker logs --tail 5 pgvs3-pg; exit 1; }
       sleep 1
     done
-    for db in pgvs3_bench ducklake_catalog ducklake_catalog_local; do
+    for db in pgvs3_bench ducklake_catalog; do
       docker exec pgvs3-pg psql -U postgres -c "CREATE DATABASE $db" 2>/dev/null || true
     done
     docker exec pgvs3-pg psql -U postgres -d pgvs3_bench -v ON_ERROR_STOP=1 \
@@ -54,25 +49,27 @@ dev-db:
 dev-db-clean:
     docker rm -f pgvs3-pg || true
 
-# Kind QA: contract, service health, and upstream ClickBench/SpatialBench inputs at smoke scale.
-[group('kind')]
-smoke: kind-up
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{ just_executable() }} kind-contract
-    QUICK=1 SUITES=validate,click,spatial {{ just_executable() }} kind-bench
+# S3/DB contract through two gateways on a disposable PostgreSQL.
+[group('test')]
+contract:
+    bash deploy/bench/stack.sh contract
 
-# Rust S3 contract against both kind gateway pods and its PostgreSQL storage.
-[group('kind')]
-kind-contract:
-    bash deploy/kind/contract.sh
+# Opt-in sustained overwrite/delete/multipart churn with vacuum evidence.
+[group('test')]
+churn:
+    bash deploy/bench/stack.sh churn
 
-# Opt-in sustained overwrite/delete/multipart churn with DB vacuum evidence.
-[group('kind')]
-kind-churn:
-    bash deploy/kind/contract.sh churn
+# DuckLake compatibility: writer on one gateway, reader on the other.
+[group('test')]
+ducklake:
+    bash deploy/bench/stack.sh bench compat
 
-# Image name for `just image` and the kind gateway chart. CI may override it.
+# DuckDB S3 benchmark, DuckLake compatibility and row-group tuning (parts: s3,compat,tuning).
+[group('bench')]
+bench parts="s3,compat,tuning":
+    bash deploy/bench/stack.sh bench '{{ parts }}'
+
+# Image name for `just image`. CI may override it.
 IMAGE := env("IMAGE", "ghcr.io/adonm/pgvs3")
 
 # Build the container image (amd64 + arm64, so AWS Graviton works); push=true publishes to GHCR.
@@ -89,49 +86,13 @@ image push="false":
     fi
     docker buildx build "${args[@]}" .
 
-# What CI runs (fmt, clippy, build, tests, then `just smoke` on kind).
+# What CI runs.
 [group('ci')]
 ci:
     #!/usr/bin/env bash
     set -euo pipefail
     hk check --all
-    python3 -m unittest discover -s deploy/bench/harness -p 'test_*.py'
-    python3 -m unittest discover -s deploy/bench/suites -p 'test_*.py'
     mbx build --release --locked
     mbx test --workspace
     just contract
-    just smoke
-
-# S3/DB tests against a temporary local PostgreSQL; no kind cluster required.
-[group('dev')]
-contract:
-    bash deploy/bench/contract.sh
-
-# --- kind: Postgres 18 + pgvs3 + DuckLake ------------------------------------
-# Select SUITES explicitly; QUICK=1 is smoke QA, never a full-scale score.
-
-# Stand up pgvs3 and DuckLake in kind with local PostgreSQL.
-[group('kind')]
-kind-up:
-    bash deploy/kind/up.sh '{{ IMAGE }}'
-
-# Verify services and the overwrite regression in the same kind test runner.
-[group('kind')]
-kind-validate:
-    SUITES=validate {{ just_executable() }} kind-bench
-
-# Run selected upstream suites sequentially (SUITES); QUICK=1 is smoke QA.
-[group('kind')]
-kind-bench:
-    bash deploy/kind/bench.sh
-
-# Tear down the kind cluster.
-[group('kind')]
-kind-down:
-    kind delete cluster --name pgvs3
-
-# Pre-release test data only: replace the kind databases.
-[group('kind')]
-[confirm("Discard pgvs3 and DuckLake data in this kind cluster?")]
-kind-reset:
-    bash deploy/kind/reset.sh
+    just ducklake

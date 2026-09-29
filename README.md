@@ -11,15 +11,39 @@ fresh database; there are no migrations. Use disposable databases only.
 > Postgres is all you need. ;P — for durable bytes and metadata here; DuckDB
 > does the analytics.
 
+## pgvs3 vs Amazon S3
+
+pgvs3 was measured locally with `just bench`: DuckDB 1.5.6 as the client, one
+16-core host, PostgreSQL 18 over loopback. The S3 column is published
+third-party figures for EC2 in the same region. Method, full tables and sources:
+[docs/benchmarks.md](docs/benchmarks.md).
+
+| | pgvs3 (local) | Amazon S3 (published) |
+| --- | ---: | ---: |
+| Small GET, per request p50 | <1 ms (4 KiB; 1.0 ms per HEAD+GET in DuckDB) | ~30 ms ([AnyBlob][anyblob]); AWS: 100–200 ms ([AWS][aws-perf]) |
+| 8 MiB GET, one stream | 14 ms · 548 MiB/s | ~190 ms · 55–60 MiB/s median ([AnyBlob][anyblob]) |
+| Aggregate GET bandwidth | 2.0 GiB/s at 16 in flight (0.45 GiB/s on the first read after a write) | ~9–11 GiB/s per 100 Gbit/s instance at 200–250 in flight ([AnyBlob][anyblob]) |
+| Small GETs per second | ~7,000 (64 in flight, one gateway) | ≥5,500 per prefix, more prefixes scale it ([AWS][aws-perf]) |
+| Small PUTs per second | ~4,400 (64 in flight) | ≥3,500 per prefix ([AWS][aws-perf]) |
+
+pgvs3 answers requests 1–2 orders of magnitude sooner, which keeps DuckDB's
+many small footer and row-group reads cheap. S3 wins on aggregate scale and
+durability. pgvs3 is bounded by one PostgreSQL, 32 TiB of object data, and in
+practice a single DuckLake writer.
+
+[anyblob]: https://www.vldb.org/pvldb/vol16/p2769-durner.pdf
+[aws-perf]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html
+
 ## Quick start
 
 Needs [mise](https://mise.jdx.dev/) and Docker (or PostgreSQL 18+ with
 `pg_cron` preloaded and installed in the target database: pass `--url`).
 
 ```sh
-just setup      # toolchain (rust, mbx, just, python, uv, kind, helm, kubectl) + cargo fetch
-just contract   # S3/DB contract against a disposable PostgreSQL and two gateways
-just smoke      # kind stack, two-gateway contract and smoke-scale workloads
+just setup      # toolchain (rust, mbx, just, uv, helm) + cargo fetch
+just contract   # S3/DB contract: two gateways on a disposable PostgreSQL
+just ducklake   # DuckLake compatibility: writer on one gateway, reader on the other
+just bench      # DuckDB S3 benchmark + DuckLake row-group tuning
 ```
 
 Run the gateway with explicit SigV4 credentials (the example key is for
@@ -79,13 +103,17 @@ multipart work; `s3p.garbage` queues unreferenced files for reclamation.
 - **Maintenance** is PostgreSQL's: DELETE and overwrite queue old files in the
   same transaction; a `pg_cron` job reclaims at most 65,536 chunk rows (about
   508 MiB) per minute and expires multipart uploads abandoned for 24 hours.
-  Per-partition autovacuum reclaims dead rows. Before listening, the gateway
-  requires `pg_cron` in its database (`cron.database_name` pointing at it),
-  checks partition settings and the job, and installs the job only when it
-  creates a fresh layout. Watch `pgvs3 stat` under sustained deletes.
+  Autovacuum, tuned on the chunks table, reclaims dead rows. Before listening,
+  the gateway requires `pg_cron` in its database (`cron.database_name`
+  pointing at it), checks the chunk table settings and the job, and installs
+  the job only when it creates a fresh layout. Watch `pgvs3 stat` under
+  sustained deletes.
 - **Buckets** are explicit: create them before writing. Deleting a bucket with
   objects or an incomplete upload returns `BucketNotEmpty`.
-- **Layout version** (`s3p.layout`, currently 7): a gateway refuses any other
+- **Capacity** is one PostgreSQL relation: 2^32 − 2 pages × 8 KB = 32 TiB,
+  about 31.7 TiB of object data at one chunk row per page. A single object or
+  part is further capped by `int4` row numbers (2^31 × 8120 bytes).
+- **Layout version** (`s3p.layout`, currently 8): a gateway refuses any other
   layout. Point a new layout at a fresh database.
 
 Why 8120-byte rows (PostgreSQL 18 `heaptoast.c`, `heaptoast.h`,
@@ -107,7 +135,7 @@ A flag overrides the same-named variable.
 | `--tls-cert`, `--tls-key` | `PGVS3_TLS_CERT`, `PGVS3_TLS_KEY` | unset | PEM file paths for HTTPS on non-loopback addresses. Set both; mount the private key read-only. |
 | `--allow-http` | `PGVS3_ALLOW_HTTP` | false | Explicitly permit plaintext HTTP outside loopback for an isolated test cluster; do not expose that listener to untrusted clients. |
 | | `PGVS3_DB_CA_FILE` | unset | Path to an additional PostgreSQL CA PEM bundle, e.g. a managed service's CA. |
-| | `PGVS3_DB_ALLOW_PLAINTEXT` | false | Permit `prefer`/`disable` to remote PostgreSQL for an isolated test cluster. Local kind sets this explicitly. |
+| | `PGVS3_DB_ALLOW_PLAINTEXT` | false | Permit `prefer`/`disable` to remote PostgreSQL for an isolated test cluster. |
 | | `PGVS3_POOL_MIN` | 64 | Connections opened at start and kept warm. Clamped to the max. |
 | | `PGVS3_POOL_MAX` | 64 | Connections open at once, per gateway. Include all replicas, rollout headroom and other clients in the PostgreSQL connection budget. |
 
@@ -120,8 +148,8 @@ A flag overrides the same-named variable.
   connections restart slow start.
 - **Reads up to 8 MiB are one query**; bitmap heap scans use PostgreSQL 18
   read-ahead, and ordered listings enable index scans for their transaction.
-- **Chunks are hash-partitioned 32 ways**: one table caps at 32 TiB, parallel
-  writers spread over 32 heaps, and each GET touches one partition.
+- **One unpartitioned chunks table**: DuckLake has a single writer, so there
+  is no insert contention to spread; the cost is the 32 TiB relation cap.
 - **Multipart parts are separate files**: parts upload in parallel with no
   staging, and Complete moves no data.
 
@@ -129,48 +157,21 @@ A flag overrides the same-named variable.
 
 pgvs3 gateways are stateless; scale them within the PostgreSQL connection
 budget (`replicas × PGVS3_POOL_MAX` plus other clients and rollout headroom).
-Keep one DuckLake catalog writer and add query-only DuckDB workers.
+The design assumes one DuckLake catalog writer; add query-only DuckDB workers
+for reads.
 
 ## Testing and benchmarks
 
-`just contract` runs the S3/DB contract on a disposable local PostgreSQL.
-`just smoke` brings up kind and runs the contract and smoke workloads. `hk.pkl`
-checks formatting, Clippy, shell/Python syntax, charts and the justfile; install
-the hooks with `mise exec -- hk install --mise`. CI runs all of these.
-
-Performance work targets DuckLake on pgvs3 with DuckDB 2.0+: absolute query
-and load performance of pinned official workloads in local kind —
-[ClickBench](https://github.com/ClickHouse/ClickBench) and
-[SpatialBench](https://github.com/apache/sedona-spatialbench). Results and scope
-are in [docs/benchmarks.md](docs/benchmarks.md); the QA sequence is in
-[CONTRIBUTING.md](CONTRIBUTING.md). The pinned DuckDB is a **2.0 development
-build**, so results are provisional until 2.0 GA.
-
-### The kind stack
-
-One PostgreSQL cluster holds two logical databases: pgvs3's objects and the
-DuckLake catalog. DuckLake data files live in the `lake` bucket. The scripts
-always address context `kind-pgvs3`.
-
-| Chart | Release | Role |
-| --- | --- | --- |
-| `postgres` | `postgres` | One PostgreSQL 18 pod and PVC |
-| `pgvs3` | `pgvs3` | Two stateless gateway replicas |
-| `kind-bench` | `kind-bench` | One short-lived Job per suite |
-
-Suites (`SUITES=...`, run sequentially by `just kind-bench`): `validate`,
-`click` (ClickBench) and `spatial` (SpatialBench). `PARTS`, `SPATIAL_SF`,
-`SPATIAL_QUERIES`, `PASSES`, `BENCH_REUSE`, `DUCKDB_MEMORY_LIMIT`, `QUICK` and
-`BENCH_WAIT_S` reach the Jobs. The benchmark should be the only thing running
-on the host. The full-scale DuckDB suites get a 24 GiB Job limit; a killed run
-deletes its Job. Results land in `.tmp/pgvs3/kind-bench.jsonl` (overwritten per
-invocation) and logs in `.tmp/pgvs3/jobs/`. The PostgreSQL chart caps
-connections at 384; update
-`maxConnections` if gateway replicas or pools change.
-
-`just kind-churn` runs opt-in two-gateway QA over
-64 × 32 MiB PUTs (`PGVS3_CHURN_ROUNDS`, `PGVS3_CHURN_MIB`): cross-gateway reads
-during writes, garbage-queue audits and autovacuum observations.
+Every recipe starts a disposable PostgreSQL in Docker and two local gateways
+(`deploy/bench/stack.sh`) and removes them on exit. `just contract` runs the
+S3/DB contract through both gateways, and `just ducklake` runs the DuckLake
+lifecycle checks. `just churn` is opt-in sustained overwrite/delete/multipart
+churn with vacuum evidence. `just bench` runs the DuckDB S3 benchmark,
+DuckLake compatibility and Parquet row-group tuning, writing
+`.tmp/pgvs3/bench.json`; results are in [docs/benchmarks.md](docs/benchmarks.md).
+`hk.pkl` checks formatting, Clippy, shell/Python syntax, the chart and the
+justfile. Install the hooks with `mise exec -- hk install --mise`. CI runs
+`just ci`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Running in a container
 
@@ -207,7 +208,9 @@ volumes:
   reads, writes, multipart), `ingest.rs` (the `COPY` write path), `cache.rs`
   (metadata cache), `pg.rs` (PostgreSQL pool and TLS).
 - `crates/pgvs3/schema.sql`: the storage layout.
-- `deploy/charts/`: `postgres`, `pgvs3`, `kind-bench`. `deploy/kind/`:
-  cluster, stack and benchmark scripts. `deploy/bench/`: benchmark image,
-  DuckLake harness, suite runners and contract scripts.
+- `crates/pgvs3/tests/s3_contract.rs`: the two-gateway S3/DB contract.
+- `deploy/bench/`: `stack.sh` (disposable PostgreSQL + gateways for every
+  test and benchmark) and `duck_bench.py` (DuckDB S3 benchmark, DuckLake
+  checks and tuning). `deploy/postgres/`: PostgreSQL 18 + pg_cron image.
+  `deploy/charts/pgvs3/`: Helm chart for the gateway.
 - `justfile`: every task (`just` lists them); `mise.toml`: toolchain pins.

@@ -1,0 +1,362 @@
+{
+ "duckdb": "1.5.6",
+ "cores": 16,
+ "run": "r5713250fd25a",
+ "s3": {
+  "small": {
+   "objects": 2000,
+   "object_bytes": 4096,
+   "put_w1": {
+    "workers": 1,
+    "seconds": 5.195,
+    "objects_per_s": 385.0,
+    "p50_ms": 2.52,
+    "p99_ms": 4.22,
+    "requests": {
+     "count": 2000,
+     "p50_ms": 2,
+     "p99_ms": 3,
+     "max_ms": 5,
+     "get_bytes": 0
+    },
+    "mib_per_s": 1.5
+   },
+   "get_w1_first": {
+    "workers": 1,
+    "seconds": 2.379,
+    "objects_per_s": 840.8,
+    "p50_ms": 1.1,
+    "p99_ms": 2.02,
+    "requests": {
+     "count": 2000,
+     "p50_ms": 0,
+     "p99_ms": 1,
+     "max_ms": 1,
+     "get_bytes": 8192000
+    },
+    "mib_per_s": 3.3
+   },
+   "get_w1": {
+    "workers": 1,
+    "seconds": 2.198,
+    "objects_per_s": 909.9,
+    "p50_ms": 1.01,
+    "p99_ms": 1.96,
+    "requests": {
+     "count": 2000,
+     "p50_ms": 0,
+     "p99_ms": 1,
+     "max_ms": 1,
+     "get_bytes": 8192000
+    },
+    "mib_per_s": 3.6
+   },
+   "put_w64": {
+    "workers": 64,
+    "seconds": 0.455,
+    "objects_per_s": 4395.3,
+    "p50_ms": 13.04,
+    "p99_ms": 26.15,
+    "requests": {
+     "count": 2000,
+     "p50_ms": 5,
+     "p99_ms": 14,
+     "max_ms": 17,
+     "get_bytes": 0
+    },
+    "mib_per_s": 17.2
+   },
+   "get_w64_first": {
+    "workers": 64,
+    "seconds": 0.262,
+    "objects_per_s": 7631.0,
+    "p50_ms": 7.04,
+    "p99_ms": 16.16,
+    "requests": {
+     "count": 2000,
+     "p50_ms": 1,
+     "p99_ms": 2,
+     "max_ms": 3,
+     "get_bytes": 8192000
+    },
+    "mib_per_s": 29.8
+   },
+   "get_w64": {
+    "workers": 64,
+    "seconds": 0.286,
+    "objects_per_s": 6999.0,
+    "p50_ms": 7.3,
+    "p99_ms": 16.75,
+    "requests": {
+     "count": 2000,
+     "p50_ms": 1,
+     "p99_ms": 3,
+     "max_ms": 5,
+     "get_bytes": 8192000
+    },
+    "mib_per_s": 27.3
+   }
+  },
+  "large": {
+   "objects": 128,
+   "object_bytes": 8388608,
+   "put_w1": {
+    "workers": 1,
+    "seconds": 12.372,
+    "objects_per_s": 10.3,
+    "p50_ms": 97.31,
+    "p99_ms": 106.18,
+    "requests": {
+     "count": 128,
+     "p50_ms": 46,
+     "p99_ms": 57,
+     "max_ms": 58,
+     "get_bytes": 0
+    },
+    "mib_per_s": 82.4
+   },
+   "get_w1_first": {
+    "workers": 1,
+    "seconds": 2.034,
+    "objects_per_s": 62.9,
+    "p50_ms": 15.09,
+    "p99_ms": 26.14,
+    "requests": {
+     "count": 128,
+     "p50_ms": 12,
+     "p99_ms": 21,
+     "max_ms": 78,
+     "get_bytes": 1073741824
+    },
+    "mib_per_s": 503.2
+   },
+   "get_w1": {
+    "workers": 1,
+    "seconds": 1.87,
+    "objects_per_s": 68.5,
+    "p50_ms": 13.85,
+    "p99_ms": 22.24,
+    "requests": {
+     "count": 128,
+     "p50_ms": 11,
+     "p99_ms": 17,
+     "max_ms": 19,
+     "get_bytes": 1073741824
+    },
+    "mib_per_s": 548.0
+   },
+   "put_w16": {
+    "workers": 16,
+    "seconds": 2.277,
+    "objects_per_s": 56.2,
+    "p50_ms": 287.25,
+    "p99_ms": 378.24,
+    "requests": {
+     "count": 128,
+     "p50_ms": 189,
+     "p99_ms": 273,
+     "max_ms": 279,
+     "get_bytes": 0
+    },
+    "mib_per_s": 449.6
+   },
+   "get_w16_first": {
+    "workers": 16,
+    "seconds": 2.275,
+    "objects_per_s": 56.3,
+    "p50_ms": 256.68,
+    "p99_ms": 621.31,
+    "requests": {
+     "count": 128,
+     "p50_ms": 249,
+     "p99_ms": 614,
+     "max_ms": 618,
+     "get_bytes": 1073741824
+    },
+    "mib_per_s": 450.4
+   },
+   "get_w16": {
+    "workers": 16,
+    "seconds": 0.495,
+    "objects_per_s": 258.6,
+    "p50_ms": 55.55,
+    "p99_ms": 93.22,
+    "requests": {
+     "count": 128,
+     "p50_ms": 43,
+     "p99_ms": 76,
+     "max_ms": 78,
+     "get_bytes": 1073741824
+    },
+    "mib_per_s": 2068.8
+   }
+  }
+ },
+ "compat": {
+  "passed": 9,
+  "failed": 0,
+  "checks": [
+   {
+    "check": "reader on gateway B sees the writer's table",
+    "ok": true
+   },
+   {
+    "check": "update and delete visible on B",
+    "ok": true
+   },
+   {
+    "check": "time travel to the first snapshot",
+    "ok": true
+   },
+   {
+    "check": "schema evolution and small appends on B",
+    "ok": true
+   },
+   {
+    "check": "compaction reduces the file count",
+    "ok": true
+   },
+   {
+    "check": "reader still correct after compaction and cleanup",
+    "ok": true
+   },
+   {
+    "check": "cleanup deleted every unreferenced object",
+    "ok": true
+   },
+   {
+    "check": "every referenced object is stored",
+    "ok": true
+   },
+   {
+    "check": "dropped table's objects are deleted",
+    "ok": true
+   }
+  ]
+ },
+ "tuning": {
+  "results": [
+   {
+    "row_group_rows": 30720,
+    "rows": 20000000,
+    "load_seconds": 9.496,
+    "files": 2,
+    "stored_mib": 832.1,
+    "put_requests": 16,
+    "queries": {
+     "full_scan": {
+      "median_s": 0.146,
+      "gets": 654,
+      "mib_read": 132.8
+     },
+     "string_filter": {
+      "median_s": 0.414,
+      "gets": 654,
+      "mib_read": 621.9
+     },
+     "range_1pct": {
+      "median_s": 0.054,
+      "gets": 17,
+      "mib_read": 2.4
+     },
+     "point_lookup": {
+      "median_s": 0.044,
+      "gets": 3,
+      "mib_read": 0.4
+     }
+    }
+   },
+   {
+    "row_group_rows": 122880,
+    "rows": 20000000,
+    "load_seconds": 9.8,
+    "files": 2,
+    "stored_mib": 829.0,
+    "put_requests": 16,
+    "queries": {
+     "full_scan": {
+      "median_s": 0.132,
+      "gets": 165,
+      "mib_read": 130.7
+     },
+     "string_filter": {
+      "median_s": 0.375,
+      "gets": 165,
+      "mib_read": 621.7
+     },
+     "range_1pct": {
+      "median_s": 0.052,
+      "gets": 7,
+      "mib_read": 3.4
+     },
+     "point_lookup": {
+      "median_s": 0.041,
+      "gets": 3,
+      "mib_read": 1.2
+     }
+    }
+   },
+   {
+    "row_group_rows": 491520,
+    "rows": 20000000,
+    "load_seconds": 9.751,
+    "files": 2,
+    "stored_mib": 828.2,
+    "put_requests": 15,
+    "queries": {
+     "full_scan": {
+      "median_s": 0.132,
+      "gets": 43,
+      "mib_read": 130.1
+     },
+     "string_filter": {
+      "median_s": 0.37,
+      "gets": 43,
+      "mib_read": 621.6
+     },
+     "range_1pct": {
+      "median_s": 0.064,
+      "gets": 3,
+      "mib_read": 4.5
+     },
+     "point_lookup": {
+      "median_s": 0.053,
+      "gets": 3,
+      "mib_read": 4.5
+     }
+    }
+   },
+   {
+    "row_group_rows": 1966080,
+    "rows": 20000000,
+    "load_seconds": 9.561,
+    "files": 2,
+    "stored_mib": 827.7,
+    "put_requests": 16,
+    "queries": {
+     "full_scan": {
+      "median_s": 0.128,
+      "gets": 13,
+      "mib_read": 130.0
+     },
+     "string_filter": {
+      "median_s": 0.684,
+      "gets": 13,
+      "mib_read": 621.4
+     },
+     "range_1pct": {
+      "median_s": 0.17,
+      "gets": 3,
+      "mib_read": 17.9
+     },
+     "point_lookup": {
+      "median_s": 0.143,
+      "gets": 3,
+      "mib_read": 17.9
+     }
+    }
+   }
+  ]
+ },
+ "machine": "Intel Core Ultra X7 358H, 16 cores, 62 GiB; client, gateways and PostgreSQL 18 (Docker) on one host over loopback"
+}

@@ -16,8 +16,6 @@ jobs:
         with:
           version: "1.17.0"
       - run: mise exec -- just ci
-      - if: always()
-        run: mise exec -- just kind-down
 
   image:
     runs-on: ubuntu-latest

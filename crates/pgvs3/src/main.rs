@@ -38,7 +38,7 @@ enum Cmd {
         tls_cert: Option<String>,
         #[arg(long, env = "PGVS3_TLS_KEY")]
         tls_key: Option<String>,
-        /// Allow plaintext HTTP on a non-loopback address (isolated benchmark rigs only).
+        /// Allow plaintext HTTP on a non-loopback address (isolated test networks only).
         #[arg(long, env = "PGVS3_ALLOW_HTTP", default_value_t = false)]
         allow_http: bool,
     },

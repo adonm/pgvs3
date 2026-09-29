@@ -1,4 +1,4 @@
--- Alpha layout v7 (db::LAYOUT_VERSION). Any layout change requires a fresh DB.
+-- Alpha layout v8 (db::LAYOUT_VERSION). Any layout change requires a fresh DB.
 --
 -- Object bytes are fixed-size INLINE rows: 8120-byte payloads stay inline
 -- with toast_tuple_target = 8160 (heaptoast.c only externalises while
@@ -47,34 +47,18 @@ CREATE TABLE IF NOT EXISTS s3p.objects (
 CREATE INDEX IF NOT EXISTS objects_parts_idx ON s3p.objects USING gin (parts)
   WHERE parts IS NOT NULL;
 
--- Hash-partitioned by file_id, 32 ways. One relation caps at MaxBlockNumber
--- (0xFFFFFFFE) x 8 KB = 32 TiB (storage/block.h): ~31.7 TiB of object data at
--- one row per page. Concurrent writers (one per PUT / multipart part, with
--- adjacent file_ids) land on 32 heaps and 32 primary-key right edges instead
--- of contending on one (LWLock:BufferContent / Lock:Extend in Performance
--- Insights); every GET is `file_id = $1` and prunes to exactly one partition.
--- Partitioned parents take no storage parameters (reloptions.c), so
--- toast_tuple_target is set per partition; STORAGE EXTERNAL is inherited
--- (tablecmds.c MergeAttributes). Partitioned tables cannot be UNLOGGED.
+-- One relation caps at MaxBlockNumber (0xFFFFFFFE) x 8 KB = 32 TiB
+-- (storage/block.h): ~31.7 TiB of object data at one row per page. That is
+-- pgvs3's capacity. Single-writer DuckLake does not need partitions to spread
+-- concurrent inserts; every GET is a `file_id = $1` primary-key range.
 CREATE TABLE IF NOT EXISTS s3p.chunks (
   file_id int8  NOT NULL,
   no      int4  NOT NULL,
   data    bytea STORAGE EXTERNAL NOT NULL,
   PRIMARY KEY (file_id, no),
   CONSTRAINT chunk_shape CHECK (no >= 0 AND octet_length(data) BETWEEN 1 AND 8120)
-) PARTITION BY HASH (file_id);
-
-DO $$
-BEGIN
-  FOR i IN 0..31 LOOP
-    EXECUTE format(
-      'CREATE TABLE IF NOT EXISTS s3p.chunks_%s PARTITION OF s3p.chunks '
-      'FOR VALUES WITH (MODULUS 32, REMAINDER %s) '
-      'WITH (toast_tuple_target = 8160, autovacuum_vacuum_scale_factor = 0.01, '
-      'autovacuum_analyze_scale_factor = 0.02, autovacuum_vacuum_threshold = 1000)',
-      lpad(i::text, 2, '0'), i);
-  END LOOP;
-END $$;
+) WITH (toast_tuple_target = 8160, autovacuum_vacuum_scale_factor = 0.01,
+        autovacuum_analyze_scale_factor = 0.02, autovacuum_vacuum_threshold = 1000);
 
 -- In-progress multipart uploads live in PostgreSQL, not gateway memory: any
 -- gateway can take any part and uploads survive gateway restarts.

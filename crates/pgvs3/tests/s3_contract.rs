@@ -1,5 +1,5 @@
-//! S3 contract against the running kind deployment. Run with `just kind-contract`;
-//! ordinary `cargo test` builds this test but needs no network or database.
+//! S3 contract against two local gateways on one disposable PostgreSQL. Run with
+//! `just contract` (or `just churn`); plain `cargo test` only builds it.
 
 use anyhow::{ensure, Result};
 use bytes::Bytes;
@@ -165,7 +165,7 @@ async fn chunk_maintenance(pool: &pgvs3::db::Pool) -> Result<(i64, i64, i64)> {
             "SELECT coalesce(sum(n_dead_tup), 0)::int8, \
                 coalesce(sum(autovacuum_count), 0)::int8, \
                 coalesce(sum(pg_total_relation_size(relid)), 0)::int8 \
-         FROM pg_stat_user_tables WHERE schemaname = 's3p' AND relname LIKE 'chunks_%'",
+         FROM pg_stat_user_tables WHERE relid = 's3p.chunks'::regclass",
             &[],
         )
         .await?;
@@ -209,7 +209,7 @@ async fn queued_then_reaped(pool: &pgvs3::db::Pool, file_id: i64) -> Result<()> 
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn bucket_lifecycle_is_visible_on_both_gateways() -> Result<()> {
     let a = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
     let b = std::env::var("PGVS3_TEST_ENDPOINT_B")?;
@@ -284,7 +284,7 @@ async fn bucket_lifecycle_is_visible_on_both_gateways() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn clean_failed_prior_contract_objects() -> Result<()> {
     let (store, _) = endpoints()?;
     let objects = store
@@ -298,7 +298,7 @@ async fn clean_failed_prior_contract_objects() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn listing_pages_keep_every_key_and_emit_common_prefixes_once() -> Result<()> {
     let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
     let store = store(&endpoint, "pgvs3-contract")?;
@@ -380,7 +380,7 @@ async fn listing_pages_keep_every_key_and_emit_common_prefixes_once() -> Result<
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn database_maintenance_is_automatic() -> Result<()> {
     let pool = pool().await?;
     let conn = pool.get().await?;
@@ -393,22 +393,17 @@ async fn database_maintenance_is_automatic() -> Result<()> {
         .await?
         .try_get(0)?;
     ensure!(cron_jobs == 1, "maintenance is not scheduled in PostgreSQL");
-    let configured_partitions: i64 = conn
+    let configured: bool = conn
         .query_typed_one(
-            "SELECT count(*) FROM pg_partition_tree('s3p.chunks') p \
-             JOIN pg_class c ON c.oid = p.relid \
-             WHERE p.isleaf AND c.reloptions @> \
-               ARRAY['autovacuum_vacuum_scale_factor=0.01', \
+            "SELECT reloptions @> ARRAY['autovacuum_vacuum_scale_factor=0.01', \
                      'autovacuum_analyze_scale_factor=0.02', \
-                     'autovacuum_vacuum_threshold=1000']",
+                     'autovacuum_vacuum_threshold=1000'] \
+             FROM pg_class WHERE oid = 's3p.chunks'::regclass",
             &[],
         )
         .await?
         .try_get(0)?;
-    ensure!(
-        configured_partitions == 32,
-        "chunk partitions lack autovacuum tuning"
-    );
+    ensure!(configured, "s3p.chunks lacks autovacuum tuning");
     let upload_age_index: bool = conn
         .query_typed_one("SELECT to_regclass('s3p.uploads_by_age') IS NOT NULL", &[])
         .await?
@@ -418,7 +413,7 @@ async fn database_maintenance_is_automatic() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn overwrite_and_delete_are_visible_on_both_gateways() -> Result<()> {
     let (a, b) = endpoints()?;
     let key = format!("{}/object", prefix());
@@ -487,7 +482,7 @@ async fn overwrite_and_delete_are_visible_on_both_gateways() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn zero_byte_cache_entry_not_used_after_remote_overwrite() -> Result<()> {
     let (a, b) = endpoints()?;
     let path = Path::from(format!("{}/zero-to-nonempty", prefix()));
@@ -505,7 +500,7 @@ async fn zero_byte_cache_entry_not_used_after_remote_overwrite() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn direct_database_overwrite_refreshes_cached_gets() -> Result<()> {
     let (gateway, _) = endpoints()?;
     let bucket = "pgvs3-contract";
@@ -536,7 +531,7 @@ async fn direct_database_overwrite_refreshes_cached_gets() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn conditional_puts_are_atomic_across_gateways() -> Result<()> {
     let (a, b) = endpoints()?;
     let path = Path::from(format!("{}/conditional", prefix()));
@@ -644,7 +639,7 @@ async fn conditional_puts_are_atomic_across_gateways() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn s3_etags_metadata_and_multipart_checksums() -> Result<()> {
     use md5::{Digest as _, Md5};
     use sha2::Sha256;
@@ -908,7 +903,7 @@ async fn s3_etags_metadata_and_multipart_checksums() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn supplied_checksums_are_verified_before_publication() -> Result<()> {
     use s3s::checksum::ChecksumHasher;
     use s3s::crypto::{Checksum as _, Crc32, Md5};
@@ -1025,7 +1020,7 @@ async fn supplied_checksums_are_verified_before_publication() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn multipart_completion_and_abort_manage_staged_rows() -> Result<()> {
     let (a, b) = endpoints()?;
     let key = format!("{}/multipart", prefix());
@@ -1090,7 +1085,7 @@ async fn multipart_completion_and_abort_manage_staged_rows() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn missing_upload_cannot_complete_an_existing_object() -> Result<()> {
     let (a, _) = endpoints()?;
     let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
@@ -1122,7 +1117,7 @@ async fn missing_upload_cannot_complete_an_existing_object() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn concurrent_uploads_of_one_key_remain_independent() -> Result<()> {
     let (a, b) = endpoints()?;
     let path = Path::from(format!("{}/parallel-uploads", prefix()));
@@ -1156,7 +1151,7 @@ async fn concurrent_uploads_of_one_key_remain_independent() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn completion_can_select_only_uploaded_parts() -> Result<()> {
     let (a, _) = endpoints()?;
     let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
@@ -1200,7 +1195,7 @@ async fn completion_can_select_only_uploaded_parts() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn expired_upload_is_atomically_unavailable_and_reaped() -> Result<()> {
     let (store, other_gateway) = endpoints()?;
     let key = format!("{}/expired", prefix());
@@ -1271,7 +1266,7 @@ async fn expired_upload_is_atomically_unavailable_and_reaped() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn scheduled_expiry_removes_old_empty_uploads() -> Result<()> {
     let (store, _) = endpoints()?;
     let key = format!("{}/cron-expiry", prefix());
@@ -1308,7 +1303,7 @@ async fn scheduled_expiry_removes_old_empty_uploads() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires kind; run just kind-contract"]
+#[ignore = "needs PostgreSQL and two gateways; run just contract"]
 async fn garbage_collector_refuses_a_live_file() -> Result<()> {
     let (store, _) = endpoints()?;
     let key = format!("{}/live-gc", prefix());
@@ -1468,7 +1463,7 @@ async fn sustained_churn_and_db_reclaim() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(90)).await;
     let settled = chunk_maintenance(&pool).await?;
     println!(
-        "{{\"qa\":\"churn\",\"rounds\":{rounds},\"object_mib\":{mib},\"reads_verified\":{reads},\"dead_before\":{},\"dead_after\":{},\"dead_settled\":{},\"autovac_before\":{},\"autovac_settled\":{},\"partition_mib_before\":{},\"partition_mib_settled\":{}}}",
+        "{{\"qa\":\"churn\",\"rounds\":{rounds},\"object_mib\":{mib},\"reads_verified\":{reads},\"dead_before\":{},\"dead_after\":{},\"dead_settled\":{},\"autovac_before\":{},\"autovac_settled\":{},\"chunks_mib_before\":{},\"chunks_mib_settled\":{}}}",
         before.0, after.0, settled.0, before.1, settled.1,
         before.2 / (1024 * 1024), settled.2 / (1024 * 1024),
     );

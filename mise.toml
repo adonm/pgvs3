@@ -1,6 +1,6 @@
 # Toolchain pins: `mise install` before just recipes, locally and in CI.
 # System packages only bootstrap Docker and native build prerequisites; mise
-# owns Rust, the kind/Helm/kubectl tools and the Cargo build cache (mbx).
+# owns Rust, Helm (chart lint), uv and the Cargo build cache (mbx).
 [tools]
 just = "1"
 rust = "stable"
@@ -8,11 +8,8 @@ mr-boxington = "1.17.0"
 hk = "2.1.0"
 uv = "0.12.1"
 python = "3.12.14"
-kind = "0.33"
-kubectl = "1"
 helm = "4"
 
-# Kind QA uses a pinned DuckDB 2.0 development wheel until 2.0 GA.
-# Do not publish a 2.0+ head-to-head result until a stable release is pinned.
+# DuckDB for `just ducklake` and `just bench`: a stable release.
 [env]
-DUCKDB_PY = "2.0.0.dev2609222040"
+DUCKDB_PY = "1.5.6"

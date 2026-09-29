@@ -1,6 +1,0 @@
-apiVersion: v2
-name: postgres
-description: Single-node PostgreSQL 18 for kind (pgvs3 and DuckLake catalog databases)
-type: application
-version: 0.1.0
-appVersion: "18"

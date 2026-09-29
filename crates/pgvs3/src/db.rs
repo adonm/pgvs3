@@ -83,7 +83,7 @@ pub async fn connect(url: &str) -> Result<Pool> {
 
 /// Storage layout this binary reads and writes (schema.sql); bumped only by
 /// breaking layout changes.
-pub const LAYOUT_VERSION: i32 = 7;
+pub const LAYOUT_VERSION: i32 = 8;
 
 /// S3 ETag: the MD5, or for multipart the MD5 of the part MD5s plus "-count".
 fn s3_etag(md5: &[u8], parts: Option<usize>) -> String {
@@ -119,14 +119,6 @@ async fn init_locked(client: &mut Client) -> Result<()> {
         .parse()?;
     anyhow::ensure!(version >= 180000, "pgvs3 requires PostgreSQL 18 or later");
     let tx = client.transaction().await?;
-    let pgvfs: bool = tx
-        .query_typed_one("SELECT to_regclass('pgvfs.chunks') IS NOT NULL", &[])
-        .await?
-        .try_get(0)?;
-    anyhow::ensure!(
-        !pgvfs,
-        "this database holds the pgvfs layout (github.com/adonm/pgvfs); the S3 gateway needs its own database"
-    );
     let chunks: bool = tx
         .query_typed_one("SELECT to_regclass('s3p.chunks') IS NOT NULL", &[])
         .await?
@@ -210,20 +202,19 @@ pub async fn ensure_maintenance(pool: &Pool) -> Result<()> {
         cron_database.as_deref() == Some(database.as_str()),
         "pg_cron must have cron.database_name={database} to run multipart cleanup"
     );
-    let partitions: i64 = conn
+    let configured: bool = conn
         .query_typed_one(
-            "SELECT count(*) FROM pg_partition_tree('s3p.chunks') p \
-             JOIN pg_class c ON c.oid = p.relid \
-             WHERE p.isleaf AND c.reloptions @> \
+            "SELECT EXISTS (SELECT 1 FROM pg_class WHERE oid = 's3p.chunks'::regclass \
+               AND relkind = 'r' AND reloptions @> \
                ARRAY['toast_tuple_target=8160', 'autovacuum_vacuum_scale_factor=0.01', \
-                     'autovacuum_analyze_scale_factor=0.02', 'autovacuum_vacuum_threshold=1000']",
+                     'autovacuum_analyze_scale_factor=0.02', 'autovacuum_vacuum_threshold=1000'])",
             &[],
         )
         .await?
         .try_get(0)?;
     anyhow::ensure!(
-        partitions == 32,
-        "s3p.chunks must have 32 partitions with the expected inline storage and autovacuum settings (found {partitions})"
+        configured,
+        "s3p.chunks lacks the expected inline storage and autovacuum settings"
     );
     for relation in [
         "s3p.garbage",
@@ -1584,8 +1575,7 @@ pub async fn buckets(pool: &Pool) -> Result<Vec<(String, SystemTime)>> {
     Ok(out)
 }
 
-/// `(logical_bytes, physical_bytes)` over objects + chunks (tables + indexes;
-/// the chunk partitions, as the partitioned parent has no storage).
+/// `(logical_bytes, physical_bytes)` over objects + chunks (tables + indexes).
 pub async fn sizes(pool: &Pool) -> Result<(i64, i64)> {
     let row = pool
         .get()
@@ -1593,8 +1583,7 @@ pub async fn sizes(pool: &Pool) -> Result<(i64, i64)> {
         .query_typed_one(
             "SELECT (SELECT COALESCE(sum(size), 0)::int8 FROM s3p.objects), \
                     pg_total_relation_size('s3p.objects') \
-                      + (SELECT COALESCE(sum(pg_total_relation_size(relid)), 0)::int8 \
-                         FROM pg_partition_tree('s3p.chunks')), \
+                      + pg_total_relation_size('s3p.chunks'), \
                     (SELECT count(*) FROM s3p.objects), \
                     (SELECT count(*) FROM s3p.chunks), \
                      pg_database_size(current_database()), \
@@ -1640,7 +1629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires kind; run just kind-contract"]
+    #[ignore = "needs PostgreSQL and two gateways; run just contract"]
     async fn starting_again_does_not_rewrite_existing_layout() -> Result<()> {
         let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
         let sql =
@@ -1664,7 +1653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires kind; run just kind-contract"]
+    #[ignore = "needs PostgreSQL and two gateways; run just contract"]
     async fn large_get_survives_overwrite_after_first_chunk() -> Result<()> {
         let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
         let bucket = "pgvs3-contract";
@@ -1728,7 +1717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires kind; run just kind-contract"]
+    #[ignore = "needs PostgreSQL and two gateways; run just contract"]
     async fn a_failed_publish_rolls_back_its_copy_rows() -> Result<()> {
         let url = std::env::var("PGVS3_TEST_DB_URL")?;
         let pool = connect(&url).await?;
@@ -1781,7 +1770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires kind; run just kind-contract"]
+    #[ignore = "needs PostgreSQL and two gateways; run just contract"]
     async fn concurrent_creates_leave_no_hidden_chunks() -> Result<()> {
         let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
         let endpoint = std::env::var("PGVS3_TEST_ENDPOINT_A")?;
@@ -1860,7 +1849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires kind; run just kind-contract"]
+    #[ignore = "needs PostgreSQL and two gateways; run just contract"]
     async fn abandoned_writer_never_publishes_partial_bytes() -> Result<()> {
         let pool = connect(&std::env::var("PGVS3_TEST_DB_URL")?).await?;
         let bucket = "pgvs3-contract";
