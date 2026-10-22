@@ -49,6 +49,7 @@ type Options struct {
 	RevalidateReads       bool
 	WriteCommit           string
 	SkipReadVerify        bool
+	InlineMax             int64
 }
 
 // Store is the PostgreSQL-backed object store.
@@ -60,11 +61,12 @@ type Store struct {
 	revalidateInline bool
 	writeCommit      string
 	skipReadVerify   bool
+	maxInline        int64
 	log              *slog.Logger
 
-	fileIDMu   sync.Mutex
-	fileIDNext int64
-	fileIDLeft int64
+	fileIDMu    sync.Mutex
+	fileIDBlock []int64
+	fileIDPos   int
 
 	bucketMu    sync.RWMutex
 	bucketCache map[string]time.Time
@@ -83,6 +85,9 @@ func Open(ctx context.Context, url string, opts Options, log *slog.Logger) (*Sto
 	}
 	if opts.WriteCommit == "" {
 		opts.WriteCommit = "on"
+	}
+	if opts.InlineMax < 0 || opts.InlineMax > MaxInlineBytes {
+		return nil, fmt.Errorf("inline max must be between 0 and %d", MaxInlineBytes)
 	}
 	switch opts.WriteCommit {
 	case "on", "local", "off", "remote_write", "remote_apply":
@@ -186,29 +191,43 @@ SET synchronous_commit = on;`)
 		pool.Close()
 		return nil, err
 	}
-	return &Store{bucketCache: make(map[string]time.Time), pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, revalidateInline: opts.RevalidateReads, writeCommit: opts.WriteCommit, skipReadVerify: opts.SkipReadVerify, log: log}, nil
+	return &Store{bucketCache: make(map[string]time.Time), pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, revalidateInline: opts.RevalidateReads, writeCommit: opts.WriteCommit, skipReadVerify: opts.SkipReadVerify, maxInline: opts.InlineMax, log: log}, nil
 }
 
 // nextFileID hands out sequence values in blocks. The sequence itself is
 // CACHE 64; batching here removes a nextval round trip from most writes.
 func (s *Store) nextFileID(ctx context.Context) (int64, error) {
 	s.fileIDMu.Lock()
-	if s.fileIDLeft > 0 {
-		id := s.fileIDNext
-		s.fileIDNext++
-		s.fileIDLeft--
-		s.fileIDMu.Unlock()
+	defer s.fileIDMu.Unlock()
+	if s.fileIDPos < len(s.fileIDBlock) {
+		id := s.fileIDBlock[s.fileIDPos]
+		s.fileIDPos++
 		return id, nil
 	}
-	s.fileIDMu.Unlock()
-	var id int64
-	if err := s.pool.QueryRow(ctx, "SELECT nextval('s3p.file_ids')").Scan(&id); err != nil {
+	rows, err := s.pool.Query(ctx, "SELECT nextval('s3p.file_ids') FROM generate_series(1,64)")
+	if err != nil {
 		return 0, err
 	}
-	s.fileIDMu.Lock()
-	s.fileIDNext = id + 1
-	s.fileIDLeft = 63
-	s.fileIDMu.Unlock()
+	block := make([]int64, 0, 64)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		block = append(block, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(block) == 0 {
+		return 0, fmt.Errorf("no file ids allocated")
+	}
+	s.fileIDBlock = block
+	s.fileIDPos = 0
+	id := s.fileIDBlock[0]
+	s.fileIDPos = 1
 	return id, nil
 }
 
@@ -217,6 +236,9 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
+// InlineMax is the largest object stored in s3p.objects.inline_data.
+func (s *Store) InlineMax() int64 { return s.maxInline }
 
 func isLoopback(host string) bool {
 	// net.ParseIP is in net; avoid importing it here by checking the common
@@ -404,6 +426,39 @@ func (s *Store) Meta(ctx context.Context, bucket, key string, fresh bool) (*Meta
 		return nil, err
 	}
 	return m, nil
+}
+
+// MetaHeader returns metadata without transferring inline_data on a cache miss.
+// It deliberately does not populate the cache, because a header-only entry
+// would break a later inline GET.
+func (s *Store) MetaHeader(ctx context.Context, bucket, key string) (*Meta, error) {
+	if m, ok, err := s.cache.Get(ctx, bucket, key); err != nil {
+		return nil, err
+	} else if ok {
+		return &m, nil
+	}
+	var m Meta
+	var epoch float64
+	var parts, ends []int64
+	var fileID pgtype.Int8
+	var hasInline bool
+	err := s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
+		parts, part_ends, etag, user_metadata, content_type, inline_data IS NOT NULL
+		FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, key).
+		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
+			&m.ContentType, &hasInline)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	m.CreatedAt = time.Unix(0, int64(epoch*1e9))
+	m.Parts, m.PartEnds = parts, ends
+	if fileID.Valid {
+		m.FileID = fileID.Int64
+	}
+	return &m, nil
 }
 
 // FreshMeta bypasses the cache and reads s3p.objects directly. The peer-cache

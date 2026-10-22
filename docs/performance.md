@@ -11,7 +11,7 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 | 8,120-byte payload per row | `RowBytes` in `internal/store/ingest.go` |
 | One row fills one 8 KB page at 99.6% | `toast_tuple_target = 8160`, `STORAGE EXTERNAL` and the 24-byte tuple header: `file_id(8) + no(4) + varlena(4) + 8120 = 8136` data bytes |
 | No TOAST, no detoasting on read | `internal/store/schema.sql`: `data bytea STORAGE EXTERNAL NOT NULL` |
-| Small objects are one row | `s3p.objects.inline_data`, `file_id NULL`, up to 64 KiB; one-round-trip `s3p.put_inline` |
+| Small objects are one row | `s3p.objects.inline_data`, `file_id NULL`, up to 64 KiB (tunable with `PGVS3_INLINE_MAX`); one-round-trip `s3p.put_inline` |
 | Immutable files | A write allocates a new `file_id`; an overwrite publishes it; rows are never updated |
 | `file_id` as a cache version tag | ETags are strong; DuckDB's external file cache keys on the URL and version tag |
 | Ordered listings are index scans | `key COLLATE "C"` primary key; `SET LOCAL enable_indexscan = on` for one listing |
@@ -110,6 +110,20 @@ adds range-pruning/planner work. A key that keeps a file together
 single-file read. With DuckLake's single writer there is no insert contention
 to spread. The one-table layout wins; a future multi-writer design can revisit
 partitioning.
+
+### Inline threshold
+
+Measured at 8 KiB / 32 KiB / 64 KiB object sizes:
+
+| Object | 64 KiB inline | 8 KiB cutoff (chunked) |
+| --- | ---: | ---: |
+| 32 KiB PUT, 1 worker | 509/s | 227/s |
+| 32 KiB GET, 1 worker | 3,619/s | 1,398/s |
+| 64 KiB PUT, 1 worker | 356/s | 200/s |
+| 64 KiB GET, 1 worker | 3,250/s | 1,272/s |
+
+Even a TOASTed 64 KiB row beats a chunked object by 2–3× at these sizes, so the
+default stays 64 KiB. 8 KiB behaves the same either way.
 
 ## Write path
 

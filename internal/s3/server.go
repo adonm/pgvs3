@@ -276,11 +276,30 @@ func (s *Server) getBucketLocation(w http.ResponseWriter, r *http.Request, bucke
 }
 
 func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	m, err := s.store.Meta(r.Context(), bucket, key, false)
+	m, err := s.store.MetaHeader(r.Context(), bucket, key)
 	if err != nil {
 		s.metaError(w, r, bucket, err)
 		return
 	}
+	part, hasPart, err := parsePartNumber(r.URL.Query())
+	if err != nil {
+		writeError(w, r, err, s.log)
+		return
+	}
+	length := m.Size
+	if hasPart {
+		start, end, ok := partBounds(m, part)
+		if !ok {
+			writeError(w, r, errInvalidRange(), s.log)
+			return
+		}
+		length = end - start + 1
+		if length < 0 {
+			length = 0
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, m.Size))
+	}
+	setPartsCount(w, m)
 	if err := readCondition(r, m.ETag); err != nil {
 		if errors.Is(err, errNotModifiedSentinel) {
 			w.Header().Set("ETag", quoteETag(m.ETag))
@@ -292,15 +311,39 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	}
 	setObjectHeaders(w, m)
 	s.setDirectoryObjectHeaders(w, bucket)
-	w.Header().Set("Content-Length", strconv.FormatInt(m.Size, 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	part, hasPart, err := parsePartNumber(r.URL.Query())
+	if err != nil {
+		writeError(w, r, err, s.log)
+		return
+	}
 	first, last, suffix, ranged, err := parseRange(r.Header.Get("Range"))
 	if err != nil {
 		writeError(w, r, errInvalidRange(), s.log)
 		return
+	}
+	var partCount int
+	if hasPart {
+		if ranged {
+			writeError(w, r, errInvalidRequest("partNumber and Range are mutually exclusive"), s.log)
+			return
+		}
+		m, err := s.store.Meta(r.Context(), bucket, key, true)
+		if err != nil {
+			s.metaError(w, r, bucket, err)
+			return
+		}
+		start, end, ok := partBounds(m, part)
+		if !ok {
+			writeError(w, r, errInvalidRange(), s.log)
+			return
+		}
+		first, last, suffix, ranged = start, end, -1, true
+		partCount = partsCount(m)
 	}
 	cond := &store.ReadCondition{IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match")}
 	sm, body, err := s.store.GetBody(r.Context(), bucket, key, first, last, suffix, cond)
@@ -333,6 +376,9 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		FileID: sm.FileID, Parts: sm.Parts, PartEnds: sm.PartEnds,
 	})
 	s.setDirectoryObjectHeaders(w, bucket)
+	if partCount > 0 {
+		w.Header().Set("x-amz-mp-parts-count", strconv.Itoa(partCount))
+	}
 	w.Header().Set("Content-Length", strconv.FormatInt(sm.Len(), 10))
 	if ranged {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", sm.Start, sm.End, sm.Size))
@@ -383,17 +429,17 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		writeError(w, r, err, s.log)
 		return
 	}
-	if r.ContentLength >= 0 && r.ContentLength <= store.MaxInlineBytes {
+	if maxInline := s.store.InlineMax(); maxInline > 0 && r.ContentLength >= 0 && r.ContentLength <= maxInline {
 		body := io.ReadCloser(r.Body)
 		if len(in.h) > 0 {
 			body = &integrityReader{r: body, in: in}
 		}
-		data, err := io.ReadAll(io.LimitReader(body, store.MaxInlineBytes+1))
+		data, err := io.ReadAll(io.LimitReader(body, maxInline+1))
 		if err != nil {
 			writeError(w, r, bodyError(err), s.log)
 			return
 		}
-		if len(data) > store.MaxInlineBytes {
+		if int64(len(data)) > maxInline {
 			writeError(w, r, errInvalidRequest("inline object exceeds 64 KiB"), s.log)
 			return
 		}

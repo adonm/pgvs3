@@ -45,6 +45,9 @@ const (
 func (a *Auth) Verify(r *http.Request) (*AuthInfo, error) {
 	h := r.Header.Get("Authorization")
 	if h == "" {
+		if r.URL.Query().Get("X-Amz-Algorithm") != "" {
+			return a.verifyPresigned(r)
+		}
 		return nil, errAccessDenied("missing Authorization header")
 	}
 	if !strings.HasPrefix(h, "AWS4-HMAC-SHA256 ") {
@@ -152,6 +155,10 @@ func (a *Auth) check(r *http.Request, secret, signedHeaders, amzDate, region, se
 }
 
 func canonicalRequest(r *http.Request, signedHeaders, payloadHash string) (string, error) {
+	return canonicalRequestQuery(r, signedHeaders, payloadHash, r.URL.RawQuery)
+}
+
+func canonicalRequestQuery(r *http.Request, signedHeaders, payloadHash, rawQuery string) (string, error) {
 	names := strings.Split(signedHeaders, ";")
 	for i := range names {
 		names[i] = strings.ToLower(strings.TrimSpace(names[i]))
@@ -182,7 +189,7 @@ func canonicalRequest(r *http.Request, signedHeaders, payloadHash string) (strin
 	return strings.Join([]string{
 		r.Method,
 		uri,
-		canonicalQuery(r.URL.RawQuery),
+		canonicalQuery(rawQuery),
 		headers.String(),
 		strings.Join(names, ";"),
 		payloadHash,
@@ -214,7 +221,9 @@ func headerValues(r *http.Request, name string) []string {
 	}
 }
 
-func canonicalQuery(raw string) string {
+func canonicalQuery(raw string) string { return canonicalQueryExcept(raw, "") }
+
+func canonicalQueryExcept(raw, exclude string) string {
 	if raw == "" {
 		return ""
 	}
@@ -228,6 +237,9 @@ func canonicalQuery(raw string) string {
 		dk, err := url.QueryUnescape(k)
 		if err != nil {
 			dk = k
+		}
+		if exclude != "" && dk == exclude {
+			continue
 		}
 		dv, err := url.QueryUnescape(v)
 		if err != nil {
@@ -271,6 +283,61 @@ func awsEncode(s string, encodeSlash bool) string {
 		}
 	}
 	return b.String()
+}
+
+// verifyPresigned validates an S3 presigned-URL query signature. Payloads are
+// UNSIGNED-PAYLOAD; S3 presigned URLs do not sign the body.
+func (a *Auth) verifyPresigned(r *http.Request) (*AuthInfo, error) {
+	q := r.URL.Query()
+	if q.Get("X-Amz-Algorithm") != "AWS4-HMAC-SHA256" {
+		return nil, errAccessDenied("unsupported presigned algorithm")
+	}
+	scopeParts := strings.Split(q.Get("X-Amz-Credential"), "/")
+	if len(scopeParts) != 5 || scopeParts[4] != "aws4_request" ||
+		(scopeParts[3] != "s3" && scopeParts[3] != "s3express") {
+		return nil, errAuthorizationHeaderMalformed()
+	}
+	accessKey, date, region, service := scopeParts[0], scopeParts[1], scopeParts[2], scopeParts[3]
+	if subtle.ConstantTimeCompare([]byte(accessKey), []byte(a.AccessKey)) != 1 {
+		return nil, &APIError{Code: "InvalidAccessKeyId", Message: "The AWS access key ID you provided does not exist.", Status: 403}
+	}
+	amzDate := q.Get("X-Amz-Date")
+	t, err := time.Parse("20060102T150405Z", amzDate)
+	if err != nil {
+		return nil, errAccessDenied("invalid X-Amz-Date")
+	}
+	expires, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
+	if err != nil || expires < 1 || expires > 604800 {
+		return nil, errAccessDenied("invalid X-Amz-Expires")
+	}
+	now := time.Now
+	if a.Now != nil {
+		now = a.Now
+	}
+	if now().After(t.Add(time.Duration(expires) * time.Second)) {
+		return nil, &APIError{Code: "AccessDenied", Message: "Request has expired.", Status: 403}
+	}
+	if t.After(now().Add(maxSkew)) {
+		return nil, &APIError{Code: "RequestTimeTooSkewed", Message: "The request time is too far in the future.", Status: 403}
+	}
+	signedHeaders := q.Get("X-Amz-SignedHeaders")
+	signature := q.Get("X-Amz-Signature")
+	if signedHeaders == "" || signature == "" {
+		return nil, errAuthorizationHeaderMalformed()
+	}
+	const payload = "UNSIGNED-PAYLOAD"
+	canonical, err := canonicalRequestQuery(r, signedHeaders, payload, canonicalQueryExcept(r.URL.RawQuery, "X-Amz-Signature"))
+	if err != nil {
+		return nil, err
+	}
+	scope := date + "/" + region + "/" + service + "/aws4_request"
+	toSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hexSHA256([]byte(canonical))
+	mac := hmac.New(sha256.New, signingKey(a.SecretKey, date, region, service))
+	mac.Write([]byte(toSign))
+	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(mac.Sum(nil))), []byte(signature)) != 1 {
+		return nil, &APIError{Code: "SignatureDoesNotMatch", Message: "The request signature we calculated does not match the signature you provided.", Status: 403}
+	}
+	return &AuthInfo{Service: service}, nil
 }
 
 func signingKey(secret, date, region, service string) []byte {

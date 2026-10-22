@@ -173,9 +173,8 @@ S3 Express One Zone additions:
   `x-amz-server-side-encryption: AES256` are accepted/returned for directory
   buckets. SSE-C and DSSE-KMS are rejected, as Express does.
 
-**Not yet implemented:** presigned-URL query authentication,
-`x-amz-checksum-type: FULL_OBJECT` and `CRC64NVME` (CRC32, CRC32C, SHA1, SHA256
-and MD5 are supported), `partNumber` on GET/HEAD, per-part checksums in
+**Not yet implemented:** `x-amz-checksum-type: FULL_OBJECT` and `CRC64NVME`
+(CRC32, CRC32C, SHA1, SHA256 and MD5 are supported), per-part checksums in
 `GetObjectAttributes`, `x-amz-client-token` idempotency for `RenameObject`,
 lifecycle expiration, bucket policies/IAM, and access points. Like Express,
 pgvs3 has no versioning, object tags, Object Lock, ACLs, lifecycle transitions,
@@ -216,6 +215,7 @@ A flag overrides the same-named environment variable.
 | `--whole-read-max` | `PGVS3_WHOLE_READ_MAX` | 64 MiB | Largest single-file span read in one query; larger spans split into pieces. |
 | `--write-commit` | `PGVS3_WRITE_COMMIT` | `on` | `synchronous_commit` for unconditional writes: `on`, `local` or `off`. Conditional writes always use `on`. |
 | `--verify-reads` | `PGVS3_VERIFY_READS` | true | Re-check the object's current `file_id` on every chunk range query. Disable only for a single writer/immutable lake. |
+| `--inline-max` | `PGVS3_INLINE_MAX` | 65536 | Largest object stored inline; `0` stores everything in chunks. |
 | `--cache-main-bytes` | `PGVS3_CACHE_MAIN_BYTES` | 64 MiB | Local cache for owned metadata keys. |
 | `--cache-hot-bytes` | `PGVS3_CACHE_HOT_BYTES` | 64 MiB | Local mirror of peer-owned metadata keys. |
 | `--peers` | `PGVS3_PEERS` | unset | Comma-separated `host:port` peer list. |

@@ -58,6 +58,18 @@ Observations:
 - **Lists are heavier** because one request materialises 1,000 XML entries;
   543/s is about 543,000 keys/s.
 
+## Inline threshold
+
+| Object | 64 KiB inline | 8 KiB cutoff (chunked) |
+| --- | ---: | ---: |
+| 32 KiB PUT, 1 worker | 509/s | 227/s |
+| 32 KiB GET, 1 worker | 3,619/s | 1,398/s |
+| 64 KiB PUT, 1 worker | 356/s | 200/s |
+| 64 KiB GET, 1 worker | 3,250/s | 1,272/s |
+
+64 KiB remains the default; chunking only wins below roughly 8 KiB, where both
+paths are already one row.
+
 ## Async commit
 
 Unconditional writes can use `PGVS3_WRITE_COMMIT=off`/`local`; conditional

@@ -91,7 +91,7 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 		return nil, ErrInvalidOffset
 	}
 	if m.Inline != nil {
-		if m.Size+size > MaxInlineBytes {
+		if m.Size+size > s.maxInline {
 			return nil, ErrInlineTooLarge
 		}
 		newBytes, err := s.readFileBytes(ctx, fileID)

@@ -14,7 +14,7 @@ const MaxInlineBytes = 65536
 // is already verified by the caller; conditions and old-file garbage collection
 // happen inside s3p.put_inline.
 func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, cond Condition, ifMatch string, userMeta []string, contentType string) (*Meta, error) {
-	if len(data) > MaxInlineBytes {
+	if int64(len(data)) > s.maxInline {
 		return nil, ErrInlineTooLarge
 	}
 	sumMD5 := md5.Sum(data)

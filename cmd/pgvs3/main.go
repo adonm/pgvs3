@@ -97,6 +97,7 @@ func serve(args []string) int {
 		wholeRead     = fs.Int64("whole-read-max", envInt64("PGVS3_WHOLE_READ_MAX", 64<<20), "largest single-file span read in one query")
 		writeCommit   = fs.String("write-commit", env("PGVS3_WRITE_COMMIT", "on"), "synchronous_commit for unconditional writes: on, local or off")
 		verifyReads   = fs.Bool("verify-reads", envBoolDefault("PGVS3_VERIFY_READS", true), "verify the current object file_id on every chunk range query")
+		inlineMax     = fs.Int64("inline-max", envInt64("PGVS3_INLINE_MAX", 65536), "largest object stored inline (0 disables, max 65536)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -118,7 +119,7 @@ func serve(args []string) int {
 	st, err := store.Open(ctx, *url, store.Options{
 		MinConns: int32(*poolMin), MaxConns: int32(*poolMax),
 		CAFile: os.Getenv("PGVS3_DB_CA_FILE"), AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
-		ObjectCacheBytes: *objectCache, ObjectCacheTTL: *objectTTL, ObjectCacheRevalidate: *objectCheck, WholeReadMax: *wholeRead, RevalidateReads: len(peersList) > 0, WriteCommit: *writeCommit, SkipReadVerify: !*verifyReads,
+		ObjectCacheBytes: *objectCache, ObjectCacheTTL: *objectTTL, ObjectCacheRevalidate: *objectCheck, WholeReadMax: *wholeRead, RevalidateReads: len(peersList) > 0, WriteCommit: *writeCommit, SkipReadVerify: !*verifyReads, InlineMax: *inlineMax,
 	}, log)
 	if err != nil {
 		log.Error("connecting to PostgreSQL", "err", err)
