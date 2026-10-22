@@ -220,10 +220,15 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 		}
 	}
 	if t.kind == 0 || t.kind == 2 {
-		var one int
-		err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE", t.bucket).Scan(&one)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return fail(ErrNoBucket)
+		if !s.bucketKnown(t.bucket) {
+			var one int
+			err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE", t.bucket).Scan(&one)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fail(ErrNoBucket)
+			}
+			if err == nil {
+				s.markBucket(t.bucket)
+			}
 		}
 	} else {
 		var alg *string
@@ -279,7 +284,23 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 	var checksum *Checksum
 	switch t.kind {
 	case 0:
-		err := swapObject(ctx, tx, t, fileIDOf(w), size, sha, etag)
+		condText := "none"
+		switch t.condition {
+		case IfAbsent:
+			condText = "if_absent"
+		case IfMatch:
+			condText = "if_match"
+		}
+		var match any
+		if t.ifMatch != "" {
+			match = t.ifMatch
+		}
+		var outcome string
+		err := tx.QueryRow(ctx, `SELECT s3p.publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			t.bucket, t.key, fileIDOf(w), size, sha, etag, t.userMeta, t.content, condText, match).Scan(&outcome)
+		if err == nil && outcome == "precondition" {
+			err = ErrPrecondition
+		}
 		if err != nil {
 			_ = tx.Rollback(ctx)
 			w.done <- err
@@ -306,13 +327,6 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			}
 		}
 		if err := commitPart(ctx, tx, t.uploadID, t.partNo, fileIDOf(w), size, sha, md5, checksum); err != nil {
-			_ = tx.Rollback(ctx)
-			w.done <- err
-			return
-		}
-	}
-	if t.kind == 0 {
-		if err := notifyTx(ctx, tx, t.bucket, t.key); err != nil {
 			_ = tx.Rollback(ctx)
 			w.done <- err
 			return

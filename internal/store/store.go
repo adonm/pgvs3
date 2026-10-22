@@ -1526,13 +1526,13 @@ func (s *Store) Buckets(ctx context.Context) ([]struct {
 }
 
 type Stats struct {
-	Objects       int64
-	Chunks        int64
-	LogicalBytes  int64
-	PhysicalBytes int64
-	DatabaseBytes int64
-	GarbageFiles  int64
-	OldestGarbage *time.Duration
+	Objects       int64          `json:"objects"`
+	Chunks        int64          `json:"chunks"`
+	LogicalBytes  int64          `json:"logical_bytes"`
+	PhysicalBytes int64          `json:"physical_bytes"`
+	DatabaseBytes int64          `json:"database_bytes"`
+	GarbageFiles  int64          `json:"garbage_files"`
+	OldestGarbage *time.Duration `json:"oldest_garbage,omitempty"`
 }
 
 func (s *Store) Stat(ctx context.Context) (Stats, error) {
@@ -1645,4 +1645,20 @@ func s3ETag(md5sum []byte, parts int) string {
 		return fmt.Sprintf("%s-%d", h, parts)
 	}
 	return h
+}
+
+// Ready checks that the database answers and the installed layout matches.
+func (s *Store) Ready(ctx context.Context) error {
+	var one int
+	if err := s.pool.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil {
+		return err
+	}
+	var version pgtype.Int4
+	if err := s.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&version); err != nil {
+		return err
+	}
+	if !version.Valid || version.Int32 != LayoutVersion {
+		return fmt.Errorf("storage layout is %v, want v%d", version.Int32, LayoutVersion)
+	}
+	return nil
 }

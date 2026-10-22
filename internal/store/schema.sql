@@ -114,6 +114,51 @@ CREATE TABLE IF NOT EXISTS s3p.garbage (
 );
 CREATE INDEX IF NOT EXISTS garbage_by_age ON s3p.garbage (queued_at, file_id);
 
+-- One-round-trip publish for a chunked object after COPY.
+CREATE OR REPLACE FUNCTION s3p.publish_object(
+  p_bucket text, p_key text, p_file_id int8, p_size int8, p_sha256 bytea,
+  p_etag text, p_meta text[], p_ct text, p_cond text DEFAULT 'none',
+  p_if_match text DEFAULT NULL
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  old_file bigint;
+  old_parts int8[];
+  old_etag text;
+  found_old boolean;
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(p_bucket, 0) # hashtextextended(p_key, 1));
+  SELECT file_id, parts, etag INTO old_file, old_parts, old_etag
+    FROM s3p.objects WHERE bucket = p_bucket AND key = p_key FOR UPDATE;
+  found_old := FOUND;
+  IF p_cond = 'if_absent' AND found_old THEN
+    RETURN 'precondition';
+  END IF;
+  IF p_cond = 'if_match' AND (NOT found_old OR old_etag <> p_if_match) THEN
+    RETURN 'precondition';
+  END IF;
+  INSERT INTO s3p.objects
+    (bucket, key, file_id, size, sha256, etag, user_metadata, content_type,
+     parts, part_ends, inline_data)
+  VALUES
+    (p_bucket, p_key, p_file_id, p_size, p_sha256, p_etag, p_meta, p_ct,
+     NULL, NULL, NULL)
+  ON CONFLICT (bucket, key) DO UPDATE SET
+    file_id = EXCLUDED.file_id, size = EXCLUDED.size, sha256 = EXCLUDED.sha256,
+    etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
+    content_type = EXCLUDED.content_type, parts = NULL, part_ends = NULL,
+    inline_data = NULL, created_at = now();
+  IF found_old THEN
+    INSERT INTO s3p.garbage (file_id)
+    SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
+    WHERE f IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f OR f = ANY(o.parts))
+      AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
+    ON CONFLICT DO NOTHING;
+  END IF;
+  PERFORM pg_notify('s3p_invalidate', p_bucket || chr(31) || p_key);
+  RETURN 'ok';
+END $$;
+
 -- One-round-trip small PUT. Returns nobucket, precondition or ok; the body is
 -- already verified and hashed by the caller.
 CREATE OR REPLACE FUNCTION s3p.put_inline(

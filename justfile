@@ -44,6 +44,14 @@ test:
     mise exec go -- go test ./...
 
 [group('test')]
+race:
+    mise exec go -- go test -race ./...
+
+[group('test')]
+fuzz:
+    mise exec go -- go test -fuzz=Fuzz -fuzztime=30s ./internal/s3 ./internal/store
+
+[group('test')]
 vet:
     mise exec go -- go vet ./...
 
@@ -71,6 +79,11 @@ load:
 IMAGE := env("KO_DOCKER_REPO", "ghcr.io/adonm/pgvs3")
 
 # ko builds a distroless static image directly from source: amd64 + arm64.
+# Local compose stack (build the image first with `just image`).
+[group('dev')]
+compose:
+    docker compose -f deploy/compose.yaml up
+
 [group('image')]
 image push="false":
     #!/usr/bin/env bash
@@ -89,5 +102,5 @@ ci:
     set -euo pipefail
     test -z "$(mise exec go -- gofmt -l cmd internal test)" || { mise exec go -- gofmt -l cmd internal test; exit 1; }
     mise exec go -- go vet ./...
-    mise exec go -- go test ./...
+    mise exec go -- go test -race ./...
     just contract

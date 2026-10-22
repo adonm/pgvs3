@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/jackc/pgx/v5/pgconn"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/store"
@@ -37,6 +39,7 @@ type Server struct {
 	region      string
 	vhostDomain string
 	accountID   string
+	metrics     *metrics
 }
 
 func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain, accountID string) *Server {
@@ -52,19 +55,39 @@ func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain, acc
 	}
 	return &Server{
 		store: st, auth: auth, log: log, region: region,
-		vhostDomain: vhostDomain, accountID: accountID,
+		vhostDomain: vhostDomain, accountID: accountID, metrics: newMetrics(),
 	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("x-amz-request-id", requestIDHeader())
-	s.log.Debug("request", "method", r.Method, "host", r.Host, "path", r.URL.Path, "query", r.URL.RawQuery)
+	start := time.Now()
+	rw := &recWriter{ResponseWriter: w}
 	if r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
 		return
 	}
+	if r.URL.Path == "/readyz" {
+		if err := s.store.Ready(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ready\n")
+		return
+	}
+	if r.URL.Path == "/metrics" {
+		s.metrics.write(w)
+		return
+	}
+	defer func() { s.metrics.observe(r.Method, rw.status, time.Since(start), rw.n) }()
+	w.Header().Set("x-amz-request-id", requestIDHeader())
+	s.log.Debug("request", "method", r.Method, "host", r.Host, "path", r.URL.Path, "query", r.URL.RawQuery)
+	s.serve(rw, r)
+}
+
+func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	info, err := s.auth.Verify(r)
 	if err != nil {
 		writeError(w, r, err, s.log)
@@ -878,6 +901,10 @@ func (s *Server) metaError(w http.ResponseWriter, r *http.Request, bucket string
 }
 
 func (s *Server) ingestError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "objects_bucket_fkey" {
+		return errNoSuchBucket()
+	}
 	switch {
 	case errors.Is(err, store.ErrPrecondition):
 		return errPreconditionFailed()

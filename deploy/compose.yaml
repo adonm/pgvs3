@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pgvs3
+    command:
+      - -c
+      - max_connections=256
+      - -c
+      - shared_buffers=1GB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pgvs3"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  gateway:
+    image: ${PGVS3_IMAGE:-ko.local:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGVS3_URL: postgres://postgres:postgres@postgres:5432/pgvs3?sslmode=disable
+      PGVS3_ACCESS_KEY: ${PGVS3_ACCESS_KEY:-pgvs3}
+      PGVS3_SECRET_KEY: ${PGVS3_SECRET_KEY:-pgvs3-local-only}
+      PGVS3_ADDR: 0.0.0.0:8014
+      PGVS3_ALLOW_HTTP: "true"
+      PGVS3_DB_ALLOW_PLAINTEXT: "true"
+      PGVS3_POOL_MIN: "8"
+      PGVS3_POOL_MAX: "64"
+    ports:
+      - "8014:8014"
+
+volumes:
+  pgdata:

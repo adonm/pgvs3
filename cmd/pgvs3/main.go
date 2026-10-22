@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -32,6 +33,9 @@ func run() int {
 	// Accept both `pgvs3 serve --url ...` and the historical
 	// `pgvs3 --url ... serve --addr ...`: strip the verb wherever it appears,
 	// then let flag.Parse see only flags.
+	if i := indexArg(args, "doctor"); i >= 0 {
+		return doctor(removeArg(args, i))
+	}
 	if i := indexArg(args, "stat"); i >= 0 {
 		return stat(removeArg(args, i))
 	}
@@ -173,6 +177,7 @@ func serve(args []string) int {
 func stat(args []string) int {
 	fs := flag.NewFlagSet("stat", flag.ContinueOnError)
 	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	asJSON := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -199,8 +204,43 @@ func stat(args []string) int {
 	if s.OldestGarbage != nil {
 		oldest = s.OldestGarbage.Round(time.Second).String()
 	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(s)
+		return 0
+	}
 	fmt.Printf("objects=%d chunks=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
 		s.Objects, s.Chunks, s.LogicalBytes>>20, s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
+	return 0
+}
+
+func doctor(args []string) int {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	st, err := store.Open(ctx, *url, store.Options{
+		MinConns: 1, MaxConns: 2, AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
+	}, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+	d, err := st.Diagnose(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Printf("server_version_num=%d layout=%d chunks=%s configured=%v objects=%d garbage=%d db=%d MiB\n",
+		d.ServerVersion, d.Layout, d.ChunksRelkind, d.ChunksConfigured, d.Objects, d.GarbageFiles, d.DatabaseBytes>>20)
+	if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured {
+		return 1
+	}
 	return 0
 }
 

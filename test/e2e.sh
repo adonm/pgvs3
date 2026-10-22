@@ -112,6 +112,11 @@ cat "$TMP/p1" "$TMP/p2" > "$TMP/multi.want"
 s3 "$B/$BUCKET/$RUN/multi.bin" -o "$TMP/multi.out"
 cmp "$TMP/multi.want" "$TMP/multi.out" || fail "multipart bytes"
 [ "$(s3 -H 'Range: bytes=5242880-' "$A/$BUCKET/$RUN/multi.bin" | wc -c)" = 1048576 ] || fail "multipart range"
+s3 "$A/$BUCKET/$RUN/multi.bin?partNumber=1" -o "$TMP/part1.out"
+cmp "$TMP/p1" "$TMP/part1.out" || fail "partNumber 1 bytes"
+[ "$(s3 -I "$A/$BUCKET/$RUN/multi.bin?partNumber=2" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')" = 1048576 ] || fail "partNumber 2 HEAD length"
+s3 -I "$A/$BUCKET/$RUN/multi.bin?partNumber=2" | tr -d '\r' | grep -qi 'x-amz-mp-parts-count: 2' || fail "part count header"
+expect 416 "$A/$BUCKET/$RUN/multi.bin?partNumber=3"
 
 # --- overwrite through A, read through B (peer cache invalidation) ----------
 expect 200 -X PUT --data-binary 'version-one' "$A/$BUCKET/$RUN/over.txt"
@@ -179,9 +184,9 @@ s3 "$ED/partcopy.dst" -o "$TMP/partcopy.out"
 cmp "$TMP/partcopy" "$TMP/partcopy.out" || fail "upload part copy bytes"
 
 # The same surface through an SDK: session auth, copy, rename, append.
-EXPR="$EXPR" E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
+EXPR="$EXPR" E2E_RUN="$RUN" E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
-import os, boto3
+import os, urllib.request, boto3
 from botocore.config import Config
 s3=boto3.client('s3', endpoint_url=os.environ['E2E_ENDPOINT'],
     aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
@@ -195,6 +200,15 @@ s3.rename_object(Bucket=b, Key='sdk.renamed', RenameSource='/sdk.copy')
 s3.put_object(Bucket=b, Key='sdk.renamed', Body=b' appended', WriteOffsetBytes=3)
 assert s3.get_object(Bucket=b, Key='sdk.renamed')['Body'].read()==b'sdk appended'
 assert s3.get_object_attributes(Bucket=b, Key='sdk.renamed', ObjectAttributes=['ObjectSize'])['ObjectSize']==12
+pc=boto3.client('s3', endpoint_url=os.environ['E2E_ENDPOINT'],
+    aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
+    region_name='us-east-1', config=Config(signature_version='s3v4', s3={'addressing_style':'path'}))
+run=os.environ['E2E_RUN']; gen='pgvs3-contract'
+pc.put_object(Bucket=gen, Key=f'{run}/presigned', Body=b'presigned')
+u=pc.generate_presigned_url('get_object', Params={'Bucket':gen,'Key':f'{run}/presigned'}, ExpiresIn=60)
+assert urllib.request.urlopen(u).read()==b'presigned'
+u=pc.generate_presigned_url('put_object', Params={'Bucket':gen,'Key':f'{run}/presigned-put'}, ExpiresIn=60)
+assert urllib.request.urlopen(urllib.request.Request(u,data=b'put',method='PUT')).status==200
 print('boto3 express ok')
 PY
 

@@ -260,9 +260,9 @@ The image is about 17 MB. It exposes `8014` (S3) and `8015` (peer cache).
   metadata (≤256 KiB); larger file bytes are left to DuckDB's external cache.
 - **Connections are reused most-recently-used first** to keep TCP slow-start out
   of the hot path.
-- **Reads up to 8 MiB are one query.** Larger reads share a repeatable-read
-  snapshot; rows stream through a bounded channel so a slow client
-  backpressures PostgreSQL.
+- **Single-file reads up to 64 MiB are one query.** Larger/multipart reads use
+  8 MiB pieces, up to eight in parallel under one exported snapshot; rows
+  stream through a bounded channel so a slow client backpressures PostgreSQL.
 - **Multipart parts are separate files.** Parts upload in parallel with no
   staging; Complete publishes the ordered part list without moving data.
 - **One unpartitioned chunks table.** DuckLake has one writer; every read is a
@@ -274,6 +274,8 @@ The image is about 17 MB. It exposes `8014` (S3) and `8015` (peer cache).
 
 ```sh
 just test       # Go unit tests
+just race       # unit tests with the race detector
+just fuzz       # 30s fuzz targets for ranges, canonical queries and COPY framing
 just contract   # S3, DuckDB 2.0, DuckLake 1.1, duckdb-object-storage, Express APIs
 just ducklake   # DuckLake compatibility through the benchmark harness
 just bench      # DuckDB S3 benchmark, DuckLake checks and row-group tuning
@@ -288,7 +290,7 @@ historical numbers.
 
 ## Repo layout
 
-- `cmd/pgvs3/`: CLI (`serve`, `stat`).
+- `cmd/pgvs3/`: CLI (`serve`, `stat --json`, `doctor`).
 - `internal/store/`: schema, PostgreSQL pool, streaming COPY/GET, multipart,
   copy/rename/append, maintenance.
 - `internal/s3/`: S3 routing, SigV4, sessions, XML, ranges, checksums, Express
@@ -296,7 +298,10 @@ historical numbers.
 - `internal/peercache/`: groupcache + Otter cross-AZ metadata cache.
 - `test/e2e.sh`: the contract.
 - `deploy/bench/`: disposable stack and DuckDB benchmark.
+- `deploy/compose.yaml`: local PostgreSQL + gateway stack.
 - `deploy/charts/pgvs3/`: Helm chart (3-AZ topology and peer cache).
+- `docs/operations.md`: probes, metrics, backup/restore and failure behavior.
+- `docs/partitioning.md`: why the chunks table stays unpartitioned.
 - `justfile`, `.ko.yaml`, `mise.toml`: toolchain and build.
 
 ## License
