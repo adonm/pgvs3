@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -25,7 +26,7 @@ var schemaFS embed.FS
 
 // LayoutVersion is the storage layout this binary reads and writes. There is
 // no in-place migration: a different layout requires a fresh database.
-const LayoutVersion = 9
+const LayoutVersion = 10
 
 const (
 	smallMax     = 8 << 20
@@ -35,12 +36,15 @@ const (
 	ReapRows     = 65536
 )
 
-// Store is the PostgreSQL-backed object store. Metadata and inline objects
-// live in s3p.objects and are served directly from PostgreSQL shared_buffers.
+// Store is the PostgreSQL-backed object store. Each bucket lives in its own
+// schema `s3b_<bucket>`, with metadata and inline objects in `objects` and
+// chunk rows in `chunks`.
 type Store struct {
 	pool      *pgxpool.Pool
 	chunkPool *pgxpool.Pool
 	log       *slog.Logger
+
+	knownBuckets sync.Map
 
 	fileIDMu    sync.Mutex
 	fileIDBlock []int64
@@ -49,6 +53,47 @@ type Store struct {
 	reapedRows      atomic.Int64
 	reapedFiles     atomic.Int64
 	maintenanceRuns atomic.Int64
+}
+
+// BucketSchema returns the PostgreSQL schema name (`s3b_<bucket>`) for a
+// valid bucket name.
+func BucketSchema(bucket string) (string, error) {
+	if len(bucket) == 0 || len(bucket) > 58 {
+		return "", ErrInvalidBucket
+	}
+	for i := 0; i < len(bucket); i++ {
+		c := bucket[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_', c == '.':
+		default:
+			return "", ErrInvalidBucket
+		}
+	}
+	return "s3b_" + bucket, nil
+}
+
+func quoteIdent(ident string) string {
+	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
+}
+
+func bucketSQLIdent(bucket string) (string, error) {
+	sc, err := BucketSchema(bucket)
+	if err != nil {
+		return "", err
+	}
+	return quoteIdent(sc), nil
+}
+
+func isMissingBucketSchema(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "3F000", "42P01", "42883":
+		return true
+	}
+	return false
 }
 
 // Open connects and warms the pool. TLS is configured via standard sslmode
@@ -221,17 +266,15 @@ func (s *Store) Init(ctx context.Context) error {
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 
-	var chunks, marked bool
-	if err := tx.QueryRow(ctx, "SELECT to_regclass('s3p.chunks') IS NOT NULL").Scan(&chunks); err != nil {
+	var marked, legacyChunks bool
+	if err := tx.QueryRow(ctx, "SELECT to_regclass('s3p.layout') IS NOT NULL, to_regclass('s3p.chunks') IS NOT NULL").
+		Scan(&marked, &legacyChunks); err != nil {
 		return err
 	}
-	if err := tx.QueryRow(ctx, "SELECT to_regclass('s3p.layout') IS NOT NULL").Scan(&marked); err != nil {
-		return err
+	if legacyChunks && !marked {
+		return fmt.Errorf("s3p.layout is missing: refusing to guess the storage layout")
 	}
-	if chunks {
-		if !marked {
-			return fmt.Errorf("s3p.layout is missing: refusing to guess the storage layout")
-		}
+	if marked {
 		var found pgtype.Int4
 		if err := tx.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&found); err != nil {
 			return err
@@ -239,9 +282,6 @@ func (s *Store) Init(ctx context.Context) error {
 		if !found.Valid || found.Int32 != LayoutVersion {
 			return fmt.Errorf("s3p holds storage layout %v; this pgvs3 reads v%d (migrate explicitly, or use a fresh database)", found.Int32, LayoutVersion)
 		}
-		// Re-apply the idempotent table/function definitions so a database
-		// created by an earlier v9 build gets new SQL helpers such as
-		// s3p.commit_part. Tables and indexes only use IF NOT EXISTS.
 		schema, err := schemaFS.ReadFile("schema.sql")
 		if err != nil {
 			return err
@@ -249,16 +289,10 @@ func (s *Store) Init(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, string(schema)); err != nil {
 			return err
 		}
-		// Metadata-only CopyObject shares file IDs between object
-		// rows. Older v8 databases have a UNIQUE constraint that prevents it;
-		// dropping it is safe because the reaper checks every reference.
-		if _, err := tx.Exec(ctx, "ALTER TABLE s3p.objects DROP CONSTRAINT IF EXISTS objects_file_id_key"); err != nil {
+		if _, err := tx.Exec(ctx, "SELECT s3p.reconcile_buckets()"); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)
-	}
-	if marked {
-		return fmt.Errorf("s3p.layout exists without chunks: refusing a partial layout")
 	}
 	schema, err := schemaFS.ReadFile("schema.sql")
 	if err != nil {
@@ -270,12 +304,12 @@ func (s *Store) Init(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, "INSERT INTO s3p.layout (version) VALUES ($1)", LayoutVersion); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, "SELECT s3p.reconcile_buckets()"); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
-// EnsureMaintenance verifies that the layout has the inline-storage,
-// autovacuum and GC relations this gateway relies on. Maintenance itself runs
-// in-process (see Maintain), so pg_cron is not required.
 // CheckLayout verifies the installed layout without running DDL. Used by
 // read-only gateways connected to a primary or a streaming standby.
 func (s *Store) CheckLayout(ctx context.Context) error {
@@ -295,85 +329,88 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 		return err
 	}
 	defer conn.Release()
-	var kind string
-	var opts []string
-	if err := conn.QueryRow(ctx, `SELECT relkind::text, reloptions FROM pg_class WHERE oid = 's3p.chunks'::regclass`).
-		Scan(&kind, &opts); err != nil {
-		return err
-	}
-	want := []string{
-		"toast_tuple_target=8160",
-		"autovacuum_vacuum_scale_factor=0.01",
-		"autovacuum_analyze_scale_factor=0.02",
-		"autovacuum_vacuum_threshold=1000",
-	}
-	hasAll := func(have []string) bool {
-		for _, w := range want {
-			found := false
-			for _, h := range have {
-				if h == w {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	}
-	if kind == "p" {
-		// Storage parameters are not allowed on a partitioned parent; every
-		// leaf must carry the inline-page and autovacuum settings.
-		var total, configured int
-		if err := conn.QueryRow(ctx, `SELECT count(*),
-			count(*) FILTER (WHERE c.reloptions @> ARRAY['toast_tuple_target=8160',
-				'autovacuum_vacuum_scale_factor=0.01',
-				'autovacuum_analyze_scale_factor=0.02',
-				'autovacuum_vacuum_threshold=1000'])
-			FROM pg_partition_tree('s3p.chunks') t
-			JOIN pg_class c ON c.oid = t.relid
-			WHERE t.isleaf`).Scan(&total, &configured); err != nil {
-			return err
-		}
-		if total == 0 || total != configured {
-			return fmt.Errorf("s3p.chunks partitions lack the expected inline storage and autovacuum settings")
-		}
-	} else if kind != "r" || !hasAll(opts) {
-		return fmt.Errorf("s3p.chunks lacks the expected inline storage and autovacuum settings")
-	}
-	for _, relation := range []string{
-		"s3p.garbage",
-		"s3p.objects_file_id_idx",
-		"s3p.objects_parts_idx",
-		"s3p.upload_parts",
-		"s3p.upload_parts_file_id_idx",
-	} {
+	for _, rel := range []string{"s3p.layout", "s3p.buckets", "s3p.file_ids"} {
 		var exists bool
-		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", relation).Scan(&exists); err != nil {
+		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", rel).Scan(&exists); err != nil {
 			return err
 		}
 		if !exists {
-			return fmt.Errorf("required layout relation %s is missing", relation)
+			return fmt.Errorf("required layout relation %s is missing", rel)
+		}
+	}
+	for _, fn := range []string{
+		"s3p.ensure_bucket(text)",
+		"s3p.drop_bucket(text,boolean)",
+		"s3p.clone_bucket(text,text)",
+		"s3p.reconcile_buckets()",
+	} {
+		var exists bool
+		if err := conn.QueryRow(ctx, "SELECT to_regprocedure($1) IS NOT NULL", fn).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("required layout function %s is missing", fn)
+		}
+	}
+	schemas, err := s.bucketSchemas(ctx, "")
+	if err != nil {
+		return err
+	}
+	for _, sc := range schemas {
+		var kind string
+		var ok bool
+		if err := conn.QueryRow(ctx, `SELECT c.relkind::text,
+			c.reloptions @> ARRAY['toast_tuple_target=8160',
+				'autovacuum_vacuum_scale_factor=0.01',
+				'autovacuum_analyze_scale_factor=0.02',
+				'autovacuum_vacuum_threshold=1000']
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = 'chunks'`, sc).Scan(&kind, &ok); err != nil {
+			return err
+		}
+		if kind != "r" || !ok {
+			return fmt.Errorf("%s.chunks lacks the expected inline storage and autovacuum settings", sc)
+		}
+		q := quoteIdent(sc)
+		for _, rel := range []string{
+			q + ".objects",
+			q + ".objects_file_id_idx",
+			q + ".objects_parts_idx",
+			q + ".upload_parts",
+			q + ".upload_parts_file_id_idx",
+			q + ".garbage",
+		} {
+			var exists bool
+			if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", rel).Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				return fmt.Errorf("required bucket relation %s is missing", rel)
+			}
 		}
 	}
 	return nil
 }
 
 // Meta reads object metadata (and inline bytes for objects <= 64 KiB) from
-// s3p.objects in PostgreSQL shared_buffers.
+// the bucket's objects table in PostgreSQL shared_buffers.
 func (s *Store) Meta(ctx context.Context, bucket, key string) (*Meta, error) {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, err
+	}
 	var m Meta
 	var epoch float64
 	var parts, ends []int64
 	var fileID pgtype.Int8
 	var inline []byte
 	var hasInline bool
-	err := s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
+	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
 		parts, part_ends, etag, user_metadata, content_type, inline_data, inline_data IS NOT NULL
-		FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, key).
+		FROM `+sc+`.objects WHERE key = $1`, key).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata, &m.ContentType, &inline, &hasInline)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -395,16 +432,20 @@ func (s *Store) Meta(ctx context.Context, bucket, key string) (*Meta, error) {
 
 // MetaHeader reads object metadata without transferring inline_data.
 func (s *Store) MetaHeader(ctx context.Context, bucket, key string) (*Meta, error) {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, err
+	}
 	var m Meta
 	var epoch float64
 	var parts, ends []int64
 	var fileID pgtype.Int8
-	err := s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
+	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
 		parts, part_ends, etag, user_metadata, content_type
-		FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, key).
+		FROM `+sc+`.objects WHERE key = $1`, key).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
 			&m.ContentType)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -756,12 +797,12 @@ func planPieces(m *Meta, start, end int64, wholeMax int64) ([]piece, error) {
 	return out, nil
 }
 
-func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc, p piece, start, end int64) (*Body, error) {
+func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc, schema string, p piece, start, end int64) (*Body, error) {
 	conn, err := s.chunkPool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := conn.Query(ctx, getRangeSQL, p.fileID, p.lo, p.hi)
+	rows, err := conn.Query(ctx, getRangeSQL(schema), p.fileID, p.lo, p.hi)
 	if err != nil {
 		conn.Release()
 		return nil, err
@@ -780,6 +821,10 @@ func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc
 }
 
 func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, bucket, key string, m *Meta, start, end int64) (*Body, error) {
+	schema, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, err
+	}
 	pieces, err := planPieces(m, start, end, wholeReadMax)
 	if err != nil {
 		return nil, err
@@ -788,7 +833,7 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, buck
 	// cut-through goroutine overlaps PostgreSQL fetch with socket writes and
 	// wins on long single-piece spans.
 	if len(pieces) == 1 && end-start+1 <= 8<<20 {
-		body, err := s.startSingleStream(ctx, cancel, pieces[0], start, end)
+		body, err := s.startSingleStream(ctx, cancel, schema, pieces[0], start, end)
 		if err != nil {
 			return nil, err
 		}
@@ -798,7 +843,7 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, buck
 	body := &Body{ch: ch, cancel: cancel}
 	go func() {
 		defer close(ch)
-		s.streamSpan(ctx, ch, bucket, key, m.FileID, pieces, start, end)
+		s.streamSpan(ctx, ch, schema, key, m.FileID, pieces, start, end)
 	}()
 	first, ok := <-ch
 	if !ok {
@@ -811,7 +856,7 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, buck
 	return body, nil
 }
 
-func (s *Store) streamSpan(ctx context.Context, ch chan<- result, bucket, key string, rootID int64, pieces []piece, start, end int64) {
+func (s *Store) streamSpan(ctx context.Context, ch chan<- result, schema, key string, rootID int64, pieces []piece, start, end int64) {
 	send := func(b []byte) bool {
 		select {
 		case ch <- result{b: b}:
@@ -821,7 +866,7 @@ func (s *Store) streamSpan(ctx context.Context, ch chan<- result, bucket, key st
 		}
 	}
 	if len(pieces) > 1 && len(pieces) <= maxParallelPieces {
-		if err := s.streamParallel(ctx, ch, bucket, key, rootID, pieces, start, end); err != nil {
+		if err := s.streamParallel(ctx, ch, schema, key, rootID, pieces, start, end); err != nil {
 			select {
 			case ch <- result{err: err}:
 			case <-ctx.Done():
@@ -830,7 +875,7 @@ func (s *Store) streamSpan(ctx context.Context, ch chan<- result, bucket, key st
 		return
 	}
 	if len(pieces) > 1 {
-		if err := s.streamSnapshot(ctx, ch, bucket, key, rootID, pieces, start, end, send); err != nil {
+		if err := s.streamSnapshot(ctx, ch, schema, key, rootID, pieces, start, end, send); err != nil {
 			select {
 			case ch <- result{err: err}:
 			case <-ctx.Done():
@@ -839,7 +884,7 @@ func (s *Store) streamSpan(ctx context.Context, ch chan<- result, bucket, key st
 		return
 	}
 	for _, p := range pieces {
-		if err := s.streamPiece(ctx, ch, bucket, key, rootID, p, start, end, send); err != nil {
+		if err := s.streamPiece(ctx, ch, schema, key, rootID, p, start, end, send); err != nil {
 			select {
 			case ch <- result{err: err}:
 			case <-ctx.Done():
@@ -858,7 +903,7 @@ const maxParallelPieces = 8
 // exported repeatable-read snapshot. Piece channels are drained in order, so
 // the response stays byte-ordered while PostgreSQL reads the pieces in
 // parallel.
-func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, key string, rootID int64, pieces []piece, start, end int64) error {
+func (s *Store) streamParallel(ctx context.Context, out chan<- result, schema, _ string, _ int64, pieces []piece, start, end int64) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	exportConn, err := s.chunkPool.Acquire(runCtx)
@@ -918,7 +963,7 @@ func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, k
 					return false
 				}
 			}
-			if err := streamRows(runCtx, tx, p, start, end, send); err != nil {
+			if err := streamRows(runCtx, tx, schema, p, start, end, send); err != nil {
 				select {
 				case ch <- result{err: err}:
 				case <-runCtx.Done():
@@ -953,33 +998,35 @@ func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, k
 	return nil
 }
 
-func (s *Store) streamSnapshot(ctx context.Context, ch chan<- result, bucket, key string, rootID int64, pieces []piece, start, end int64, send func([]byte) bool) error {
+func (s *Store) streamSnapshot(ctx context.Context, _ chan<- result, schema, _ string, _ int64, pieces []piece, start, end int64, send func([]byte) bool) error {
 	tx, err := s.chunkPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	for _, p := range pieces {
-		if err := streamRows(ctx, tx, p, start, end, send); err != nil {
+		if err := streamRows(ctx, tx, schema, p, start, end, send); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
 }
 
-func (s *Store) streamPiece(ctx context.Context, _ chan<- result, _ string, _ string, _ int64, p piece, start, end int64, send func([]byte) bool) error {
-	return streamRows(ctx, s.chunkPool, p, start, end, send)
+func (s *Store) streamPiece(ctx context.Context, _ chan<- result, schema string, _ string, _ int64, p piece, start, end int64, send func([]byte) bool) error {
+	return streamRows(ctx, s.chunkPool, schema, p, start, end, send)
 }
 
 type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-const getRangeSQL = `SELECT c.no, c.data FROM s3p.chunks c
+func getRangeSQL(schema string) string {
+	return `SELECT c.no, c.data FROM ` + schema + `.chunks c
 WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3`
+}
 
-func streamRows(ctx context.Context, q querier, p piece, start, end int64, send func([]byte) bool) error {
-	rows, err := q.Query(ctx, getRangeSQL, p.fileID, p.lo, p.hi)
+func streamRows(ctx context.Context, q querier, schema string, p piece, start, end int64, send func([]byte) bool) error {
+	rows, err := q.Query(ctx, getRangeSQL(schema), p.fileID, p.lo, p.hi)
 	if err != nil {
 		return err
 	}
@@ -1086,6 +1133,10 @@ func (s *Store) Put(ctx context.Context, bucket, key string, data []byte) error 
 
 // Delete removes one object and queues its storage for reaping.
 func (s *Store) Delete(ctx context.Context, bucket, key string) (bool, error) {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return false, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -1096,13 +1147,16 @@ func (s *Store) Delete(ctx context.Context, bucket, key string) (bool, error) {
 	}
 	var fileID pgtype.Int8
 	var parts []int64
-	err = tx.QueryRow(ctx, "DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id, parts", bucket, key).Scan(&fileID, &parts)
+	err = tx.QueryRow(ctx, "DELETE FROM "+sc+".objects WHERE key = $1 RETURNING file_id, parts", key).Scan(&fileID, &parts)
+	if isMissingBucketSchema(err) {
+		return false, nil
+	}
 	found := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return false, err
 	}
 	if found && fileID.Valid {
-		if err := queueFiles(ctx, tx, fileID.Int64, parts); err != nil {
+		if err := queueFiles(ctx, tx, sc, fileID.Int64, parts); err != nil {
 			return false, err
 		}
 	}
@@ -1118,6 +1172,10 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 	if len(keys) == 0 {
 		return nil
 	}
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1129,22 +1187,25 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 		return err
 	}
 	_, err = tx.Exec(ctx, `WITH doomed AS (
-		DELETE FROM s3p.objects WHERE bucket = $1 AND key = ANY($2::text[])
+		DELETE FROM `+sc+`.objects WHERE key = ANY($1::text[])
 		RETURNING file_id, parts
 	), dead AS (
 		SELECT file_id FROM doomed UNION ALL SELECT unnest(parts) FROM doomed
 	)
-	INSERT INTO s3p.garbage (file_id)
+	INSERT INTO `+sc+`.garbage (file_id)
 	SELECT DISTINCT d.file_id FROM dead d
 	WHERE d.file_id IS NOT NULL
-	  AND NOT EXISTS (SELECT 1 FROM s3p.objects o
+	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
 	    WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id
-	      AND NOT (o.bucket = $1 AND o.key = ANY($2::text[])))
-	  AND NOT EXISTS (SELECT 1 FROM s3p.objects o
+	      AND NOT (o.key = ANY($1::text[])))
+	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
 	    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
-	      AND NOT (o.bucket = $1 AND o.key = ANY($2::text[])))
-	  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = d.file_id)
-	ON CONFLICT DO NOTHING`, bucket, keys)
+	      AND NOT (o.key = ANY($1::text[])))
+	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
+	ON CONFLICT DO NOTHING`, keys)
+	if isMissingBucketSchema(err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -1152,11 +1213,21 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 }
 
 func (s *Store) CreateBucket(ctx context.Context, name string) error {
-	_, err := s.pool.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", name)
-	return err
+	if _, err := BucketSchema(name); err != nil {
+		return err
+	}
+	var sc string
+	if err := s.pool.QueryRow(ctx, "SELECT s3p.ensure_bucket($1)", name).Scan(&sc); err != nil {
+		return err
+	}
+	s.knownBuckets.Store(name, struct{}{})
+	return nil
 }
 
 func (s *Store) BucketExists(ctx context.Context, name string) (bool, error) {
+	if _, err := BucketSchema(name); err != nil {
+		return false, err
+	}
 	var one int
 	err := s.pool.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1", name).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1174,41 +1245,78 @@ const (
 )
 
 func (s *Store) DeleteBucket(ctx context.Context, name string) (BucketDeletion, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
+	return s.DropBucket(ctx, name, false)
+}
+
+// DropBucket drops the bucket's PostgreSQL schema (`DROP SCHEMA CASCADE`).
+// When force is true, non-empty buckets are dropped immediately along with all
+// objects, chunks and uploads.
+func (s *Store) DropBucket(ctx context.Context, name string, force bool) (BucketDeletion, error) {
+	if _, err := BucketSchema(name); err != nil {
+		return BucketNotFound, err
+	}
+	var outcome string
+	if err := s.pool.QueryRow(ctx, "SELECT s3p.drop_bucket($1, $2)", name, force).Scan(&outcome); err != nil {
 		return 0, err
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	var one int
-	err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR UPDATE", name).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
+	switch outcome {
+	case "deleted":
+		s.knownBuckets.Delete(name)
+		return BucketDeleted, nil
+	case "not_empty":
+		return BucketNotEmpty, nil
+	default:
 		return BucketNotFound, nil
 	}
-	if err != nil {
-		return 0, err
+}
+
+// CloneBucket copies all committed objects and chunks from srcBucket into an
+// empty dstBucket inside PostgreSQL without streaming bytes through the gateway.
+func (s *Store) CloneBucket(ctx context.Context, srcBucket, dstBucket string) error {
+	if _, err := BucketSchema(srcBucket); err != nil {
+		return err
 	}
-	var occupied bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM s3p.objects WHERE bucket = $1)
-		OR EXISTS (SELECT 1 FROM s3p.uploads WHERE bucket = $1)`, name).Scan(&occupied); err != nil {
-		return 0, err
+	if _, err := BucketSchema(dstBucket); err != nil {
+		return err
 	}
-	if occupied {
-		return BucketNotEmpty, nil
+	var outcome string
+	if err := s.pool.QueryRow(ctx, "SELECT s3p.clone_bucket($1, $2)", srcBucket, dstBucket).Scan(&outcome); err != nil {
+		return err
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM s3p.buckets WHERE name = $1", name); err != nil {
-		return 0, err
+	switch outcome {
+	case "ok":
+		s.knownBuckets.Store(dstBucket, struct{}{})
+		return nil
+	case "not_found":
+		return ErrNoBucket
+	case "not_empty":
+		return ErrBucketNotEmpty
+	default:
+		return fmt.Errorf("unexpected clone_bucket outcome %q", outcome)
 	}
-	return BucketDeleted, tx.Commit(ctx)
 }
 
 func (s *Store) CreateUpload(ctx context.Context, bucket, key string, userMeta []string, contentType string, checksumAlgorithm *string) (string, error) {
-	if _, err := s.pool.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", bucket); err != nil {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
 		return "", err
 	}
+	if _, ok := s.knownBuckets.Load(bucket); !ok {
+		if err := s.CreateBucket(ctx, bucket); err != nil {
+			return "", err
+		}
+	}
+	query := `INSERT INTO ` + sc + `.uploads (upload_id, key, checksum_algorithm, user_metadata, content_type)
+		VALUES (gen_random_uuid()::text, $1, $2, $3, $4)
+		RETURNING upload_id`
 	var id string
-	err := s.pool.QueryRow(ctx, `INSERT INTO s3p.uploads (upload_id, bucket, key, checksum_algorithm, user_metadata, content_type)
-		VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5)
-		RETURNING upload_id`, bucket, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
+	err = s.pool.QueryRow(ctx, query, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
+	if isMissingBucketSchema(err) {
+		if err := s.CreateBucket(ctx, bucket); err != nil {
+			return "", err
+		}
+		err = s.pool.QueryRow(ctx, query, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
+	}
 	return id, err
 }
 
@@ -1228,24 +1336,28 @@ type Completed struct {
 // CompleteUpload validates the listed parts and publishes the ordered part
 // list without moving any data.
 func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, requestKey string, listed []ListedPart) (*Completed, error) {
+	sc, err := bucketSQLIdent(requestBucket)
+	if err != nil {
+		return nil, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	var bucket, key, contentType string
+	var key, contentType string
 	var algorithm pgtype.Text
 	var userMeta []string
-	err = tx.QueryRow(ctx, `SELECT bucket, key, checksum_algorithm, user_metadata, content_type
-		FROM s3p.uploads WHERE upload_id = $1 FOR UPDATE`, uploadID).
-		Scan(&bucket, &key, &algorithm, &userMeta, &contentType)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err = tx.QueryRow(ctx, `SELECT key, checksum_algorithm, user_metadata, content_type
+		FROM `+sc+`.uploads WHERE upload_id = $1 FOR UPDATE`, uploadID).
+		Scan(&key, &algorithm, &userMeta, &contentType)
+	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return nil, ErrNoUpload
 	}
 	if err != nil {
 		return nil, err
 	}
-	if bucket != requestBucket || key != requestKey {
+	if key != requestKey {
 		return nil, ErrNoUpload
 	}
 	if len(listed) == 0 {
@@ -1257,7 +1369,7 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 		}
 	}
 	rows, err := tx.Query(ctx, `SELECT part_no, file_id, size, sha256, md5, checksum
-		FROM s3p.upload_parts WHERE upload_id = $1 ORDER BY part_no`, uploadID)
+		FROM `+sc+`.upload_parts WHERE upload_id = $1 ORDER BY part_no`, uploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -1323,46 +1435,50 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 		return nil, ErrInvalidPart
 	}
 	etag := s3ETag(md5All.Sum(nil), len(ids))
-	if err := swapObjectParts(ctx, tx, bucket, key, nil, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
+	if err := swapObjectParts(ctx, tx, sc, requestBucket, key, nil, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
 		return nil, err
 	}
 	for _, c := range selectedChecks {
-		if _, err := tx.Exec(ctx, `INSERT INTO s3p.object_part_checksums
-			(bucket, key, part_no, file_id, algorithm, value) VALUES ($1,$2,$3,$4,$5,$6)
-			ON CONFLICT (bucket, key, part_no) DO UPDATE SET file_id = EXCLUDED.file_id,
+		if _, err := tx.Exec(ctx, `INSERT INTO `+sc+`.object_part_checksums
+			(key, part_no, file_id, algorithm, value) VALUES ($1,$2,$3,$4,$5)
+			ON CONFLICT (key, part_no) DO UPDATE SET file_id = EXCLUDED.file_id,
 			  algorithm = EXCLUDED.algorithm, value = EXCLUDED.value`,
-			bucket, key, c.no, c.fileID, algorithm.String, c.checksum); err != nil {
+			key, c.no, c.fileID, algorithm.String, c.checksum); err != nil {
 			return nil, err
 		}
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM s3p.uploads WHERE upload_id = $1", uploadID); err != nil {
+	if _, err := tx.Exec(ctx, "DELETE FROM "+sc+".uploads WHERE upload_id = $1", uploadID); err != nil {
 		return nil, err
 	}
-	if err := queueFileIDs(ctx, tx, unused); err != nil {
+	if err := queueFileIDs(ctx, tx, sc, unused); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return &Completed{Bucket: bucket, Key: key, ETag: etag, Size: size}, nil
+	return &Completed{Bucket: requestBucket, Key: key, ETag: etag, Size: size}, nil
 }
 
 func (s *Store) AbortUpload(ctx context.Context, uploadID, bucket, key string) (bool, error) {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return false, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	var one int
-	err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3 FOR UPDATE", uploadID, bucket, key).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err = tx.QueryRow(ctx, "SELECT 1 FROM "+sc+".uploads WHERE upload_id = $1 AND key = $2 FOR UPDATE", uploadID, key).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
 	var ids []int64
-	rows, err := tx.Query(ctx, "SELECT file_id FROM s3p.upload_parts WHERE upload_id = $1", uploadID)
+	rows, err := tx.Query(ctx, "SELECT file_id FROM "+sc+".upload_parts WHERE upload_id = $1", uploadID)
 	if err != nil {
 		return false, err
 	}
@@ -1375,10 +1491,10 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID, bucket, key string) (
 		ids = append(ids, id)
 	}
 	rows.Close()
-	if _, err := tx.Exec(ctx, "DELETE FROM s3p.uploads WHERE upload_id = $1", uploadID); err != nil {
+	if _, err := tx.Exec(ctx, "DELETE FROM "+sc+".uploads WHERE upload_id = $1", uploadID); err != nil {
 		return false, err
 	}
-	if err := queueFileIDs(ctx, tx, ids); err != nil {
+	if err := queueFileIDs(ctx, tx, sc, ids); err != nil {
 		return false, err
 	}
 	return true, tx.Commit(ctx)
@@ -1393,12 +1509,19 @@ type Listed struct {
 
 // List returns key-ordered objects in [prefix, prefixEnd) with key > after.
 func (s *Store) List(ctx context.Context, bucket, prefix, prefixEnd, after string, limit int) ([]Listed, error) {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, err
+	}
 	query := `SELECT key, size, etag, EXTRACT(EPOCH FROM created_at)::float8
-		FROM s3p.objects
-		WHERE bucket = $1 AND key COLLATE "C" >= $2 AND key COLLATE "C" < $3
-		  AND key COLLATE "C" > $4
-		ORDER BY key COLLATE "C" LIMIT $5`
-	rows, err := s.pool.Query(ctx, query, bucket, prefix, prefixEnd, after, limit)
+		FROM ` + sc + `.objects
+		WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
+		  AND key COLLATE "C" > $3
+		ORDER BY key COLLATE "C" LIMIT $4`
+	rows, err := s.pool.Query(ctx, query, prefix, prefixEnd, after, limit)
+	if isMissingBucketSchema(err) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1446,7 +1569,39 @@ func (s *Store) Buckets(ctx context.Context) ([]struct {
 	return out, rows.Err()
 }
 
+func (s *Store) bucketSchemas(ctx context.Context, bucket string) ([]string, error) {
+	if bucket != "" {
+		sc, err := BucketSchema(bucket)
+		if err != nil {
+			return nil, err
+		}
+		var exists bool
+		if err := s.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", quoteIdent(sc)+".objects").Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, ErrNoBucket
+		}
+		return []string{sc}, nil
+	}
+	rows, err := s.pool.Query(ctx, "SELECT schema_name FROM s3p.buckets ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sc string
+		if err := rows.Scan(&sc); err != nil {
+			return nil, err
+		}
+		out = append(out, sc)
+	}
+	return out, rows.Err()
+}
+
 type Stats struct {
+	Buckets       int64          `json:"buckets"`
 	Objects       int64          `json:"objects"`
 	Chunks        int64          `json:"chunks"`
 	LogicalBytes  int64          `json:"logical_bytes"`
@@ -1457,29 +1612,60 @@ type Stats struct {
 }
 
 func (s *Store) Stat(ctx context.Context) (Stats, error) {
+	return s.StatBucket(ctx, "")
+}
+
+func (s *Store) StatBucket(ctx context.Context, bucket string) (Stats, error) {
 	var st Stats
-	var oldest pgtype.Float8
-	err := s.pool.QueryRow(ctx, `SELECT (SELECT COALESCE(sum(size),0)::int8 FROM s3p.objects),
-		pg_total_relation_size('s3p.objects') + pg_total_relation_size('s3p.chunks'),
-		(SELECT count(*) FROM s3p.objects),
-		(SELECT count(*) FROM s3p.chunks),
-		pg_database_size(current_database()),
-		(SELECT count(*) FROM s3p.garbage),
-		(SELECT EXTRACT(EPOCH FROM now() - min(queued_at))::float8 FROM s3p.garbage)`).
-		Scan(&st.LogicalBytes, &st.PhysicalBytes, &st.Objects, &st.Chunks, &st.DatabaseBytes, &st.GarbageFiles, &oldest)
+	schemas, err := s.bucketSchemas(ctx, bucket)
 	if err != nil {
 		return st, err
 	}
-	if oldest.Valid {
-		d := time.Duration(oldest.Float64 * float64(time.Second))
+	st.Buckets = int64(len(schemas))
+	var maxOldest float64
+	var hasOldest bool
+	for _, sc := range schemas {
+		q := quoteIdent(sc)
+		var logical, physical, objs, chunks, garb int64
+		var oldest pgtype.Float8
+		err := s.pool.QueryRow(ctx, `SELECT
+			(SELECT COALESCE(sum(size),0)::int8 FROM `+q+`.objects),
+			pg_total_relation_size('`+q+`.objects') + pg_total_relation_size('`+q+`.chunks'),
+			(SELECT count(*) FROM `+q+`.objects),
+			(SELECT count(*) FROM `+q+`.chunks),
+			(SELECT count(*) FROM `+q+`.garbage),
+			(SELECT EXTRACT(EPOCH FROM now() - min(queued_at))::float8 FROM `+q+`.garbage)`).
+			Scan(&logical, &physical, &objs, &chunks, &garb, &oldest)
+		if isMissingBucketSchema(err) {
+			continue
+		}
+		if err != nil {
+			return st, err
+		}
+		st.LogicalBytes += logical
+		st.PhysicalBytes += physical
+		st.Objects += objs
+		st.Chunks += chunks
+		st.GarbageFiles += garb
+		if oldest.Valid && (!hasOldest || oldest.Float64 > maxOldest) {
+			maxOldest = oldest.Float64
+			hasOldest = true
+		}
+	}
+	if err := s.pool.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&st.DatabaseBytes); err != nil {
+		return st, err
+	}
+	if hasOldest {
+		d := time.Duration(maxOldest * float64(time.Second))
 		st.OldestGarbage = &d
 	}
 	return st, nil
 }
 
-// Maintain expires abandoned multipart uploads and reaps garbage older than
-// grace, at most ReapRows chunk rows per run. A session-level try-lock
-// serialises reapers across gateways.
+// Maintain reconciles restored/dropped bucket schemas, expires abandoned
+// multipart uploads and reaps garbage older than grace across all buckets, at
+// most ReapRows chunk rows per run. A session-level try-lock serialises
+// reapers across gateways.
 func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	s.maintenanceRuns.Add(1)
 	const lock int64 = 0x70677674 // "pgvt"
@@ -1494,38 +1680,63 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", lock)
 
-	var expired int
-	if err := conn.QueryRow(ctx, "SELECT s3p.expire_uploads(interval '24 hours', 64, NULL)").Scan(&expired); err != nil {
+	if _, err := conn.Exec(ctx, "SELECT s3p.reconcile_buckets()"); err != nil {
 		return err
 	}
-	if expired > 0 {
-		s.log.Info("expired multipart uploads", "count", expired)
+	schemas, err := s.bucketSchemas(ctx, "")
+	if err != nil {
+		return err
 	}
-	remaining := ReapRows
-	for remaining > 0 {
-		n, done, err := s.reapOne(ctx, conn.Conn(), grace, remaining)
-		if err != nil {
+	var totalExpired int
+	for _, sc := range schemas {
+		q := quoteIdent(sc)
+		var expired int
+		if err := conn.QueryRow(ctx, "SELECT "+q+".expire_uploads(interval '24 hours', 64)").Scan(&expired); err != nil {
+			if isMissingBucketSchema(err) {
+				continue
+			}
 			return err
 		}
-		if n == 0 && !done {
+		totalExpired += expired
+	}
+	if totalExpired > 0 {
+		s.log.Info("expired multipart uploads", "count", totalExpired)
+	}
+	remaining := ReapRows
+	for _, sc := range schemas {
+		q := quoteIdent(sc)
+		for remaining > 0 {
+			n, done, err := s.reapOne(ctx, conn.Conn(), q, grace, remaining)
+			if isMissingBucketSchema(err) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			if n == 0 && !done {
+				break
+			}
+			s.reapedRows.Add(int64(n))
+			if done {
+				s.reapedFiles.Add(1)
+			}
+			remaining -= max(n, 1)
+		}
+		if remaining <= 0 {
 			break
 		}
-		s.reapedRows.Add(int64(n))
-		if done {
-			s.reapedFiles.Add(1)
-		}
-		remaining -= max(n, 1)
 	}
 	return nil
 }
-func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, grace time.Duration, budget int) (int, bool, error) {
+
+func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, schema string, grace time.Duration, budget int) (int, bool, error) {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return 0, false, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	var fileID int64
-	err = tx.QueryRow(ctx, `SELECT file_id FROM s3p.garbage
+	err = tx.QueryRow(ctx, `SELECT file_id FROM `+schema+`.garbage
 		WHERE queued_at <= now() - make_interval(secs => $1)
 		ORDER BY queued_at, file_id LIMIT 1 FOR UPDATE SKIP LOCKED`, grace.Seconds()).Scan(&fileID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1535,22 +1746,22 @@ func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, grace time.Duration
 		return 0, false, err
 	}
 	var referenced bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM s3p.objects WHERE file_id IS NOT NULL AND file_id = $1)
-		OR EXISTS (SELECT 1 FROM s3p.objects WHERE parts IS NOT NULL AND parts @> ARRAY[$1::int8])
-		OR EXISTS (SELECT 1 FROM s3p.upload_parts WHERE file_id = $1)`, fileID).Scan(&referenced); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM `+schema+`.objects WHERE file_id IS NOT NULL AND file_id = $1)
+		OR EXISTS (SELECT 1 FROM `+schema+`.objects WHERE parts IS NOT NULL AND parts @> ARRAY[$1::int8])
+		OR EXISTS (SELECT 1 FROM `+schema+`.upload_parts WHERE file_id = $1)`, fileID).Scan(&referenced); err != nil {
 		return 0, false, err
 	}
 	if referenced {
 		// A shared CopyObject/UploadPartCopy file can be queued by an older
 		// gateway. Drop the false-positive garbage row instead of wedging the
 		// reaper behind it forever.
-		if _, err := tx.Exec(ctx, "DELETE FROM s3p.garbage WHERE file_id = $1", fileID); err != nil {
+		if _, err := tx.Exec(ctx, "DELETE FROM "+schema+".garbage WHERE file_id = $1", fileID); err != nil {
 			return 0, false, err
 		}
 		return 0, true, tx.Commit(ctx)
 	}
-	tag, err := tx.Exec(ctx, `DELETE FROM s3p.chunks WHERE ctid IN
-		(SELECT ctid FROM s3p.chunks WHERE file_id = $1 LIMIT $2)`, fileID, budget)
+	tag, err := tx.Exec(ctx, `DELETE FROM `+schema+`.chunks WHERE ctid IN
+		(SELECT ctid FROM `+schema+`.chunks WHERE file_id = $1 LIMIT $2)`, fileID, budget)
 	if err != nil {
 		return 0, false, err
 	}
@@ -1558,11 +1769,11 @@ func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, grace time.Duration
 	done := false
 	if n < budget {
 		var left bool
-		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM s3p.chunks WHERE file_id = $1)", fileID).Scan(&left); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+schema+".chunks WHERE file_id = $1)", fileID).Scan(&left); err != nil {
 			return 0, false, err
 		}
 		if !left {
-			if _, err := tx.Exec(ctx, "DELETE FROM s3p.garbage WHERE file_id = $1", fileID); err != nil {
+			if _, err := tx.Exec(ctx, "DELETE FROM "+schema+".garbage WHERE file_id = $1", fileID); err != nil {
 				return 0, false, err
 			}
 			done = true

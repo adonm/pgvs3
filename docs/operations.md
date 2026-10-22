@@ -28,7 +28,7 @@ enforces authentication, authorization, and TLS.
 ## Probes and Prometheus metrics
 
 - `GET /healthz` — process liveness (does not touch PostgreSQL).
-- `GET /readyz` — checks PostgreSQL connectivity and schema layout v9; returns
+- `GET /readyz` — checks PostgreSQL connectivity and schema layout v10; returns
   `503` while draining or if the database is unreachable.
 - `GET /metrics` — Prometheus metrics:
   - `pgvs3_requests_total{method,code}`
@@ -40,18 +40,48 @@ enforces authentication, authorization, and TLS.
 ## CLI diagnostics and maintenance
 
 ```sh
-pgvs3 doctor --url "$PGVS3_URL"          # verify PG 18+, layout v9, and table reloptions
-pgvs3 stat   --url "$PGVS3_URL" --json   # logical/physical bytes, objects, chunks, garbage age
-pgvs3 reap   --url "$PGVS3_URL" --all    # drain all eligible garbage outside the grace window
+pgvs3 doctor --url "$PGVS3_URL"                   # verify PG 18+, layout v10, and per-bucket reloptions
+pgvs3 stat   --url "$PGVS3_URL" [--bucket B] --json # logical/physical bytes, objects, chunks, garbage age
+pgvs3 reap   --url "$PGVS3_URL" --all             # drain all eligible garbage outside the grace window
+pgvs3 clone  --url "$PGVS3_URL" <src> <dst>       # server-side clone of a whole bucket
+pgvs3 drop   --url "$PGVS3_URL" [--force] <bkt>   # drop a bucket schema (`DROP SCHEMA CASCADE`)
 ```
 
 In normal operation, one gateway per cluster runs background maintenance every
-minute (coordinated via `pg_try_advisory_lock`), expiring abandoned multipart
-uploads and reaping up to 65,536 chunk rows (~508 MiB) per pass of files
-deleted longer ago than `--reap-grace` (default `10m`), chaining additional
-passes immediately when a pass saturates its row budget.
+minute (coordinated via `pg_try_advisory_lock`), reconciling restored/dropped
+`s3b_<bucket>` schemas, expiring abandoned multipart uploads, and reaping up to
+65,536 chunk rows (~508 MiB) per pass of files deleted longer ago than
+`--reap-grace` (default `10m`), chaining additional passes immediately when a
+pass saturates its row budget.
 
-## Backup and restore
+## Bucket snapshots, cloning, and deletion
+
+Each bucket `<name>` lives in its own PostgreSQL schema `s3b_<name>`:
+
+- **Single-bucket snapshot & restore:**
+  ```sh
+  pg_dump -Fc -n '"s3b_lake"' "$PGVS3_URL" > lake.dump
+  pg_restore --single-transaction -d "$PGVS3_URL" lake.dump
+  ```
+  On the next maintenance tick (or gateway startup / `pgvs3 reap`),
+  `s3p.reconcile_buckets()` automatically registers any restored `s3b_*` schema
+  in `s3p.buckets` and advances `s3p.file_ids` past its highest `file_id`.
+- **Whole-bucket clone (server-side):**
+  ```sh
+  pgvs3 clone --url "$PGVS3_URL" lake lake-staging
+  # or over HTTP:
+  curl -X PUT -H 'x-amz-copy-source: /lake' http://127.0.0.1:8014/lake-staging
+  ```
+- **Instant bucket deletion & OS disk reclaim:**
+  ```sh
+  pgvs3 drop --url "$PGVS3_URL" --force lake-staging
+  # or over HTTP:
+  curl -X DELETE 'http://127.0.0.1:8014/lake-staging?force=true'
+  ```
+  `DROP SCHEMA CASCADE` unlinks the bucket's table files immediately with no
+  reaper lag or `VACUUM FULL`.
+
+## Full-database backup and restore
 
 All state lives in PostgreSQL; there is no sidecar store to back up.
 
@@ -65,7 +95,7 @@ All state lives in PostgreSQL; there is no sidecar store to back up.
 
 ## Schema upgrades
 
-Layout v9 is not backwards-compatible with earlier alpha layouts, and gateways
+Layout v10 is not backwards-compatible with earlier alpha layouts, and gateways
 refuse to start against a mismatched version. To migrate across breaking
 layouts, copy data into a fresh database via DuckDB/rclone and switch
 `PGVS3_URL`.

@@ -9,24 +9,24 @@ way they are.
 
 | Mechanism | How it works |
 | --- | --- |
-| **Inline small objects (≤64 KiB)** | Stored directly in `s3p.objects.inline_data` (`file_id NULL`). Written in one `s3p.put_inline` call and read in one primary-key lookup without touching `s3p.chunks`. |
-| **8,120-byte chunk rows** | Larger objects split into 8,120-byte rows in `s3p.chunks`. With `file_id(8) + no(4) + varlena(4) + 8120` plus the 24-byte tuple header, one row fills an 8 KB page at 99.6% occupancy. |
-| **No TOAST overhead** | `s3p.chunks` sets `toast_tuple_target = 8160` and `STORAGE EXTERNAL`, so PostgreSQL never detoasts or chases out-of-line pointers on read. |
-| **Immutable files** | Every write allocates a fresh `file_id`; overwrites swap the pointer on `s3p.objects` and queue the old `file_id` for reaping. Chunk rows are never updated in place. |
+| **Per-bucket PostgreSQL schema (`s3b_<bucket>`)** | Each bucket gets its own `objects`, `chunks`, `uploads`, and `garbage` tables (32 TiB capacity and independent autovacuum per bucket, instant `DROP SCHEMA CASCADE`, single-bucket `pg_dump -n`). |
+| **Inline small objects (≤64 KiB)** | Stored directly in `objects.inline_data` (`file_id NULL`). Written in one `put_inline` call and read in one primary-key lookup without touching `chunks`. |
+| **8,120-byte chunk rows** | Larger objects split into 8,120-byte rows in `chunks`. With `file_id(8) + no(4) + varlena(4) + 8120` plus the 24-byte tuple header, one row fills an 8 KB page at 99.6% occupancy. |
+| **No TOAST overhead** | `chunks` sets `toast_tuple_target = 8160` and `STORAGE EXTERNAL`, so PostgreSQL never detoasts or chases out-of-line pointers on read. |
+| **Immutable files** | Every write allocates a fresh `file_id`; overwrites swap the pointer on `objects` and queue the old `file_id` for reaping. Chunk rows are never updated in place. |
 | **Strong ETag caching** | `file_id` backs strong ETags so DuckDB's external file cache can reuse local blocks without re-fetching. |
-| **Split connection pools** | The main pool keeps `enable_indexscan = on` for fast B-tree lookups on `s3p.objects` and `ListObjectsV2`; a dedicated `chunkPool` sets `enable_indexscan = off` so `s3p.chunks` range reads use PostgreSQL 18 bitmap heap scans with read-ahead (`effective_io_concurrency = 32`). |
-| **Unpartitioned chunks table** | `s3p.chunks` is a single table (capped at 32 TiB / ~31.7 TiB of payload). Partitioning by hash or range was slower on point reads and writes; see [partitioning.md](partitioning.md). |
+| **Split connection pools** | The main pool keeps `enable_indexscan = on` for fast B-tree lookups on `objects` and `ListObjectsV2`; a dedicated `chunkPool` sets `enable_indexscan = off` so `chunks` range reads use PostgreSQL 18 bitmap heap scans with read-ahead (`effective_io_concurrency = 32`). |
+| **Unpartitioned chunks table per bucket** | Each bucket's `chunks` is a single table (capped at 32 TiB / ~31.7 TiB of payload). Partitioning within a bucket by hash or range was slower on point reads and writes; see [partitioning.md](partitioning.md). |
 | **Aggressive autovacuum** | Tuned to `autovacuum_vacuum_scale_factor = 0.01` and `analyze_scale_factor = 0.02` so freed pages are recycled quickly after whole-file deletes. |
 
 ## Read path
 
 1. **Inline fast path (≤64 KiB):** `Meta` fetches metadata and `inline_data` in
-   a single primary-key `Index Scan` on `s3p.objects` (~6 µs in
-   `shared_buffers`, ~0.17 ms p50 over HTTP). `HEAD` queries only header
-   columns and never transfers `inline_data`.
+   a single primary-key `Index Scan` on `objects` (~6 µs in `shared_buffers`,
+   ~0.17 ms p50 over HTTP). `HEAD` queries only header columns and never
+   transfers `inline_data`.
 2. **Single-query reads (64 KiB – 64 MiB):** A single-file read up to 64 MiB
-   runs as one `s3p.chunks` range query (`file_id = $1 AND no BETWEEN $2 AND $3`)
-   while verifying the object still points to `file_id`.
+   runs as one `chunks` range query (`file_id = $1 AND no BETWEEN $2 AND $3`).
 3. **Parallel snapshot reads (>64 MiB and multipart):** Larger spans split into
    8 MiB pieces and fetch up to 8 pieces concurrently on separate connections
    under one exported `REPEATABLE READ` snapshot.
@@ -41,21 +41,25 @@ way they are.
 
 ## Write path
 
-1. **Inline writes (≤64 KiB):** `s3p.put_inline` auto-creates the bucket,
-   takes a per-key transaction advisory lock, checks `If-Match` /
-   `If-None-Match`, queues any replaced `file_id` for GC, and upserts the row
-   in one round trip.
+1. **Inline writes (≤64 KiB):** `s3b_<bucket>.put_inline` takes a per-key
+   transaction advisory lock, checks `If-Match` / `If-None-Match`, queues any
+   replaced `file_id` for GC, and upserts the row in one round trip. If the
+   bucket schema does not exist yet, the gateway calls `s3p.ensure_bucket` once
+   and retries.
 2. **Streaming binary `COPY` (>64 KiB):** `internal/store/ingest.go` hashes the
    request body (MD5 + SHA-256/CRC) while framing 4 MiB binary `COPY` batches
-   from a `sync.Pool` into `s3p.chunks`.
-3. **Atomic publish:** In the same transaction as `COPY`, `s3p.publish_object`
-   evaluates conditional headers, updates `s3p.objects`, and queues any
-   replaced `file_id`. If a client disconnects mid-upload, the transaction
-   rolls back and publishes nothing.
-4. **Zero-copy multipart and `CopyObject`:** Multipart parts upload in parallel
-   as independent `file_id`s; `CompleteMultipartUpload` validates checksums and
-   records the ordered `file_id` array without moving bytes. `CopyObject` and
-   whole-file `UploadPartCopy` share the source's immutable `file_id`s.
+   from a `sync.Pool` into `s3b_<bucket>.chunks`.
+3. **Atomic publish:** In the same transaction as `COPY`,
+   `s3b_<bucket>.publish_object` evaluates conditional headers, updates
+   `objects`, and queues any replaced `file_id`. If a client disconnects
+   mid-upload, the transaction rolls back and publishes nothing.
+4. **Zero-copy multipart, `CopyObject`, and bucket clones:** Multipart parts
+   upload in parallel as independent `file_id`s; `CompleteMultipartUpload`
+   validates checksums and records the ordered `file_id` array without moving
+   bytes. Same-bucket `CopyObject` and whole-file `UploadPartCopy` share the
+   source's immutable `file_id`s; cross-bucket `CopyObject` and
+   `s3p.clone_bucket` copy chunk rows inside PostgreSQL without streaming bytes
+   through the gateway.
 5. **Single-query batch delete:** `DeleteObjects` locks and deletes up to 1,000
    keys and queues unreferenced files in two SQL statements instead of 1,000
    round trips.

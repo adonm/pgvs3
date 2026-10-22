@@ -19,6 +19,10 @@ type PartInfo struct {
 
 // Attributes returns metadata plus per-part sizes for GetObjectAttributes.
 func (s *Store) Attributes(ctx context.Context, bucket, key string) (*Meta, []PartInfo, error) {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, nil, err
+	}
 	m, err := s.Meta(ctx, bucket, key)
 	if err != nil {
 		return nil, nil, err
@@ -31,7 +35,7 @@ func (s *Store) Attributes(ctx context.Context, bucket, key string) (*Meta, []Pa
 		}
 		checks := map[int32]partCheck{}
 		rows, err := s.pool.Query(ctx, `SELECT part_no, file_id, algorithm, value
-			FROM s3p.object_part_checksums WHERE bucket = $1 AND key = $2`, bucket, key)
+			FROM `+sc+`.object_part_checksums WHERE key = $1`, key)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -77,18 +81,22 @@ type UploadPartInfo struct {
 
 // ListParts returns one page of an in-progress multipart upload's parts.
 func (s *Store) ListParts(ctx context.Context, uploadID, bucket, key string, max int, marker int32) ([]UploadPartInfo, bool, int32, error) {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, false, 0, err
+	}
 	var algorithm pgtype.Text
 	var epoch float64
-	err := s.pool.QueryRow(ctx, `SELECT checksum_algorithm, EXTRACT(EPOCH FROM created_at)::float8
-		FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3`, uploadID, bucket, key).
+	err = s.pool.QueryRow(ctx, `SELECT checksum_algorithm, EXTRACT(EPOCH FROM created_at)::float8
+		FROM `+sc+`.uploads WHERE upload_id = $1 AND key = $2`, uploadID, key).
 		Scan(&algorithm, &epoch)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return nil, false, 0, ErrNoUpload
 	}
 	if err != nil {
 		return nil, false, 0, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT part_no, size, md5, checksum FROM s3p.upload_parts
+	rows, err := s.pool.Query(ctx, `SELECT part_no, size, md5, checksum FROM `+sc+`.upload_parts
 		WHERE upload_id = $1 AND part_no > $2 ORDER BY part_no LIMIT $3`, uploadID, marker, max+1)
 	if err != nil {
 		return nil, false, 0, err
@@ -131,11 +139,18 @@ type UploadInfo struct {
 
 // ListUploads returns one page of in-progress uploads in key/upload order.
 func (s *Store) ListUploads(ctx context.Context, bucket, prefix, bound, keyMarker, uploadMarker string, max int) ([]UploadInfo, bool, error) {
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, false, err
+	}
 	rows, err := s.pool.Query(ctx, `SELECT key, upload_id, EXTRACT(EPOCH FROM created_at)::float8
-		FROM s3p.uploads
-		WHERE bucket = $1 AND key >= $2 AND key < $3
-		  AND (key > $4 OR (key = $4 AND upload_id > $5))
-		ORDER BY key, upload_id LIMIT $6`, bucket, prefix, bound, keyMarker, uploadMarker, max+1)
+		FROM `+sc+`.uploads
+		WHERE key >= $1 AND key < $2
+		  AND (key > $3 OR (key = $3 AND upload_id > $4))
+		ORDER BY key, upload_id LIMIT $5`, prefix, bound, keyMarker, uploadMarker, max+1)
+	if isMissingBucketSchema(err) {
+		return nil, false, nil
+	}
 	if err != nil {
 		return nil, false, err
 	}

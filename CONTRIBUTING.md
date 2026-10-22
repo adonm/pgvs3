@@ -36,9 +36,10 @@ mise exec go -- gofmt -w cmd internal test
 
 ## Storage layout changes
 
-`internal/store/schema.sql` defines layout `v9` (`store.LayoutVersion = 9`).
-Objects up to 64 KiB live inline in `s3p.objects.inline_data`; larger objects
-use 8,120-byte rows in `s3p.chunks`.
+`internal/store/schema.sql` defines layout `v10` (`store.LayoutVersion = 10`).
+Each bucket lives in its own PostgreSQL schema `s3b_<bucket>`. Objects up to
+64 KiB live inline in `objects.inline_data`; larger objects use 8,120-byte rows
+in `chunks`.
 
 Any incompatible schema change must:
 

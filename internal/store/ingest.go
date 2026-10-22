@@ -23,8 +23,6 @@ import (
 // 8120 bytes plus the 24-byte tuple header is 8160, exactly one 8 KB page.
 const RowBytes = 8120
 
-const copySQL = "COPY s3p.chunks (file_id, no, data) FROM STDIN WITH (FORMAT binary)"
-
 var copyHeader = []byte("PGCOPY\n\xff\r\n\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 var copyTrailer = []byte{0xFF, 0xFF}
 
@@ -68,6 +66,8 @@ type Published struct {
 
 var (
 	ErrNoBucket        = errors.New("bucket does not exist")
+	ErrInvalidBucket   = errors.New("invalid bucket name")
+	ErrBucketNotEmpty  = errors.New("bucket is not empty")
 	ErrNoUpload        = errors.New("upload does not exist")
 	ErrPrecondition    = errors.New("object precondition failed")
 	ErrMissingChecksum = errors.New("part lacks the upload's checksum")
@@ -168,6 +168,7 @@ func (f *rowFramer) digests() (int64, []byte, []byte) {
 type writerTarget struct {
 	kind       int // 0 object, 1 part
 	bucket     string
+	schema     string
 	key        string
 	condition  Condition
 	ifMatch    string
@@ -201,7 +202,7 @@ type ChunkWriter struct {
 	closed    bool
 }
 
-// StartObject begins an object write. The bucket check and file ID allocation
+// StartObject begins an object write. The bucket schema and file ID allocation
 // happen before this returns, so the HTTP handler can stream the body straight
 // into COPY.
 func (s *Store) StartObject(ctx context.Context, bucket, key string, cond Condition, ifMatch string, userMeta []string, contentType string) (*ChunkWriter, error) {
@@ -218,6 +219,18 @@ func (s *Store) StartPart(ctx context.Context, uploadID, bucket, key string, par
 }
 
 func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, error) {
+	sc, err := bucketSQLIdent(t.bucket)
+	if err != nil {
+		return nil, err
+	}
+	t.schema = sc
+	if t.kind == 0 {
+		if _, ok := s.knownBuckets.Load(t.bucket); !ok {
+			if err := s.CreateBucket(ctx, t.bucket); err != nil {
+				return nil, err
+			}
+		}
+	}
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -233,20 +246,19 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 		return nil, err
 	}
 	if t.kind != 0 {
-
 		var alg *string
 		err = tx.QueryRow(ctx,
-			"SELECT checksum_algorithm FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3 FOR KEY SHARE",
-			t.uploadID, t.bucket, t.key).Scan(&alg)
-		if errors.Is(err, pgx.ErrNoRows) {
+			"SELECT checksum_algorithm FROM "+t.schema+".uploads WHERE upload_id = $1 AND key = $2 FOR KEY SHARE",
+			t.uploadID, t.key).Scan(&alg)
+		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 			return fail(ErrNoUpload)
+		}
+		if err != nil {
+			return fail(err)
 		}
 		if alg != nil {
 			t.checksumAl = *alg
 		}
-	}
-	if err != nil {
-		return fail(err)
 	}
 	fileID, err := s.nextFileID(ctx)
 	if err != nil {
@@ -271,7 +283,11 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 
 func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr *io.PipeReader, t writerTarget) {
 	defer conn.Release()
+	copySQL := "COPY " + t.schema + ".chunks (file_id, no, data) FROM STDIN WITH (FORMAT binary)"
 	if _, err := tx.Conn().PgConn().CopyFrom(ctx, pr, copySQL); err != nil {
+		if isMissingBucketSchema(err) {
+			w.store.knownBuckets.Delete(t.bucket)
+		}
 		_ = pr.CloseWithError(err)
 		_ = tx.Rollback(ctx)
 		w.done <- err
@@ -299,8 +315,8 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			match = t.ifMatch
 		}
 		var outcome string
-		err := tx.QueryRow(ctx, `SELECT s3p.publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-			t.bucket, t.key, fileIDOf(w), size, sha, etag, t.userMeta, t.content, condText, match).Scan(&outcome)
+		err := tx.QueryRow(ctx, "SELECT "+t.schema+".publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+			t.key, fileIDOf(w), size, sha, etag, t.userMeta, t.content, condText, match).Scan(&outcome)
 		if err == nil && outcome == "precondition" {
 			err = ErrPrecondition
 		}
@@ -326,7 +342,7 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 				return
 			}
 		}
-		if err := commitPart(ctx, tx, t.uploadID, t.partNo, fileIDOf(w), size, sha, md5, checksum); err != nil {
+		if err := commitPart(ctx, tx, t.schema, t.uploadID, t.partNo, fileIDOf(w), size, sha, md5, checksum); err != nil {
 			_ = tx.Rollback(ctx)
 			w.done <- err
 			return
@@ -410,14 +426,7 @@ func (w *ChunkWriter) abort() {
 	w.framer.release()
 }
 
-func swapObject(ctx context.Context, tx pgx.Tx, t writerTarget, fileID, size int64, sha []byte, etag string) error {
-	return swapObjectParts(ctx, tx, t.bucket, t.key, &t, fileID, size, sha, etag, t.userMeta, t.content, nil, nil)
-}
-
-func swapObjectParts(ctx context.Context, tx pgx.Tx, bucket, key string, t *writerTarget, fileID, size int64, sha []byte, etag string, userMeta []string, content string, parts, ends []int64) error {
-	if _, err := tx.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", bucket); err != nil {
-		return err
-	}
+func swapObjectParts(ctx context.Context, tx pgx.Tx, schema, bucket, key string, t *writerTarget, fileID, size int64, sha []byte, etag string, userMeta []string, content string, parts, ends []int64) error {
 	if err := lockObjectKey(ctx, tx, bucket, key); err != nil {
 		return err
 	}
@@ -425,8 +434,8 @@ func swapObjectParts(ctx context.Context, tx pgx.Tx, bucket, key string, t *writ
 	var oldParts []int64
 	var oldETag string
 	err := tx.QueryRow(ctx,
-		"SELECT file_id, parts, etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE",
-		bucket, key).Scan(&oldFile, &oldParts, &oldETag)
+		"SELECT file_id, parts, etag FROM "+schema+".objects WHERE key = $1 FOR UPDATE",
+		key).Scan(&oldFile, &oldParts, &oldETag)
 	old := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
@@ -444,23 +453,23 @@ func swapObjectParts(ctx context.Context, tx pgx.Tx, bucket, key string, t *writ
 			}
 		}
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM s3p.object_part_checksums WHERE bucket = $1 AND key = $2", bucket, key); err != nil {
+	if _, err := tx.Exec(ctx, "DELETE FROM "+schema+".object_part_checksums WHERE key = $1", key); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx,
-		`INSERT INTO s3p.objects (bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL)
-		 ON CONFLICT (bucket, key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size,
+		`INSERT INTO `+schema+`.objects (key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
+		 ON CONFLICT (key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size,
 		   sha256 = EXCLUDED.sha256, etag = EXCLUDED.etag,
 		   user_metadata = EXCLUDED.user_metadata, content_type = EXCLUDED.content_type,
 		   parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends, inline_data = NULL,
 		   created_at = now()`,
-		bucket, key, fileID, size, sha, etag, userMeta, content, parts, ends)
+		key, fileID, size, sha, etag, userMeta, content, parts, ends)
 	if err != nil {
 		return err
 	}
 	if old && oldFile.Valid {
-		return queueFiles(ctx, tx, oldFile.Int64, oldParts)
+		return queueFiles(ctx, tx, schema, oldFile.Int64, oldParts)
 	}
 	return nil
 }
@@ -474,38 +483,39 @@ func lockObjectKey(ctx context.Context, tx pgx.Tx, bucket, key string) error {
 	return err
 }
 
-func queueFiles(ctx context.Context, tx pgx.Tx, fileID int64, parts []int64) error {
+func queueFiles(ctx context.Context, tx pgx.Tx, schema string, fileID int64, parts []int64) error {
 	dead := make([]int64, 0, len(parts)+1)
 	dead = append(dead, parts...)
 	if fileID != 0 {
 		dead = append(dead, fileID)
 	}
-	return queueFileIDs(ctx, tx, dead)
+	return queueFileIDs(ctx, tx, schema, dead)
 }
 
-// queueFileIDs queues only unreferenced files. CopyObject, UploadPartCopy and
-// multipart parts can share a file ID, so "the old row pointed at it" is not
-// enough to prove it is dead.
-func queueFileIDs(ctx context.Context, tx pgx.Tx, ids []int64) error {
+// queueFileIDs queues only unreferenced files within a bucket schema.
+// CopyObject, UploadPartCopy and multipart parts can share a file ID within
+// the same bucket, so "the old row pointed at it" is not enough to prove it
+// is dead.
+func queueFileIDs(ctx context.Context, tx pgx.Tx, schema string, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO s3p.garbage (file_id)
+	_, err := tx.Exec(ctx, `INSERT INTO `+schema+`.garbage (file_id)
 		SELECT f FROM unnest($1::int8[]) AS f
 		WHERE f <> 0
-		  AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
-		  AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
-		  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
+		  AND NOT EXISTS (SELECT 1 FROM `+schema+`.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
+		  AND NOT EXISTS (SELECT 1 FROM `+schema+`.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
+		  AND NOT EXISTS (SELECT 1 FROM `+schema+`.upload_parts p WHERE p.file_id = f)
 		ON CONFLICT DO NOTHING`, ids)
 	return err
 }
 
-func commitPart(ctx context.Context, tx pgx.Tx, uploadID string, partNo int32, fileID, size int64, sha, md5sum []byte, checksum *Checksum) error {
+func commitPart(ctx context.Context, tx pgx.Tx, schema, uploadID string, partNo int32, fileID, size int64, sha, md5sum []byte, checksum *Checksum) error {
 	var value *string
 	if checksum != nil {
 		value = &checksum.Value
 	}
-	_, err := tx.Exec(ctx, `SELECT s3p.commit_part($1,$2,$3,$4,$5,$6,$7)`,
+	_, err := tx.Exec(ctx, "SELECT "+schema+".commit_part($1,$2,$3,$4,$5,$6,$7)",
 		uploadID, partNo, fileID, size, sha, md5sum, value)
 	return err
 }

@@ -11,9 +11,17 @@ import (
 )
 
 // CopyPart records a multipart part that references an existing single-file
-// object, without moving bytes. It returns ok=false when the source is inline,
-// multipart, a range, or uses a checksum we cannot reproduce.
+// object in the same bucket, without moving bytes. It returns ok=false when
+// the source is in a different bucket, inline, multipart, a range, or uses a
+// checksum we cannot reproduce.
 func (s *Store) CopyPart(ctx context.Context, uploadID, bucket, key string, partNo int32, srcBucket, srcKey string) (*Published, bool, error) {
+	if srcBucket != bucket {
+		return nil, false, nil
+	}
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, false, err
+	}
 	src, err := s.Meta(ctx, srcBucket, srcKey)
 	if err != nil {
 		return nil, false, err
@@ -31,10 +39,10 @@ func (s *Store) CopyPart(ctx context.Context, uploadID, bucket, key string, part
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	var algorithm pgtype.Text
-	err = tx.QueryRow(ctx, `SELECT checksum_algorithm FROM s3p.uploads
-		WHERE upload_id = $1 AND bucket = $2 AND key = $3 FOR KEY SHARE`,
-		uploadID, bucket, key).Scan(&algorithm)
-	if err == pgx.ErrNoRows {
+	err = tx.QueryRow(ctx, `SELECT checksum_algorithm FROM `+sc+`.uploads
+		WHERE upload_id = $1 AND key = $2 FOR KEY SHARE`,
+		uploadID, key).Scan(&algorithm)
+	if err == pgx.ErrNoRows || isMissingBucketSchema(err) {
 		return nil, false, ErrNoUpload
 	}
 	if err != nil {
@@ -49,17 +57,17 @@ func (s *Store) CopyPart(ctx context.Context, uploadID, bucket, key string, part
 		checksum = &v
 	}
 	var old pgtype.Int8
-	err = tx.QueryRow(ctx, `DELETE FROM s3p.upload_parts WHERE upload_id = $1 AND part_no = $2
+	err = tx.QueryRow(ctx, `DELETE FROM `+sc+`.upload_parts WHERE upload_id = $1 AND part_no = $2
 		RETURNING file_id`, uploadID, partNo).Scan(&old)
 	if err != nil && err != pgx.ErrNoRows {
 		return nil, false, err
 	}
 	if old.Valid {
-		if err := queueFiles(ctx, tx, old.Int64, nil); err != nil {
+		if err := queueFiles(ctx, tx, sc, old.Int64, nil); err != nil {
 			return nil, false, err
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO s3p.upload_parts
+	if _, err := tx.Exec(ctx, `INSERT INTO `+sc+`.upload_parts
 		(upload_id, part_no, file_id, size, sha256, md5, checksum)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
 		uploadID, partNo, src.FileID, src.Size, src.SHA256, md5sum, checksum); err != nil {

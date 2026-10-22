@@ -60,14 +60,21 @@ SELECT * FROM lake.events;
 
 ## How it works
 
+- **One PostgreSQL schema per bucket (`s3b_<bucket>`).** Every bucket has its
+  own isolated `objects`, `chunks`, `uploads`, and `garbage` tables:
+  - **32 TiB capacity and independent autovacuum per bucket.**
+  - **Instant bucket deletion (`DROP SCHEMA CASCADE`):** returns disk space to
+    the OS in milliseconds with no reaper lag or vacuum bloat.
+  - **Single-bucket snapshots & clones:** dump/restore individual buckets with
+    `pg_dump -n s3b_<bucket>`, or clone a bucket inside PostgreSQL with
+    `pgvs3 clone <src> <dst>` (`PUT /{dst}` with `x-amz-copy-source: /{src}`).
 - **Small objects (≤64 KiB) are one row.** Objects up to 64 KiB live inline in
-  `s3p.objects.inline_data`. A small `PUT` is one SQL call; a small `GET` or
-  `HEAD` is a single primary-key B-tree lookup (~6 µs in PostgreSQL
-  `shared_buffers`).
+  `objects.inline_data`. A small `PUT` is one SQL call; a small `GET` or `HEAD`
+  is a single primary-key B-tree lookup (~6 µs in PostgreSQL `shared_buffers`).
 - **Larger objects pack one row per 8 KB page.** Payloads above 64 KiB are
-  stored in `s3p.chunks` as 8,120-byte rows (`STORAGE EXTERNAL`, no TOAST),
-  filling each 8 KB PostgreSQL page at 99.6% occupancy.
-- **Immutable files, atomic publish.** Writes stream into `s3p.chunks` via
+  stored in the bucket's `chunks` table as 8,120-byte rows (`STORAGE EXTERNAL`,
+  no TOAST), filling each 8 KB PostgreSQL page at 99.6% occupancy.
+- **Immutable files, atomic publish.** Writes stream into `chunks` via
   binary `COPY` under a new `file_id` and publish in the same transaction.
   Interrupted writes leave nothing visible.
 - **Cut-through streaming reads.** Single-file reads up to 64 MiB run as one
@@ -126,8 +133,14 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`,
   `ListMultipartUploads`), `CopyObject`, `GetObjectAttributes`, and
   `partNumber` on `GET`/`HEAD`.
-- **Zero-copy copies:** `CopyObject` and whole-object `UploadPartCopy` share
-  immutable `file_id`s without copying chunk rows.
+- **Zero-copy & server-side copies:** Same-bucket `CopyObject` and whole-object
+  `UploadPartCopy` share immutable `file_id`s without copying chunk rows;
+  cross-bucket `CopyObject` and whole-bucket clones (`PUT /{dst}` with
+  `x-amz-copy-source: /{src}`) copy chunk rows inside PostgreSQL without
+  streaming bytes through the gateway.
+- **Instant bucket drop:** `DELETE /{bucket}?force=true` (or
+  `pgvs3 drop --force <bucket>`) drops `s3b_<bucket>` with `DROP SCHEMA CASCADE`
+  and immediately returns OS disk space.
 - **Checksums:** verifies MD5, CRC32, CRC32C, CRC64NVME, SHA-1, and SHA-256 on
   upload; stores per-part checksums on multipart uploads.
 - **Plain HTTP & static sites:** `GET /{bucket}/{key}` works with any HTTP
@@ -154,9 +167,11 @@ Every flag maps to an environment variable.
 Subcommands:
 
 - `pgvs3 serve` — run the S3/HTTP gateway (default when no subcommand is given).
-- `pgvs3 stat [--json]` — report objects, chunks, logical vs physical size, and
-  queued garbage.
-- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v9, and table settings.
+- `pgvs3 stat [--bucket B] [--json]` — report buckets, objects, chunks, logical
+  vs physical size, and queued garbage.
+- `pgvs3 clone <src-bucket> <dst-bucket>` — clone a bucket inside PostgreSQL.
+- `pgvs3 drop [--force] <bucket>` — drop a bucket schema (`DROP SCHEMA CASCADE`).
+- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v10, and table settings.
 - `pgvs3 reap [--all]` — run garbage collection immediately.
 - `pgvs3 health` — poll `/readyz` for container health checks.
 
@@ -164,8 +179,8 @@ Build the container image with `ko` or pull the published image and OCI Helm
 chart from GHCR:
 
 ```sh
-docker pull ghcr.io/adonm/pgvs3:v0.1.0
-helm install pgvs3 oci://ghcr.io/adonm/charts/pgvs3 --version 0.1.0
+docker pull ghcr.io/adonm/pgvs3:v0.2.0
+helm install pgvs3 oci://ghcr.io/adonm/charts/pgvs3 --version 0.2.0
 
 just image            # local ko.local image
 just image push=true  # multi-arch ghcr.io/adonm/pgvs3 (amd64 + arm64)
@@ -174,15 +189,17 @@ just chart push=true  # OCI Helm chart oci://ghcr.io/adonm/charts/pgvs3
 
 ## Limits to keep in mind
 
-- **32 TiB per database:** `s3p.chunks` is a single PostgreSQL table, capped at
-  32 TiB (`MaxBlockNumber × 8 KB`, ~31.7 TiB of object payload) and ~17.4 TB per
-  object.
-- **Single-writer design:** built for one DuckLake writer and many readers.
-  Scale reads with additional DuckDB workers, gateway pods, and PostgreSQL read
-  replicas.
-- **Disk reclamation:** deleted pages are reused by PostgreSQL after
-  `--reap-grace` and autovacuum, but plain `VACUUM` does not return disk space
-  to the OS without `VACUUM FULL` or `pg_repack`.
+- **32 TiB per bucket:** each bucket's `chunks` table is a single PostgreSQL
+  relation capped at 32 TiB (`MaxBlockNumber × 8 KB`, ~31.7 TiB of object
+  payload) and ~17.4 TB per object.
+- **Single-writer design per lake:** built for one DuckLake writer per bucket
+  and many readers. Scale reads with additional DuckDB workers, gateway pods,
+  and PostgreSQL read replicas.
+- **Disk reclamation:** dropping a bucket (`pgvs3 drop --force <bucket>`)
+  immediately returns disk space to the OS via `DROP SCHEMA CASCADE`. Within a
+  live bucket, deleted pages are reused by PostgreSQL after `--reap-grace` and
+  autovacuum, while returning space to the OS without dropping the bucket
+  requires `VACUUM FULL` or `pg_repack`.
 
 ## Testing and documentation
 

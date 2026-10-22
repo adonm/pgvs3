@@ -206,8 +206,26 @@ func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	if !s.readOnly {
+	if s.readOnly {
+		ok, err := s.store.BucketExists(r.Context(), bucket)
+		if err != nil {
+			if errors.Is(err, store.ErrInvalidBucket) {
+				writeError(w, r, errInvalidBucketName(), s.log)
+				return
+			}
+			writeError(w, r, errInternal(err, s.log), s.log)
+			return
+		}
+		if !ok {
+			writeError(w, r, errNoSuchBucket(), s.log)
+			return
+		}
+	} else {
 		if err := s.store.CreateBucket(r.Context(), bucket); err != nil {
+			if errors.Is(err, store.ErrInvalidBucket) {
+				writeError(w, r, errInvalidBucketName(), s.log)
+				return
+			}
 			writeError(w, r, errInternal(err, s.log), s.log)
 			return
 		}
@@ -217,9 +235,35 @@ func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket strin
 }
 
 func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	src := strings.TrimPrefix(strings.TrimSpace(r.Header.Get("x-amz-copy-source")), "/")
+	if src == "" {
+		src = strings.TrimPrefix(strings.TrimSpace(r.URL.Query().Get("clone")), "/")
+	}
+	if src != "" {
+		if err := s.store.CloneBucket(r.Context(), src, bucket); err != nil {
+			switch {
+			case errors.Is(err, store.ErrInvalidBucket):
+				writeError(w, r, errInvalidBucketName(), s.log)
+			case errors.Is(err, store.ErrNoBucket):
+				writeError(w, r, errNoSuchBucket(), s.log)
+			case errors.Is(err, store.ErrBucketNotEmpty):
+				writeError(w, r, apiErr("BucketNotEmpty", "The destination bucket is not empty.", http.StatusConflict), s.log)
+			default:
+				writeError(w, r, errInternal(err, s.log), s.log)
+			}
+			return
+		}
+		w.Header().Set("Location", "/"+bucket)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	s.log.Debug("create bucket", "bucket", bucket, "content_length", r.ContentLength)
 	if err := s.store.CreateBucket(r.Context(), bucket); err != nil {
 		s.log.Debug("create bucket failed", "bucket", bucket, "err", err)
+		if errors.Is(err, store.ErrInvalidBucket) {
+			writeError(w, r, errInvalidBucketName(), s.log)
+			return
+		}
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return
 	}
@@ -229,8 +273,15 @@ func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket str
 }
 
 func (s *Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	res, err := s.store.DeleteBucket(r.Context(), bucket)
+	q := r.URL.Query()
+	force := q.Get("force") == "true" || q.Get("force") == "1" ||
+		strings.EqualFold(r.Header.Get("x-amz-force-delete"), "true")
+	res, err := s.store.DropBucket(r.Context(), bucket, force)
 	if err != nil {
+		if errors.Is(err, store.ErrInvalidBucket) {
+			writeError(w, r, errInvalidBucketName(), s.log)
+			return
+		}
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return
 	}
@@ -818,11 +869,14 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 }
 
 func (s *Server) metaError(w http.ResponseWriter, r *http.Request, _ string, err error) {
-	if errors.Is(err, store.ErrNotFound) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		writeError(w, r, errNoSuchKey(), s.log)
-		return
+	case errors.Is(err, store.ErrInvalidBucket):
+		writeError(w, r, errInvalidBucketName(), s.log)
+	default:
+		writeError(w, r, errInternal(err, s.log), s.log)
 	}
-	writeError(w, r, errInternal(err, s.log), s.log)
 }
 
 func (s *Server) ingestError(err error) error {
@@ -835,6 +889,8 @@ func (s *Server) ingestError(err error) error {
 		return errPreconditionFailed()
 	case errors.Is(err, store.ErrNoBucket):
 		return errNoSuchBucket()
+	case errors.Is(err, store.ErrInvalidBucket):
+		return errInvalidBucketName()
 	case errors.Is(err, store.ErrNoUpload):
 		return errNoSuchUpload()
 	case errors.Is(err, store.ErrMissingChecksum):

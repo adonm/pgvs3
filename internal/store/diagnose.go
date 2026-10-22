@@ -10,6 +10,7 @@ import (
 type Diagnosis struct {
 	ServerVersion    int    `json:"server_version_num"`
 	Layout           int    `json:"layout"`
+	Buckets          int64  `json:"buckets"`
 	ChunksRelkind    string `json:"chunks_relkind"`
 	ChunksConfigured bool   `json:"chunks_configured"`
 	Objects          int64  `json:"objects"`
@@ -31,27 +32,40 @@ func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 	if layout.Valid {
 		d.Layout = int(layout.Int32)
 	}
-	if err := s.pool.QueryRow(ctx, "SELECT relkind::text FROM pg_class WHERE oid = 's3p.chunks'::regclass").Scan(&d.ChunksRelkind); err != nil {
+	var hasEnsure bool
+	if err := s.pool.QueryRow(ctx, "SELECT to_regprocedure('s3p.ensure_bucket(text)') IS NOT NULL").Scan(&hasEnsure); err != nil {
 		return d, err
 	}
-	want := `reloptions @> ARRAY['toast_tuple_target=8160',
-		'autovacuum_vacuum_scale_factor=0.01',
-		'autovacuum_analyze_scale_factor=0.02',
-		'autovacuum_vacuum_threshold=1000']`
-	query := `SELECT EXISTS (SELECT 1 FROM pg_class WHERE oid = 's3p.chunks'::regclass AND ` + want + `)`
-	if d.ChunksRelkind == "p" {
-		query = `SELECT count(*) > 0 AND count(*) = count(*) FILTER (WHERE c.reloptions @> ARRAY['toast_tuple_target=8160',
-			'autovacuum_vacuum_scale_factor=0.01',
-			'autovacuum_analyze_scale_factor=0.02',
-			'autovacuum_vacuum_threshold=1000'])
-			FROM pg_partition_tree('s3p.chunks') t JOIN pg_class c ON c.oid = t.relid WHERE t.isleaf`
-	}
-	if err := s.pool.QueryRow(ctx, query).Scan(&d.ChunksConfigured); err != nil {
+	d.ChunksRelkind = "r"
+	d.ChunksConfigured = hasEnsure
+	schemas, err := s.bucketSchemas(ctx, "")
+	if err != nil {
 		return d, err
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM s3p.objects),
-		(SELECT count(*) FROM s3p.garbage), pg_database_size(current_database())`).
-		Scan(&d.Objects, &d.GarbageFiles, &d.DatabaseBytes); err != nil {
+	d.Buckets = int64(len(schemas))
+	for _, sc := range schemas {
+		q := quoteIdent(sc)
+		var kind string
+		var ok bool
+		err := s.pool.QueryRow(ctx, `SELECT c.relkind::text,
+			c.reloptions @> ARRAY['toast_tuple_target=8160',
+				'autovacuum_vacuum_scale_factor=0.01',
+				'autovacuum_analyze_scale_factor=0.02',
+				'autovacuum_vacuum_threshold=1000']
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = 'chunks'`, sc).Scan(&kind, &ok)
+		if err != nil || kind != "r" || !ok {
+			d.ChunksConfigured = false
+		}
+		var objs, garb int64
+		if err := s.pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM "+q+".objects), (SELECT count(*) FROM "+q+".garbage)").
+			Scan(&objs, &garb); err == nil {
+			d.Objects += objs
+			d.GarbageFiles += garb
+		}
+	}
+	if err := s.pool.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&d.DatabaseBytes); err != nil {
 		return d, err
 	}
 	return d, nil

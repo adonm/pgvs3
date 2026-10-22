@@ -12,10 +12,14 @@ const MaxInlineBytes = 65536
 
 // PutInline publishes an object up to 64 KiB in one SQL round trip. The body
 // is already verified by the caller; conditions and old-file garbage collection
-// happen inside s3p.put_inline.
+// happen inside the bucket schema's put_inline function.
 func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, cond Condition, ifMatch string, userMeta []string, contentType string) (*Meta, error) {
 	if int64(len(data)) > MaxInlineBytes {
 		return nil, ErrInlineTooLarge
+	}
+	sc, err := bucketSQLIdent(bucket)
+	if err != nil {
+		return nil, err
 	}
 	sumMD5 := md5.Sum(data)
 	sumSHA := sha256.Sum256(data)
@@ -34,10 +38,17 @@ func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, 
 	if userMeta == nil {
 		userMeta = []string{}
 	}
+	query := "SELECT " + sc + ".put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9)"
 	var result string
-	err := s.pool.QueryRow(ctx,
-		"SELECT s3p.put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-		bucket, key, data, sumSHA[:], etag, userMeta, contentType, condText, match, "on").Scan(&result)
+	err = s.pool.QueryRow(ctx, query,
+		key, data, sumSHA[:], etag, userMeta, contentType, condText, match, "on").Scan(&result)
+	if isMissingBucketSchema(err) {
+		if err := s.CreateBucket(ctx, bucket); err != nil {
+			return nil, err
+		}
+		err = s.pool.QueryRow(ctx, query,
+			key, data, sumSHA[:], etag, userMeta, contentType, condText, match, "on").Scan(&result)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -50,6 +61,7 @@ func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, 
 	default:
 		return nil, ErrPrecondition
 	}
+	s.knownBuckets.Store(bucket, struct{}{})
 	m := Meta{
 		Size: int64(len(data)), SHA256: sumSHA[:], ETag: etag,
 		UserMetadata: userMeta, ContentType: contentType, CreatedAt: time.Now(),

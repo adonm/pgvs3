@@ -14,14 +14,11 @@ RUN="interop-$(date +%s)-$$"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-if ! command -v rclone >/dev/null 2>&1; then
-  rclone() { mise exec rclone -- rclone "$@"; }
-fi
-if ! command -v restic >/dev/null 2>&1; then
-  restic() { mise exec restic -- restic "$@"; }
-fi
+RCLONE_BIN=$(mise which rclone 2>/dev/null || command -v rclone || true)
+RESTIC_BIN=$(mise which restic 2>/dev/null || command -v restic || true)
 
-if command -v rclone >/dev/null 2>&1; then
+if [ -n "$RCLONE_BIN" ]; then
+  rclone() { "$RCLONE_BIN" "$@"; }
   export RCLONE_CONFIG_PGVS3_TYPE=s3
   export RCLONE_CONFIG_PGVS3_PROVIDER=Other
   export RCLONE_CONFIG_PGVS3_ENV_AUTH=false
@@ -46,7 +43,8 @@ else
   echo "SKIP rclone: not installed" >&2
 fi
 
-if command -v restic >/dev/null 2>&1; then
+if [ -n "$RESTIC_BIN" ]; then
+  restic() { "$RESTIC_BIN" "$@"; }
   export AWS_ACCESS_KEY_ID="$PGVS3_ACCESS_KEY"
   export AWS_SECRET_ACCESS_KEY="$PGVS3_SECRET_KEY"
   export AWS_DEFAULT_REGION=us-east-1

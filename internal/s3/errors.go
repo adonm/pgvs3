@@ -34,6 +34,10 @@ func errNoSuchBucket() *APIError {
 	return apiErr("NoSuchBucket", "The specified bucket does not exist.", http.StatusNotFound)
 }
 
+func errInvalidBucketName() *APIError {
+	return apiErr("InvalidBucketName", "The specified bucket is not valid.", http.StatusBadRequest)
+}
+
 func errNoSuchUpload() *APIError {
 	return apiErr("NoSuchUpload", "The specified multipart upload does not exist.", http.StatusNotFound)
 }

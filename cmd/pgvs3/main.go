@@ -42,6 +42,12 @@ func run() int {
 	if i := indexArg(args, "stat"); i >= 0 {
 		return stat(removeArg(args, i))
 	}
+	if i := indexArg(args, "clone"); i >= 0 {
+		return cloneBucket(removeArg(args, i))
+	}
+	if i := indexArg(args, "drop"); i >= 0 {
+		return dropBucket(removeArg(args, i))
+	}
 	if i := indexArg(args, "serve"); i >= 0 {
 		args = removeArg(args, i)
 	}
@@ -121,6 +127,7 @@ func serve(args []string) int {
 func stat(args []string) int {
 	fs := flag.NewFlagSet("stat", flag.ContinueOnError)
 	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	bucket := fs.String("bucket", "", "limit stats to one bucket")
 	asJSON := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -133,7 +140,7 @@ func stat(args []string) int {
 		return 1
 	}
 	defer st.Close()
-	s, err := st.Stat(ctx)
+	s, err := st.StatBucket(ctx, *bucket)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -152,9 +159,82 @@ func stat(args []string) int {
 		_ = enc.Encode(s)
 		return 0
 	}
-	fmt.Printf("objects=%d chunks=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
-		s.Objects, s.Chunks, s.LogicalBytes>>20, s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
+	fmt.Printf("buckets=%d objects=%d chunks=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
+		s.Buckets, s.Objects, s.Chunks, s.LogicalBytes>>20, s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
 	return 0
+}
+
+func cloneBucket(args []string) int {
+	fs := flag.NewFlagSet("clone", flag.ContinueOnError)
+	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: pgvs3 clone [--url URL] <src-bucket> <dst-bucket>")
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+	if err := st.CheckLayout(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := st.CloneBucket(ctx, rest[0], rest[1]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Printf("cloned=%s->%s\n", rest[0], rest[1])
+	return 0
+}
+
+func dropBucket(args []string) int {
+	fs := flag.NewFlagSet("drop", flag.ContinueOnError)
+	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	force := fs.Bool("force", false, "drop non-empty bucket and reclaim its schema immediately")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: pgvs3 drop [--url URL] [--force] <bucket>")
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+	if err := st.CheckLayout(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	res, err := st.DropBucket(ctx, rest[0], *force)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	switch res {
+	case store.BucketDeleted:
+		fmt.Printf("dropped=%s\n", rest[0])
+		return 0
+	case store.BucketNotEmpty:
+		fmt.Fprintf(os.Stderr, "bucket %s is not empty (pass --force to drop its schema)\n", rest[0])
+		return 1
+	default:
+		fmt.Fprintf(os.Stderr, "bucket %s does not exist\n", rest[0])
+		return 1
+	}
 }
 
 func health(args []string) int {
@@ -234,8 +314,8 @@ func doctor(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("server_version_num=%d layout=%d chunks=%s configured=%v objects=%d garbage=%d db=%d MiB\n",
-		d.ServerVersion, d.Layout, d.ChunksRelkind, d.ChunksConfigured, d.Objects, d.GarbageFiles, d.DatabaseBytes>>20)
+	fmt.Printf("server_version_num=%d layout=%d buckets=%d chunks=%s configured=%v objects=%d garbage=%d db=%d MiB\n",
+		d.ServerVersion, d.Layout, d.Buckets, d.ChunksRelkind, d.ChunksConfigured, d.Objects, d.GarbageFiles, d.DatabaseBytes>>20)
 	if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured {
 		return 1
 	}

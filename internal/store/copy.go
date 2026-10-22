@@ -10,8 +10,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// CopyOptions controls a metadata-only CopyObject. The bytes are shared; the
-// GC keeps a file while any object still references it.
+// CopyOptions controls a CopyObject. Same-bucket copies are metadata-only
+// (bytes are shared; GC keeps a file while any object references it).
+// Cross-bucket copies duplicate chunk rows inside PostgreSQL without streaming
+// bytes through the gateway.
 type CopyOptions struct {
 	ReplaceMetadata bool
 	UserMetadata    []string
@@ -22,16 +24,26 @@ type CopyOptions struct {
 	DestIfNone      string
 }
 
-// Copy creates or replaces dst with src's bytes. No chunk rows move.
+// Copy creates or replaces dst with src's bytes.
 func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, opts CopyOptions) (*Meta, error) {
+	srcSchema, err := bucketSQLIdent(srcBucket)
+	if err != nil {
+		return nil, err
+	}
+	dstSchema, err := bucketSQLIdent(dstBucket)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := s.knownBuckets.Load(dstBucket); !ok {
+		if err := s.CreateBucket(ctx, dstBucket); err != nil {
+			return nil, err
+		}
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	if _, err := tx.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", dstBucket); err != nil {
-		return nil, err
-	}
 	if err := lockTwo(ctx, tx, srcBucket, srcKey, dstBucket, dstKey); err != nil {
 		return nil, err
 	}
@@ -42,10 +54,10 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	var srcHasInline bool
 	err = tx.QueryRow(ctx, `SELECT file_id, size, sha256, etag, user_metadata, content_type,
 		parts, part_ends, EXTRACT(EPOCH FROM created_at)::float8, inline_data, inline_data IS NOT NULL
-		FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`, srcBucket, srcKey).
+		FROM `+srcSchema+`.objects WHERE key = $1 FOR UPDATE`, srcKey).
 		Scan(&srcFile, &src.Size, &src.SHA256, &src.ETag, &src.UserMetadata, &src.ContentType,
 			&src.Parts, &src.PartEnds, &srcEpoch, &srcInline, &srcHasInline)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -66,8 +78,15 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	var oldFile pgtype.Int8
 	var oldParts []int64
 	var destETag string
-	err = tx.QueryRow(ctx, `SELECT file_id, parts, etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`,
-		dstBucket, dstKey).Scan(&oldFile, &oldParts, &destETag)
+	err = tx.QueryRow(ctx, `SELECT file_id, parts, etag FROM `+dstSchema+`.objects WHERE key = $1 FOR UPDATE`,
+		dstKey).Scan(&oldFile, &oldParts, &destETag)
+	if isMissingBucketSchema(err) {
+		_ = tx.Rollback(ctx)
+		if err := s.CreateBucket(ctx, dstBucket); err != nil {
+			return nil, err
+		}
+		return s.Copy(ctx, srcBucket, srcKey, dstBucket, dstKey, opts)
+	}
 	destExists := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
@@ -79,37 +98,108 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	if opts.ReplaceMetadata {
 		meta, ct = opts.UserMetadata, opts.ContentType
 	}
-	var srcFileVal any
-	if srcFile.Valid {
-		srcFileVal = srcFile.Int64
+	dstFileID := src.FileID
+	dstParts := src.Parts
+	idMap := map[int64]int64{}
+	if srcBucket != dstBucket && src.Inline == nil && srcFile.Valid {
+		if len(src.Parts) == 0 {
+			newID, err := s.nextFileID(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(ctx,
+				"INSERT INTO "+dstSchema+".chunks (file_id, no, data) SELECT $1, no, data FROM "+srcSchema+".chunks WHERE file_id = $2",
+				newID, src.FileID); err != nil {
+				return nil, err
+			}
+			dstFileID = newID
+		} else {
+			dstParts = make([]int64, len(src.Parts))
+			for i, oldPartID := range src.Parts {
+				newID, ok := idMap[oldPartID]
+				if !ok {
+					newID, err = s.nextFileID(ctx)
+					if err != nil {
+						return nil, err
+					}
+					if _, err := tx.Exec(ctx,
+						"INSERT INTO "+dstSchema+".chunks (file_id, no, data) SELECT $1, no, data FROM "+srcSchema+".chunks WHERE file_id = $2",
+						newID, oldPartID); err != nil {
+						return nil, err
+					}
+					idMap[oldPartID] = newID
+				}
+				dstParts[i] = newID
+			}
+			dstFileID = dstParts[0]
+		}
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM s3p.object_part_checksums WHERE bucket = $1 AND key = $2", dstBucket, dstKey); err != nil {
+	var dstFileVal any
+	if srcFile.Valid {
+		dstFileVal = dstFileID
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM "+dstSchema+".object_part_checksums WHERE key = $1", dstKey); err != nil {
 		return nil, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO s3p.objects
-		(bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-		ON CONFLICT (bucket, key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size,
+	_, err = tx.Exec(ctx, `INSERT INTO `+dstSchema+`.objects
+		(key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size,
 		  sha256 = EXCLUDED.sha256, etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
 		  content_type = EXCLUDED.content_type, parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends,
 		  inline_data = EXCLUDED.inline_data, created_at = now()`,
-		dstBucket, dstKey, srcFileVal, src.Size, src.SHA256, src.ETag, meta, ct, src.Parts, src.PartEnds, src.Inline)
+		dstKey, dstFileVal, src.Size, src.SHA256, src.ETag, meta, ct, dstParts, src.PartEnds, src.Inline)
 	if err != nil {
 		return nil, err
 	}
-	if srcBucket != dstBucket || srcKey != dstKey {
-		if _, err := tx.Exec(ctx, `INSERT INTO s3p.object_part_checksums
-			(bucket, key, part_no, file_id, algorithm, value)
-			SELECT $3, $4, part_no, file_id, algorithm, value
-			FROM s3p.object_part_checksums WHERE bucket = $1 AND key = $2
-			ON CONFLICT (bucket, key, part_no) DO UPDATE SET file_id = EXCLUDED.file_id,
+	if srcBucket == dstBucket && srcKey != dstKey {
+		if _, err := tx.Exec(ctx, `INSERT INTO `+dstSchema+`.object_part_checksums
+			(key, part_no, file_id, algorithm, value)
+			SELECT $2, part_no, file_id, algorithm, value
+			FROM `+srcSchema+`.object_part_checksums WHERE key = $1
+			ON CONFLICT (key, part_no) DO UPDATE SET file_id = EXCLUDED.file_id,
 			  algorithm = EXCLUDED.algorithm, value = EXCLUDED.value`,
-			srcBucket, srcKey, dstBucket, dstKey); err != nil {
+			srcKey, dstKey); err != nil {
 			return nil, err
+		}
+	} else if srcBucket != dstBucket && len(dstParts) > 0 {
+		rows, err := tx.Query(ctx,
+			"SELECT part_no, file_id, algorithm, value FROM "+srcSchema+".object_part_checksums WHERE key = $1",
+			srcKey)
+		if err != nil {
+			return nil, err
+		}
+		type checkRow struct {
+			no       int32
+			fileID   int64
+			alg, val string
+		}
+		var checks []checkRow
+		for rows.Next() {
+			var c checkRow
+			if err := rows.Scan(&c.no, &c.fileID, &c.alg, &c.val); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if mapped, ok := idMap[c.fileID]; ok {
+				c.fileID = mapped
+			}
+			checks = append(checks, c)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		for _, c := range checks {
+			if _, err := tx.Exec(ctx, `INSERT INTO `+dstSchema+`.object_part_checksums
+				(key, part_no, file_id, algorithm, value) VALUES ($1,$2,$3,$4,$5)`,
+				dstKey, c.no, c.fileID, c.alg, c.val); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if destExists && oldFile.Valid {
-		if err := queueFiles(ctx, tx, oldFile.Int64, oldParts); err != nil {
+		if err := queueFiles(ctx, tx, dstSchema, oldFile.Int64, oldParts); err != nil {
 			return nil, err
 		}
 	}
@@ -117,6 +207,8 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 		return nil, err
 	}
 	out := src
+	out.FileID = dstFileID
+	out.Parts = dstParts
 	out.UserMetadata, out.ContentType = meta, ct
 	out.CreatedAt = time.Now()
 	return &out, nil
