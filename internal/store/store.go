@@ -32,7 +32,7 @@ const (
 	wholeReadMax = 64 << 20
 	partRows     = smallMax/RowBytes + 2
 	chunkSize    = 256 << 10
-	reapRows     = 65536
+	ReapRows     = 65536
 )
 
 // Store is the PostgreSQL-backed object store. Metadata and inline objects
@@ -342,7 +342,13 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 	} else if kind != "r" || !hasAll(opts) {
 		return fmt.Errorf("s3p.chunks lacks the expected inline storage and autovacuum settings")
 	}
-	for _, relation := range []string{"s3p.garbage", "s3p.objects_parts_idx", "s3p.upload_parts"} {
+	for _, relation := range []string{
+		"s3p.garbage",
+		"s3p.objects_file_id_idx",
+		"s3p.objects_parts_idx",
+		"s3p.upload_parts",
+		"s3p.upload_parts_file_id_idx",
+	} {
 		var exists bool
 		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", relation).Scan(&exists); err != nil {
 			return err
@@ -1132,7 +1138,10 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 	SELECT DISTINCT d.file_id FROM dead d
 	WHERE d.file_id IS NOT NULL
 	  AND NOT EXISTS (SELECT 1 FROM s3p.objects o
-	    WHERE (o.file_id = d.file_id OR d.file_id = ANY(o.parts))
+	    WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id
+	      AND NOT (o.bucket = $1 AND o.key = ANY($2::text[])))
+	  AND NOT EXISTS (SELECT 1 FROM s3p.objects o
+	    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
 	      AND NOT (o.bucket = $1 AND o.key = ANY($2::text[])))
 	  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = d.file_id)
 	ON CONFLICT DO NOTHING`, bucket, keys)
@@ -1469,7 +1478,7 @@ func (s *Store) Stat(ctx context.Context) (Stats, error) {
 }
 
 // Maintain expires abandoned multipart uploads and reaps garbage older than
-// grace, at most reapRows chunk rows per run. A transaction-scoped try-lock
+// grace, at most ReapRows chunk rows per run. A session-level try-lock
 // serialises reapers across gateways.
 func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	s.maintenanceRuns.Add(1)
@@ -1492,7 +1501,7 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	if expired > 0 {
 		s.log.Info("expired multipart uploads", "count", expired)
 	}
-	remaining := reapRows
+	remaining := ReapRows
 	for remaining > 0 {
 		n, err := s.reapOne(ctx, conn.Conn(), grace, remaining)
 		if err != nil {
@@ -1524,7 +1533,8 @@ func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, grace time.Duration
 		return 0, err
 	}
 	var referenced bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM s3p.objects WHERE file_id = $1 OR $1 = ANY(parts))
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM s3p.objects WHERE file_id IS NOT NULL AND file_id = $1)
+		OR EXISTS (SELECT 1 FROM s3p.objects WHERE parts IS NOT NULL AND parts @> ARRAY[$1::int8])
 		OR EXISTS (SELECT 1 FROM s3p.upload_parts WHERE file_id = $1)`, fileID).Scan(&referenced); err != nil {
 		return 0, err
 	}

@@ -195,17 +195,15 @@ func reap(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	before, _ := st.Stat(ctx)
 	for i := 0; ; i++ {
+		before := st.ReapedRows()
 		if err := st.Maintain(ctx, *grace); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		after, _ := st.Stat(ctx)
-		if !*all || after.GarbageFiles == 0 || after.GarbageFiles >= before.GarbageFiles || i >= 100 {
+		if !*all || st.ReapedRows() == before || i >= 1000 {
 			break
 		}
-		before = after
 	}
 	after, err := st.Stat(ctx)
 	if err != nil {
@@ -255,11 +253,21 @@ func maintain(ctx context.Context, st *store.Store, grace, interval time.Duratio
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-			if err := st.Maintain(runCtx, grace); err != nil && ctx.Err() == nil {
-				log.Error("maintenance", "err", err)
+			for ctx.Err() == nil {
+				before := st.ReapedRows()
+				runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				err := st.Maintain(runCtx, grace)
+				cancel()
+				if err != nil {
+					if ctx.Err() == nil {
+						log.Error("maintenance", "err", err)
+					}
+					break
+				}
+				if st.ReapedRows()-before < store.ReapRows {
+					break
+				}
 			}
-			cancel()
 		}
 	}
 }

@@ -79,8 +79,9 @@ way they are.
   `--reap-grace` (default 10 minutes) so in-flight readers can finish without
   holding long transactions.
 - **Bounded GC passes:** Every minute, one gateway acquires a cluster-wide
-  `pg_try_advisory_lock` and deletes at most 65,536 chunk rows (~508 MiB) per
-  pass.
+  `pg_try_advisory_lock` and deletes up to 65,536 chunk rows (~508 MiB) per
+  pass; if a pass hits the row cap, it immediately chains additional passes
+  until the eligible backlog is drained.
 - **Space reuse:** Freed pages are reused by subsequent writes once autovacuum
   marks them dead. Long-running snapshots hold back vacuum horizon; avoid
   multi-hour open transactions on the storage database.

@@ -47,8 +47,9 @@ pgvs3 reap   --url "$PGVS3_URL" --all    # drain all eligible garbage outside th
 
 In normal operation, one gateway per cluster runs background maintenance every
 minute (coordinated via `pg_try_advisory_lock`), expiring abandoned multipart
-uploads and reaping up to 65,536 chunk rows (~508 MiB) of files deleted longer
-ago than `--reap-grace` (default `10m`).
+uploads and reaping up to 65,536 chunk rows (~508 MiB) per pass of files
+deleted longer ago than `--reap-grace` (default `10m`), chaining additional
+passes immediately when a pass saturates its row budget.
 
 ## Backup and restore
 

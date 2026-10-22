@@ -493,7 +493,8 @@ func queueFileIDs(ctx context.Context, tx pgx.Tx, ids []int64) error {
 	_, err := tx.Exec(ctx, `INSERT INTO s3p.garbage (file_id)
 		SELECT f FROM unnest($1::int8[]) AS f
 		WHERE f <> 0
-		  AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f OR f = ANY(o.parts))
+		  AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
+		  AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
 		  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
 		ON CONFLICT DO NOTHING`, ids)
 	return err

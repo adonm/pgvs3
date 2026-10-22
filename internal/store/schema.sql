@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS s3p.objects (
   )
 ) WITH (autovacuum_vacuum_scale_factor = 0.02);
 ALTER SEQUENCE s3p.file_ids OWNED BY s3p.objects.file_id;
+CREATE INDEX IF NOT EXISTS objects_file_id_idx ON s3p.objects (file_id)
+  WHERE file_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS objects_parts_idx ON s3p.objects USING gin (parts)
   WHERE parts IS NOT NULL;
 
@@ -104,6 +106,7 @@ CREATE TABLE IF NOT EXISTS s3p.upload_parts (
     size <= 2147483648::int8 * 8120 AND octet_length(sha256) = 32 AND
     octet_length(md5) = 16 AND (checksum IS NULL OR octet_length(checksum) BETWEEN 1 AND 128))
 );
+CREATE INDEX IF NOT EXISTS upload_parts_file_id_idx ON s3p.upload_parts (file_id);
 CREATE INDEX IF NOT EXISTS uploads_by_age ON s3p.uploads (created_at, upload_id);
 
 -- A file becomes garbage in the *same transaction* that drops its final
@@ -139,7 +142,9 @@ BEGIN
     RETURNING file_id INTO old;
   IF old IS NOT NULL THEN
     INSERT INTO s3p.garbage (file_id)
-    SELECT old WHERE NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = old OR old = ANY(o.parts))
+    SELECT old
+    WHERE NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id IS NOT NULL AND o.file_id = old)
+      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[old])
       AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = old)
     ON CONFLICT DO NOTHING;
   END IF;
@@ -182,11 +187,12 @@ BEGIN
     etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
     content_type = EXCLUDED.content_type, parts = NULL, part_ends = NULL,
     inline_data = NULL, created_at = now();
-  IF found_old THEN
+  IF found_old AND old_file IS NOT NULL THEN
     INSERT INTO s3p.garbage (file_id)
     SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
     WHERE f IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f OR f = ANY(o.parts))
+      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
+      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
       AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
     ON CONFLICT DO NOTHING;
   END IF;
@@ -237,11 +243,12 @@ BEGIN
     etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
     content_type = EXCLUDED.content_type, parts = NULL, part_ends = NULL,
     inline_data = EXCLUDED.inline_data, created_at = now();
-  IF found_old THEN
+  IF found_old AND old_file IS NOT NULL THEN
     INSERT INTO s3p.garbage (file_id)
     SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
     WHERE f IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f OR f = ANY(o.parts))
+      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
+      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
       AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
     ON CONFLICT DO NOTHING;
   END IF;
@@ -293,7 +300,7 @@ BEGIN
     SELECT file_id INTO victim_file FROM s3p.garbage
       ORDER BY queued_at, file_id LIMIT 1 FOR UPDATE SKIP LOCKED;
     EXIT WHEN victim_file IS NULL;
-    IF EXISTS (SELECT 1 FROM s3p.objects WHERE file_id = victim_file) OR
+    IF EXISTS (SELECT 1 FROM s3p.objects WHERE file_id IS NOT NULL AND file_id = victim_file) OR
        EXISTS (SELECT 1 FROM s3p.objects WHERE parts IS NOT NULL AND parts @> ARRAY[victim_file]) OR
        EXISTS (SELECT 1 FROM s3p.upload_parts WHERE file_id = victim_file) THEN
       -- A shared CopyObject/UploadPartCopy file can be queued by an older
