@@ -1,44 +1,41 @@
 # pgvs3 — S3 on PostgreSQL
 
-pgvs3 is a small, fast S3-compatible gateway that stores objects as rows in
-PostgreSQL. It is built to be DuckLake's object store: DuckLake keeps its
-catalog in PostgreSQL, and with pgvs3 the data files live there too, so every
-DuckDB that attaches the catalog sees the same tables and the same data.
+pgvs3 is a small, fast S3 and HTTP gateway that stores objects as rows in
+PostgreSQL. It is built for [DuckLake](https://ducklake.select/): DuckLake
+already keeps its catalog in PostgreSQL, and with pgvs3 the Parquet files live
+there too — one database to run, back up, and replicate.
 
-The gateway is Go, stateless over PostgreSQL, and runs as a distroless static
-container built with [ko](https://ko.build/). It uses the v9 storage layout
-(small objects are stored inline in `s3p.objects`).
+The gateway is written in Go, holds zero in-process state, and ships as a
+~14 MB distroless static container built with [ko](https://ko.build/).
 
-> **No request authentication.** pgvs3 accepts signed and unsigned requests
-> without validation. Bind it to a private network or put it behind a service
-> mesh; never expose the S3 or web listener publicly.
+> **Private-network only.** pgvs3 does not validate S3 signatures or
+> credentials; signed and unsigned requests are both accepted. Run it on a
+> loopback interface, private VPC/VLAN, or behind a service mesh that enforces
+> access control and TLS.
 
-**Status: early alpha, no releases.** Any storage layout change requires a fresh
-database; there are no migrations. Use disposable databases only.
-
-> Postgres is all you need. ;P — for durable bytes and metadata here; DuckDB
-> does the analytics.
+**Status: early alpha.** Storage layout changes require a fresh database (no
+in-place migrations).
 
 ## Quick start
 
-Needs [mise](https://mise.jdx.dev/) and Docker (or PostgreSQL 18+ with a
-`--url`).
+Requires [mise](https://mise.jdx.dev/) and Docker (or an existing PostgreSQL
+18+ instance).
 
 ```sh
 just setup
-just dev-db                 # PostgreSQL 18 on 127.0.0.1:5432
+just dev-db   # starts PostgreSQL 18 on 127.0.0.1:5432
 go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmode=disable' serve
 ```
 
-Buckets auto-create on write, and the same `:8014` listener serves both S3 and
-plain HTTP / static websites:
+Buckets are created automatically on first write. The single `:8014` port
+serves both S3 clients and plain HTTP:
 
 ```sh
 curl -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
 curl http://127.0.0.1:8014/lake/README.md
 ```
 
-DuckDB 2.0+:
+### Use from DuckDB 2.0+
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
@@ -49,7 +46,7 @@ CREATE SECRET (
 SELECT * FROM read_text('s3://lake/README.md') LIMIT 1;
 ```
 
-DuckLake 1.1 on DuckDB 2.0 (catalog and data in the same PostgreSQL):
+### Use with DuckLake (catalog + files in the same PostgreSQL)
 
 ```sql
 INSTALL ducklake; INSTALL postgres; LOAD ducklake; LOAD postgres;
@@ -61,213 +58,148 @@ INSERT INTO lake.events VALUES (42, DATE '2026-09-01', 1.0);
 SELECT * FROM lake.events;
 ```
 
-## Why it is fast
+## How it works
 
-The layout is deliberately narrow:
+- **Small objects (≤64 KiB) are one row.** Objects up to 64 KiB live inline in
+  `s3p.objects.inline_data`. A small `PUT` is one SQL call; a small `GET` or
+  `HEAD` is a single primary-key B-tree lookup (~6 µs in PostgreSQL
+  `shared_buffers`).
+- **Larger objects pack one row per 8 KB page.** Payloads above 64 KiB are
+  stored in `s3p.chunks` as 8,120-byte rows (`STORAGE EXTERNAL`, no TOAST),
+  filling each 8 KB PostgreSQL page at 99.6% occupancy.
+- **Immutable files, atomic publish.** Writes stream into `s3p.chunks` via
+  binary `COPY` under a new `file_id` and publish in the same transaction.
+  Interrupted writes leave nothing visible.
+- **Cut-through streaming reads.** Single-file reads up to 64 MiB run as one
+  query; larger and multipart objects stream in 8 MiB parallel pieces under one
+  repeatable-read snapshot so concurrent overwrites cannot corrupt an in-flight
+  read.
+- **PostgreSQL `shared_buffers` is the only cache.** Gateways hold no local
+  metadata or byte cache. Every gateway pod sees writes immediately with strict
+  MVCC consistency and zero invalidation lag; `--read-only` gateways can run
+  against PostgreSQL streaming standbys for local-AZ reads.
+- **Built-in garbage collection.** Overwritten and deleted files stay readable
+  for `--reap-grace` (default 10 minutes), then an in-process reaper removes
+  dead chunk rows in bounded passes. No `pg_cron` extension is needed.
 
-- **Small objects are one row.** Objects up to 64 KiB live in
-  `s3p.objects.inline_data` with `file_id = NULL`; a small PUT is one SQL call
-  and a small GET is one primary-key lookup, with no chunk rows.
-- **Larger objects use one 8 KB page per chunk row.** A chunk is
-  `file_id(8) + no(4) + varlena(4) + 8120` bytes plus the 24-byte tuple header.
-  With `toast_tuple_target = 8160` and `STORAGE EXTERNAL`, one row fills one
-  page at 99.6% occupancy with no TOAST and no detoasting on read.
-- **Files are immutable.** A write streams rows under a new `file_id`; an
-  overwrite publishes a new `file_id`. `file_id` is the cache version tag, so a
-  warm DuckDB never revalidates bytes it already holds.
-- **Reads are primary-key range queries.** A single-file read up to 64 MiB is
-  one query; responses up to 8 MiB stream synchronously, while longer reads use
-  a cut-through goroutine so PostgreSQL fetch overlaps socket writes. Larger
-  spans/multipart reads use one repeatable-read snapshot so an overwrite cannot
-  remove later rows mid-response.
-- **Writes are one binary `COPY`.** The body is hashed and framed as it
-  arrives; chunks and the object row commit in the same transaction. A failed
-  or abandoned write publishes nothing.
-- **Autovacuum is tuned for whole-file deletes** (`scale_factor = 0.01`,
-  `threshold = 1000`), and the unordered chunks table uses bitmap heap scans
-  with PostgreSQL 18 read-ahead. Ordered listings temporarily enable index
-  scans.
-- **Maintenance is in-process.** A background reaper removes at most 65,536
-  chunk rows per run after a 10-minute grace, serialised across gateways with
-  an advisory try-lock. pg_cron is not required.
-- **The connection pool is most-recently-used first**, keeping TCP slow-start
-  out of the hot path.
+See [docs/performance.md](docs/performance.md) for the full storage and query
+design.
 
-`docs/performance.md` maps each pgvfs technique to the implementation.
+## Performance at a glance
 
-## Performance and multi-gateway caching
+Measured with `just load` against PostgreSQL 18 in Docker (`shared_buffers=1GB`)
+on a 16-core host (6-vCPU VM numbers in [docs/benchmarks.md](docs/benchmarks.md)):
 
-PostgreSQL's `shared_buffers` on `s3p.objects` is the single shared cache
-across all gateways:
+- **Latency (1 worker):** `0.17 ms` p50 for 4 KiB `GET`, `0.15 ms` for `HEAD`,
+  and `0.78 ms` for durable 4 KiB `PUT` (`synchronous_commit = on`).
+- **Small-object throughput:** **32.5k `GET`/s**, **30.2k `HEAD`/s**, and
+  **17.5k durable 4 KiB `PUT`/s**.
+- **Large-object bandwidth (64 MiB):** **3.45 GiB/s** read (16 workers) and
+  **458 MiB/s** write (8 workers).
 
-- Metadata and small objects (≤64 KiB) live in `s3p.objects`, indexed by
-  `(bucket, key)`. A primary-key `Index Scan` in `shared_buffers` takes ~6 µs
-  inside PostgreSQL (**0.17 ms GET / 0.15 ms HEAD p50** over HTTP at 1 worker,
-  reaching **32.5k GET/s** and **30.2k HEAD/s** on 16 cores; 0.47 ms and
-  8.2k–9.2k/s on a 6-vCPU VM).
-- Removing `LISTEN/NOTIFY` and in-process caches eliminates commit-time
-  notification lock contention in PostgreSQL: durable 4 KiB PUTs reach
-  **17.5k/s** at 64 workers on 16 cores (**3.7k/s** on 6 vCPU,
-  `synchronous_commit = on`); 64 MiB reads stream at **3.45 GiB/s** and writes
-  at **458 MiB/s**.
-- Gateways hold **zero in-process object or metadata state**. Any number of
-  gateway containers can run behind a load balancer or Kubernetes `Deployment`
-  with strict MVCC consistency and zero invalidation lag; `--read-only`
-  gateways can point at PostgreSQL streaming standbys for local-AZ read scale.
+**Compared with AWS S3 Express One Zone (`us-east-1`):**
 
-Versus S3 Express One Zone (`us-east-1`), pgvs3 is ~10× lower latency on
-loopback/LAN (0.17 ms vs single-digit ms) and charges $0 per request, while
-one 16-core node is ~6× below Express's 200k GET/s and 100k PUT/s default
-bucket quotas. For 500 GB written and read once a month, Express is cheaper on
-64 MiB Parquet files ($57/mo vs $100–200/mo dedicated, or $40/mo gp3 on an
-existing Postgres), while pgvs3 wins on 122M 4 KiB objects ($165/mo dedicated
-or $40/mo existing vs $199/mo on Express due to $1.13/M PUT fees). See
+1. **Latency:** pgvs3 is ~10× faster on loopback/LAN (`0.17 ms` vs
+   single-digit ms).
+2. **Read ceiling:** one 16-core pgvs3 node (`32.5k GET/s`) is ~6× below
+   Express's `200k GET/s` default bucket quota (`2M/s` max).
+3. **Write ceiling:** pgvs3 (`17.5k PUT/s`) is ~6× below Express's `100k PUT/s`
+   default bucket quota (`200k/s` max).
+4. **Bandwidth:** pgvs3 streams `3.45 GiB/s` from cache/NVMe (`125–1,000 MiB/s`
+   on cold EBS gp3); Express scales elastically with client network.
+5. **500 GB of 64 MiB Parquet files (1× W+R/mo):** Express is ~$57/mo vs
+   ~$100–200/mo for a dedicated pgvs3 node, or $40/mo in gp3 disk on an
+   existing PostgreSQL.
+6. **500 GB of 122M 4 KiB objects (1× W+R/mo):** Express rises to ~$199/mo due
+   to `$1.13/M` `PUT` fees; pgvs3 charges $0 per request and stays at ~$165/mo
+   dedicated or $40/mo on an existing PostgreSQL.
+
+Full tables and DuckDB `httpfs` benchmarks are in
 [docs/benchmarks.md](docs/benchmarks.md).
 
-## S3 surface
+## S3 and HTTP support
 
-`GET` (ranges and conditional), `HEAD`, `PUT`, `DELETE`, `DeleteObjects`,
-`ListObjectsV2`, `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket`,
-multipart uploads, `CopyObject`, `UploadPartCopy`, `GetObjectAttributes`,
-`ListParts`, `ListMultipartUploads` and `partNumber` on GET/HEAD.
+- **Supported S3 operations:** `GET` (byte ranges and conditional headers),
+  `HEAD`, `PUT`, `DELETE`, `DeleteObjects`, `ListObjectsV2`, `ListBuckets`,
+  `CreateBucket`, `HeadBucket`, `DeleteBucket`, multipart uploads
+  (`CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`,
+  `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`,
+  `ListMultipartUploads`), `CopyObject`, `GetObjectAttributes`, and
+  `partNumber` on `GET`/`HEAD`.
+- **Zero-copy copies:** `CopyObject` and whole-object `UploadPartCopy` share
+  immutable `file_id`s without copying chunk rows.
+- **Checksums:** verifies MD5, CRC32, CRC32C, CRC64NVME, SHA-1, and SHA-256 on
+  upload; stores per-part checksums on multipart uploads.
+- **Plain HTTP & static sites:** `GET /{bucket}/{key}` works with any HTTP
+  client or browser. Trailing slashes resolve to `index.html`, plain
+  `GET /{bucket}` serves `/{bucket}/index.html` when present, and `Content-Type`
+  falls back to the filename extension.
+- **Out of scope:** IAM/bucket policies, versioning, object tags, Object Lock,
+  ACLs, lifecycle rules, replication, event notifications, SSE-C/DSSE-KMS, and
+  multipart `FULL_OBJECT` checksums.
 
-pgvs3 does not validate SigV4 or any other request authentication. Signed and
-unsigned requests are both accepted; clients may keep sending credentials, but
-they are ignored. The S3 listener must therefore be private or behind a service
-mesh that enforces access control.
+## Configuration and CLI
 
-- **CopyObject** shares immutable files between object rows; GC checks every
-  reference before reaping. **UploadPartCopy** of a whole single-file object is
-  metadata-only; ranged and multipart-source copies stream.
-- `GetObjectAttributes`, `ListParts` and `ListMultipartUploads` are implemented.
-  Single PUTs accept `CRC64NVME` and `x-amz-checksum-type: FULL_OBJECT`; CRC32,
-  CRC32C, SHA1, SHA256 and MD5 are also verified. Multipart part checksums are
-  returned in `ObjectParts`.
-- SSE-S3 (`AES256`) and `aws:kms` headers are accepted as bookkeeping. SSE-C
-  and DSSE-KMS are rejected.
+Every flag maps to an environment variable.
 
-**Not yet implemented:** multipart `x-amz-checksum-type: FULL_OBJECT`, lifecycle
-expiration, bucket policies/IAM, and access points. pgvs3 has no versioning,
-object tags, Object Lock, ACLs, lifecycle transitions, replication, Event
-Notifications, S3 Select, S3 website configuration/redirect rules, access logs,
-Storage Lens or Transfer Acceleration. ETags are opaque; single PUTs use MD5.
-
-## Plain HTTP and static websites
-
-The single `:8014` listener serves S3 clients, plain HTTP clients and static
-websites at the same `/{bucket}/{key}` URLs:
-
-```sh
-curl http://127.0.0.1:8014/lake/index.html
-curl http://127.0.0.1:8014/lake/docs/
-```
-
-A trailing slash resolves to `index.html`, and plain `GET /{bucket}` without S3
-query parameters or headers serves `/{bucket}/index.html` when present. Content
-type is taken from object metadata with a filename-extension fallback. Range,
-`HEAD`, ETag and conditional reads work identically for S3 and HTTP clients.
-
-The listener is unauthenticated and plain HTTP: run the container inside a
-private network or behind a service mesh that enforces access control and TLS.
-
-## Configuration
-
-A flag overrides the same-named environment variable. Buckets auto-create on
-write.
-
-| Flag | Variable | Default | Meaning |
+| Flag | Environment variable | Default | Description |
 | --- | --- | --- | --- |
-| `--url` | `PGVS3_URL` | `postgres://localhost/pgvs3` | PostgreSQL URL (`sslmode` controls DB TLS). |
-| `--addr` | `PGVS3_ADDR` | `0.0.0.0:8014` | S3, plain HTTP, `/healthz`, `/readyz` and `/metrics` listen address. |
-| `--pool-max` | `PGVS3_POOL_MAX` | `64` | Connections per gateway. Size the fleet against PostgreSQL `max_connections`. |
-| `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long deleted files stay readable before GC. |
-| `--read-only` | `PGVS3_READ_ONLY` | `false` | Reject mutating methods and skip DDL/reaping (use against a standby). |
-| `--log-level` | `PGVS3_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
+| `--url` | `PGVS3_URL` | `postgres://localhost/pgvs3` | PostgreSQL connection URL (use `sslmode` for DB TLS). |
+| `--addr` | `PGVS3_ADDR` | `0.0.0.0:8014` | Listen address for S3, HTTP, `/healthz`, `/readyz`, and `/metrics`. |
+| `--pool-max` | `PGVS3_POOL_MAX` | `64` | Max PostgreSQL connections per gateway pod. |
+| `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long overwritten/deleted files stay readable before GC. |
+| `--read-only` | `PGVS3_READ_ONLY` | `false` | Reject writes and skip DDL/reaping (for PostgreSQL standbys). |
+| `--log-level` | `PGVS3_LOG_LEVEL` | `info` | Log verbosity (`debug`, `info`, `warn`, `error`). |
 
-`pgvs3 health` polls `/readyz` for container orchestrators. `pgvs3 stat [--json]`
-reports logical vs physical size, queued files and the age of the oldest queued
-file. `pgvs3 doctor` checks the database layout, and `pgvs3 reap [--all]` runs
-garbage collection on demand.
+Subcommands:
 
-## Storage cost and limits
+- `pgvs3 serve` — run the S3/HTTP gateway (default when no subcommand is given).
+- `pgvs3 stat [--json]` — report objects, chunks, logical vs physical size, and
+  queued garbage.
+- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v9, and table settings.
+- `pgvs3 reap [--all]` — run garbage collection immediately.
+- `pgvs3 health` — poll `/readyz` for container health checks.
 
-- **WAL on write is about 1× the bytes.**
-- **One relation caps at 32 TiB** (`MaxBlockNumber × 8 KB`), about 31.7 TiB of
-  object data. A single object or part is capped by `int4` row numbers.
-- **Peak heap** is live data plus files deleted inside the reap grace plus
-  space held by long transactions. Freed pages are reused; plain `VACUUM` does
-  not return space to the operating system.
-- **One PostgreSQL** bounds capacity and write throughput. The design assumes a
-  single DuckLake writer; add read-only DuckDB workers for reads and read
-  replicas for PostgreSQL read scale.
-
-## Container
-
-`ko` builds a static, nonroot, distroless image directly from source — no
-Dockerfile, no shell, no libc:
+Build the container image with `ko`:
 
 ```sh
 just image            # local ko.local image
-just image push=true  # ghcr.io/adonm/pgvs3, amd64 + arm64
+just image push=true  # multi-arch ghcr.io/adonm/pgvs3 (amd64 + arm64)
 ```
 
-The image is about 14 MB and exposes `8014` (S3 and HTTP).
+## Limits to keep in mind
 
-## Design decisions
+- **32 TiB per database:** `s3p.chunks` is a single PostgreSQL table, capped at
+  32 TiB (`MaxBlockNumber × 8 KB`, ~31.7 TiB of object payload) and ~17.4 TB per
+  object.
+- **Single-writer design:** built for one DuckLake writer and many readers.
+  Scale reads with additional DuckDB workers, gateway pods, and PostgreSQL read
+  replicas.
+- **Disk reclamation:** deleted pages are reused by PostgreSQL after
+  `--reap-grace` and autovacuum, but plain `VACUUM` does not return disk space
+  to the OS without `VACUUM FULL` or `pg_repack`.
 
-- **PostgreSQL `shared_buffers` is the shared cache.** Gateways keep no
-  in-process metadata or object cache; `s3p.objects` serves metadata and ≤64 KiB
-  inline objects directly from PostgreSQL RAM, and DuckDB caches larger file
-  bytes client-side.
-- **Connections are reused most-recently-used first** to keep TCP slow-start out
-  of the hot path.
-- **Single-file reads up to 64 MiB are one query.** Larger/multipart reads use
-  8 MiB pieces, up to eight in parallel under one exported snapshot; rows
-  stream through a bounded channel so a slow client backpressures PostgreSQL.
-- **Multipart parts are separate files.** Parts upload in parallel with no
-  staging; Complete publishes the ordered part list without moving data.
-- **One unpartitioned chunks table.** DuckLake has one writer; every read is a
-  `file_id = $1` primary-key range.
-- **Maintenance runs in the gateway.** Removing pg_cron keeps managed
-  PostgreSQL and small installations simple.
-
-## Testing and benchmarks
+## Testing and documentation
 
 ```sh
 just test       # Go unit tests
-just race       # unit tests with the race detector
-just fuzz       # 30s fuzz targets for ranges, canonical queries and COPY framing
-just contract   # S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
-just interop    # rclone, restic, boto3, DuckLake and SlateDB
-just ducklake   # DuckLake compatibility through the benchmark harness
-just bench      # DuckDB S3 benchmark, DuckLake checks and row-group tuning
+just race       # unit tests with race detector
+just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
+just interop    # rclone, restic, boto3, DuckLake, and SlateDB
+just load       # direct S3 load generator benchmark
+just bench      # DuckDB httpfs + DuckLake benchmark suite
 ```
 
-Every recipe starts a disposable PostgreSQL 18 in Docker and two local
-gateways, then removes them. `just contract` covers conditional writes,
-pagination, multipart, byte ranges, cross-gateway consistency,
-copy, attributes, multipart and both DuckDB 2.0 and
-`duckdb-object-storage` on 1.5.6. `just interop` drives rclone, restic, boto3,
-DuckLake and a small SlateDB Rust program against the same gateway. DuckDB 2.0
-currently ships DuckLake 1.1; set `DUCKLAKE_VERSION=2.1` to make interop fail
-until the 2.1 extension is published. `docs/benchmarks.md` has the method and
-historical numbers.
+Further reading:
 
-## Repo layout
-
-- `cmd/pgvs3/`: CLI (`serve`, `stat --json`, `doctor`, `health`, `reap`).
-- `internal/store/`: schema, PostgreSQL pool, streaming COPY/GET, multipart,
-  copy, maintenance.
-- `internal/s3/`: S3 routing, XML, ranges, checksums and multipart.
-- `test/e2e.sh`: the S3 contract.
-- `test/interop.sh`: rclone, restic, boto3, DuckLake and SlateDB.
-- `test/slatedb/`: the SlateDB Rust smoke program.
-- `deploy/bench/`: disposable stack and DuckDB benchmark.
-- `deploy/compose.yaml`: local PostgreSQL + gateway stack.
-- `deploy/charts/pgvs3/`: Helm chart (stateless multi-AZ Deployment).
-- `docs/operations.md`: probes, metrics, backup/restore and failure behavior.
-- `docs/partitioning.md`: why the chunks table stays unpartitioned.
-- `justfile`, `.ko.yaml`, `mise.toml`: toolchain and build.
+- [docs/performance.md](docs/performance.md) — storage layout, read/write paths,
+  and DuckDB tuning
+- [docs/benchmarks.md](docs/benchmarks.md) — full benchmark tables and S3
+  Express One Zone comparison
+- [docs/operations.md](docs/operations.md) — deployment, probes, backups, and
+  failure recovery
+- [docs/partitioning.md](docs/partitioning.md) — why `s3p.chunks` is unpartitioned
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development workflow and invariants
 
 ## License
 

@@ -3,100 +3,90 @@
 ## First run
 
 ```sh
-just image                    # ko.local:latest
-docker compose -f deploy/compose.yaml up
+just image                                # builds ko.local:latest
+docker compose -f deploy/compose.yaml up  # starts PostgreSQL 18 + pgvs3
 curl -fsS http://127.0.0.1:8014/healthz
 curl -fsS http://127.0.0.1:8014/readyz
 ```
 
 Buckets are created automatically on first write.
 
-## Plain HTTP and authentication
+## Network and security model
 
-`:8014` (`PGVS3_ADDR`, default `0.0.0.0:8014`) serves the S3 API, plain HTTP
-and static websites (`/{bucket}/{key}`, with directory paths resolving to
-`index.html`), plus `/healthz`, `/readyz` and `/metrics`.
+The single listener (`--addr` / `PGVS3_ADDR`, default `0.0.0.0:8014`) serves:
 
-The listener is unauthenticated. SigV4 headers and presigned query parameters
-are accepted and ignored. Run the container inside a private network or behind
-a service mesh that enforces access control and TLS.
+- S3 API requests
+- Plain HTTP and static websites (`/{bucket}/{key}`, resolving trailing slashes
+  to `index.html`)
+- `/healthz`, `/readyz`, and `/metrics`
 
-## Probes and metrics
+**pgvs3 does not authenticate requests.** SigV4 headers and presigned URL
+parameters are accepted and ignored so standard S3 SDKs work out of the box.
+Always run the gateway inside a private network or behind a service mesh that
+enforces authentication, authorization, and TLS.
 
-- `GET /healthz` — process liveness, no database access.
-- `GET /readyz` — database reachable and layout version matches; returns 503
-  while draining or during a database outage.
-- `GET /metrics` — Prometheus text:
+## Probes and Prometheus metrics
+
+- `GET /healthz` — process liveness (does not touch PostgreSQL).
+- `GET /readyz` — checks PostgreSQL connectivity and schema layout v9; returns
+  `503` while draining or if the database is unreachable.
+- `GET /metrics` — Prometheus metrics:
   - `pgvs3_requests_total{method,code}`
-  - `pgvs3_request_duration_seconds_sum` / `_count` and latency buckets
+  - `pgvs3_request_duration_seconds_{bucket,sum,count}`
   - `pgvs3_response_bytes_total`
   - `pgvs3_pg_pool_*` and `pgvs3_chunk_pool_*`
-  - reaper and maintenance-run counters
+  - reaper and maintenance pass counters
 
-## Diagnose
+## CLI diagnostics and maintenance
 
 ```sh
-pgvs3 doctor --url "$PGVS3_URL"
-pgvs3 stat   --url "$PGVS3_URL" --json
-pgvs3 reap   --url "$PGVS3_URL" --all
+pgvs3 doctor --url "$PGVS3_URL"          # verify PG 18+, layout v9, and table reloptions
+pgvs3 stat   --url "$PGVS3_URL" --json   # logical/physical bytes, objects, chunks, garbage age
+pgvs3 reap   --url "$PGVS3_URL" --all    # drain all eligible garbage outside the grace window
 ```
 
-`doctor` checks PostgreSQL 18, layout v9 and the chunks table settings without
-changing the database. `stat` reports logical/physical bytes, objects, chunks,
-garbage and the oldest queued file. `reap --all` runs bounded maintenance
-passes until no garbage remains.
-
-## Layout upgrades
-
-Layout v9 is not compatible with v8. A gateway refuses any other version; do
-not point it at a mixed database. To move data, copy the catalog and data into
-a fresh database with DuckDB, then switch the gateway URL. There is no in-place
-migration in the alpha.
+In normal operation, one gateway per cluster runs background maintenance every
+minute (coordinated via `pg_try_advisory_lock`), expiring abandoned multipart
+uploads and reaping up to 65,536 chunk rows (~508 MiB) of files deleted longer
+ago than `--reap-grace` (default `10m`).
 
 ## Backup and restore
 
-pgvs3 has no separate durable store: back up PostgreSQL.
+All state lives in PostgreSQL; there is no sidecar store to back up.
 
-- **Logical:** `pg_dump -Fc "$PGVS3_URL" > pgvs3.dump`; restore into an empty
-  database with `pg_restore`. Stop writes first for a consistent logical copy.
-- **Physical/PITR:** use `pg_basebackup` plus WAL archiving, or your managed
-  provider's snapshot/PITR. The chunks and object rows are in the same
-  transaction, so a snapshot never names objects whose bytes are missing.
-- **Restore validation:** run `pgvs3 doctor`, start the gateway, then read a
-  known object and compare its SHA-256/ETag before directing clients at it.
+- **Physical backup / PITR (recommended):** use `pg_basebackup` + WAL archiving
+  or managed cloud snapshots. Because chunks and object metadata commit in the
+  same transaction, any point-in-time snapshot is internally consistent.
+- **Logical backup:** stop writes, run `pg_dump -Fc "$PGVS3_URL" > pgvs3.dump`,
+  and restore into a fresh database with `pg_restore`.
+- **Post-restore check:** run `pgvs3 doctor`, start the gateway, and verify a
+  known object before shifting traffic.
 
-## Maintenance
+## Schema upgrades
 
-The gateway runs upload expiry and bounded garbage reaping every minute.
-Deleted files remain readable for `PGVS3_REAP_GRACE` (10 minutes). One reaper
-runs per cluster via an advisory lock.
+Layout v9 is not backwards-compatible with earlier alpha layouts, and gateways
+refuse to start against a mismatched version. To migrate across breaking
+layouts, copy data into a fresh database via DuckDB/rclone and switch
+`PGVS3_URL`.
 
-Watch `pgvs3 stat` for garbage age and physical growth. A single PostgreSQL is
-the capacity and write-throughput boundary: 32 TiB per database, about 17.4 TB
-per object. Add DuckDB readers rather than more writers; the design assumes one
-DuckLake writer.
+## Graceful shutdown, standbys, and Kubernetes
 
-## Shutdown and read-only gateways
+- **Graceful drain:** on `SIGTERM`, `/readyz` immediately returns `503` while
+  the server continues accepting requests for 5 seconds so load balancers can
+  deregister the pod, then waits for in-flight transfers to finish.
+- **Read-only standbys:** pass `--read-only` (`PGVS3_READ_ONLY=true`) when
+  pointing gateways at a PostgreSQL streaming standby. Mutating requests return
+  `405`/`403`, and schema initialization and reaping are skipped.
+- **Kubernetes / Helm:** `deploy/charts/pgvs3` deploys a stateless multi-AZ
+  `Deployment` with optional HPA (`autoscaling.enabled=true`) and `PodDisruptionBudget`.
+  Ensure PostgreSQL `max_connections` exceeds `replicas × PGVS3_POOL_MAX × 2`
+  (main pool + chunk pool).
+- **Failure handling:**
+  - *Gateway pod crash:* remaining pods continue serving immediately (zero local state).
+  - *PostgreSQL restart:* reads retry once on a fresh connection; interrupted
+    writes roll back cleanly.
+  - *Full disk:* writes fail atomically without publishing partial objects.
+    Run `pgvs3 reap --all` and `VACUUM` / `pg_repack`, or expand storage.
 
-On `SIGTERM`, `/readyz` flips to 503 and the gateway keeps serving for 5 s
-before `http.Server.Shutdown` waits for in-flight requests. Set
-`PGVS3_READ_ONLY=true` to reject mutating methods, skip DDL and reaping, and
-run against a PostgreSQL standby.
-
-`just fault` exercises peer loss, a PostgreSQL restart during a large PUT, and
-object churn.
-
-## Failure behavior
-
-- **PostgreSQL restart:** reads retry once on a fresh connection; a write that
-  loses its connection publishes nothing.
-- **Gateway replica down:** gateways hold no state; remaining pods continue
-  serving immediately from PostgreSQL.
-- **Full disk:** writes fail; the gateway does not acknowledge partial objects.
-  Reclaim with `VACUUM`/`pg_repack` or restore capacity.
-
-## Kubernetes
-
-The Helm chart runs a stateless multi-AZ `Deployment` and can scale freely with
-an HPA (`autoscaling.enabled=true`) as long as PostgreSQL `max_connections` is
-sized for the replica ceiling.
+`just fault` tests gateway loss, mid-upload PostgreSQL restarts, and high
+overwrite churn.
