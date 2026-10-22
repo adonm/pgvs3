@@ -178,21 +178,50 @@ func (s *Server) listMultipartUploads(w http.ResponseWriter, r *http.Request, bu
 	if isDirectoryBucket(bucket) {
 		storageClass = "EXPRESS_ONEZONE"
 	}
+	delimiter := q.Get("delimiter")
 	out := listMultipartUploadsResult{
 		Xmlns: s3Namespace, Bucket: bucket, Prefix: prefix, KeyMarker: keyMarker,
 		UploadIDMarker: uploadMarker, MaxUploads: max, IsTruncated: truncated,
-		Delimiter: q.Get("delimiter"),
+		Delimiter: delimiter,
 	}
+	seen := map[string]bool{}
+	if delimiter != "" {
+		if rest := strings.TrimPrefix(keyMarker, prefix); rest != keyMarker {
+			if idx := strings.Index(rest, delimiter); idx >= 0 {
+				seen[prefix+rest[:idx+len(delimiter)]] = true
+			}
+		}
+	}
+	lastKey, lastID := keyMarker, uploadMarker
 	for _, u := range uploads {
+		lastKey, lastID = u.Key, u.UploadID
+		if delimiter != "" {
+			rest := strings.TrimPrefix(u.Key, prefix)
+			if idx := strings.Index(rest, delimiter); idx >= 0 {
+				cp := prefix + rest[:idx+len(delimiter)]
+				if !seen[cp] {
+					if len(out.Uploads)+len(out.CommonPrefixes) >= max {
+						out.IsTruncated = true
+						break
+					}
+					seen[cp] = true
+					out.CommonPrefixes = append(out.CommonPrefixes, commonPrefixXML{Prefix: cp})
+				}
+				continue
+			}
+		}
+		if len(out.Uploads)+len(out.CommonPrefixes) >= max {
+			out.IsTruncated = true
+			break
+		}
 		out.Uploads = append(out.Uploads, uploadXML{
 			Key: u.Key, UploadID: u.UploadID, StorageClass: storageClass, Initiated: isoTime(u.Initiated),
 			Initiator: ownerXML{ID: "pgvs3", DisplayName: "pgvs3"},
 			Owner:     ownerXML{ID: "pgvs3", DisplayName: "pgvs3"},
 		})
 	}
-	if truncated && len(uploads) > 0 {
-		last := uploads[len(uploads)-1]
-		out.NextKeyMarker, out.NextUploadIDMarker = last.Key, last.UploadID
+	if out.IsTruncated {
+		out.NextKeyMarker, out.NextUploadIDMarker = lastKey, lastID
 	}
 	writeXML(w, http.StatusOK, out)
 }

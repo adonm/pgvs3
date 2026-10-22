@@ -37,6 +37,9 @@ func run() int {
 	if i := indexArg(args, "health"); i >= 0 {
 		return health(removeArg(args, i))
 	}
+	if i := indexArg(args, "reap"); i >= 0 {
+		return reap(removeArg(args, i))
+	}
 	if i := indexArg(args, "doctor"); i >= 0 {
 		return doctor(removeArg(args, i))
 	}
@@ -266,6 +269,50 @@ func health(args []string) int {
 	if resp.StatusCode != http.StatusOK {
 		return 1
 	}
+	return 0
+}
+
+func reap(args []string) int {
+	fs := flag.NewFlagSet("reap", flag.ContinueOnError)
+	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	grace := fs.Duration("grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "only reap files deleted at least this long ago")
+	all := fs.Bool("all", false, "repeat the bounded pass until no garbage remains")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	st, err := store.Open(ctx, *url, store.Options{
+		MinConns: 1, MaxConns: 2, AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
+	}, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+	if err := st.CheckLayout(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	before, _ := st.Stat(ctx)
+	for i := 0; ; i++ {
+		if err := st.Maintain(ctx, *grace); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		after, _ := st.Stat(ctx)
+		if !*all || after.GarbageFiles == 0 || after.GarbageFiles >= before.GarbageFiles || i >= 100 {
+			break
+		}
+		before = after
+	}
+	after, err := st.Stat(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Printf("garbage_files=%d reaped_rows=%d reaped_files=%d db=%d MiB\n",
+		after.GarbageFiles, st.ReapedRows(), st.ReapedFiles(), after.DatabaseBytes>>20)
 	return 0
 }
 

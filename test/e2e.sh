@@ -168,6 +168,16 @@ expect 200 -X PUT --data-binary 'base' "$ED/app"
 expect 200 -X PUT -H 'x-amz-write-offset-bytes: 4' --data-binary ' appended' "$ED/app"
 [ "$(s3 "$ED/app")" = 'base appended' ] || fail "append bytes"
 expect 409 -X PUT -H 'x-amz-write-offset-bytes: 1' --data-binary 'x' "$ED/app"
+expect 200 -X PUT --data-binary '' "$ED/empty-spill"
+head -c 100000 /dev/zero > "$TMP/empty-append"
+expect 200 -X PUT -H 'x-amz-write-offset-bytes: 0' --data-binary @"$TMP/empty-append" "$ED/empty-spill"
+[ "$(s3 "$ED/empty-spill" | wc -c)" = 100000 ] || fail "empty inline append spill"
+
+# CRC64NVME / FULL_OBJECT checksum on a single PUT.
+crc64=$(python3 -c 'import base64,struct; print(base64.b64encode(struct.pack(">Q",0xAE8B14860A799888)).decode())')
+expect 200 -X PUT -H "x-amz-checksum-crc64nvme: $crc64" -H 'x-amz-sdk-checksum-algorithm: CRC64NVME' -H 'x-amz-checksum-type: FULL_OBJECT' --data-binary '123456789' "$ED/crc64"
+[ "$(s3 "$ED/crc64")" = 123456789 ] || fail "crc64 body"
+expect 400 -X PUT -H "x-amz-checksum-crc64nvme: AAAAAAAAAAA=" -H 'x-amz-sdk-checksum-algorithm: CRC64NVME' --data-binary '123456789' "$ED/crc64-bad"
 
 # Attributes, multipart copy and multipart listings.
 s3 -H 'x-amz-object-attributes: ETag,ObjectSize,Checksum,ObjectParts,StorageClass' "$ED/app?attributes" | grep -q ObjectSize || fail "attributes"
@@ -179,6 +189,9 @@ ce=$(s3 -D - -o /dev/null -X PUT -H 'x-amz-copy-source: /partcopy.src' -H 'x-amz
 [ -n "$ce" ] || fail "upload part copy etag"
 s3 "$ED/partcopy.dst?uploadId=$upc_id" | grep -q '<PartNumber>1</PartNumber>' || fail "list parts"
 s3 "$ED?uploads" | grep -q '<UploadId>' || fail "list multipart uploads"
+s3 -X POST "$ED/$RUN/mp/a/one?uploads" >/dev/null
+s3 -X POST "$ED/$RUN/mp/b/two?uploads" >/dev/null
+s3 "$ED?uploads&prefix=$RUN/mp/&delimiter=/" | grep -q "<Prefix>$RUN/mp/a/</Prefix>" || fail "multipart delimiter"
 cat > "$TMP/upc.xml" <<XML
 <CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>$ce</ETag></Part></CompleteMultipartUpload>
 XML
@@ -189,7 +202,7 @@ cmp "$TMP/partcopy" "$TMP/partcopy.out" || fail "upload part copy bytes"
 # The same surface through an SDK: session auth, copy, rename, append.
 EXPR="$EXPR" E2E_RUN="$RUN" E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
-import os, urllib.request, boto3
+import os, time, urllib.request, boto3
 from botocore.config import Config
 s3=boto3.client('s3', endpoint_url=os.environ['E2E_ENDPOINT'],
     aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
@@ -212,6 +225,19 @@ u=pc.generate_presigned_url('get_object', Params={'Bucket':gen,'Key':f'{run}/pre
 assert urllib.request.urlopen(u).read()==b'presigned'
 u=pc.generate_presigned_url('put_object', Params={'Bucket':gen,'Key':f'{run}/presigned-put'}, ExpiresIn=60)
 assert urllib.request.urlopen(urllib.request.Request(u,data=b'put',method='PUT')).status==200
+pc.put_object(Bucket=gen, Key=f'{run}/spill', Body=b'a'*60000)
+pc.put_object(Bucket=gen, Key=f'{run}/spill', Body=b'b'*10000, WriteOffsetBytes=60000)
+assert pc.get_object(Bucket=gen, Key=f'{run}/spill')['Body'].read()==b'a'*60000+b'b'*10000
+pc.put_object(Bucket=gen, Key=f'{run}/over-inline', Body=b'old')
+up=pc.create_multipart_upload(Bucket=gen, Key=f'{run}/over-inline')
+part=pc.upload_part(Bucket=gen, Key=f'{run}/over-inline', UploadId=up['UploadId'], PartNumber=1, Body=b'n'*1048576)
+pc.complete_multipart_upload(Bucket=gen, Key=f'{run}/over-inline', UploadId=up['UploadId'], MultipartUpload={'Parts':[{'PartNumber':1,'ETag':part['ETag']}]})
+assert pc.get_object(Bucket=gen, Key=f'{run}/over-inline')['Body'].read()==b'n'*1048576
+pc.put_object(Bucket=gen, Key=f'{run}/shared-src', Body=b'shared')
+pc.copy_object(Bucket=gen, Key=f'{run}/shared-copy', CopySource={'Bucket':gen,'Key':f'{run}/shared-src'})
+pc.delete_objects(Bucket=gen, Delete={'Objects':[{'Key':f'{run}/shared-src'},{'Key':f'{run}/presigned'}]})
+time.sleep(2)
+assert pc.get_object(Bucket=gen, Key=f'{run}/shared-copy')['Body'].read()==b'shared'
 for i in range(100):
     pc.put_object(Bucket=gen, Key=f'{run}/churn', Body=b'x'*1024)
     if i % 5 == 0:

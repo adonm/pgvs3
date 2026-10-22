@@ -13,7 +13,9 @@ func TestRowFramerLayout(t *testing.T) {
 	if _, err := f.push([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	out := f.finish()
+	b := f.finish()
+	defer putFramerBuf(b)
+	out := b.Bytes()
 	if string(out[:11]) != "PGCOPY\n\xff\r\n\x00" {
 		t.Fatalf("bad signature")
 	}
@@ -47,7 +49,9 @@ func TestRowFramerSplitsAtRowBoundary(t *testing.T) {
 	if _, err := f.push(make([]byte, RowBytes+RowBytes/2)); err != nil {
 		t.Fatal(err)
 	}
-	out := f.finish()
+	b := f.finish()
+	defer putFramerBuf(b)
+	out := b.Bytes()
 	// 1.5 rows become two rows (8120 + 4060 bytes), each with 26 bytes of
 	// framing, plus the COPY header and trailer.
 	if want := len(copyHeader) + RowBytes + RowBytes/2 + 2*26 + 2; len(out) != want {

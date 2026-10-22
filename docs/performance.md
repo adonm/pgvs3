@@ -42,6 +42,9 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 - **Out-of-order rows are held.** Bitmap scans return TID order; `streamRows`
   buffers the few rows that run ahead and emits `no` order.
 - **256 KiB response chunks** amortise syscalls without adding a large copy.
+- **Checksums cover modern SDKs.** CRC64NVME and FULL_OBJECT are accepted on
+  single PUTs; multipart uses per-part CRC32/CRC32C/SHA1/SHA256/CRC64NVME
+  checksums and a composite ETag.
 - **Metadata is cached.** Otter (W-TinyLFU) serves metadata reads without a
   lock, with a 5-second TTL. `HEAD` uses the cache; on a miss it fetches and
   caches the full row, including inline bytes, so a later GET cannot see a
@@ -144,6 +147,16 @@ default stays 64 KiB. 8 KiB behaves the same either way.
   advisory lock, evaluates conditions, swaps the object row, queues replaced
   files and sends NOTIFY. Chunks and metadata commit together; an interrupted
   write publishes nothing.
+- **The COPY framer reuses 4 MiB buffers.** A `sync.Pool` removes per-flush
+  allocations under concurrent large writes; `commit_part` replaces an old
+  part and queues it in one SQL call.
+- **Batch deletes take one query.** `DeleteMany` locks all keys, deletes the
+  rows, queues only unreferenced shared files and emits every NOTIFY in two
+  statements instead of 1,000 round trips. The reaper self-heals false-positive
+  garbage rows left by older gateways.
+- **Append can promote inline objects.** Crossing the 64 KiB inline threshold
+  writes the old inline prefix as a chunked first part and attaches the new
+  append file, without rewriting either byte range.
 - **Multipart parts are separate files.** Parts upload in parallel with no
   staging; Complete publishes the ordered part list. It validates ETags and
   checksums but moves no data.

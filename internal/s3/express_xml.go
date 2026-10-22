@@ -70,16 +70,17 @@ type uploadXML struct {
 }
 
 type listMultipartUploadsResult struct {
-	XMLName            xml.Name    `xml:"ListMultipartUploadsResult"`
-	Xmlns              string      `xml:"xmlns,attr"`
-	Bucket             string      `xml:"Bucket"`
-	KeyMarker          string      `xml:"KeyMarker"`
-	UploadIDMarker     string      `xml:"UploadIdMarker"`
-	NextKeyMarker      string      `xml:"NextKeyMarker,omitempty"`
-	NextUploadIDMarker string      `xml:"NextUploadIdMarker,omitempty"`
-	Delimiter          string      `xml:"Delimiter,omitempty"`
-	Prefix             string      `xml:"Prefix"`
-	MaxUploads         int         `xml:"MaxUploads"`
-	IsTruncated        bool        `xml:"IsTruncated"`
-	Uploads            []uploadXML `xml:"Upload"`
+	XMLName            xml.Name          `xml:"ListMultipartUploadsResult"`
+	Xmlns              string            `xml:"xmlns,attr"`
+	Bucket             string            `xml:"Bucket"`
+	KeyMarker          string            `xml:"KeyMarker"`
+	UploadIDMarker     string            `xml:"UploadIdMarker"`
+	NextKeyMarker      string            `xml:"NextKeyMarker,omitempty"`
+	NextUploadIDMarker string            `xml:"NextUploadIdMarker,omitempty"`
+	Delimiter          string            `xml:"Delimiter,omitempty"`
+	Prefix             string            `xml:"Prefix"`
+	MaxUploads         int               `xml:"MaxUploads"`
+	IsTruncated        bool              `xml:"IsTruncated"`
+	Uploads            []uploadXML       `xml:"Upload"`
+	CommonPrefixes     []commonPrefixXML `xml:"CommonPrefixes"`
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -31,6 +32,24 @@ var copyTrailer = []byte{0xFF, 0xFF}
 // sendBatch is the COPY flush granularity: enough to amortise the protocol,
 // small enough to keep the request body backpressured at PostgreSQL's pace.
 const sendBatch = 4 << 20
+
+var framerPool = sync.Pool{New: func() any {
+	return bytes.NewBuffer(make([]byte, 0, sendBatch+RowBytes))
+}}
+
+func getFramerBuf() *bytes.Buffer {
+	b := framerPool.Get().(*bytes.Buffer)
+	b.Reset()
+	return b
+}
+
+func putFramerBuf(b *bytes.Buffer) {
+	if b == nil {
+		return
+	}
+	b.Reset()
+	framerPool.Put(b)
+}
 
 // Checksum is one verified request checksum, named as S3 spells the header.
 type Checksum struct {
@@ -72,7 +91,7 @@ type rowFramer struct {
 func newRowFramer(fileID int64) *rowFramer {
 	f := &rowFramer{
 		fileID: fileID,
-		buf:    bytes.NewBuffer(make([]byte, 0, sendBatch+RowBytes)),
+		buf:    getFramerBuf(),
 		sha:    sha256.New(),
 		md5:    md5.New(),
 	}
@@ -80,7 +99,7 @@ func newRowFramer(fileID int64) *rowFramer {
 	return f
 }
 
-func (f *rowFramer) push(src []byte) ([]byte, error) {
+func (f *rowFramer) push(src []byte) (*bytes.Buffer, error) {
 	limit := (int64(math.MaxInt32) + 1) * RowBytes
 	if int64(len(src)) > limit-f.size {
 		return nil, fmt.Errorf("object part exceeds the maximum addressable row count")
@@ -98,19 +117,26 @@ func (f *rowFramer) push(src []byte) ([]byte, error) {
 	if f.buf.Len() < sendBatch {
 		return nil, nil
 	}
-	out := f.buf.Bytes()
-	f.buf = bytes.NewBuffer(make([]byte, 0, sendBatch+RowBytes))
+	out := f.buf
+	f.buf = getFramerBuf()
 	return out, nil
 }
 
 // finish frames any partial row and the COPY trailer.
-func (f *rowFramer) finish() []byte {
+func (f *rowFramer) finish() *bytes.Buffer {
 	if len(f.pending) > 0 {
 		f.frameRows(f.pending)
 		f.pending = nil
 	}
 	f.buf.Write(copyTrailer)
-	return f.buf.Bytes()
+	out := f.buf
+	f.buf = nil
+	return out
+}
+
+func (f *rowFramer) release() {
+	putFramerBuf(f.buf)
+	f.buf = nil
 }
 
 func (f *rowFramer) frameRows(data []byte) {
@@ -364,7 +390,9 @@ func (w *ChunkWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	if out != nil {
-		if _, err := w.pw.Write(out); err != nil {
+		_, err := w.pw.Write(out.Bytes())
+		putFramerBuf(out)
+		if err != nil {
 			return 0, err
 		}
 	}
@@ -381,10 +409,13 @@ func (w *ChunkWriter) Finish(checksums []Checksum) (Published, error) {
 	w.checksums = checksums
 	w.mu.Unlock()
 
-	if _, err := w.pw.Write(w.framer.finish()); err != nil {
+	out := w.framer.finish()
+	if _, err := w.pw.Write(out.Bytes()); err != nil {
+		putFramerBuf(out)
 		w.abort()
 		return Published{}, err
 	}
+	putFramerBuf(out)
 	w.mu.Lock()
 	w.closed = true
 	w.mu.Unlock()
@@ -410,6 +441,7 @@ func (w *ChunkWriter) abort() {
 	w.mu.Unlock()
 	_ = w.pw.CloseWithError(errAborted)
 	<-w.done
+	w.framer.release()
 }
 
 func swapObject(ctx context.Context, tx pgx.Tx, t writerTarget, fileID, size int64, sha []byte, etag string) error {
@@ -420,7 +452,7 @@ func swapObjectParts(ctx context.Context, tx pgx.Tx, bucket, key string, t *writ
 	if err := lockObjectKey(ctx, tx, bucket, key); err != nil {
 		return err
 	}
-	var oldFile int64
+	var oldFile pgtype.Int8
 	var oldParts []int64
 	var oldETag string
 	err := tx.QueryRow(ctx,
@@ -444,18 +476,19 @@ func swapObjectParts(ctx context.Context, tx pgx.Tx, bucket, key string, t *writ
 		}
 	}
 	_, err = tx.Exec(ctx,
-		`INSERT INTO s3p.objects (bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`INSERT INTO s3p.objects (bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL)
 		 ON CONFLICT (bucket, key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size,
 		   sha256 = EXCLUDED.sha256, etag = EXCLUDED.etag,
 		   user_metadata = EXCLUDED.user_metadata, content_type = EXCLUDED.content_type,
-		   parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends, created_at = now()`,
+		   parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends, inline_data = NULL,
+		   created_at = now()`,
 		bucket, key, fileID, size, sha, etag, userMeta, content, parts, ends)
 	if err != nil {
 		return err
 	}
-	if old {
-		return queueFiles(ctx, tx, oldFile, oldParts)
+	if old && oldFile.Valid {
+		return queueFiles(ctx, tx, oldFile.Int64, oldParts)
 	}
 	return nil
 }
@@ -472,33 +505,34 @@ func lockObjectKey(ctx context.Context, tx pgx.Tx, bucket, key string) error {
 func queueFiles(ctx context.Context, tx pgx.Tx, fileID int64, parts []int64) error {
 	dead := make([]int64, 0, len(parts)+1)
 	dead = append(dead, parts...)
-	dead = append(dead, fileID)
+	if fileID != 0 {
+		dead = append(dead, fileID)
+	}
+	return queueFileIDs(ctx, tx, dead)
+}
+
+// queueFileIDs queues only unreferenced files. CopyObject, UploadPartCopy and
+// multipart parts can share a file ID, so "the old row pointed at it" is not
+// enough to prove it is dead.
+func queueFileIDs(ctx context.Context, tx pgx.Tx, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	_, err := tx.Exec(ctx, `INSERT INTO s3p.garbage (file_id)
-		SELECT f.file_id FROM unnest($1::int8[]) AS f(file_id)
-		WHERE NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f.file_id OR f.file_id = ANY(o.parts))
-		  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f.file_id)
-		ON CONFLICT DO NOTHING`, dead)
+		SELECT f FROM unnest($1::int8[]) AS f
+		WHERE f <> 0
+		  AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f OR f = ANY(o.parts))
+		  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
+		ON CONFLICT DO NOTHING`, ids)
 	return err
 }
 
 func commitPart(ctx context.Context, tx pgx.Tx, uploadID string, partNo int32, fileID, size int64, sha, md5sum []byte, checksum *Checksum) error {
-	var old int64
-	err := tx.QueryRow(ctx,
-		"DELETE FROM s3p.upload_parts WHERE upload_id = $1 AND part_no = $2 RETURNING file_id",
-		uploadID, partNo).Scan(&old)
-	if err == nil {
-		if _, err := tx.Exec(ctx, "INSERT INTO s3p.garbage (file_id) VALUES ($1) ON CONFLICT DO NOTHING", old); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return err
-	}
 	var value *string
 	if checksum != nil {
 		value = &checksum.Value
 	}
-	_, err = tx.Exec(ctx,
-		"INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256, md5, checksum) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+	_, err := tx.Exec(ctx, `SELECT s3p.commit_part($1,$2,$3,$4,$5,$6,$7)`,
 		uploadID, partNo, fileID, size, sha, md5sum, value)
 	return err
 }

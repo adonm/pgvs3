@@ -91,9 +91,6 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 		return nil, ErrInvalidOffset
 	}
 	if m.Inline != nil {
-		if m.Size+size > s.maxInline {
-			return nil, ErrInlineTooLarge
-		}
 		newBytes, err := s.readFileBytes(ctx, fileID)
 		if err != nil {
 			return nil, err
@@ -103,13 +100,67 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 		data = append(data, newBytes...)
 		shaAll := sha256.Sum256(data)
 		etag := randomETag()
-		if _, err := tx.Exec(ctx, `UPDATE s3p.objects SET file_id = NULL, size = $3,
-			sha256 = $4, etag = $5, parts = NULL, part_ends = NULL, inline_data = $6,
-			created_at = now() WHERE bucket = $1 AND key = $2`,
-			bucket, key, len(data), shaAll[:], etag, data); err != nil {
+		if len(data) <= int(s.maxInline) {
+			if _, err := tx.Exec(ctx, `UPDATE s3p.objects SET file_id = NULL, size = $3,
+				sha256 = $4, etag = $5, parts = NULL, part_ends = NULL, inline_data = $6,
+				created_at = now() WHERE bucket = $1 AND key = $2`,
+				bucket, key, len(data), shaAll[:], etag, data); err != nil {
+				return nil, err
+			}
+			if err := queueFiles(ctx, tx, fileID, nil); err != nil {
+				return nil, err
+			}
+			if err := notifyTx(ctx, tx, bucket, key); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			out := m
+			out.Size, out.SHA256, out.ETag, out.Inline = int64(len(data)), shaAll[:], etag, data
+			out.FileID, out.Parts, out.PartEnds, out.CreatedAt = 0, nil, nil, time.Now()
+			s.cache.Put(ctx, bucket, key, out)
+			s.invalidatePeers(ctx, bucket, key)
+			s.objects.invalidate(bucket, key)
+			return &out, nil
+		}
+		if m.Size == 0 {
+			if _, err := tx.Exec(ctx, `UPDATE s3p.objects SET file_id = $3, size = $4,
+				sha256 = $5, etag = $6, parts = NULL, part_ends = NULL, inline_data = NULL,
+				created_at = now() WHERE bucket = $1 AND key = $2`,
+				bucket, key, fileID, int64(len(data)), shaAll[:], etag); err != nil {
+				return nil, err
+			}
+			if err := notifyTx(ctx, tx, bucket, key); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			out := m
+			out.Size, out.SHA256, out.ETag, out.Inline = int64(len(data)), shaAll[:], etag, nil
+			out.FileID, out.Parts, out.PartEnds, out.CreatedAt = fileID, nil, nil, time.Now()
+			s.cache.Put(ctx, bucket, key, out)
+			s.invalidatePeers(ctx, bucket, key)
+			s.objects.invalidate(bucket, key)
+			return &out, nil
+		}
+		// Promote the inline prefix to chunks and keep the appended file as
+		// the second part. No bytes are rewritten.
+		inlineID, err := s.nextFileID(ctx)
+		if err != nil {
 			return nil, err
 		}
-		if err := queueFiles(ctx, tx, fileID, nil); err != nil {
+		if err := insertChunks(ctx, tx, inlineID, m.Inline); err != nil {
+			return nil, err
+		}
+		newSize := int64(len(data))
+		parts := []int64{inlineID, fileID}
+		ends := []int64{int64(len(m.Inline)), newSize}
+		if _, err := tx.Exec(ctx, `UPDATE s3p.objects SET file_id = $3, size = $4,
+			sha256 = $5, etag = $6, parts = $7, part_ends = $8, inline_data = NULL,
+			created_at = now() WHERE bucket = $1 AND key = $2`,
+			bucket, key, inlineID, newSize, shaAll[:], etag, parts, ends); err != nil {
 			return nil, err
 		}
 		if err := notifyTx(ctx, tx, bucket, key); err != nil {
@@ -119,13 +170,14 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 			return nil, err
 		}
 		out := m
-		out.Size, out.SHA256, out.ETag, out.Inline = int64(len(data)), shaAll[:], etag, data
-		out.FileID, out.Parts, out.PartEnds, out.CreatedAt = 0, nil, nil, time.Now()
+		out.Size, out.SHA256, out.ETag, out.Inline = newSize, shaAll[:], etag, nil
+		out.FileID, out.Parts, out.PartEnds, out.CreatedAt = inlineID, parts, ends, time.Now()
 		s.cache.Put(ctx, bucket, key, out)
 		s.invalidatePeers(ctx, bucket, key)
 		s.objects.invalidate(bucket, key)
 		return &out, nil
 	}
+
 	parts := m.Parts
 	ends := m.PartEnds
 	if parts == nil {
@@ -195,6 +247,17 @@ func (s *Store) readFileBytes(ctx context.Context, fileID int64) ([]byte, error)
 		out = append(out, b...)
 	}
 	return out, rows.Err()
+}
+
+func insertChunks(ctx context.Context, tx pgx.Tx, fileID int64, data []byte) error {
+	for no, off := 0, 0; off < len(data); no, off = no+1, off+RowBytes {
+		end := min(off+RowBytes, len(data))
+		if _, err := tx.Exec(ctx, "INSERT INTO s3p.chunks (file_id, no, data) VALUES ($1,$2,$3)",
+			fileID, int32(no), data[off:end]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func randomETag() string {

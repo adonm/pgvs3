@@ -37,11 +37,14 @@ network; neither uses S3 authentication.
 ```sh
 pgvs3 doctor --url "$PGVS3_URL"
 pgvs3 stat   --url "$PGVS3_URL" --json
+pgvs3 reap   --url "$PGVS3_URL" --all
 ```
 
 `doctor` checks PostgreSQL 18, layout v9 and the chunks table settings without
 changing the database. `stat` reports logical/physical bytes, objects, chunks,
-garbage and the oldest queued file.
+garbage and the oldest queued file. `reap --all` runs bounded maintenance
+passes until no garbage remains, which is useful before a backup or when all
+gateways are scaled to zero.
 
 ## Layout upgrades
 

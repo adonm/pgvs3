@@ -352,6 +352,16 @@ func (s *Store) Init(ctx context.Context) error {
 		if !found.Valid || found.Int32 != LayoutVersion {
 			return fmt.Errorf("s3p holds storage layout %v; this pgvs3 reads v%d (migrate explicitly, or use a fresh database)", found.Int32, LayoutVersion)
 		}
+		// Re-apply the idempotent table/function definitions so a database
+		// created by an earlier v9 build gets new SQL helpers such as
+		// s3p.commit_part. Tables and indexes only use IF NOT EXISTS.
+		schema, err := schemaFS.ReadFile("schema.sql")
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, string(schema)); err != nil {
+			return err
+		}
 		// Metadata-only CopyObject/RenameObject share file IDs between object
 		// rows. Older v8 databases have a UNIQUE constraint that prevents it;
 		// dropping it is safe because the reaper checks every reference.
@@ -1368,10 +1378,10 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 		return err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	for _, k := range keys {
-		if err := notifyTx(ctx, tx, bucket, k); err != nil {
-			return err
-		}
+	// Serialise with publish_object/Copy per key without 1,000 round trips.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0) # hashtextextended(k,1))
+		FROM unnest($2::text[]) AS k`, bucket, keys); err != nil {
+		return err
 	}
 	_, err = tx.Exec(ctx, `WITH doomed AS (
 		DELETE FROM s3p.objects WHERE bucket = $1 AND key = ANY($2::text[])
@@ -1379,9 +1389,19 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 	), dead AS (
 		SELECT file_id FROM doomed UNION ALL SELECT unnest(parts) FROM doomed
 	)
-	INSERT INTO s3p.garbage (file_id) SELECT DISTINCT file_id FROM dead WHERE file_id IS NOT NULL
+	INSERT INTO s3p.garbage (file_id)
+	SELECT DISTINCT d.file_id FROM dead d
+	WHERE d.file_id IS NOT NULL
+	  AND NOT EXISTS (SELECT 1 FROM s3p.objects o
+	    WHERE (o.file_id = d.file_id OR d.file_id = ANY(o.parts))
+	      AND NOT (o.bucket = $1 AND o.key = ANY($2::text[])))
+	  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = d.file_id)
 	ON CONFLICT DO NOTHING`, bucket, keys)
 	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_notify('s3p_invalidate', $1 || chr(31) || k)
+		FROM unnest($2::text[]) AS k`, bucket, keys); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1598,12 +1618,10 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 	if err := swapObjectParts(ctx, tx, bucket, key, nil, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
 		return nil, err
 	}
-	if len(unused) > 0 {
-		if _, err := tx.Exec(ctx, "INSERT INTO s3p.garbage (file_id) SELECT unnest($1::int8[]) ON CONFLICT DO NOTHING", unused); err != nil {
-			return nil, err
-		}
-	}
 	if _, err := tx.Exec(ctx, "DELETE FROM s3p.uploads WHERE upload_id = $1", uploadID); err != nil {
+		return nil, err
+	}
+	if err := queueFileIDs(ctx, tx, unused); err != nil {
 		return nil, err
 	}
 	if err := notifyTx(ctx, tx, bucket, key); err != nil {
@@ -1652,10 +1670,8 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID, bucket, key string) (
 	if _, err := tx.Exec(ctx, "DELETE FROM s3p.uploads WHERE upload_id = $1", uploadID); err != nil {
 		return false, err
 	}
-	if len(ids) > 0 {
-		if _, err := tx.Exec(ctx, "INSERT INTO s3p.garbage (file_id) SELECT unnest($1::int8[]) ON CONFLICT DO NOTHING", ids); err != nil {
-			return false, err
-		}
+	if err := queueFileIDs(ctx, tx, ids); err != nil {
+		return false, err
 	}
 	return true, tx.Commit(ctx)
 }
@@ -1820,7 +1836,13 @@ func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, grace time.Duration
 		return 0, err
 	}
 	if referenced {
-		return 0, fmt.Errorf("garbage file %d is still referenced", fileID)
+		// A shared CopyObject/UploadPartCopy file can be queued by an older
+		// gateway. Drop the false-positive garbage row instead of wedging the
+		// reaper behind it forever.
+		if _, err := tx.Exec(ctx, "DELETE FROM s3p.garbage WHERE file_id = $1", fileID); err != nil {
+			return 0, err
+		}
+		return 1, tx.Commit(ctx)
 	}
 	tag, err := tx.Exec(ctx, `DELETE FROM s3p.chunks WHERE ctid IN
 		(SELECT ctid FROM s3p.chunks WHERE file_id = $1 LIMIT $2)`, fileID, budget)
@@ -1897,3 +1919,6 @@ func (s *Store) WriteMetrics(w io.Writer) {
 		fmt.Fprintf(w, "pgvs3_meta_cache_evicted_total %d\n", evicted)
 	}
 }
+
+func (s *Store) ReapedRows() int64  { return s.reapedRows.Load() }
+func (s *Store) ReapedFiles() int64 { return s.reapedFiles.Load() }

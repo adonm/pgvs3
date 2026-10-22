@@ -170,15 +170,17 @@ S3 Express One Zone additions:
   reference before reaping. **UploadPartCopy** of a whole single-file object
   is metadata-only; ranged and multipart-source copies stream.
 - `GetObjectAttributes`, `ListParts` and `ListMultipartUploads` are implemented.
+  Single PUTs accept `CRC64NVME` and `x-amz-checksum-type: FULL_OBJECT`; CRC32,
+  CRC32C, SHA1, SHA256 and MD5 are also verified.
   `ListDirectoryBuckets` is selected when the request is signed for
   `s3express` (AWS SDKs use that signing name).
 - `x-amz-storage-class: EXPRESS_ONEZONE` and
   `x-amz-server-side-encryption: AES256` are accepted/returned for directory
   buckets. SSE-C and DSSE-KMS are rejected, as Express does.
 
-**Not yet implemented:** `x-amz-checksum-type: FULL_OBJECT` and `CRC64NVME`
-(CRC32, CRC32C, SHA1, SHA256 and MD5 are supported), per-part checksums in
-`GetObjectAttributes`, `x-amz-client-token` idempotency for `RenameObject`,
+**Not yet implemented:** multipart `x-amz-checksum-type: FULL_OBJECT`, per-part
+checksums in `GetObjectAttributes`, `x-amz-client-token` idempotency for
+`RenameObject`,
 lifecycle expiration, bucket policies/IAM, and access points. Like Express,
 pgvs3 has no versioning, object tags, Object Lock, ACLs, lifecycle transitions,
 replication, Event Notifications, S3 Select, website hosting, access logs,
@@ -297,7 +299,7 @@ historical numbers.
 
 ## Repo layout
 
-- `cmd/pgvs3/`: CLI (`serve`, `stat --json`, `doctor`, `health`).
+- `cmd/pgvs3/`: CLI (`serve`, `stat --json`, `doctor`, `health`, `reap`).
 - `internal/store/`: schema, PostgreSQL pool, streaming COPY/GET, multipart,
   copy/rename/append, maintenance.
 - `internal/s3/`: S3 routing, SigV4, sessions, XML, ranges, checksums, Express

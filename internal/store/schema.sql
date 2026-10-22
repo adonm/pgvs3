@@ -114,6 +114,25 @@ CREATE TABLE IF NOT EXISTS s3p.garbage (
 );
 CREATE INDEX IF NOT EXISTS garbage_by_age ON s3p.garbage (queued_at, file_id);
 
+-- One-round-trip replacement of a multipart part, including safe garbage.
+CREATE OR REPLACE FUNCTION s3p.commit_part(
+  p_upload text, p_no int4, p_file_id int8, p_size int8, p_sha bytea,
+  p_md5 bytea, p_checksum text DEFAULT NULL
+) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE old bigint;
+BEGIN
+  DELETE FROM s3p.upload_parts WHERE upload_id = p_upload AND part_no = p_no
+    RETURNING file_id INTO old;
+  IF old IS NOT NULL THEN
+    INSERT INTO s3p.garbage (file_id)
+    SELECT old WHERE NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = old OR old = ANY(o.parts))
+      AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = old)
+    ON CONFLICT DO NOTHING;
+  END IF;
+  INSERT INTO s3p.upload_parts (upload_id, part_no, file_id, size, sha256, md5, checksum)
+  VALUES (p_upload, p_no, p_file_id, p_size, p_sha, p_md5, p_checksum);
+END $$;
+
 -- One-round-trip publish for a chunked object after COPY.
 CREATE OR REPLACE FUNCTION s3p.publish_object(
   p_bucket text, p_key text, p_file_id int8, p_size int8, p_sha256 bytea,
@@ -264,7 +283,10 @@ BEGIN
     IF EXISTS (SELECT 1 FROM s3p.objects WHERE file_id = victim_file) OR
        EXISTS (SELECT 1 FROM s3p.objects WHERE parts IS NOT NULL AND parts @> ARRAY[victim_file]) OR
        EXISTS (SELECT 1 FROM s3p.upload_parts WHERE file_id = victim_file) THEN
-      RAISE EXCEPTION 'garbage file % is still referenced', victim_file;
+      -- A shared CopyObject/UploadPartCopy file can be queued by an older
+      -- gateway. Drop the false-positive marker and continue.
+      DELETE FROM s3p.garbage WHERE file_id = victim_file;
+      CONTINUE;
     END IF;
     WITH doomed AS (
       SELECT no FROM s3p.chunks WHERE file_id = victim_file

@@ -17,17 +17,18 @@ import (
 )
 
 var supportedChecksums = map[string]bool{
-	"content-md5":           true,
-	"x-amz-checksum-md5":    true,
-	"x-amz-checksum-crc32":  true,
-	"x-amz-checksum-crc32c": true,
-	"x-amz-checksum-sha1":   true,
-	"x-amz-checksum-sha256": true,
-	"x-amz-checksum-sha512": true,
+	"content-md5":              true,
+	"x-amz-checksum-md5":       true,
+	"x-amz-checksum-crc32":     true,
+	"x-amz-checksum-crc32c":    true,
+	"x-amz-checksum-crc64nvme": true,
+	"x-amz-checksum-sha1":      true,
+	"x-amz-checksum-sha256":    true,
+	"x-amz-checksum-sha512":    true,
 }
 
 var checksumAlgorithms = map[string]bool{
-	"CRC32": true, "CRC32C": true, "SHA1": true, "SHA256": true,
+	"CRC32": true, "CRC32C": true, "CRC64NVME": true, "SHA1": true, "SHA256": true,
 }
 
 type integrity struct {
@@ -40,6 +41,12 @@ func newIntegrity(h http.Header) (*integrity, error) {
 	in := &integrity{h: map[string]hash.Hash{}, expected: map[string]string{}}
 	for name, values := range h {
 		lower := strings.ToLower(name)
+		if lower == "x-amz-checksum-type" {
+			if len(values) != 1 || (values[0] != "FULL_OBJECT" && values[0] != "COMPOSITE") {
+				return nil, errInvalidRequest("invalid x-amz-checksum-type")
+			}
+			continue
+		}
 		if lower == "content-md5" || (strings.HasPrefix(lower, "x-amz-checksum-") && lower != "x-amz-checksum-algorithm") {
 			if !supportedChecksums[lower] {
 				return nil, errNotImplemented()
@@ -88,6 +95,8 @@ func (in *integrity) addHasher(name string) {
 		in.h[name] = crc32.NewIEEE()
 	case "x-amz-checksum-crc32c":
 		in.h[name] = crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	case "x-amz-checksum-crc64nvme":
+		in.h[name] = newCRC64NVME()
 	case "x-amz-checksum-sha1":
 		in.h[name] = sha1.New()
 	case "x-amz-checksum-sha256":
@@ -146,6 +155,8 @@ func algorithmHasher(algorithm string) (hash.Hash, string, bool) {
 		return crc32.NewIEEE(), "x-amz-checksum-crc32", true
 	case "CRC32C":
 		return crc32.New(crc32.MakeTable(crc32.Castagnoli)), "x-amz-checksum-crc32c", true
+	case "CRC64NVME":
+		return newCRC64NVME(), "x-amz-checksum-crc64nvme", true
 	case "SHA1":
 		return sha1.New(), "x-amz-checksum-sha1", true
 	case "SHA256":
