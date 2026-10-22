@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"time"
 
+	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
@@ -36,12 +37,17 @@ func putCopyBuf(b []byte) { copyBufPool.Put(&b) }
 // Server is the S3 HTTP front end. It is stateless over PostgreSQL, so any
 // gateway instance can serve any request of any multipart upload.
 type Server struct {
-	store    *store.Store
-	log      *slog.Logger
-	metrics  *metrics
-	readOnly bool
-	draining atomic.Bool
+	store       *store.Store
+	log         *slog.Logger
+	metrics     *metrics
+	readOnly    bool
+	draining    atomic.Bool
+	origin      *objcache.Tier
+	metricsHook func(io.Writer)
 }
+
+// SetMetricsHook appends another protocol's counters to /metrics.
+func (s *Server) SetMetricsHook(f func(io.Writer)) { s.metricsHook = f }
 
 func New(st *store.Store, log *slog.Logger, readOnly bool) *Server {
 	return &Server{
@@ -73,6 +79,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/metrics" {
 		s.metrics.write(w, s.store)
+		if s.metricsHook != nil {
+			s.metricsHook(w)
+		}
 		return
 	}
 	defer func() { s.metrics.observe(r.Method, rw.status, time.Since(start), rw.n) }()
@@ -85,6 +94,10 @@ func (s *Server) SetDraining(v bool) { s.draining.Store(v) }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	prepareBody(r)
+	if strings.HasPrefix(r.URL.EscapedPath(), CachePrefix) {
+		s.serveCacheHTTP(w, r)
+		return
+	}
 	bucket, key, err := splitPath(r)
 	if err != nil {
 		writeError(w, r, errInvalidRequest("invalid object path"), s.log)
@@ -92,6 +105,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, r, errAccessDenied("gateway is read-only"), s.log)
+		return
+	}
+	if s.origin != nil {
+		s.serveOrigin(w, r, bucket, key)
 		return
 	}
 	q := r.URL.Query()

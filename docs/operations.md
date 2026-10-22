@@ -28,7 +28,7 @@ enforces authentication, authorization, and TLS.
 ## Probes and Prometheus metrics
 
 - `GET /healthz` — process liveness (does not touch PostgreSQL).
-- `GET /readyz` — checks PostgreSQL connectivity and schema layout v10; returns
+- `GET /readyz` — checks PostgreSQL connectivity and schema layout v11; returns
   `503` while draining or if the database is unreachable.
 - `GET /metrics` — Prometheus metrics:
   - `pgvs3_requests_total{method,code}`
@@ -40,11 +40,11 @@ enforces authentication, authorization, and TLS.
 ## CLI diagnostics and maintenance
 
 ```sh
-pgvs3 doctor --url "$PGVS3_URL"                   # verify PG 18+, layout v10, and per-bucket reloptions
-pgvs3 stat   --url "$PGVS3_URL" [--bucket B] --json # logical/physical bytes, objects, chunks, garbage age
-pgvs3 reap   --url "$PGVS3_URL" --all             # drain all eligible garbage outside the grace window
-pgvs3 clone  --url "$PGVS3_URL" <src> <dst>       # server-side clone of a whole bucket
-pgvs3 drop   --url "$PGVS3_URL" [--force] <bkt>   # drop a bucket schema (`DROP SCHEMA CASCADE`)
+pgvs3 doctor --url "$PGVS3_URL"                         # PG 18+, layout v11, per-namespace settings
+pgvs3 stat   --url "$PGVS3_URL" [--kind K] [--name N] --json
+pgvs3 reap   --url "$PGVS3_URL" --all                   # garbage + TTL sweep
+pgvs3 clone  --url "$PGVS3_URL" [--kind bucket|cache] <src> <dst>
+pgvs3 drop   --url "$PGVS3_URL" [--kind bucket|cache|queue] [--force] <name>
 ```
 
 In normal operation, one gateway per cluster runs background maintenance every
@@ -54,9 +54,20 @@ minute (coordinated via `pg_try_advisory_lock`), reconciling restored/dropped
 `--reap-grace` (default `10m`), chaining additional passes immediately when a
 pass saturates its row budget.
 
-## Bucket snapshots, cloning, and deletion
+## Namespaces: buckets, caches, queues
 
-Each bucket `<name>` lives in its own PostgreSQL schema `s3b_<name>`:
+Every namespace is a PostgreSQL schema, typed by prefix:
+
+| Kind | Schema | Tables | Durability |
+| --- | --- | --- | --- |
+| bucket | `s3b_<name>` | objects, chunks, uploads, garbage | WAL-logged |
+| cache | `s3c_<name>` | objects, chunks, garbage | UNLOGGED (truncated on crash) |
+| queue | `s3q_<name>` | messages | WAL-logged |
+
+## Snapshots, cloning, and deletion
+
+Each namespace `<name>` lives in its own schema, so a single `pg_dump -n`
+captures exactly one bucket, cache DB or queue:
 
 - **Single-bucket snapshot & restore:**
   ```sh
@@ -66,16 +77,16 @@ Each bucket `<name>` lives in its own PostgreSQL schema `s3b_<name>`:
   On the next maintenance tick (or gateway startup / `pgvs3 reap`),
   `s3p.reconcile_buckets()` automatically registers any restored `s3b_*` schema
   in `s3p.buckets` and advances `s3p.file_ids` past its highest `file_id`.
-- **Whole-bucket clone (server-side):**
+- **Whole-namespace clone (server-side):**
   ```sh
   pgvs3 clone --url "$PGVS3_URL" lake lake-staging
-  # or over HTTP:
+  pgvs3 clone --kind cache --url "$PGVS3_URL" cache cache-copy
   curl -X PUT -H 'x-amz-copy-source: /lake' http://127.0.0.1:8014/lake-staging
   ```
-- **Instant bucket deletion & OS disk reclaim:**
+- **Instant deletion & OS disk reclaim:**
   ```sh
   pgvs3 drop --url "$PGVS3_URL" --force lake-staging
-  # or over HTTP:
+  pgvs3 drop --kind queue --force jobs
   curl -X DELETE 'http://127.0.0.1:8014/lake-staging?force=true'
   ```
   `DROP SCHEMA CASCADE` unlinks the bucket's table files immediately with no
@@ -121,3 +132,39 @@ layouts, copy data into a fresh database via DuckDB/rclone and switch
 
 `just fault` tests gateway loss, mid-upload PostgreSQL restarts, and high
 overwrite churn.
+
+## SQS
+
+SQS shares the `:8014` listener. Point any SDK at it:
+
+```sh
+aws --endpoint-url http://127.0.0.1:8014 sqs create-queue --queue-name jobs
+aws --endpoint-url http://127.0.0.1:8014 sqs send-message \
+  --queue-url http://127.0.0.1:8014/jobs --message-body '{"job":1}'
+aws --endpoint-url http://127.0.0.1:8014 sqs receive-message \
+  --queue-url http://127.0.0.1:8014/jobs --max-number-of-messages 10
+```
+
+Queues store `VisibilityTimeout`, `DelaySeconds`, `MaximumMessageSize`,
+`MessageRetentionPeriod` and `ReceiveMessageWaitTimeSeconds` in
+`s3p.namespaces.attrs`. Receive leases a batch with `FOR UPDATE SKIP LOCKED`;
+`DeleteMessage`/`ChangeMessageVisibility` match on the receipt handle.
+
+## Cache tier in front of another object store
+
+```sh
+cat > origin.yaml <<'YAML'
+type: s3
+config:
+  bucket: my-origin
+  endpoint: s3.us-east-1.amazonaws.com
+  access_key: ...
+  secret_key: ...
+YAML
+pgvs3 serve --origin-config origin.yaml --cache-namespace origin --cache-ttl 5m
+```
+
+Every S3 `GET` is served from `s3c_<namespace>` when the cached size and origin
+mtime still match, and downloaded otherwise. `PUT` writes through to the origin
+and refreshes the cache; `DELETE` removes both. `--cache-retention` evicts idle
+entries. Supported origin types are `s3`, `filesystem` and `inmem`.

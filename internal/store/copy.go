@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/adonm/pgvs3/internal/ns"
 )
 
 // CopyOptions controls a CopyObject. Same-bucket copies are metadata-only
@@ -34,7 +36,7 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := s.knownBuckets.Load(dstBucket); !ok {
+	if !s.known(ns.Bucket, dstBucket) {
 		if err := s.CreateBucket(ctx, dstBucket); err != nil {
 			return nil, err
 		}

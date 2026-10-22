@@ -36,10 +36,10 @@ mise exec go -- gofmt -w cmd internal test
 
 ## Storage layout changes
 
-`internal/store/schema.sql` defines layout `v10` (`store.LayoutVersion = 10`).
-Each bucket lives in its own PostgreSQL schema `s3b_<bucket>`. Objects up to
-64 KiB live inline in `objects.inline_data`; larger objects use 8,120-byte rows
-in `chunks`.
+`internal/store/schema.sql` defines layout `v11` (`store.LayoutVersion = 11`).
+Namespaces are PostgreSQL schemas typed by prefix: `s3b_` bucket, `s3c_` cache
+(UNLOGGED) and `s3q_` queue. Objects up to the kind's inline ceiling live in
+`objects.inline_data`; larger objects use 8,120-byte rows in `chunks`.
 
 Any incompatible schema change must:
 
@@ -74,3 +74,15 @@ Any incompatible schema change must:
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+## Package map
+
+| Package | Responsibility |
+| --- | --- |
+| `internal/ns` | namespace kinds, name validation, schema naming |
+| `internal/store` | PostgreSQL layout, objects, blocks, cache, queues, GC |
+| `internal/s3` | S3 + plain HTTP handlers, cache-tier proxy |
+| `internal/sqs` | SQS JSON and Query protocols |
+| `internal/resp` | RESP2/RESP3 server |
+| `internal/objcache` | thanos-objstore read-through tier |
+| `internal/gateway` | protocol mux and HTTP server |

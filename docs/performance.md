@@ -9,10 +9,12 @@ way they are.
 
 | Mechanism | How it works |
 | --- | --- |
-| **Per-bucket PostgreSQL schema (`s3b_<bucket>`)** | Each bucket gets its own `objects`, `chunks`, `uploads`, and `garbage` tables (32 TiB capacity and independent autovacuum per bucket, instant `DROP SCHEMA CASCADE`, single-bucket `pg_dump -n`). |
+| **One schema per namespace, typed by prefix** | `s3b_<name>` (durable bucket), `s3c_<name>` (cache, UNLOGGED tables) and `s3q_<name>` (SQS queue) each own their tables, autovacuum workers and 32 TiB chunk budget. Namespaces can be snapshotted with `pg_dump -n`, cloned in-database and dropped with `DROP SCHEMA CASCADE`. |
 | **Inline small objects (≤64 KiB)** | Stored directly in `objects.inline_data` (`file_id NULL`, LZ4-compressed when compressible) with optional `expires_at`. Written in one `put_inline` call and read in one primary-key lookup without touching `chunks`. |
 | **Length-discriminated LZ4 8,120-byte chunk blocks** | Larger objects split into logical 8,120-byte blocks in `chunks` (`internal/store/block.go`). Each block is LZ4-compressed if it shrinks (`len(stored) < wantLen`) or stored raw (`len(stored) == wantLen`) with zero header bytes, so incompressible blocks never exceed the 8,160-byte page budget and logical offsets remain `no × 8,120` for `O(1)` byte-range seeking. |
-| **Dual S3/HTTP + RESP protocol mux** | `internal/s3/serve.go` sniffs the first 5 bytes of each TCP connection on `:8014` and routes RESP2/RESP3 traffic to `internal/s3/resp.go`, coalescing pipelined `GET` and `SET` bursts into single-query `CacheMGet` / `CacheMSet` round trips against `s3b_<bucket>`. |
+| **One-port protocol mux** | `internal/gateway` routes HTTP (`S3`, `SQS`, plain web) and RESP2/RESP3 by first bytes on `:8014`; RESP batches pipelined `GET`/`SET` bursts into single-query `CacheMGet` / `CacheMSet` round trips against `s3c_<namespace>`. |
+| **Message queues** | `s3q_<name>.messages` holds one compressed body per row with `visible_at`/`receipt` leases; receive is a single `FOR UPDATE SKIP LOCKED` statement and delete is keyed by receipt. |
+| **Read-through origin cache** | `internal/objcache` wraps a thanos `objstore.Bucket`: `GET` verifies size+mtime, downloads into `s3c_<namespace>`, and `PUT`/`DELETE` write through and refresh the cached copy. |
 | **No TOAST overhead** | `chunks` sets `toast_tuple_target = 8160` and `STORAGE EXTERNAL`, so PostgreSQL never detoasts or chases out-of-line pointers on read. |
 | **Immutable files** | Every write allocates a fresh `file_id`; overwrites swap the pointer on `objects` and queue the old `file_id` for reaping. Chunk rows are never updated in place. |
 | **Strong ETag caching** | `file_id` backs strong ETags so DuckDB's external file cache can reuse local blocks without re-fetching. |
@@ -83,10 +85,12 @@ way they are.
 - **Read grace window:** Deleted or overwritten files remain in `s3p.chunks` for
   `--reap-grace` (default 10 minutes) so in-flight readers can finish without
   holding long transactions.
-- **Bounded GC passes:** Every minute, one gateway acquires a cluster-wide
-  `pg_try_advisory_lock` and deletes up to 65,536 chunk rows (~508 MiB) per
-  pass; if a pass hits the row cap, it immediately chains additional passes
-  until the eligible backlog is drained.
+- **Bounded, chained GC passes:** Every minute, one gateway acquires a
+  cluster-wide `pg_try_advisory_lock` and deletes up to 65,536 chunk rows
+  (~508 MiB) per pass; a saturated pass immediately chains another.
+- **TTL expiry is chained too:** `expire_objects(4096)` runs repeatedly until a
+  pass comes back short, so a burst of expiring keys drains in one tick instead
+  of ~4 keys/s/bucket.
 - **Space reuse:** Freed pages are reused by subsequent writes once autovacuum
   marks them dead. Long-running snapshots hold back vacuum horizon; avoid
   multi-hour open transactions on the storage database.

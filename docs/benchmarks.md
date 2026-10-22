@@ -47,23 +47,36 @@ objects are served directly from PostgreSQL `shared_buffers`.
 | 64 MiB PUT (S3) | 1 | 220 MiB/s | 183 ms | 223 ms | 86 MiB/s (577 ms) |
 | 64 MiB PUT (S3) | 8 | 509 MiB/s | 820 ms | 1,109 ms | 171 MiB/s (2,391 ms) |
 | 8 KiB range from 64 MiB | 64 | 16,171 req/s | 3.57 ms | 9.67 ms | 6,397 req/s (9.07 ms) |
-| ListObjectsV2 (1,000 keys) | 64 | 2,164 req/s | 25.6 ms | 92.4 ms | 638 req/s (98.4 ms) |
+| ListObjectsV2 (1,000 keys) | 64 | 2,019 req/s | 27.3 ms | 99.1 ms | 638 req/s (98.4 ms) |
+| **RESP 4 KiB GET** | 1 / 64 / 64p16 | **12,242 / 96,966 / 460,381 req/s** | **0.072 / 0.60 / 0.128 ms** | 0.21 / 1.74 / 0.34 ms | — |
+| **RESP 4 KiB SET (sync)** | 1 / 64 / 64p16 | **5,018 / 48,215 / 213,603 req/s** | **0.183 / 1.12 / 0.284 ms** | 0.46 / 4.13 / 0.66 ms | — |
+| **SQS SendMessage 4 KiB** | 1 / 64 / 64p16 | **1,083 / 12,681 / 12,500 msg/s** | **0.86 / 4.81 / 4.90 ms** | 1.66 / 9.32 / 10.9 ms | — |
+| **SQS Receive+Delete 4 KiB** | 1 / 32 | **96 / 2,086 msg/s** | **99.7 / 152 ms** | 149 / 183 ms | — |
+| **Cache tier 4 KiB GET (warm)** | 1 / 16 | **3,121 / 12,233 req/s** | **0.29 / 1.18 ms** | 0.71 / 2.98 ms | — |
+| **Cache tier 4 KiB PUT (write-through)** | 1 / 16 | **974 / 5,326 req/s** | **0.92 / 2.56 ms** | 2.77 / 7.34 ms | — |
+| **Cache tier 64 MiB GET (warm)** | 1 / 16 | **1,442 / 4,005 MiB/s** | 43.9 / 253 ms | 60.2 / 366 ms | — |
+| **Cache tier 64 MiB PUT (write-through)** | 1 / 16 | **205 / 488 MiB/s** | 227 / 1,307 ms | 236 / 3,268 ms | — |
 
 Key takeaways:
 
-- **Sub-100 µs RESP cache reads & 459k GET/s pipelined:** Over RESP on `:8014`,
-  a 1-worker 4 KiB `GET` completes in **`0.081 ms` (81 µs) p50** (9,850 req/s),
-  scales to **91.0k `GET`/s** unpipelined at 64 workers, and reaches **459.0k
-  `GET`/s (1.79 GiB/s)** at pipeline depth 16 via `CacheMGet` query coalescing.
-- **110k/s durable pipelined RESP writes:** Pipelined 4 KiB `SET`s coalesce into
-  single-transaction `CacheMSet` upserts with LZ4 block compression, reaching
-  **110.2k durable `SET`/s (431 MiB/s, `0.56 ms` p50)** at pipeline 16 (and
-  **23.9k `SET`/s** unpipelined) with `synchronous_commit = on`.
-- **Sub-millisecond S3 small reads & 20.4k/s durable S3 writes:** S3 4 KiB
-  `GET` reaches **35.5k req/s** (`0.17 ms` p50 at 1 worker) and durable 4 KiB
-  `PUT` reaches **20.4k req/s**.
-- **Multi-GiB/s large-object reads:** 64 MiB reads stream at **1.24 GiB/s** from
-  1 worker and **4.16 GiB/s (4,262 MiB/s)** across 16 workers.
+- **Sub-100 µs RESP reads & 460k GET/s pipelined:** a 1-worker 4 KiB `GET`
+  completes in **`0.072 ms` (72 µs) p50** (12.2k req/s), scales to **97.0k
+  `GET`/s** unpipelined and **460.4k `GET`/s (1.76 GiB/s)** at pipeline 16 via
+  `CacheMGet` coalescing.
+- **213k/s durable pipelined RESP writes:** pipelined `SET`s coalesce into one
+  `CacheMSet` statement with LZ4 block compression, reaching **213.6k durable
+  `SET`/s (834 MiB/s, `0.28 ms` p50)** at pipeline 16 (48.2k unpipelined).
+- **SQS:** **12.7k `SendMessage`/s** at 64 workers and **2.1k
+  receive+delete/s** at 32 workers (each receive is one `SKIP LOCKED` lease,
+  each delete one receipt lookup).
+- **Sub-millisecond S3 small reads & 20.9k/s durable S3 writes:** S3 4 KiB
+  `GET` reaches **35.8k req/s** (`0.17 ms` p50 at 1 worker) and durable 4 KiB
+  `PUT` reaches **20.9k req/s**.
+- **Cache tier:** a warm 4 KiB `GET` through the objstore proxy costs one
+  PostgreSQL read and reaches **12.2k req/s**; 64 MiB reads reach **4.0 GiB/s**
+  and write-through PUTs **488 MiB/s** (origin is a local filesystem).
+- **Multi-GiB/s large-object reads:** 64 MiB reads stream at **1.30 GiB/s** from
+  1 worker and **4.17 GiB/s (4,275 MiB/s)** across 16 workers.
 - **Fast byte ranges and listings:** 8 KiB range reads from 64 MiB objects
   reach 16.1k req/s (3.55 ms p50), and 1,000-key `ListObjectsV2` calls reach
   1,840 req/s (~1.84M keys/s).

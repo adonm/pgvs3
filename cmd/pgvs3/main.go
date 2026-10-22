@@ -14,15 +14,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/adonm/pgvs3/internal/s3"
+	"github.com/adonm/pgvs3/internal/gateway"
+	"github.com/adonm/pgvs3/internal/ns"
+	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
 var version = "dev"
 
-func main() {
-	os.Exit(run())
-}
+func main() { os.Exit(run()) }
 
 func run() int {
 	args := os.Args[1:]
@@ -30,23 +30,16 @@ func run() int {
 		fmt.Println(version)
 		return 0
 	}
-	if i := indexArg(args, "health"); i >= 0 {
-		return health(removeArg(args, i))
-	}
-	if i := indexArg(args, "reap"); i >= 0 {
-		return reap(removeArg(args, i))
-	}
-	if i := indexArg(args, "doctor"); i >= 0 {
-		return doctor(removeArg(args, i))
-	}
-	if i := indexArg(args, "stat"); i >= 0 {
-		return stat(removeArg(args, i))
-	}
-	if i := indexArg(args, "clone"); i >= 0 {
-		return cloneBucket(removeArg(args, i))
-	}
-	if i := indexArg(args, "drop"); i >= 0 {
-		return dropBucket(removeArg(args, i))
+	for _, cmd := range []struct {
+		name string
+		fn   func([]string) int
+	}{
+		{"health", health}, {"reap", reap}, {"doctor", doctor}, {"stat", stat},
+		{"clone", cloneNS}, {"drop", dropNS}, {"version", nil},
+	} {
+		if i := indexArg(args, cmd.name); i >= 0 && cmd.fn != nil {
+			return cmd.fn(removeArg(args, i))
+		}
 	}
 	if i := indexArg(args, "serve"); i >= 0 {
 		args = removeArg(args, i)
@@ -73,16 +66,20 @@ func serve(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var (
 		url       = fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-		addr      = fs.String("addr", env("PGVS3_ADDR", "0.0.0.0:8014"), "S3 and HTTP listen address")
+		addr      = fs.String("addr", env("PGVS3_ADDR", "0.0.0.0:8014"), "S3/SQS/HTTP/RESP listen address")
 		poolMax   = fs.Int("pool-max", envInt("PGVS3_POOL_MAX", 64), "PostgreSQL connections per gateway")
+		maxConns  = fs.Int("max-conns", envInt("PGVS3_MAX_CONNS", 4096), "concurrent client connections")
 		reapGrace = fs.Duration("reap-grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "how long deleted files stay readable")
-		readOnly  = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating S3 requests")
+		readOnly  = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating requests")
 		logLevel  = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
+		originCfg = fs.String("origin-config", env("PGVS3_ORIGIN_CONFIG", ""), "objstore YAML file: serve S3 as a read-through cache")
+		cacheTTL  = fs.Duration("cache-ttl", envDuration("PGVS3_CACHE_TTL", time.Minute), "origin revalidation interval")
+		cacheKeep = fs.Duration("cache-retention", envDuration("PGVS3_CACHE_RETENTION", 24*time.Hour), "evict cached objects after this idle period")
+		cacheNS   = fs.String("cache-namespace", env("PGVS3_CACHE_NAMESPACE", "origin"), "cache namespace for origin objects")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-
 	log := newLogger(*logLevel)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -110,14 +107,30 @@ func serve(args []string) int {
 		go maintain(ctx, st, *reapGrace, min(*reapGrace, time.Minute), log)
 	}
 
-	handler := s3.New(st, log, *readOnly)
+	var origin *objcache.Tier
+	if *originCfg != "" {
+		cfg, err := os.ReadFile(*originCfg)
+		if err != nil {
+			log.Error("reading origin config", "err", err)
+			return 1
+		}
+		origin, err = objcache.New(log, cfg, st, *cacheNS, *cacheTTL, *cacheKeep)
+		if err != nil {
+			log.Error("building origin cache", "err", err)
+			return 1
+		}
+		defer origin.Close()
+		log.Info("origin cache enabled", "namespace", *cacheNS, "ttl", *cacheTTL)
+	}
+
+	g := gateway.New(st, log, *readOnly, origin)
 	go func() {
 		<-ctx.Done()
-		handler.SetDraining(true)
+		g.SetDraining(true)
 	}()
-	srv := s3.NewHTTPServer(*addr, handler, log)
+	srv := gateway.NewHTTPServer(*addr, g, log)
 	log.Info("pgvs3 starting", "version", version, "addr", *addr)
-	if err := s3.Run(ctx, srv, 5*time.Second, log); err != nil {
+	if err := gateway.Run(ctx, srv, g, 5*time.Second, *maxConns, log); err != nil {
 		log.Error("serving", "err", err)
 		return 1
 	}
@@ -127,20 +140,17 @@ func serve(args []string) int {
 func stat(args []string) int {
 	fs := flag.NewFlagSet("stat", flag.ContinueOnError)
 	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	bucket := fs.String("bucket", "", "limit stats to one bucket")
+	kind := fs.String("kind", "", "bucket, cache or queue (default: all)")
+	name := fs.String("name", "", "namespace name")
 	asJSON := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+	st := mustStore(ctx, *url)
 	defer st.Close()
-	s, err := st.StatBucket(ctx, *bucket)
+	s, err := st.StatNamespace(ctx, ns.Kind(*kind), *name, "", 0)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -159,92 +169,87 @@ func stat(args []string) int {
 		_ = enc.Encode(s)
 		return 0
 	}
-	fmt.Printf("buckets=%d objects=%d chunks=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
-		s.Buckets, s.Objects, s.Chunks, s.LogicalBytes>>20, s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
+	fmt.Printf("namespaces=%d buckets=%d objects=%d chunks=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
+		s.Namespaces, s.Buckets, s.Objects, s.Chunks, s.LogicalBytes>>20,
+		s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
 	return 0
 }
 
-func cloneBucket(args []string) int {
+func cloneNS(args []string) int {
 	fs := flag.NewFlagSet("clone", flag.ContinueOnError)
 	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	kind := fs.String("kind", "bucket", "bucket or cache")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	rest := fs.Args()
 	if len(rest) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: pgvs3 clone [--url URL] <src-bucket> <dst-bucket>")
+		fmt.Fprintln(os.Stderr, "usage: pgvs3 clone [--kind bucket|cache] <src> <dst>")
 		return 2
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+	st := mustStore(ctx, *url)
 	defer st.Close()
 	if err := st.CheckLayout(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if err := st.CloneBucket(ctx, rest[0], rest[1]); err != nil {
+	if err := st.CloneNamespace(ctx, ns.Kind(*kind), rest[0], rest[1]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("cloned=%s->%s\n", rest[0], rest[1])
+	fmt.Printf("cloned=%s->%s kind=%s\n", rest[0], rest[1], *kind)
 	return 0
 }
 
-func dropBucket(args []string) int {
+func dropNS(args []string) int {
 	fs := flag.NewFlagSet("drop", flag.ContinueOnError)
 	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	force := fs.Bool("force", false, "drop non-empty bucket and reclaim its schema immediately")
+	kind := fs.String("kind", "bucket", "bucket, cache or queue")
+	force := fs.Bool("force", false, "drop non-empty namespaces and reclaim their schema immediately")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	rest := fs.Args()
 	if len(rest) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: pgvs3 drop [--url URL] [--force] <bucket>")
+		fmt.Fprintln(os.Stderr, "usage: pgvs3 drop [--kind bucket|cache|queue] [--force] <name>")
 		return 2
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+	st := mustStore(ctx, *url)
 	defer st.Close()
 	if err := st.CheckLayout(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	res, err := st.DropBucket(ctx, rest[0], *force)
+	res, err := st.DropNamespace(ctx, ns.Kind(*kind), rest[0], *force)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	switch res {
 	case store.BucketDeleted:
-		fmt.Printf("dropped=%s\n", rest[0])
+		fmt.Printf("dropped=%s kind=%s\n", rest[0], *kind)
 		return 0
 	case store.BucketNotEmpty:
-		fmt.Fprintf(os.Stderr, "bucket %s is not empty (pass --force to drop its schema)\n", rest[0])
+		fmt.Fprintf(os.Stderr, "namespace %s is not empty (pass --force)\n", rest[0])
 		return 1
 	default:
-		fmt.Fprintf(os.Stderr, "bucket %s does not exist\n", rest[0])
+		fmt.Fprintf(os.Stderr, "namespace %s does not exist\n", rest[0])
 		return 1
 	}
 }
 
 func health(args []string) int {
 	fs := flag.NewFlagSet("health", flag.ContinueOnError)
-	url := fs.String("url", env("PGVS3_HEALTH_URL", "http://127.0.0.1:8014/readyz"), "readiness URL")
+	u := fs.String("url", env("PGVS3_HEALTH_URL", "http://127.0.0.1:8014/readyz"), "readiness URL")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(*url)
+	resp, err := client.Get(*u)
 	if err != nil {
 		return 1
 	}
@@ -263,13 +268,9 @@ func reap(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+	st := mustStore(ctx, *url)
 	defer st.Close()
 	if err := st.CheckLayout(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -290,8 +291,8 @@ func reap(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("garbage_files=%d reaped_rows=%d reaped_files=%d db=%d MiB\n",
-		after.GarbageFiles, st.ReapedRows(), st.ReapedFiles(), after.DatabaseBytes>>20)
+	fmt.Printf("garbage_files=%d reaped_rows=%d reaped_files=%d expired_objects=%d db=%d MiB\n",
+		after.GarbageFiles, st.ReapedRows(), st.ReapedFiles(), st.ExpiredObjects(), after.DatabaseBytes>>20)
 	return 0
 }
 
@@ -301,25 +302,31 @@ func doctor(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+	st := mustStore(ctx, *url)
 	defer st.Close()
 	d, err := st.Diagnose(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("server_version_num=%d layout=%d buckets=%d chunks=%s configured=%v objects=%d garbage=%d db=%d MiB\n",
-		d.ServerVersion, d.Layout, d.Buckets, d.ChunksRelkind, d.ChunksConfigured, d.Objects, d.GarbageFiles, d.DatabaseBytes>>20)
+	fmt.Printf("server_version_num=%d layout=%d namespaces=%d buckets=%d queues=%d caches=%d configured=%v objects=%d garbage=%d db=%d MiB\n",
+		d.ServerVersion, d.Layout, d.Namespaces, d.Buckets, d.Queues, d.Caches,
+		d.ChunksConfigured, d.Objects, d.GarbageFiles, d.DatabaseBytes>>20)
 	if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured {
 		return 1
 	}
 	return 0
+}
+
+func mustStore(ctx context.Context, url string) *store.Store {
+	st, err := store.Open(ctx, url, 4, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	return st
 }
 
 func maintain(ctx context.Context, st *store.Store, grace, interval time.Duration, log *slog.Logger) {

@@ -18,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/adonm/pgvs3/internal/ns"
 )
 
 // RowBytes is the payload per chunk row. file_id(8) + no(4) + varlena(4) +
@@ -171,6 +173,7 @@ func (f *rowFramer) digests() (int64, []byte, []byte) {
 
 type writerTarget struct {
 	kind       int // 0 object, 1 part
+	nsKind     ns.Kind
 	bucket     string
 	schema     string
 	key        string
@@ -178,6 +181,7 @@ type writerTarget struct {
 	ifMatch    string
 	expiresAt  *time.Time
 	keepTTL    bool
+	originETag string
 	userMeta   []string
 	content    string
 	uploadID   string
@@ -213,8 +217,14 @@ type ChunkWriter struct {
 // happen before this returns, so the HTTP handler can stream the body straight
 // into COPY.
 func (s *Store) StartObject(ctx context.Context, bucket, key string, cond Condition, ifMatch string, userMeta []string, contentType string) (*ChunkWriter, error) {
+	return s.StartObjectKind(ctx, ns.Bucket, bucket, key, cond, ifMatch, userMeta, contentType, nil, false, "")
+}
+
+// StartObjectKind begins an object write in any namespace kind.
+func (s *Store) StartObjectKind(ctx context.Context, kind ns.Kind, name, key string, cond Condition, ifMatch string, userMeta []string, contentType string, expiresAt *time.Time, keepTTL bool, originETag string) (*ChunkWriter, error) {
 	return s.startWriter(ctx, writerTarget{
-		kind: 0, bucket: bucket, key: key, condition: cond, ifMatch: ifMatch,
+		kind: 0, nsKind: kind, bucket: name, key: key, condition: cond, ifMatch: ifMatch,
+		expiresAt: expiresAt, keepTTL: keepTTL, originETag: originETag,
 		userMeta: userMeta, content: contentType,
 	})
 }
@@ -229,14 +239,20 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 	if t.userMeta == nil {
 		t.userMeta = []string{}
 	}
-	sc, err := bucketSQLIdent(t.bucket)
+	if t.nsKind == "" {
+		t.nsKind = ns.Bucket
+	}
+	if s.overQuota(t.nsKind, t.bucket) {
+		return nil, ErrQuotaExceeded
+	}
+	sc, err := nsSQLIdent(t.nsKind, t.bucket)
 	if err != nil {
 		return nil, err
 	}
 	t.schema = sc
 	if t.kind == 0 {
-		if _, ok := s.knownBuckets.Load(t.bucket); !ok {
-			if err := s.CreateBucket(ctx, t.bucket); err != nil {
+		if !s.known(t.nsKind, t.bucket) {
+			if err := s.EnsureNamespace(ctx, t.nsKind, t.bucket, nil, nil); err != nil {
 				return nil, err
 			}
 		}
@@ -296,7 +312,7 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 	copySQL := "COPY " + t.schema + ".chunks (file_id, no, data) FROM STDIN WITH (FORMAT binary)"
 	if _, err := tx.Conn().PgConn().CopyFrom(ctx, pr, copySQL); err != nil {
 		if isMissingBucketSchema(err) {
-			w.store.knownBuckets.Delete(t.bucket)
+			w.store.forget(t.nsKind, t.bucket)
 		}
 		_ = pr.CloseWithError(err)
 		_ = tx.Rollback(ctx)
@@ -327,8 +343,9 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			match = t.ifMatch
 		}
 		var outcome string
-		err := tx.QueryRow(ctx, "SELECT "+t.schema+".publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-			t.key, fileIDOf(w), size, sha, etag, t.userMeta, t.content, condText, match, t.expiresAt, t.keepTTL).Scan(&outcome)
+		err := tx.QueryRow(ctx, "SELECT "+t.schema+".publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+			t.key, fileIDOf(w), size, sha, etag, t.userMeta, t.content, condText, match,
+			t.expiresAt, t.keepTTL, t.originETag).Scan(&outcome)
 		if err == nil && outcome == "precondition" {
 			err = ErrPrecondition
 		}

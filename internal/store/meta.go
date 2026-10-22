@@ -5,7 +5,8 @@ import (
 	"time"
 )
 
-// Meta is everything needed to serve a range without reading s3p.objects.
+// Meta is everything needed to serve a range without reading the objects row
+// again.
 type Meta struct {
 	Size         int64
 	SHA256       []byte
@@ -13,7 +14,10 @@ type Meta struct {
 	UserMetadata []string
 	ContentType  string
 	CreatedAt    time.Time
-	FileID       int64
+	ExpiresAt    *time.Time
+	// OriginETag records the upstream object version for cache-tier entries.
+	OriginETag string
+	FileID     int64
 	// Multipart objects: part file IDs in order and cumulative end offsets.
 	// Both nil for a single-file object.
 	Parts    []int64
@@ -55,4 +59,9 @@ func (m *Meta) Segments() ([]Segment, error) {
 		prev = end
 	}
 	return out, nil
+}
+
+// Live reports whether the object has not expired.
+func (m *Meta) Live(now time.Time) bool {
+	return m.ExpiresAt == nil || m.ExpiresAt.After(now)
 }

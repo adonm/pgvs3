@@ -60,7 +60,7 @@ func main() {
 	bucket := flag.String("bucket", "bench", "bucket")
 	access := flag.String("access", "testkey", "access key")
 	secret := flag.String("secret", "testsecret", "secret key")
-	op := flag.String("op", "get", "put, get, head, range, list, resp-set or resp-get")
+	op := flag.String("op", "get", "put, get, head, range, list, resp-set, resp-get, sqs-send or sqs-recv")
 	size := flag.Int64("size", 4096, "object size for put/get")
 	rangeSize := flag.Int64("range-size", 8192, "range length for -op range")
 	workers := flag.Int("workers", 16, "concurrent workers")
@@ -69,9 +69,14 @@ func main() {
 	count := flag.Int("count", 2000, "objects to prefill/read")
 	warmup := flag.Bool("warmup", false, "read every key once before measuring")
 	prefix := flag.String("prefix", "", "key prefix (a unique one is generated if empty)")
+	queue := flag.String("queue", "benchq", "SQS queue name for sqs-send/sqs-recv")
 	flag.Parse()
 	if *prefix == "" {
 		*prefix = fmt.Sprintf("bench-%d", time.Now().UnixNano())
+	}
+	if strings.HasPrefix(*op, "sqs-") {
+		runSQS(*endpoint, *queue, *op, *size, *workers, max(*pipeline, 1), *duration)
+		return
 	}
 	if strings.HasPrefix(*op, "resp-") {
 		runRESP(*endpoint, *bucket, *op, *size, *workers, max(*pipeline, 1), *duration, *count, *prefix)

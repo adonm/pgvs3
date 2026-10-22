@@ -6,12 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/adonm/pgvs3/internal/ns"
 )
 
 var ErrNotInteger = errors.New("value is not an integer or out of range")
@@ -24,9 +27,9 @@ type CacheSetOptions struct {
 	ReturnOld bool
 }
 
-// CacheGet returns the uncompressed bytes of an object (inline or chunked).
-func (s *Store) CacheGet(ctx context.Context, bucket, key string) ([]byte, bool, error) {
-	sc, err := bucketSQLIdent(bucket)
+// CacheGet returns the value of one cache key.
+func (s *Store) CacheGet(ctx context.Context, name, key string) ([]byte, bool, error) {
+	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
 		return nil, false, err
 	}
@@ -42,37 +45,39 @@ func (s *Store) CacheGet(ctx context.Context, bucket, key string) ([]byte, bool,
 	if err != nil {
 		return nil, false, err
 	}
-	if hasInline {
-		raw, err := decompressBlock(nil, inline, int(size))
+	if !hasInline {
+		// A cache value larger than one page spilled into chunks.
+		sl, err := s.GetKind(ctx, ns.Cache, name, key, 0, -1, -1)
+		if errors.Is(err, ErrNotFound) {
+			return nil, false, nil
+		}
 		if err != nil {
 			return nil, false, err
 		}
-		return raw, true, nil
+		return sl.Bytes, true, nil
 	}
-	sl, err := s.Get(ctx, bucket, key, 0, -1, -1)
-	if errors.Is(err, ErrNotFound) {
-		return nil, false, nil
-	}
+	raw, err := decompressBlock(nil, inline, int(size))
 	if err != nil {
 		return nil, false, err
 	}
-	return sl.Bytes, true, nil
+	return raw, true, nil
 }
 
-// CacheSet writes a value (compressed inline <= 64 KiB, or compressed 8,120 B
-// chunk blocks > 64 KiB) to the bucket schema.
-func (s *Store) CacheSet(ctx context.Context, bucket, key string, val []byte, opts CacheSetOptions) ([]byte, bool, bool, error) {
+// CacheSet writes a value (one compressed page when it fits, chunked blocks
+// above that) into a cache namespace.
+func (s *Store) CacheSet(ctx context.Context, name, key string, val []byte, opts CacheSetOptions) ([]byte, bool, bool, error) {
 	var oldVal []byte
 	var hadOld bool
 	if opts.ReturnOld {
-		v, ok, err := s.CacheGet(ctx, bucket, key)
+		v, ok, err := s.CacheGet(ctx, name, key)
 		if err != nil {
 			return nil, false, false, err
 		}
 		oldVal, hadOld = v, ok
 	}
-	if int64(len(val)) <= MaxInlineBytes {
-		_, err := s.PutInlineOpts(ctx, bucket, key, val, opts.Condition, "", nil, "application/octet-stream", opts.ExpiresAt, opts.KeepTTL)
+	if int64(len(val)) <= int64(ns.Cache.InlineMax()) {
+		_, err := s.PutInlineKind(ctx, ns.Cache, name, key, val, opts.Condition, "", nil,
+			"application/octet-stream", opts.ExpiresAt, opts.KeepTTL, "")
 		if errors.Is(err, ErrPrecondition) {
 			return oldVal, hadOld, false, nil
 		}
@@ -81,15 +86,8 @@ func (s *Store) CacheSet(ctx context.Context, bucket, key string, val []byte, op
 		}
 		return oldVal, hadOld, true, nil
 	}
-	w, err := s.startWriter(ctx, writerTarget{
-		kind:      0,
-		bucket:    bucket,
-		key:       key,
-		condition: opts.Condition,
-		expiresAt: opts.ExpiresAt,
-		keepTTL:   opts.KeepTTL,
-		content:   "application/octet-stream",
-	})
+	w, err := s.StartObjectKind(ctx, ns.Cache, name, key, opts.Condition, "", nil,
+		"application/octet-stream", opts.ExpiresAt, opts.KeepTTL, "")
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -111,14 +109,14 @@ func (s *Store) CacheSet(ctx context.Context, bucket, key string, val []byte, op
 	return oldVal, hadOld, true, nil
 }
 
-// CacheMGet fetches multiple keys in one SQL query for inline objects and
-// streams any chunked (> 64 KiB) objects from their chunks table.
-func (s *Store) CacheMGet(ctx context.Context, bucket string, keys []string) ([][]byte, error) {
+// CacheMGet fetches multiple keys in one SQL query for inline values and
+// streams any chunked values.
+func (s *Store) CacheMGet(ctx context.Context, name string, keys []string) ([][]byte, error) {
 	out := make([][]byte, len(keys))
 	if len(keys) == 0 {
 		return out, nil
 	}
-	sc, err := bucketSQLIdent(bucket)
+	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +160,7 @@ func (s *Store) CacheMGet(ctx context.Context, bucket string, keys []string) ([]
 		return nil, err
 	}
 	for _, idx := range chunkedIdx {
-		v, ok, err := s.CacheGet(ctx, bucket, keys[idx])
+		v, ok, err := s.CacheGet(ctx, name, keys[idx])
 		if err != nil {
 			return nil, err
 		}
@@ -173,133 +171,25 @@ func (s *Store) CacheMGet(ctx context.Context, bucket string, keys []string) ([]
 	return out, nil
 }
 
-// CacheMSet writes multiple inline (<= 64 KiB) key-value pairs in one atomic
-// SQL round trip and one WAL commit, falling back to CacheSet for > 64 KiB
-// chunked values.
-func (s *Store) CacheMSet(ctx context.Context, bucket string, keys []string, vals [][]byte) error {
-	if len(keys) == 0 {
-		return nil
-	}
-	for _, v := range vals {
-		if int64(len(v)) > MaxInlineBytes {
-			for i := range keys {
-				if _, _, _, err := s.CacheSet(ctx, bucket, keys[i], vals[i], CacheSetOptions{}); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-	}
-	sc, err := bucketSQLIdent(bucket)
-	if err != nil {
-		return err
-	}
-	if _, ok := s.knownBuckets.Load(bucket); !ok {
-		if err := s.CreateBucket(ctx, bucket); err != nil {
-			return err
-		}
-	}
-	// Deduplicate keys within the batch (last value wins) so ON CONFLICT DO
-	// UPDATE does not touch the same row twice in one statement.
-	seen := make(map[string]int, len(keys))
-	var uKeys []string
-	var uStored [][]byte
-	var uSizes []int64
-	var uSHAs [][]byte
-	var uETags []string
-	for i, k := range keys {
-		v := vals[i]
-		sumMD5 := md5.Sum(v)
-		sumSHA := sha256.Sum256(v)
-		etag := hex.EncodeToString(sumMD5[:])
-		stored := compressBlock(nil, v)
-		if idx, ok := seen[k]; ok {
-			uStored[idx] = stored
-			uSizes[idx] = int64(len(v))
-			uSHAs[idx] = sumSHA[:]
-			uETags[idx] = etag
-			continue
-		}
-		seen[k] = len(uKeys)
-		uKeys = append(uKeys, k)
-		uStored = append(uStored, stored)
-		uSizes = append(uSizes, int64(len(v)))
-		uSHAs = append(uSHAs, sumSHA[:])
-		uETags = append(uETags, etag)
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0) # hashtextextended(k,1))
-		FROM (SELECT unnest($2::text[]) AS k ORDER BY 1) s`, bucket, uKeys); err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `WITH old_objs AS (
-		SELECT key, file_id, parts FROM `+sc+`.objects
-		WHERE key = ANY($1::text[]) AND file_id IS NOT NULL
-		FOR UPDATE
-	), cleared AS (
-		DELETE FROM `+sc+`.object_part_checksums WHERE key = ANY($1::text[])
-	), upserted AS (
-		INSERT INTO `+sc+`.objects (key, file_id, size, sha256, etag, expires_at, parts, part_ends, inline_data)
-		SELECT k, NULL, sz, sha, et, NULL, NULL, NULL, dat
-		FROM unnest($1::text[], $2::int8[], $3::bytea[], $4::text[], $5::bytea[])
-		  AS t(k, sz, sha, et, dat)
-		ON CONFLICT (key) DO UPDATE SET
-		  file_id = NULL, size = EXCLUDED.size, sha256 = EXCLUDED.sha256,
-		  etag = EXCLUDED.etag, user_metadata = '{}'::text[],
-		  content_type = 'application/octet-stream', expires_at = NULL,
-		  parts = NULL, part_ends = NULL, inline_data = EXCLUDED.inline_data,
-		  created_at = now()
-		RETURNING key
-	), dead AS (
-		SELECT file_id FROM old_objs WHERE file_id IS NOT NULL
-		UNION ALL
-		SELECT unnest(parts) FROM old_objs WHERE parts IS NOT NULL
-	)
-	INSERT INTO `+sc+`.garbage (file_id)
-	SELECT DISTINCT d.file_id FROM dead d
-	WHERE d.file_id IS NOT NULL
-	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
-	    WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id
-	      AND NOT (o.key = ANY($1::text[])))
-	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
-	    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
-	      AND NOT (o.key = ANY($1::text[])))
-	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
-	ON CONFLICT DO NOTHING`, uKeys, uSizes, uSHAs, uETags, uStored)
-	if isMissingBucketSchema(err) {
-		_ = tx.Rollback(ctx)
-		if err := s.CreateBucket(ctx, bucket); err != nil {
-			return err
-		}
-		return s.CacheMSet(ctx, bucket, keys, vals)
-	}
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
 // CacheDel removes keys and returns the number of live keys that were deleted.
-func (s *Store) CacheDel(ctx context.Context, bucket string, keys []string) (int64, error) {
+// Keys are sorted before locking so concurrent batches cannot deadlock.
+func (s *Store) CacheDel(ctx context.Context, name string, keys []string) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
-	sc, err := bucketSQLIdent(bucket)
+	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
 		return 0, err
 	}
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0) # hashtextextended(k,1))
-		FROM unnest($2::text[]) AS k`, bucket, keys); err != nil {
+		FROM unnest($2::text[]) AS k`, name, sorted); err != nil {
 		return 0, err
 	}
 	var deleted int64
@@ -336,13 +226,12 @@ func (s *Store) CacheDel(ctx context.Context, bucket string, keys []string) (int
 	return deleted, nil
 }
 
-// CacheExists returns the count of requested keys that exist (with duplicates
-// counted per Redis EXISTS semantics).
-func (s *Store) CacheExists(ctx context.Context, bucket string, keys []string) (int64, error) {
+// CacheExists counts requested keys that exist (duplicates counted per Redis).
+func (s *Store) CacheExists(ctx context.Context, name string, keys []string) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
-	sc, err := bucketSQLIdent(bucket)
+	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
 		return 0, err
 	}
@@ -357,10 +246,9 @@ func (s *Store) CacheExists(ctx context.Context, bucket string, keys []string) (
 	return count, err
 }
 
-// CacheExpire sets or clears (`expiresAt == nil` for PERSIST) the expiration on
-// a live key.
-func (s *Store) CacheExpire(ctx context.Context, bucket, key string, expiresAt *time.Time) (bool, error) {
-	sc, err := bucketSQLIdent(bucket)
+// CacheExpire sets or clears (`expiresAt == nil`) a key's expiration.
+func (s *Store) CacheExpire(ctx context.Context, name, key string, expiresAt *time.Time) (bool, error) {
+	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
 		return false, err
 	}
@@ -373,7 +261,7 @@ func (s *Store) CacheExpire(ctx context.Context, bucket, key string, expiresAt *
 		return tag.RowsAffected() > 0, err
 	}
 	if !expiresAt.After(time.Now()) {
-		n, err := s.CacheDel(ctx, bucket, []string{key})
+		n, err := s.CacheDel(ctx, name, []string{key})
 		return n > 0, err
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE `+sc+`.objects SET expires_at = $2
@@ -385,8 +273,8 @@ func (s *Store) CacheExpire(ctx context.Context, bucket, key string, expiresAt *
 }
 
 // CacheTTL returns the remaining TTL of a key.
-func (s *Store) CacheTTL(ctx context.Context, bucket, key string) (time.Duration, bool, bool, error) {
-	sc, err := bucketSQLIdent(bucket)
+func (s *Store) CacheTTL(ctx context.Context, name, key string) (time.Duration, bool, bool, error) {
+	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
 		return 0, false, false, err
 	}
@@ -410,15 +298,15 @@ func (s *Store) CacheTTL(ctx context.Context, bucket, key string) (time.Duration
 	return d, true, true, nil
 }
 
-// CacheIncrBy atomically increments a signed 64-bit decimal integer stored at
-// key (initializing to 0 if missing or expired) and preserves any active TTL.
-func (s *Store) CacheIncrBy(ctx context.Context, bucket, key string, delta int64) (int64, error) {
-	sc, err := bucketSQLIdent(bucket)
+// CacheIncrBy atomically increments a decimal integer stored at key and
+// preserves any active TTL.
+func (s *Store) CacheIncrBy(ctx context.Context, name, key string, delta int64) (int64, error) {
+	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
 		return 0, err
 	}
-	if _, ok := s.knownBuckets.Load(bucket); !ok {
-		if err := s.CreateBucket(ctx, bucket); err != nil {
+	if !s.known(ns.Cache, name) {
+		if err := s.EnsureNamespace(ctx, ns.Cache, name, nil, nil); err != nil {
 			return 0, err
 		}
 	}
@@ -427,7 +315,7 @@ func (s *Store) CacheIncrBy(ctx context.Context, bucket, key string, delta int64
 		return 0, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	if err := lockObjectKey(ctx, tx, bucket, key); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0) # hashtextextended($2,1))`, name, key); err != nil {
 		return 0, err
 	}
 	var (
@@ -443,10 +331,10 @@ func (s *Store) CacheIncrBy(ctx context.Context, bucket, key string, delta int64
 		Scan(&size, &inline, &hasInline, &expiresAt, &live)
 	if isMissingBucketSchema(err) {
 		_ = tx.Rollback(ctx)
-		if err := s.CreateBucket(ctx, bucket); err != nil {
+		if err := s.EnsureNamespace(ctx, ns.Cache, name, nil, nil); err != nil {
 			return 0, err
 		}
-		return s.CacheIncrBy(ctx, bucket, key, delta)
+		return s.CacheIncrBy(ctx, name, key, delta)
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return 0, err
@@ -482,8 +370,9 @@ func (s *Store) CacheIncrBy(ctx context.Context, bucket, key string, delta int64
 	stored := compressBlock(nil, payload)
 	var outcome string
 	if err := tx.QueryRow(ctx,
-		"SELECT "+sc+".put_inline($1,$2,$3,$4,$5,$6,$7,'none',NULL,'on',$8,false)",
-		key, stored, int64(len(payload)), sumSHA[:], etag, []string{}, "text/plain; charset=utf-8", keepExp).Scan(&outcome); err != nil {
+		"SELECT "+sc+".put_inline(p_key=>$1,p_data=>$2,p_size=>$3,p_sha256=>$4,p_etag=>$5,p_meta=>$6,p_ct=>$7,p_expires_at=>$8)",
+		key, stored, int64(len(payload)), sumSHA[:], etag, []string{},
+		"text/plain; charset=utf-8", keepExp).Scan(&outcome); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -492,24 +381,26 @@ func (s *Store) CacheIncrBy(ctx context.Context, bucket, key string, delta int64
 	return next, nil
 }
 
-// CacheDBSize returns the number of non-expired objects in a bucket.
-func (s *Store) CacheDBSize(ctx context.Context, bucket string) (int64, error) {
-	sc, err := bucketSQLIdent(bucket)
+// CacheDBSize returns the number of live keys in a cache namespace.
+func (s *Store) CacheDBSize(ctx context.Context, name string) (int64, error) {
+	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
 		return 0, err
 	}
 	var n int64
-	err = s.pool.QueryRow(ctx, `SELECT count(*) FROM `+sc+`.objects WHERE expires_at IS NULL OR expires_at > now()`).Scan(&n)
+	err = s.pool.QueryRow(ctx, `SELECT count(*) FROM `+sc+`.objects
+		WHERE expires_at IS NULL OR expires_at > now()`).Scan(&n)
 	if isMissingBucketSchema(err) {
 		return 0, nil
 	}
 	return n, err
 }
 
-// CacheFlush drops and recreates a bucket schema immediately.
-func (s *Store) CacheFlush(ctx context.Context, bucket string) error {
-	if _, err := s.DropBucket(ctx, bucket, true); err != nil {
+// CacheFlush drops and recreates a cache namespace. It can never touch an S3
+// bucket or SQS queue because the kind is part of the schema name.
+func (s *Store) CacheFlush(ctx context.Context, name string) error {
+	if _, err := s.DropNamespace(ctx, ns.Cache, name, true); err != nil {
 		return err
 	}
-	return s.CreateBucket(ctx, bucket)
+	return s.EnsureNamespace(ctx, ns.Cache, name, nil, nil)
 }

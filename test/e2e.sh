@@ -299,7 +299,7 @@ assert ra.echo(b'hello') == b'hello'
 # Basic SET/GET across gateways A and B, plus HTTP read of the same key in `s3b_cache`.
 assert ra.set('greeting', b'hello-from-resp') is True
 assert rb.get('greeting') == b'hello-from-resp'
-assert urllib.request.urlopen(f'{ep_b}/cache/greeting').read() == b'hello-from-resp'
+assert urllib.request.urlopen(f"{ep_b}/_cache/cache/greeting").read() == b'hello-from-resp'
 
 # NX, XX, GET, EX, PX, TTL, PERSIST.
 assert ra.set('greeting', b'nope', nx=True) is None
@@ -362,8 +362,89 @@ PY
 
 # Verify that the 256 KiB compressible object in `s3b_cache.chunks` was stored compressed.
 comp_bytes=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
-  'SELECT sum(octet_length(c.data)) FROM "s3b_cache".chunks c JOIN "s3b_cache".objects o ON o.file_id = c.file_id WHERE o.key = '\''big-blob'\''')
+  'SELECT sum(octet_length(c.data)) FROM "s3c_cache".chunks c JOIN "s3c_cache".objects o ON o.file_id = c.file_id WHERE o.key = '\''big-blob'\''')
 [ "$comp_bytes" -lt 4096 ] || fail "expected 256 KiB compressible chunks < 4096 B, got $comp_bytes"
+
+# --- SQS queue protocol ----------------------------------------------------
+E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" E2E_RUN="$RUN" \
+mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
+import os, time, boto3
+from botocore.config import Config
+ep = os.environ['E2E_ENDPOINT']
+sqs = boto3.client('sqs', endpoint_url=ep, aws_access_key_id=os.environ['E2E_KEY'],
+    aws_secret_access_key=os.environ['E2E_SECRET'], region_name='us-east-1',
+    config=Config(retries={'max_attempts': 0}))
+name = 'q-' + os.environ['E2E_RUN'].lower().replace('_', '-')
+url = sqs.create_queue(QueueName=name, Attributes={'VisibilityTimeout': '2'})['QueueUrl']
+assert sqs.get_queue_url(QueueName=name)['QueueUrl'] == url
+assert any(u.endswith('/' + name) for u in sqs.list_queues(QueueNamePrefix='q-').get('QueueUrls', []))
+assert sqs.send_message(QueueUrl=url, MessageBody='hello-sqs')['MD5OfMessageBody']
+batch = sqs.send_message_batch(QueueUrl=url, Entries=[
+    {'Id': 'a', 'MessageBody': 'one'}, {'Id': 'b', 'MessageBody': 'two'}])
+assert len(batch['Successful']) == 2, batch
+msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=2)['Messages']
+bodies = sorted(m['Body'] for m in msgs)
+assert bodies == ['hello-sqs', 'one', 'two'], bodies
+time.sleep(2.5)
+again = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)['Messages']
+assert again, 'messages did not become visible again'
+for m in again:
+    sqs.delete_message(QueueUrl=url, ReceiptHandle=m['ReceiptHandle'])
+attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=['All'])['Attributes']
+assert int(attrs['ApproximateNumberOfMessages']) == 0, attrs
+sqs.purge_queue(QueueUrl=url)
+sqs.delete_queue(QueueUrl=url)
+try:
+    sqs.get_queue_url(QueueName=name)
+    raise AssertionError('queue still exists')
+except sqs.exceptions.QueueDoesNotExist:
+    pass
+print('sqs ok')
+PY
+
+# --- S3 cache tier over a filesystem origin (thanos objstore) ---------------
+ORIGIN_DIR="$TMP/origin"
+mkdir -p "$ORIGIN_DIR"
+cat > "$TMP/origin.yaml" <<YAML
+type: filesystem
+config:
+  directory: $ORIGIN_DIR
+YAML
+read -r ocache_port < <(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+.tmp/pgvs3/pgvs3 serve --url "$PGVS3_TEST_DB_URL" --addr "127.0.0.1:$ocache_port" \
+  --origin-config "$TMP/origin.yaml" --cache-namespace "ocache-$RUN" --cache-ttl 0s \
+  > "$TMP/ocache.log" 2>&1 &
+ocache_pid=$!
+for _ in $(seq 1 120); do
+  curl -fsS --max-time 1 "http://127.0.0.1:$ocache_port/healthz" >/dev/null 2>&1 && break
+  sleep .25
+done
+OCACHE_PID=$ocache_pid OCACHE_ENDPOINT="http://127.0.0.1:$ocache_port" OCACHE_DIR="$ORIGIN_DIR" OCACHE_RUN="$RUN" \
+E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
+mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
+import os, boto3
+from botocore.config import Config
+c = boto3.client('s3', endpoint_url=os.environ['OCACHE_ENDPOINT'],
+    aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
+    region_name='us-east-1', config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
+b = 'edge'
+k = os.environ['OCACHE_RUN'] + '/obj.bin'
+body = b'origin-payload-' + b'x' * 4000
+c.put_object(Bucket=b, Key=k, Body=body, ContentType='application/octet-stream')
+assert c.get_object(Bucket=b, Key=k)['Body'].read() == body
+head = c.head_object(Bucket=b, Key=k)
+assert head['ContentLength'] == len(body)
+assert c.get_object(Bucket=b, Key=k, Range='bytes=0-15')['Body'].read() == body[:16]
+p = os.path.join(os.environ['OCACHE_DIR'], b, k)
+open(p, 'wb').write(b'origin-updated')
+assert c.get_object(Bucket=b, Key=k)['Body'].read() == b'origin-updated'
+keys = [o['Key'] for o in c.list_objects_v2(Bucket=b, Prefix=os.environ['OCACHE_RUN'] + '/').get('Contents', [])]
+assert k in keys, keys
+c.delete_object(Bucket=b, Key=k)
+assert not os.path.exists(p)
+print('s3cache ok')
+PY
+kill "$ocache_pid" 2>/dev/null || true
 
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
 export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY \

@@ -1,21 +1,43 @@
-package s3
+package resp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
-const defaultCacheBucket = "cache"
+// DefaultCache is the cache namespace used when a client has not run SELECT.
+const DefaultCache = "cache"
+
+// Server terminates RESP2/RESP3 on a connection.
+type Server struct {
+	store    *store.Store
+	log      *slog.Logger
+	readOnly bool
+	metrics  *metrics
+}
+
+// New returns a RESP server over the shared store.
+func New(st *store.Store, log *slog.Logger, readOnly bool) *Server {
+	return &Server{store: st, log: log, readOnly: readOnly, metrics: newMetrics()}
+}
+
+// Metrics writes this server's Prometheus counters.
+func (s *Server) Metrics(w io.Writer) { s.metrics.write(w) }
+
+func (s *Server) ServeConn(ctx context.Context, conn net.Conn) { s.serveRESP(ctx, conn) }
 
 type respCmd struct {
 	name string
@@ -23,15 +45,17 @@ type respCmd struct {
 }
 
 type respSession struct {
-	bucket string
-	proto  int
+	bucket  string
+	proto   int
+	inMulti bool
+	queued  []respCmd
 }
 
 func (s *Server) serveRESP(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	br := bufio.NewReaderSize(conn, 64<<10)
 	bw := bufio.NewWriterSize(conn, 64<<10)
-	sess := &respSession{bucket: defaultCacheBucket, proto: 2}
+	sess := &respSession{bucket: DefaultCache, proto: 2}
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
@@ -61,6 +85,15 @@ func (s *Server) serveRESP(ctx context.Context, conn net.Conn) {
 
 func (s *Server) execRESPBatch(ctx context.Context, bw *bufio.Writer, sess *respSession, batch []respCmd) bool {
 	for i := 0; i < len(batch); i++ {
+		if sess.inMulti {
+			switch batch[i].name {
+			case "EXEC", "DISCARD", "MULTI":
+			default:
+				sess.queued = append(sess.queued, batch[i])
+				writeRESPSimple(bw, "QUEUED")
+				continue
+			}
+		}
 		// Coalesce consecutive pipelined GETs on the same bucket into a single
 		// CacheMGet query.
 		if batch[i].name == "GET" && len(batch[i].args) == 1 {
@@ -161,6 +194,120 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 
 	args := cmd.args
 	switch cmd.name {
+	case "MULTI":
+		if sess.inMulti {
+			writeRESPError(bw, "ERR MULTI calls can not be nested")
+			return false
+		}
+		sess.inMulti = true
+		sess.queued = sess.queued[:0]
+		writeRESPSimple(bw, "OK")
+	case "DISCARD":
+		if !sess.inMulti {
+			writeRESPError(bw, "ERR DISCARD without MULTI")
+			return false
+		}
+		sess.inMulti = false
+		sess.queued = sess.queued[:0]
+		writeRESPSimple(bw, "OK")
+	case "EXEC":
+		if !sess.inMulti {
+			writeRESPError(bw, "ERR EXEC without MULTI")
+			return false
+		}
+		sess.inMulti = false
+		queued := sess.queued
+		sess.queued = nil
+		if len(queued) == 0 {
+			writeRESPArrayHeader(bw, 0)
+			return false
+		}
+		var inner bytes.Buffer
+		ib := bufio.NewWriter(&inner)
+		for _, q := range queued {
+			s.execRESPCommand(ctx, ib, sess, q)
+		}
+		_ = ib.Flush()
+		writeRESPArrayHeader(bw, len(queued))
+		_, _ = bw.Write(inner.Bytes())
+	case "WATCH", "UNWATCH":
+		writeRESPSimple(bw, "OK")
+	case "TYPE":
+		if len(args) != 1 {
+			writeRESPError(bw, "ERR wrong number of arguments for 'type' command")
+			return false
+		}
+		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		_, err := s.store.MetaHeaderKind(ctx, ns.Cache, b, k)
+		if errors.Is(err, store.ErrNotFound) {
+			writeRESPSimple(bw, "none")
+		} else if err != nil {
+			writeRESPError(bw, "ERR "+err.Error())
+		} else {
+			writeRESPSimple(bw, "string")
+		}
+	case "SCAN":
+		s.respScan(ctx, bw, sess, args)
+	case "APPEND":
+		if rejectRO() {
+			return false
+		}
+		if len(args) != 2 {
+			writeRESPError(bw, "ERR wrong number of arguments for 'append' command")
+			return false
+		}
+		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		if b != sess.bucket {
+			writeRESPError(bw, "ERR cross-namespace write denied")
+			return false
+		}
+		cur, _, err := s.store.CacheGet(ctx, b, k)
+		if err != nil {
+			writeRESPError(bw, "ERR "+err.Error())
+			return false
+		}
+		next := append(append([]byte(nil), cur...), args[1]...)
+		if _, _, _, err := s.store.CacheSet(ctx, b, k, next, store.CacheSetOptions{KeepTTL: true}); err != nil {
+			writeRESPError(bw, "ERR "+err.Error())
+			return false
+		}
+		writeRESPInt(bw, int64(len(next)))
+	case "SETRANGE":
+		if rejectRO() {
+			return false
+		}
+		if len(args) != 3 {
+			writeRESPError(bw, "ERR wrong number of arguments for 'setrange' command")
+			return false
+		}
+		off, err := strconv.ParseInt(string(args[1]), 10, 64)
+		if err != nil || off < 0 {
+			writeRESPError(bw, "ERR offset is out of range")
+			return false
+		}
+		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		if b != sess.bucket {
+			writeRESPError(bw, "ERR cross-namespace write denied")
+			return false
+		}
+		cur, _, err := s.store.CacheGet(ctx, b, k)
+		if err != nil {
+			writeRESPError(bw, "ERR "+err.Error())
+			return false
+		}
+		if int64(len(cur)) < off {
+			cur = append(cur, make([]byte, off-int64(len(cur)))...)
+		}
+		need := off + int64(len(args[2]))
+		if int64(len(cur)) < need {
+			cur = append(cur, make([]byte, need-int64(len(cur)))...)
+		}
+		copy(cur[off:], args[2])
+		if _, _, _, err := s.store.CacheSet(ctx, b, k, cur, store.CacheSetOptions{KeepTTL: true}); err != nil {
+			writeRESPError(bw, "ERR "+err.Error())
+			return false
+		}
+		writeRESPInt(bw, int64(len(cur)))
 	case "PING":
 		if len(args) == 0 {
 			writeRESPSimple(bw, "PONG")
@@ -179,7 +326,7 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		writeRESPSimple(bw, "OK")
 		return true
 	case "RESET":
-		sess.bucket = defaultCacheBucket
+		sess.bucket = DefaultCache
 		sess.proto = 2
 		writeRESPSimple(bw, "RESET")
 	case "HELLO":
@@ -249,13 +396,13 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 				return false
 			}
 			if n == 0 {
-				target = defaultCacheBucket
+				target = DefaultCache
 			} else {
-				target = fmt.Sprintf("%s-%d", defaultCacheBucket, n)
+				target = fmt.Sprintf("%s-%d", DefaultCache, n)
 			}
 		}
-		if _, err := store.BucketSchema(target); err != nil {
-			writeRESPError(bw, "ERR invalid bucket name")
+		if !ns.ValidName(target) {
+			writeRESPError(bw, "ERR invalid namespace name")
 			return false
 		}
 		sess.bucket = target
@@ -265,9 +412,22 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			writeRESPError(bw, "ERR wrong number of arguments for 'get' command")
 			return false
 		}
-		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
-		val, ok, err := s.store.CacheGet(ctx, b, k)
-		if err != nil {
+		raw := string(args[0])
+		b, k := resolveRESPTarget(sess.bucket, raw)
+		var val []byte
+		var ok bool
+		var err error
+		if strings.HasPrefix(raw, "s3://") {
+			// Explicit cross-namespace read of a durable bucket.
+			var sl *store.Slice
+			sl, err = s.store.GetKind(ctx, ns.Bucket, b, k, 0, -1, -1)
+			if sl != nil {
+				val, ok = sl.Bytes, true
+			}
+		} else {
+			val, ok, err = s.store.CacheGet(ctx, b, k)
+		}
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			status = 500
 			writeRESPError(bw, "ERR "+err.Error())
 			return false
@@ -306,6 +466,10 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		if b != sess.bucket {
+			writeRESPError(bw, "ERR cross-namespace write denied")
+			return false
+		}
 		val := args[1]
 		opts, err := parseRESPSetOptions(args[2:])
 		if err != nil {
@@ -341,6 +505,10 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		if b != sess.bucket {
+			writeRESPError(bw, "ERR cross-namespace write denied")
+			return false
+		}
 		_, _, wrote, err := s.store.CacheSet(ctx, b, k, args[1], store.CacheSetOptions{Condition: store.IfAbsent})
 		if err != nil {
 			writeRESPError(bw, "ERR "+err.Error())
@@ -370,6 +538,10 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		exp := time.Now().Add(time.Duration(n) * unit)
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		if b != sess.bucket {
+			writeRESPError(bw, "ERR cross-namespace write denied")
+			return false
+		}
 		if _, _, _, err := s.store.CacheSet(ctx, b, k, args[2], store.CacheSetOptions{ExpiresAt: &exp}); err != nil {
 			writeRESPError(bw, "ERR "+err.Error())
 			return false
@@ -384,6 +556,10 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		if b != sess.bucket {
+			writeRESPError(bw, "ERR cross-namespace write denied")
+			return false
+		}
 		oldVal, hadOld, _, err := s.store.CacheSet(ctx, b, k, args[1], store.CacheSetOptions{ReturnOld: true})
 		if err != nil {
 			writeRESPError(bw, "ERR "+err.Error())
@@ -429,6 +605,10 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		b0 := sess.bucket
 		for i := 0; i < n; i++ {
 			b, k := resolveRESPTarget(sess.bucket, string(args[2*i]))
+			if b != sess.bucket {
+				writeRESPError(bw, "ERR cross-namespace write denied")
+				return false
+			}
 			if i == 0 {
 				b0 = b
 			} else if b != b0 {
@@ -461,7 +641,12 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		keys := make([]string, len(args))
 		for i, a := range args {
-			_, keys[i] = resolveRESPTarget(sess.bucket, string(a))
+			kb, kk := resolveRESPTarget(sess.bucket, string(a))
+			if kb != sess.bucket {
+				writeRESPError(bw, "ERR cross-namespace write denied")
+				return false
+			}
+			keys[i] = kk
 		}
 		n, err := s.store.CacheDel(ctx, sess.bucket, keys)
 		if err != nil {
@@ -509,6 +694,44 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			exp = time.UnixMilli(n)
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		if b != sess.bucket {
+			writeRESPError(bw, "ERR cross-namespace write denied")
+			return false
+		}
+		curTTL, hasTTL, exists, err := s.store.CacheTTL(ctx, b, k)
+		if err != nil {
+			writeRESPError(bw, "ERR "+err.Error())
+			return false
+		}
+		if !exists {
+			writeRESPInt(bw, 0)
+			return false
+		}
+		want := time.Until(exp)
+		for _, opt := range args[2:] {
+			switch strings.ToUpper(string(opt)) {
+			case "NX":
+				if hasTTL {
+					writeRESPInt(bw, 0)
+					return false
+				}
+			case "XX":
+				if !hasTTL {
+					writeRESPInt(bw, 0)
+					return false
+				}
+			case "GT":
+				if !hasTTL || want <= curTTL {
+					writeRESPInt(bw, 0)
+					return false
+				}
+			case "LT":
+				if hasTTL && want >= curTTL {
+					writeRESPInt(bw, 0)
+					return false
+				}
+			}
+		}
 		ok, err := s.store.CacheExpire(ctx, b, k, &exp)
 		if err != nil {
 			writeRESPError(bw, "ERR "+err.Error())
@@ -590,6 +813,10 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
+		if b != sess.bucket {
+			writeRESPError(bw, "ERR cross-namespace write denied")
+			return false
+		}
 		next, err := s.store.CacheIncrBy(ctx, b, k, delta)
 		if errors.Is(err, store.ErrNotInteger) {
 			writeRESPError(bw, "ERR value is not an integer or out of range")
@@ -605,8 +832,13 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			writeRESPError(bw, "ERR wrong number of arguments for 'strlen' command")
 			return false
 		}
-		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
-		m, err := s.store.MetaHeader(ctx, b, k)
+		raw := string(args[0])
+		b, k := resolveRESPTarget(sess.bucket, raw)
+		kind := ns.Cache
+		if strings.HasPrefix(raw, "s3://") {
+			kind = ns.Bucket
+		}
+		m, err := s.store.MetaHeaderKind(ctx, kind, b, k)
 		if errors.Is(err, store.ErrNotFound) {
 			writeRESPInt(bw, 0)
 			return false
@@ -627,8 +859,13 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			writeRESPError(bw, "ERR value is not an integer or out of range")
 			return false
 		}
-		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
-		m, err := s.store.MetaHeader(ctx, b, k)
+		raw := string(args[0])
+		b, k := resolveRESPTarget(sess.bucket, raw)
+		kind := ns.Cache
+		if strings.HasPrefix(raw, "s3://") {
+			kind = ns.Bucket
+		}
+		m, err := s.store.MetaHeaderKind(ctx, kind, b, k)
 		if errors.Is(err, store.ErrNotFound) || (err == nil && m.Size == 0) {
 			writeRESPBulk(bw, sess.proto, []byte{})
 			return false
@@ -648,7 +885,7 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			return false
 		}
 		endIdx = min(endIdx, m.Size-1)
-		sl, err := s.store.Get(ctx, b, k, startIdx, endIdx, -1)
+		sl, err := s.store.GetKind(ctx, kind, b, k, startIdx, endIdx, -1)
 		if err != nil {
 			writeRESPError(bw, "ERR "+err.Error())
 			return false
@@ -676,17 +913,25 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			return false
 		}
 		pat := string(args[0])
-		rows, err := s.store.List(ctx, sess.bucket, "", "", "", 10000)
-		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
-			return false
-		}
+		prefix := literalPrefix(pat)
 		var matched []string
-		for _, r := range rows {
-			if pat == "*" {
-				matched = append(matched, r.Key)
-			} else if ok, _ := path.Match(pat, r.Key); ok {
-				matched = append(matched, r.Key)
+		after := ""
+		for {
+			rows, err := s.store.List(ctx, sess.bucket, prefix, prefixUpper(prefix), after, 1024)
+			if err != nil {
+				writeRESPError(bw, "ERR "+err.Error())
+				return false
+			}
+			for _, r := range rows {
+				after = r.Key
+				if pat == "*" {
+					matched = append(matched, r.Key)
+				} else if ok, _ := path.Match(pat, r.Key); ok {
+					matched = append(matched, r.Key)
+				}
+			}
+			if len(rows) < 1024 {
+				break
 			}
 		}
 		writeRESPArrayHeader(bw, len(matched))
@@ -695,7 +940,7 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 	case "INFO":
 		st, _ := s.store.StatBucket(ctx, sess.bucket)
-		info := fmt.Sprintf("# Server\r\nredis_version:7.2.0-pgvs3\r\n# Keyspace\r\ndb0:keys=%d,logical_bytes=%d,physical_bytes=%d\r\n",
+		info := fmt.Sprintf("# Server\r\nredis_version:6.2.0\r\npgvs3_version:0.3.0\r\nredis_mode:standalone\r\n# Keyspace\r\ndb0:keys=%d,logical_bytes=%d,physical_bytes=%d\r\n",
 			st.Objects, st.LogicalBytes, st.PhysicalBytes)
 		writeRESPBulkString(bw, info)
 	default:
@@ -846,4 +1091,91 @@ func writeRESPBulkString(bw *bufio.Writer, s string) {
 
 func writeRESPArrayHeader(bw *bufio.Writer, n int) {
 	_, _ = bw.WriteString("*" + strconv.Itoa(n) + "\r\n")
+}
+
+// literalPrefix returns the leading literal bytes of a Redis glob pattern.
+func literalPrefix(pat string) string {
+	for i := 0; i < len(pat); i++ {
+		switch pat[i] {
+		case '*', '?', '[', '\\':
+			return pat[:i]
+		}
+	}
+	return pat
+}
+
+// prefixUpper returns a strict upper bound for keys starting with prefix.
+func prefixUpper(prefix string) string { return prefix + "\U0010FFFF" }
+
+// respScan implements SCAN cursor/count/match/type over the cache namespace.
+func (s *Server) respScan(ctx context.Context, bw *bufio.Writer, sess *respSession, args [][]byte) {
+	if len(args) < 1 {
+		writeRESPError(bw, "ERR wrong number of arguments for 'scan' command")
+		return
+	}
+	cursor := string(args[0])
+	count := 10
+	match := "*"
+	for i := 1; i+1 < len(args); i += 2 {
+		switch strings.ToUpper(string(args[i])) {
+		case "MATCH":
+			match = string(args[i+1])
+		case "COUNT":
+			if n, err := strconv.Atoi(string(args[i+1])); err == nil && n > 0 {
+				count = n
+			}
+		case "TYPE":
+			// Only strings exist; a non-string TYPE yields no keys.
+			if !strings.EqualFold(string(args[i+1]), "string") {
+				writeRESPArrayHeader(bw, 2)
+				writeRESPBulkString(bw, "0")
+				writeRESPArrayHeader(bw, 0)
+				return
+			}
+		}
+	}
+	prefix := literalPrefix(match)
+	after := ""
+	if cursor != "0" {
+		after = cursor
+	}
+	limit := max(count*4, 64)
+	var keys []string
+	next := "0"
+	for len(keys) < count {
+		rows, err := s.store.List(ctx, sess.bucket, prefix, prefixUpper(prefix), after, limit)
+		if err != nil {
+			writeRESPError(bw, "ERR "+err.Error())
+			return
+		}
+		if len(rows) == 0 {
+			next = "0"
+			break
+		}
+		for _, r := range rows {
+			after = r.Key
+			if match == "*" {
+				keys = append(keys, r.Key)
+			} else if ok, _ := path.Match(match, r.Key); ok {
+				keys = append(keys, r.Key)
+			}
+			if len(keys) >= count {
+				next = after
+				break
+			}
+		}
+		if len(keys) >= count {
+			break
+		}
+		if len(rows) < limit {
+			next = "0"
+			break
+		}
+	}
+	writeRESPArrayHeader(bw, 2)
+	writeRESPBulkString(bw, next)
+	writeRESPArrayHeader(bw, len(keys))
+	for _, k := range keys {
+		writeRESPBulkString(bw, k)
+	}
 }

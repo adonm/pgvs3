@@ -1,10 +1,13 @@
 # pgvs3 — S3 on PostgreSQL
 
-pgvs3 is a small, fast S3, HTTP, and RESP (Redis/Valkey) gateway that stores
-objects and cached values as compressed blocks in PostgreSQL. It is built for
-[DuckLake](https://ducklake.select/) and co-located services: DuckLake keeps
-its catalog in PostgreSQL, and with pgvs3 both lake files and cached blobs live
-there too — one database to run, back up, and replicate.
+pgvs3 is a small, fast storage server that speaks **S3**, **SQS**,
+**HTTP** and **RESP (Redis/Valkey)** over one PostgreSQL database, and can also
+run as an **accelerating cache tier in front of any object store** that
+[thanos-io/objstore](https://github.com/thanos-io/objstore) supports.
+
+It is built for [DuckLake](https://ducklake.select/) and co-located services:
+DuckLake keeps its catalog in PostgreSQL, and with pgvs3 lake files, queues and
+cached blobs live there too — one database to run, back up, and replicate.
 
 The gateway is written in Go, holds zero in-process state, and ships as a
 ~14 MB distroless static container built with [ko](https://ko.build/).
@@ -28,19 +31,24 @@ just dev-db   # starts PostgreSQL 18 on 127.0.0.1:5432
 go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmode=disable' serve
 ```
 
-Buckets are created automatically on first write. The single `:8014` port
-serves S3 clients, plain HTTP, and RESP (Redis/Valkey) clients on the same
-underlying bucket tables:
+Namespaces are created automatically on first write. The single `:8014` port
+speaks S3, SQS, plain HTTP and RESP (Redis/Valkey); the protocol is detected
+from the connection, so there is nothing to configure:
 
 ```sh
 # S3 / plain HTTP
 curl -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
 curl http://127.0.0.1:8014/lake/README.md
 
-# Redis / Valkey (RESP2 & RESP3 on the same :8014 port)
+# Redis / Valkey (RESP2 & RESP3)
 redis-cli -p 8014 SET greeting "hello from resp" EX 60
-curl http://127.0.0.1:8014/cache/greeting
-redis-cli -p 8014 GET s3://lake/README.md
+curl http://127.0.0.1:8014/_cache/cache/greeting
+redis-cli -p 8014 GET s3://lake/README.md     # explicit cross-namespace read
+
+# SQS (boto3, aws cli --endpoint-url http://127.0.0.1:8014)
+aws --endpoint-url http://127.0.0.1:8014 sqs create-queue --queue-name jobs
+aws --endpoint-url http://127.0.0.1:8014 sqs send-message \
+  --queue-url http://127.0.0.1:8014/jobs --message-body '{"job":1}'
 ```
 
 ### Use from DuckDB 2.0+
@@ -68,8 +76,10 @@ SELECT * FROM lake.events;
 
 ## How it works
 
-- **One PostgreSQL schema per bucket (`s3b_<bucket>`).** Every bucket has its
-  own isolated `objects`, `chunks`, `uploads`, and `garbage` tables:
+- **One PostgreSQL schema per namespace, typed by prefix.** `s3b_<name>` is a
+  durable bucket, `s3c_<name>` a volatile cache database (UNLOGGED tables),
+  `s3q_<name>` an SQS queue. Each owns its tables, autovacuum workers and 32 TiB
+  chunk budget:
   - **32 TiB capacity and independent autovacuum per bucket.**
   - **Instant bucket deletion (`DROP SCHEMA CASCADE`):** returns disk space to
     the OS in milliseconds with no reaper lag or vacuum bloat.
@@ -77,17 +87,21 @@ SELECT * FROM lake.events;
     `pg_dump -n s3b_<bucket>`, or clone a bucket inside PostgreSQL with
     `pgvs3 clone <src> <dst>` (`PUT /{dst}` with `x-amz-copy-source: /{src}`).
 - **Length-discriminated LZ4 block compression.** Every inline object
-  (`≤64 KiB`) and every `8,120`-byte chunk block is compressed with an
+  (bucket: `≤64 KiB`, cache/queue: one 8 KB page) and every `8,120`-byte chunk
+  block is compressed with an
   allocation-free pure-Go LZ4 block codec if it shrinks (`len(stored) < wantLen`),
   or stored as raw bytes with **zero header bytes** if incompressible
   (`len(stored) == wantLen`, e.g. Zstd Parquet). Logical chunk offsets remain
   `no × 8,120`, preserving `O(1)` byte-range seeking and the exact 8,160-byte
   PostgreSQL page budget (`99.6%` fill, no TOAST).
-- **Unified S3 + HTTP + RESP (Redis/Valkey) protocol mux.** First-byte
-  detection on `:8014` routes HTTP/S3 and RESP2/RESP3 connections to the same
-  `s3b_<bucket>.objects` and `s3b_<bucket>.chunks` tables (including optional
-  per-object `expires_at` TTLs and pipelined `CacheMGet` / `CacheMSet`
-  coalescing).
+- **Four protocols, one port.** S3/SQS/HTTP share the HTTP listener; RESP2/3
+  is detected from the first byte. RESP defaults to the `cache` namespace and
+  can read any durable bucket with `GET s3://<bucket>/<key>`; writes are
+  confined to cache namespaces.
+- **Accelerating cache tier (`--origin-config`).** With a Thanos objstore YAML
+  file, every S3 `GET` becomes a read-through cache in `s3c_<namespace>` with
+  TTL revalidation and write-through `PUT`/`DELETE`. Supported origins: `s3`,
+  `filesystem` and `inmem`.
 - **Immutable files, atomic publish.** Writes stream into `chunks` via
   binary `COPY` under a new `file_id` and publish in the same transaction.
   Interrupted writes leave nothing visible.
@@ -111,16 +125,21 @@ design.
 Measured with `just load` against PostgreSQL 18 in Docker (`shared_buffers=1GB`)
 on a 16-core host (6-vCPU VM numbers in [docs/benchmarks.md](docs/benchmarks.md)):
 
-- **Latency (1 worker):** **`0.081 ms` (81 µs)** p50 for 4 KiB RESP `GET`
-  (`0.17 ms` for S3 `GET`, `0.14 ms` for `HEAD`), and **`0.68 ms`** for durable
-  4 KiB RESP `SET` (`0.82 ms` for S3 `PUT`, `synchronous_commit = on`).
-- **RESP cache throughput (4 KiB, 64 workers):** **91.0k `GET`/s** unpipelined
-  and **459.0k `GET`/s (1.79 GiB/s)** at pipeline 16; **23.9k durable `SET`/s**
-  unpipelined and **110.2k durable `SET`/s (431 MiB/s)** at pipeline 16.
-- **S3 throughput (4 KiB):** **35.5k `GET`/s**, **30.0k `HEAD`/s**, and
-  **20.4k durable `PUT`/s**.
-- **Large-object bandwidth (64 MiB S3):** **4.16 GiB/s (4,262 MiB/s)** read
-  (16 workers) and **509 MiB/s** write (8 workers).
+- **Latency (1 worker):** **`0.072 ms` (72 µs)** p50 for 4 KiB RESP `GET`
+  (`0.17 ms` for S3 `GET`, `0.14 ms` for `HEAD`), **`0.18 ms`** for durable
+  4 KiB RESP `SET` (`0.81 ms` for S3 `PUT`, `synchronous_commit = on`), and
+  **`0.86 ms`** for an SQS `SendMessage`.
+- **RESP cache throughput (4 KiB, 64 workers):** **97.0k `GET`/s** unpipelined
+  and **460.4k `GET`/s (1.76 GiB/s)** at pipeline 16; **48.2k durable `SET`/s**
+  unpipelined and **213.6k durable `SET`/s (834 MiB/s)** at pipeline 16.
+- **S3 throughput (4 KiB):** **35.8k `GET`/s**, **26.1k `HEAD`/s**, and
+  **20.9k durable `PUT`/s**.
+- **SQS throughput (4 KiB):** **12.7k `SendMessage`/s** and **2.1k
+  receive+delete/s** at 32 workers.
+- **Large-object bandwidth (64 MiB S3):** **4.17 GiB/s (4,275 MiB/s)** read
+  (16 workers) and **529 MiB/s** write (8 workers).
+- **Cache tier (64 MiB, filesystem origin, warm):** **4.0 GiB/s** read and
+  **488 MiB/s** write through the proxy.
 
 **Compared with AWS S3 Express One Zone (`us-east-1`):**
 
@@ -165,15 +184,24 @@ Full tables and DuckDB `httpfs` benchmarks are in
   client or browser. Trailing slashes resolve to `index.html`, plain
   `GET /{bucket}` serves `/{bucket}/index.html` when present, and `Content-Type`
   falls back to the filename extension.
+- **SQS:** `CreateQueue`, `GetQueueUrl`, `ListQueues`, `DeleteQueue`,
+  `PurgeQueue`, `SendMessage`, `SendMessageBatch`, `ReceiveMessage`,
+  `DeleteMessage`, `DeleteMessageBatch`, `ChangeMessageVisibility`,
+  `ChangeMessageVisibilityBatch`, `GetQueueAttributes`, `SetQueueAttributes`
+  over both the JSON (`AmazonSQS.*`) and Query (`Action=`) protocols, with
+  visibility timeouts, delays, retention and long polling.
+- **S3 cache tier:** `GET`/`HEAD`/`PUT`/`DELETE`/`ListObjectsV2` in front of an
+  objstore origin, with TTL revalidation (`--cache-ttl`) and idle eviction
+  (`--cache-retention`).
 - **RESP (Redis/Valkey) cache protocol on `:8014`:** supports `GET`, `SET`
   (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `SETNX`, `SETEX`,
   `PSETEX`, `GETSET`, `GETDEL`, `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`,
   `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`,
-  `INCR`, `DECR`, `INCRBY`, `DECRBY`, `STRLEN`, `GETRANGE` (slices compressed
-  8,120-byte blocks without full-object reads), `SELECT <db|bucket>`,
+  `INCR`, `DECR`, `INCRBY`, `DECRBY`, `STRLEN`, `GETRANGE`, `APPEND`,
+  `SETRANGE`, `SCAN`, `TYPE`, `MULTI`/`EXEC`/`DISCARD`, `SELECT`,
   `FLUSHDB`, `DBSIZE`, `KEYS`, `INFO`, and `HELLO 2`/`3`. Pipelined `GET` and
   `SET` bursts automatically coalesce into single-query `CacheMGet` /
-  `CacheMSet` database round trips.
+  `CacheMSet` database round trips. `EXPIRE` honours `NX`/`XX`/`GT`/`LT`.
 - **Out of scope:** IAM/bucket policies, versioning, object tags, Object Lock,
   ACLs, lifecycle rules, replication, event notifications, SSE-C/DSSE-KMS, and
   multipart `FULL_OBJECT` checksums.
@@ -190,15 +218,21 @@ Every flag maps to an environment variable.
 | `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long overwritten/deleted files stay readable before GC. |
 | `--read-only` | `PGVS3_READ_ONLY` | `false` | Reject writes and skip DDL/reaping (for PostgreSQL standbys). |
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | Log verbosity (`debug`, `info`, `warn`, `error`). |
+| `--max-conns` | `PGVS3_MAX_CONNS` | `4096` | Concurrent client connections before shedding load. |
+| `--origin-config` | `PGVS3_ORIGIN_CONFIG` | unset | objstore YAML file; enables the S3 cache tier. |
+| `--cache-ttl` | `PGVS3_CACHE_TTL` | `1m` | Origin revalidation interval (`0` = always revalidate). |
+| `--cache-retention` | `PGVS3_CACHE_RETENTION` | `24h` | Evict idle cached objects after this period. |
+| `--cache-namespace` | `PGVS3_CACHE_NAMESPACE` | `origin` | Cache namespace holding origin objects. |
 
 Subcommands:
 
 - `pgvs3 serve` — run the S3/HTTP gateway (default when no subcommand is given).
-- `pgvs3 stat [--bucket B] [--json]` — report buckets, objects, chunks, logical
-  vs physical size, and queued garbage.
-- `pgvs3 clone <src-bucket> <dst-bucket>` — clone a bucket inside PostgreSQL.
-- `pgvs3 drop [--force] <bucket>` — drop a bucket schema (`DROP SCHEMA CASCADE`).
-- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v10, and table settings.
+- `pgvs3 stat [--kind bucket|cache|queue] [--name N] [--json]` — namespace
+  usage, logical vs physical size and queued garbage.
+- `pgvs3 clone [--kind bucket|cache] <src> <dst>` — clone inside PostgreSQL.
+- `pgvs3 drop [--kind bucket|cache|queue] [--force] <name>` — drop a namespace
+  schema (`DROP SCHEMA CASCADE`).
+- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v11, and table settings.
 - `pgvs3 reap [--all]` — run garbage collection immediately.
 - `pgvs3 health` — poll `/readyz` for container health checks.
 
