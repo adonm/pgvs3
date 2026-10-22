@@ -11,6 +11,9 @@ func compressBlock(dst, src []byte) []byte {
 	if n < 16 || n > MaxInlineBytes {
 		return src
 	}
+	if likelyIncompressible(src) {
+		return src
+	}
 	maxOut := n - 1
 	if cap(dst) < maxOut {
 		dst = make([]byte, maxOut)
@@ -166,6 +169,24 @@ lastLiterals:
 	copy(dst[di:], src[anchor:])
 	di += litLen
 	return dst[:di]
+}
+
+// likelyIncompressible samples a block and skips LZ4 when the byte
+// distribution looks like already-compressed or encrypted data. DuckLake
+// writes zstd Parquet, so most large blocks take this path and pay no
+// compression CPU at all.
+func likelyIncompressible(src []byte) bool {
+	const sample = 512
+	n := min(len(src), sample)
+	var seen [256]bool
+	distinct := 0
+	for _, b := range src[:n] {
+		if !seen[b] {
+			seen[b] = true
+			distinct++
+		}
+	}
+	return distinct > 200
 }
 
 // decompressBlock decodes a block produced by compressBlock into wantLen bytes.
