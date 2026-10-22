@@ -148,8 +148,10 @@ pgvs3 serve --addr 0.0.0.0:8014
 `GET` (ranges and conditional), `HEAD`, `PUT`, `DELETE`, `DeleteObjects`,
 `ListObjectsV2`, `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket`,
 multipart uploads, `CopyObject`, `UploadPartCopy`, `GetObjectAttributes`,
-`ListParts`, `ListMultipartUploads`, `RenameObject`, and appends via
-`x-amz-write-offset-bytes`.
+`ListParts`, `ListMultipartUploads`, `RenameObject`, `partNumber` on GET/HEAD,
+presigned-URL query auth, and appends via `x-amz-write-offset-bytes`. Presigned
+URLs use SigV4; with boto3 and a custom endpoint, set
+`signature_version='s3v4'` explicitly if it defaults to SigV2.
 
 S3 Express One Zone additions:
 
@@ -164,8 +166,8 @@ S3 Express One Zone additions:
 - **AppendObject** is `PUT` with `x-amz-write-offset-bytes`; the new bytes become
   another part and existing bytes never move. The 10,000-part limit applies.
 - **CopyObject** shares immutable files between object rows; GC checks every
-  reference before reaping. **UploadPartCopy** currently copies the requested
-  source range through the streaming ingest path.
+  reference before reaping. **UploadPartCopy** of a whole single-file object
+  is metadata-only; ranged and multipart-source copies stream.
 - `GetObjectAttributes`, `ListParts` and `ListMultipartUploads` are implemented.
   `ListDirectoryBuckets` is selected when the request is signed for
   `s3express` (AWS SDKs use that signing name).
