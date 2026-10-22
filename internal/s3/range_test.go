@@ -62,14 +62,6 @@ func TestSplitPathKeepsDoubleEncodedSlash(t *testing.T) {
 	}
 }
 
-func TestCanonicalQuery(t *testing.T) {
-	got := canonicalQuery("list-type=2&prefix=a%2Fb&max-keys=10&uploads")
-	want := "list-type=2&max-keys=10&prefix=a%2Fb&uploads="
-	if got != want {
-		t.Fatalf("canonicalQuery = %q, want %q", got, want)
-	}
-}
-
 func TestETagMatching(t *testing.T) {
 	for _, tc := range []struct {
 		header, etag string

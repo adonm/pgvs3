@@ -82,8 +82,6 @@ func serve(args []string) int {
 	var (
 		url           = fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
 		addr          = fs.String("addr", env("PGVS3_ADDR", "127.0.0.1:8014"), "S3 listen address")
-		accessKey     = fs.String("access-key", env("PGVS3_ACCESS_KEY", ""), "SigV4 access key")
-		secretKey     = fs.String("secret-key", env("PGVS3_SECRET_KEY", ""), "SigV4 secret key")
 		tlsCert       = fs.String("tls-cert", env("PGVS3_TLS_CERT", ""), "PEM certificate")
 		tlsKey        = fs.String("tls-key", env("PGVS3_TLS_KEY", ""), "PEM private key")
 		allowHTTP     = fs.Bool("allow-http", envBool("PGVS3_ALLOW_HTTP"), "allow plaintext HTTP outside loopback")
@@ -109,7 +107,6 @@ func serve(args []string) int {
 		inlineMax     = fs.Int64("inline-max", envInt64("PGVS3_INLINE_MAX", 65536), "largest object stored inline (0 disables, max 65536)")
 		buckets       = fs.String("buckets", env("PGVS3_BUCKETS", ""), "comma-separated buckets to create at startup")
 		readOnly      = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating S3 requests")
-		noAuth        = fs.Bool("no-auth", envBool("PGVS3_NO_AUTH"), "accept unsigned S3 requests (trust the network)")
 		webAddr       = fs.String("web-addr", env("PGVS3_WEB_ADDR", ""), "plain HTTP web/static-site listen address")
 		webIndex      = fs.String("web-index", env("PGVS3_WEB_INDEX", "index.html"), "index object for directory requests")
 		webError      = fs.String("web-error", env("PGVS3_WEB_ERROR", ""), "optional 404 object key")
@@ -126,13 +123,6 @@ func serve(args []string) int {
 		*objectCheck = true
 	}
 	log := newLogger(*logLevel)
-	if !*noAuth && (*accessKey == "" || *secretKey == "") {
-		log.Error("PGVS3_ACCESS_KEY and PGVS3_SECRET_KEY are required unless --no-auth is set")
-		return 2
-	}
-	if *noAuth {
-		log.Warn("authentication disabled; any client that can reach this listener can read and write objects")
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -183,8 +173,7 @@ func serve(args []string) int {
 		go maintain(ctx, st, *reapGrace, *maintainEvery, log)
 	}
 
-	auth := &s3.Auth{AccessKey: *accessKey, SecretKey: *secretKey, Disabled: *noAuth}
-	handler := s3.New(st, auth, log, *region, *vhost, *readOnly)
+	handler := s3.New(st, log, *region, *vhost, *readOnly)
 	if *adminAddr != "" {
 		handler.SetAdminOnly(true)
 	}

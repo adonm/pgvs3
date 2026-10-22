@@ -28,12 +28,6 @@ spec:
             - name: PGVS3_URL
               valueFrom:
                 secretKeyRef: { name: {{ .Values.urlSecretName | quote }}, key: url }
-            - name: PGVS3_ACCESS_KEY
-              valueFrom:
-                secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: accessKey }
-            - name: PGVS3_SECRET_KEY
-              valueFrom:
-                secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: secretKey }
             - { name: PGVS3_REGION, value: {{ .Values.region | quote }} }
             {{- if .Values.vhostDomain }}
             - { name: PGVS3_VHOST_DOMAIN, value: {{ .Values.vhostDomain | quote }} }

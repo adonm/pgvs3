@@ -15,17 +15,17 @@ For a real deployment put the URL and keys in Secrets and use TLS outside
 loopback; `PGVS3_ALLOW_HTTP` and `PGVS3_DB_ALLOW_PLAINTEXT` are for isolated
 development only.
 
-## Plain HTTP and no-auth
+## Plain HTTP and authentication
 
-`PGVS3_WEB_ADDR=127.0.0.1:8080` serves objects over unauthenticated plain HTTP
-at `/{bucket}/{key}`. Directory requests append `PGVS3_WEB_INDEX` (default
+`PGVS3_WEB_ADDR=127.0.0.1:8080` serves objects over plain HTTP at
+`/{bucket}/{key}`. Directory requests append `PGVS3_WEB_INDEX` (default
 `index.html`); `PGVS3_WEB_ERROR` names an optional 404 object. Use it for static
 sites or non-S3 clients. It supports `HEAD`, ranges, ETags and conditional GETs.
 
-`PGVS3_NO_AUTH=true` accepts unsigned requests on the S3 listener and does not
-require access/secret keys. Put either
-listener behind a service mesh or private network; neither mode adds
-authentication by itself.
+Both the S3 and web listeners are unauthenticated. SigV4 headers and presigned
+query parameters are accepted but not verified. The network or service mesh is
+the only access-control boundary: bind listeners privately and do not expose a
+public LoadBalancer or Ingress unless you intend public read/write access.
 
 ## Probes and metrics
 
@@ -42,7 +42,7 @@ authentication by itself.
 
 Set `PGVS3_ADMIN_ADDR=127.0.0.1:8016` to move probes and metrics to a separate
 listener; `/metrics` is then removed from the S3 listener. Bind the peer port (`8015`) and any metrics listener to a private
-network; neither uses S3 authentication.
+network; neither uses S3 authentication. SigV4 is not validated on either listener.
 
 ## Diagnose
 

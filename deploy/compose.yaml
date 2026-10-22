@@ -24,8 +24,6 @@ services:
         condition: service_healthy
     environment:
       PGVS3_URL: postgres://postgres:postgres@postgres:5432/pgvs3?sslmode=disable
-      PGVS3_ACCESS_KEY: ${PGVS3_ACCESS_KEY:-pgvs3}
-      PGVS3_SECRET_KEY: ${PGVS3_SECRET_KEY:-pgvs3-local-only}
       PGVS3_ADDR: 0.0.0.0:8014
       PGVS3_ALLOW_HTTP: "true"
       PGVS3_DB_ALLOW_PLAINTEXT: "true"
@@ -33,7 +31,7 @@ services:
       PGVS3_POOL_MAX: "64"
       PGVS3_BUCKETS: lake
     ports:
-      - "8014:8014"
+      - "127.0.0.1:8014:8014"
     healthcheck:
       test: ["CMD", "/ko-app/pgvs3", "health"]
       interval: 5s

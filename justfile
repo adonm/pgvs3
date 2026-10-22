@@ -58,7 +58,6 @@ fault:
 [group('test')]
 fuzz:
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=10s ./internal/s3
-    mise exec go -- go test -fuzz=FuzzCanonicalQuery -fuzztime=10s ./internal/s3
     mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=10s ./internal/store
 
 [group('test')]
@@ -114,6 +113,5 @@ ci:
     mise exec go -- go vet ./...
     mise exec go -- go test -race ./...
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=5s ./internal/s3
-    mise exec go -- go test -fuzz=FuzzCanonicalQuery -fuzztime=5s ./internal/s3
     mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=5s ./internal/store
     just contract

@@ -35,7 +35,6 @@ func putCopyBuf(b []byte) { copyBufPool.Put(&b) }
 // gateway instance can serve any request of any multipart upload.
 type Server struct {
 	store       *store.Store
-	auth        *Auth
 	log         *slog.Logger
 	region      string
 	vhostDomain string
@@ -45,13 +44,12 @@ type Server struct {
 	draining    atomic.Bool
 }
 
-func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain string, readOnly bool) *Server {
+func New(st *store.Store, log *slog.Logger, region, vhostDomain string, readOnly bool) *Server {
 	if region == "" {
 		region = "us-east-1"
 	}
-	auth.VHostDomain = vhostDomain
 	return &Server{
-		store: st, auth: auth, log: log, region: region,
+		store: st, log: log, region: region,
 		vhostDomain: vhostDomain, metrics: newMetrics(), readOnly: readOnly,
 	}
 }
@@ -124,11 +122,7 @@ func (s *Server) AdminHandler() http.Handler {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	_, err := s.auth.Verify(r)
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
+	prepareBody(r)
 	bucket, key, err := splitPath(r, s.vhostDomain)
 	if err != nil {
 		writeError(w, r, errInvalidRequest("invalid object path"), s.log)
@@ -923,9 +917,6 @@ func (s *Server) ingestError(err error) error {
 }
 
 func bodyError(err error) error {
-	if errors.Is(err, errPayloadHashMismatch) {
-		return apiErr("XAmzContentSHA256Mismatch", "The provided x-amz-content-sha256 does not match the body.", http.StatusBadRequest)
-	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return apiErr("IncompleteBody", "The request body terminated unexpectedly.", http.StatusBadRequest)
 	}

@@ -9,6 +9,10 @@ The gateway is Go, stateless over PostgreSQL, and runs as a distroless static
 container built with [ko](https://ko.build/). It uses the v9 storage layout
 (small objects are stored inline in `s3p.objects`).
 
+> **No request authentication.** pgvs3 accepts signed and unsigned requests
+> without validation. Bind it to a private network or put it behind a service
+> mesh; never expose the S3 or web listener publicly.
+
 **Status: early alpha, no releases.** Any storage layout change requires a fresh
 database; there are no migrations. Use disposable databases only.
 
@@ -31,9 +35,8 @@ go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_benc
 (the example key is for loopback development only):
 
 ```sh
-export PGVS3_ACCESS_KEY=pgvs3 PGVS3_SECRET_KEY=pgvs3-local-only
-curl --aws-sigv4 aws:amz:us-east-1:s3 --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
-     -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
+curl -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
+curl http://127.0.0.1:8014/lake/README.md
 ```
 
 DuckDB 2.0+:
@@ -41,8 +44,7 @@ DuckDB 2.0+:
 ```sql
 INSTALL httpfs; LOAD httpfs;
 CREATE SECRET (
-    TYPE s3, KEY_ID 'pgvs3', SECRET 'pgvs3-local-only',
-    REGION 'us-east-1', ENDPOINT '127.0.0.1:8014',
+    TYPE s3, REGION 'us-east-1', ENDPOINT '127.0.0.1:8014',
     URL_STYLE 'path', USE_SSL false
 );
 SELECT * FROM read_text('s3://lake/README.md') LIMIT 1;
@@ -96,7 +98,7 @@ The layout is deliberately narrow:
 
 ## Performance
 
-On a shared 6-vCPU loopback host, direct SigV4 load on the current v9 build
+On a shared 6-vCPU loopback host, direct S3 load on the current v9 build
 gives a 0.28 ms p50 for one 4 KiB GET and about 18.4k 4 KiB GET/s at 256
 workers; cached HEAD is 0.24 ms at one worker and 17.6k/s at 64. A 4 KiB PUT
 is 1.32 ms at one worker (2.1k/s at 16; async commit reaches 3.97k/s in an
@@ -149,9 +151,12 @@ pgvs3 serve --addr 0.0.0.0:8014
 `GET` (ranges and conditional), `HEAD`, `PUT`, `DELETE`, `DeleteObjects`,
 `ListObjectsV2`, `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket`,
 multipart uploads, `CopyObject`, `UploadPartCopy`, `GetObjectAttributes`,
-`ListParts`, `ListMultipartUploads`, `partNumber` on GET/HEAD and presigned-URL
-query auth. Presigned URLs use SigV4; with boto3 and a custom endpoint, set
-`signature_version='s3v4'` explicitly if it defaults to SigV2.
+`ListParts`, `ListMultipartUploads` and `partNumber` on GET/HEAD.
+
+pgvs3 does not validate SigV4 or any other request authentication. Signed and
+unsigned requests are both accepted; clients may keep sending credentials, but
+they are ignored. The S3 listener must therefore be private or behind a service
+mesh that enforces access control.
 
 - **CopyObject** shares immutable files between object rows; GC checks every
   reference before reaping. **UploadPartCopy** of a whole single-file object is
@@ -187,9 +192,10 @@ fallback. Range, `HEAD`, ETag and conditional reads work. The web listener is
 unauthenticated and plain HTTP: bind it to a private interface or put it behind
 the service mesh.
 
-For S3 clients that authenticate at a mesh/gateway layer, `--no-auth` /
-`PGVS3_NO_AUTH=true` accepts unsigned S3 requests. Do not expose a no-auth
-listener publicly.
+The S3 listener is also unauthenticated: any client that can reach it can read,
+write and delete objects. Bind it to a private interface or put it behind a
+service mesh that enforces access control. TLS still protects transport when
+configured, but it is not authentication.
 
 ## Configuration
 
@@ -199,8 +205,6 @@ A flag overrides the same-named environment variable.
 | --- | --- | --- | --- |
 | `--url` | `PGVS3_URL` | local dev DB | PostgreSQL URL. Remote hosts require `sslmode=require`; certificates and hostnames are verified against system CAs plus `PGVS3_DB_CA_FILE`. Loopback may use plaintext. |
 | `--addr` | `PGVS3_ADDR` | `127.0.0.1:8014` | S3 listen address. |
-| `--access-key` | `PGVS3_ACCESS_KEY` | required unless `--no-auth` | SigV4 access key. |
-| `--secret-key` | `PGVS3_SECRET_KEY` | required unless `--no-auth` | SigV4 secret key. |
 | `--vhost-domain` | `PGVS3_VHOST_DOMAIN` | unset | Virtual-host suffix, e.g. `s3.internal`. |
 | `--tls-cert`, `--tls-key` | `PGVS3_TLS_CERT`, `PGVS3_TLS_KEY` | unset | PEM files for HTTPS on non-loopback addresses. |
 | `--allow-http` | `PGVS3_ALLOW_HTTP` | false | Explicitly permit plaintext HTTP outside loopback. |
@@ -221,7 +225,6 @@ A flag overrides the same-named environment variable.
 | `--read-only` | `PGVS3_READ_ONLY` | false | Reject mutating methods; skip DDL, reaping and bucket creation. Use against a standby. |
 | `--drain` | `PGVS3_DRAIN` | `5s` | Keep serving while `/readyz` returns 503, then shut down. |
 | `--admin-addr` | `PGVS3_ADMIN_ADDR` | unset | Optional separate listener for `/healthz`, `/readyz` and `/metrics`. |
-| `--no-auth` | `PGVS3_NO_AUTH` | false | Accept unsigned S3 requests. Only for a trusted mesh/private listener. |
 | `--web-addr` | `PGVS3_WEB_ADDR` | unset | Plain HTTP object/static-site listener. |
 | `--web-index` | `PGVS3_WEB_INDEX` | `index.html` | Object appended to directory requests. |
 | `--web-error` | `PGVS3_WEB_ERROR` | unset | Optional bucket-relative 404 object. |
@@ -231,7 +234,7 @@ A flag overrides the same-named environment variable.
 | `--peer-addr` | `PGVS3_PEER_ADDR` | `0.0.0.0:8015` | Peer cache listen address. |
 | `--peer-advertise` | `PGVS3_PEER_ADVERTISE` | required with peers | This gateway's address as peers see it; must be in `PGVS3_PEERS`. |
 | `--peer-secret` | `PGVS3_PEER_SECRET` | unset | Shared secret header for peer requests. |
-| `--region` | `PGVS3_REGION` | `us-east-1` | SigV4 region and bucket ARN region. |
+| `--region` | `PGVS3_REGION` | `us-east-1` | Region returned by bucket location queries. |
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 
 `GET /healthz`, `GET /readyz` and `GET /metrics` are unauthenticated. Bind
@@ -306,7 +309,7 @@ historical numbers.
 - `cmd/pgvs3/`: CLI (`serve`, `stat --json`, `doctor`, `health`, `reap`).
 - `internal/store/`: schema, PostgreSQL pool, streaming COPY/GET, multipart,
   copy, maintenance.
-- `internal/s3/`: S3 routing, SigV4, XML, ranges, checksums and multipart.
+- `internal/s3/`: S3 routing, XML, ranges, checksums and multipart.
 - `internal/peercache/`: groupcache + Otter cross-AZ metadata cache.
 - `test/e2e.sh`: the S3 contract.
 - `test/interop.sh`: rclone, restic, boto3, DuckLake and SlateDB.

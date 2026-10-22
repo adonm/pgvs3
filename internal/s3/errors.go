@@ -27,10 +27,6 @@ func errAccessDenied(msg string) *APIError {
 	return apiErr("AccessDenied", msg, http.StatusForbidden)
 }
 
-func errAuthorizationHeaderMalformed() *APIError {
-	return apiErr("AuthorizationHeaderMalformed", "The authorization header is malformed.", http.StatusBadRequest)
-}
-
 func errNoSuchKey() *APIError {
 	return apiErr("NoSuchKey", "The specified key does not exist.", http.StatusNotFound)
 }

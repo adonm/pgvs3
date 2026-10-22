@@ -3,7 +3,6 @@ image: ghcr.io/adonm/pgvs3:latest
 # Secret with `url` (and `caCert`, possibly empty, for a private database CA).
 # The URL never enters Helm values or release history.
 urlSecretName: pgvs3-db
-s3SecretName: pgvs3-s3
 region: us-east-1
 # Idempotently created at startup; avoids a manual bucket bootstrap.
 buckets: "lake"

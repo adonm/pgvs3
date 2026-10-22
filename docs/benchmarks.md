@@ -2,7 +2,7 @@
 
 Two harnesses:
 
-- **`just load`** drives the gateway directly with SigV4 (no DuckDB client), so
+- **`just load`** drives the gateway directly with signed requests (signatures are ignored), so
   the numbers isolate HTTP, PostgreSQL and the storage layout.
 - **`just bench`** drives DuckDB 2.0 / DuckLake through `httpfs`, which is the
   real client path and includes DuckDB's own request handling.
