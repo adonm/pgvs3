@@ -20,16 +20,12 @@ import (
 type Auth struct {
 	AccessKey   string
 	SecretKey   string
-	Sessions    *SessionIssuer
 	VHostDomain string
 	Now         func() time.Time
 }
 
 // AuthInfo describes how a request was authenticated.
 type AuthInfo struct {
-	Session bool
-	Mode    string
-	Bucket  string
 	Service string
 }
 
@@ -41,7 +37,7 @@ const (
 
 // Verify checks the request signature and, for non-unsigned payloads, wraps
 // the body so its SHA-256 is checked as it is consumed. It does not read the
-// body. S3 Express session tokens select the temporary session secret.
+// body.
 func (a *Auth) Verify(r *http.Request) (*AuthInfo, error) {
 	h := r.Header.Get("Authorization")
 	if h == "" {
@@ -68,30 +64,13 @@ func (a *Auth) Verify(r *http.Request) (*AuthInfo, error) {
 	}
 	scopeParts := strings.Split(cred, "/")
 	if len(scopeParts) != 5 || scopeParts[4] != "aws4_request" ||
-		(scopeParts[3] != "s3" && scopeParts[3] != "s3express") {
+		scopeParts[3] != "s3" {
 		return nil, errAuthorizationHeaderMalformed()
 	}
 	accessKey, date, region, service := scopeParts[0], scopeParts[1], scopeParts[2], scopeParts[3]
 	secret := a.SecretKey
 	info := &AuthInfo{Service: service}
-	if token := r.Header.Get("x-amz-s3session-token"); token != "" {
-		if a.Sessions == nil {
-			return nil, errAccessDenied("session authentication is not configured")
-		}
-		bucket, _, _ := splitPath(r, a.VHostDomain)
-		sess, err := a.Sessions.Validate(token, bucket)
-		if err != nil {
-			return nil, errAccessDenied(err.Error())
-		}
-		if subtle.ConstantTimeCompare([]byte(accessKey), []byte(sess.AccessKey)) != 1 {
-			return nil, &APIError{Code: "InvalidAccessKeyId", Message: "The AWS access key ID you provided does not exist.", Status: 403}
-		}
-		if sess.Mode == "ReadOnly" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-			return nil, errAccessDenied("read-only session cannot modify the bucket")
-		}
-		secret = sess.SecretKey
-		info = &AuthInfo{Session: true, Mode: sess.Mode, Bucket: sess.Bucket}
-	} else if subtle.ConstantTimeCompare([]byte(accessKey), []byte(a.AccessKey)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(accessKey), []byte(a.AccessKey)) != 1 {
 		return nil, &APIError{Code: "InvalidAccessKeyId", Message: "The AWS access key ID you provided does not exist.", Status: 403}
 	}
 	amzDate := r.Header.Get("x-amz-date")
@@ -294,7 +273,7 @@ func (a *Auth) verifyPresigned(r *http.Request) (*AuthInfo, error) {
 	}
 	scopeParts := strings.Split(q.Get("X-Amz-Credential"), "/")
 	if len(scopeParts) != 5 || scopeParts[4] != "aws4_request" ||
-		(scopeParts[3] != "s3" && scopeParts[3] != "s3express") {
+		scopeParts[3] != "s3" {
 		return nil, errAuthorizationHeaderMalformed()
 	}
 	accessKey, date, region, service := scopeParts[0], scopeParts[1], scopeParts[2], scopeParts[3]

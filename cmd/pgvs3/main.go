@@ -100,8 +100,6 @@ func serve(args []string) int {
 		peerSecret    = fs.String("peer-secret", env("PGVS3_PEER_SECRET", ""), "shared secret for peer cache requests")
 		logLevel      = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
 		vhost         = fs.String("vhost-domain", env("PGVS3_VHOST_DOMAIN", ""), "virtual-host suffix, e.g. s3.internal")
-		accountID     = fs.String("account-id", env("PGVS3_ACCOUNT_ID", "000000000000"), "account id in bucket ARNs")
-		sessionKey    = fs.String("session-key", env("PGVS3_SESSION_KEY", ""), "HMAC key for S3 Express session tokens")
 		objectCache   = fs.Int64("object-cache-bytes", envInt64("PGVS3_OBJECT_CACHE_BYTES", 64<<20), "small-object byte cache size (0 disables)")
 		objectTTL     = fs.Duration("object-cache-ttl", envDuration("PGVS3_OBJECT_CACHE_TTL", 5*time.Second), "small-object cache TTL")
 		objectCheck   = fs.Bool("object-cache-revalidate", envBoolDefault("PGVS3_OBJECT_CACHE_REVALIDATE", false), "revalidate each small-object cache hit against PostgreSQL")
@@ -179,10 +177,7 @@ func serve(args []string) int {
 	}
 
 	auth := &s3.Auth{AccessKey: *accessKey, SecretKey: *secretKey}
-	if *sessionKey != "" {
-		auth.Sessions = s3.NewSessionIssuer([]byte(*sessionKey), 5*time.Minute)
-	}
-	handler := s3.New(st, auth, log, *region, *vhost, *accountID, *readOnly)
+	handler := s3.New(st, auth, log, *region, *vhost, *readOnly)
 	if *adminAddr != "" {
 		handler.SetAdminOnly(true)
 	}

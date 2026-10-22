@@ -154,17 +154,12 @@ default stays 64 KiB. 8 KiB behaves the same either way.
   rows, queues only unreferenced shared files and emits every NOTIFY in two
   statements instead of 1,000 round trips. The reaper self-heals false-positive
   garbage rows left by older gateways.
-- **Append can promote inline objects.** Crossing the 64 KiB inline threshold
-  writes the old inline prefix as a chunked first part and attaches the new
-  append file, without rewriting either byte range.
 - **Multipart parts are separate files.** Parts upload in parallel with no
   staging; Complete publishes the ordered part list. It validates ETags and
   checksums but moves no data.
 - **CopyObject is metadata-only.** The destination row shares the source's
-  immutable file IDs. `RenameObject` updates the key. The reaper only queues a
-  file when no object or upload part references it.
-- **AppendObject writes only new bytes.** `x-amz-write-offset-bytes` becomes
-  another part; the object's `parts`/`part_ends` arrays grow in one transaction.
+  immutable file IDs. The reaper only queues a file when no object or upload
+  part references it.
 - **No sharded COPY.** One stream already writes about 300 MiB/s and more than
   four streams were slower on an 8-core PostgreSQL. Publishing shards early
   would also leak rows from a crashed writer.

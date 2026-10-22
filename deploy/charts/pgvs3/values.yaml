@@ -4,12 +4,7 @@ image: ghcr.io/adonm/pgvs3:latest
 # The URL never enters Helm values or release history.
 urlSecretName: pgvs3-db
 s3SecretName: pgvs3-s3
-# Optional secret with a `sessionKey` key for CreateSession tokens. If unset,
-# each gateway derives the key from the SigV4 secret; use a shared value when
-# gateways run in more than one AZ.
-sessionKeySecretName: ""
 region: us-east-1
-accountId: "000000000000"
 # Idempotently created at startup; avoids a manual bucket bootstrap.
 buckets: "lake"
 # Keep below the container memory limit; Go uses it as a soft heap ceiling.

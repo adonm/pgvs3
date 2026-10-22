@@ -34,13 +34,7 @@ spec:
             - name: PGVS3_SECRET_KEY
               valueFrom:
                 secretKeyRef: { name: {{ .Values.s3SecretName | quote }}, key: secretKey }
-            {{- if .Values.sessionKeySecretName }}
-            - name: PGVS3_SESSION_KEY
-              valueFrom:
-                secretKeyRef: { name: {{ .Values.sessionKeySecretName | quote }}, key: sessionKey }
-            {{- end }}
             - { name: PGVS3_REGION, value: {{ .Values.region | quote }} }
-            - { name: PGVS3_ACCOUNT_ID, value: {{ .Values.accountId | quote }} }
             {{- if .Values.vhostDomain }}
             - { name: PGVS3_VHOST_DOMAIN, value: {{ .Values.vhostDomain | quote }} }
             {{- end }}

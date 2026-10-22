@@ -102,11 +102,11 @@ workers; cached HEAD is 0.24 ms at one worker and 17.6k/s at 64. A 4 KiB PUT
 is 1.32 ms at one worker (2.1k/s at 16; async commit reaches 3.97k/s in an
 earlier run). 8 MiB GETs reach 1.09 GiB/s and 64 MiB GETs 1.06 GiB/s at 16
 workers.
-S3 Express One Zone publishes consistent single-digit-millisecond latency and 200k reads / 100k writes per
-second per directory bucket by default. Per-request latency is in the same
-band; the aggregate ceiling is not — pgvs3 is one PostgreSQL, Express is a
-managed service. Full methodology, Go-vs-Express tables and the cost comparison
-are in [docs/benchmarks.md](docs/benchmarks.md).
+For context, S3 Express One Zone publishes single-digit-millisecond latency and
+200k reads / 100k writes per directory bucket by default. Per-request latency
+is in the same band; the aggregate ceiling is not — pgvs3 is one PostgreSQL.
+Full methodology and the published-service comparison are in
+[docs/benchmarks.md](docs/benchmarks.md).
 
 ## Cross-AZ metadata cache
 
@@ -149,49 +149,25 @@ pgvs3 serve --addr 0.0.0.0:8014
 `GET` (ranges and conditional), `HEAD`, `PUT`, `DELETE`, `DeleteObjects`,
 `ListObjectsV2`, `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket`,
 multipart uploads, `CopyObject`, `UploadPartCopy`, `GetObjectAttributes`,
-`ListParts`, `ListMultipartUploads`, `RenameObject`, `partNumber` on GET/HEAD,
-presigned-URL query auth, and appends via `x-amz-write-offset-bytes`. Presigned
-URLs use SigV4; with boto3 and a custom endpoint, set
+`ListParts`, `ListMultipartUploads`, `partNumber` on GET/HEAD and presigned-URL
+query auth. Presigned URLs use SigV4; with boto3 and a custom endpoint, set
 `signature_version='s3v4'` explicitly if it defaults to SigV2.
 
-S3 Express One Zone additions:
-
-- **Directory buckets** named `base--zone-id--x-s3`, including virtual-hosted
-  zonal requests and `HeadBucket`'s `x-amz-bucket-location-type`,
-  `x-amz-bucket-arn` and `x-amz-bucket-region` headers.
-- **CreateSession** (`GET /{bucket}?session`) issues stateless, HMAC-signed,
-  five-minute credentials scoped to one bucket. Zonal requests authenticate with
-  `x-amz-s3session-token`; both `s3` and `s3express` SigV4 signing names work.
-  Read-only sessions reject mutating methods.
-- **RenameObject** (`PUT /{key}?renameObject`) moves metadata only.
-- **AppendObject** is `PUT` with `x-amz-write-offset-bytes`; the new bytes become
-  another part and existing bytes never move. The 10,000-part limit applies.
 - **CopyObject** shares immutable files between object rows; GC checks every
-  reference before reaping. **UploadPartCopy** of a whole single-file object
-  is metadata-only; ranged and multipart-source copies stream.
+  reference before reaping. **UploadPartCopy** of a whole single-file object is
+  metadata-only; ranged and multipart-source copies stream.
 - `GetObjectAttributes`, `ListParts` and `ListMultipartUploads` are implemented.
   Single PUTs accept `CRC64NVME` and `x-amz-checksum-type: FULL_OBJECT`; CRC32,
   CRC32C, SHA1, SHA256 and MD5 are also verified. Multipart part checksums are
   returned in `ObjectParts`.
-  `ListDirectoryBuckets` is selected when the request is signed for
-  `s3express` (AWS SDKs use that signing name).
-- `x-amz-storage-class: EXPRESS_ONEZONE` and
-  `x-amz-server-side-encryption: AES256` are accepted/returned for directory
-  buckets. SSE-C and DSSE-KMS are rejected, as Express does.
+- SSE-S3 (`AES256`) and `aws:kms` headers are accepted as bookkeeping. SSE-C
+  and DSSE-KMS are rejected.
 
 **Not yet implemented:** multipart `x-amz-checksum-type: FULL_OBJECT`, lifecycle
-expiration, bucket policies/IAM, and access points. `GetObjectAttributes`
-returns per-part checksums and `RenameObject` honours `x-amz-client-token`. Like Express,
-pgvs3 has no versioning, object tags, Object Lock, ACLs, lifecycle transitions,
-replication, Event Notifications, S3 Select, website hosting, access logs,
-Storage Lens or Transfer Acceleration. ETags are opaque; single PUTs use MD5
-and appends use a random strong ETag.
-
-A known AWS SDK quirk: boto3's `create_bucket` for a directory bucket calls
-`CreateSession` first, and with a custom endpoint it can return `NoSuchBucket`
-before sending `CreateBucket`. Create the bucket once with the CLI or REST
-(`PUT /{bucket}` with a `CreateBucketConfiguration`); object operations then
-work normally, including session auth.
+expiration, bucket policies/IAM, and access points. pgvs3 has no versioning,
+object tags, Object Lock, ACLs, lifecycle transitions, replication, Event
+Notifications, S3 Select, website hosting, access logs, Storage Lens or
+Transfer Acceleration. ETags are opaque; single PUTs use MD5.
 
 ## Configuration
 
@@ -203,9 +179,7 @@ A flag overrides the same-named environment variable.
 | `--addr` | `PGVS3_ADDR` | `127.0.0.1:8014` | S3 listen address. |
 | `--access-key` | `PGVS3_ACCESS_KEY` | required | SigV4 access key. |
 | `--secret-key` | `PGVS3_SECRET_KEY` | required | SigV4 secret key. |
-| `--session-key` | `PGVS3_SESSION_KEY` | derived from secret | HMAC key for CreateSession tokens. Share it across gateways. |
-| `--vhost-domain` | `PGVS3_VHOST_DOMAIN` | unset | Extra virtual-host suffix, e.g. `s3.internal`. `--x-s3` hosts are always recognized. |
-| `--account-id` | `PGVS3_ACCOUNT_ID` | `000000000000` | Account ID in `x-amz-bucket-arn`. |
+| `--vhost-domain` | `PGVS3_VHOST_DOMAIN` | unset | Virtual-host suffix, e.g. `s3.internal`. |
 | `--tls-cert`, `--tls-key` | `PGVS3_TLS_CERT`, `PGVS3_TLS_KEY` | unset | PEM files for HTTPS on non-loopback addresses. |
 | `--allow-http` | `PGVS3_ALLOW_HTTP` | false | Explicitly permit plaintext HTTP outside loopback. |
 | | `PGVS3_DB_CA_FILE` | unset | Extra PostgreSQL CA bundle. |
@@ -285,7 +259,8 @@ The image is about 17 MB. It exposes `8014` (S3) and `8015` (peer cache).
 just test       # Go unit tests
 just race       # unit tests with the race detector
 just fuzz       # 30s fuzz targets for ranges, canonical queries and COPY framing
-just contract   # S3, DuckDB 2.0, DuckLake 1.1, duckdb-object-storage, Express APIs
+just contract   # S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
+just interop    # rclone, restic, boto3, DuckLake and SlateDB
 just ducklake   # DuckLake compatibility through the benchmark harness
 just bench      # DuckDB S3 benchmark, DuckLake checks and row-group tuning
 ```
@@ -293,19 +268,23 @@ just bench      # DuckDB S3 benchmark, DuckLake checks and row-group tuning
 Every recipe starts a disposable PostgreSQL 18 in Docker and two local
 gateways, then removes them. `just contract` covers conditional writes,
 pagination, multipart, byte ranges, cross-gateway reads, peer invalidation,
-CreateSession, copy/rename/append, attributes, and both DuckDB 2.0 and
-`duckdb-object-storage` on 1.5.6. `docs/benchmarks.md` has the method and
+copy, attributes, multipart and both DuckDB 2.0 and
+`duckdb-object-storage` on 1.5.6. `just interop` drives rclone, restic, boto3,
+DuckLake and a small SlateDB Rust program against the same gateway. DuckDB 2.0
+currently ships DuckLake 1.1; set `DUCKLAKE_VERSION=2.1` to make interop fail
+until the 2.1 extension is published. `docs/benchmarks.md` has the method and
 historical numbers.
 
 ## Repo layout
 
 - `cmd/pgvs3/`: CLI (`serve`, `stat --json`, `doctor`, `health`, `reap`).
 - `internal/store/`: schema, PostgreSQL pool, streaming COPY/GET, multipart,
-  copy/rename/append, maintenance.
-- `internal/s3/`: S3 routing, SigV4, sessions, XML, ranges, checksums, Express
-  extensions.
+  copy, maintenance.
+- `internal/s3/`: S3 routing, SigV4, XML, ranges, checksums and multipart.
 - `internal/peercache/`: groupcache + Otter cross-AZ metadata cache.
-- `test/e2e.sh`: the contract.
+- `test/e2e.sh`: the S3 contract.
+- `test/interop.sh`: rclone, restic, boto3, DuckLake and SlateDB.
+- `test/slatedb/`: the SlateDB Rust smoke program.
 - `deploy/bench/`: disposable stack and DuckDB benchmark.
 - `deploy/compose.yaml`: local PostgreSQL + gateway stack.
 - `deploy/charts/pgvs3/`: Helm chart (3-AZ topology and peer cache).

@@ -127,31 +127,8 @@ expect 200 -X PUT --data-binary 'version-one' "$A/$BUCKET/$RUN/over.txt"
 expect 200 -X PUT --data-binary 'version-two' "$A/$BUCKET/$RUN/over.txt"
 [ "$(s3 "$B/$BUCKET/$RUN/over.txt")" = version-two ] || fail "peer read v2"
 
-# --- S3 Express One Zone surface -------------------------------------------
-EXPR="demo-$RUN--use1-az1--x-s3"
-ED="$A/$EXPR"
-cat > "$TMP/bucket.xml" <<'XML'
-<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Location><Type>AvailabilityZone</Type><Name>use1-az1</Name></Location><Bucket><Type>Directory</Type><DataRedundancy>SingleAvailabilityZone</DataRedundancy></Bucket></CreateBucketConfiguration>
-XML
-expect 200 -X PUT --data-binary @"$TMP/bucket.xml" "$ED"
-s3 -I "$ED" | tr -d '\r' | grep -qi 'x-amz-bucket-location-type: AvailabilityZone' || fail "directory bucket headers"
-
-# CreateSession and short-lived session credentials.
-session=$(s3 "$ED?session")
-sak=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("AccessKeyId")][0])' <<<"$session")
-ssk=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("SecretAccessKey")][0])' <<<"$session")
-stok=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("SessionToken")][0])' <<<"$session")
-sesscode() { local ak=$1 sk=$2 tok=$3; shift 3; curl -sS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$ak:$sk" -H "x-amz-s3session-token: $tok" -o /dev/null -w '%{http_code}' "$@"; }
-[ "$(sesscode "$sak" "$ssk" "$stok" -X PUT --data-binary 'session' "$ED/session.txt")" = 200 ] || fail "session PUT"
-[ "$(sesscode "$sak" "$ssk" "$stok" "$ED/session.txt")" = 200 ] || fail "session GET"
-ro=$(s3 -H 'x-amz-create-session-mode: ReadOnly' "$ED?session")
-rak=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("AccessKeyId")][0])' <<<"$ro")
-rsk=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("SecretAccessKey")][0])' <<<"$ro")
-rtok=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("SessionToken")][0])' <<<"$ro")
-[ "$(sesscode "$rak" "$rsk" "$rtok" -X PUT --data-binary 'no' "$ED/ro.txt")" = 403 ] || fail "read-only session wrote"
-[ "$(sesscode "$rak" "$rsk" "$rtok" "$ED/session.txt")" = 200 ] || fail "read-only session read"
-
-# Copy, delete the source, and let the reaper run; the shared file must survive.
+# --- standard S3 copy, shared-file reaping and attributes ------------------
+ED="$A/$BUCKET"
 expect 200 -X PUT --data-binary 'copy me' "$ED/src"
 expect 200 -X PUT -H 'x-amz-copy-source: /src' "$ED/copy"
 [ "$(s3 "$ED/copy")" = 'copy me' ] || fail "copy bytes"
@@ -159,33 +136,14 @@ expect 204 -X DELETE "$ED/src"
 sleep 2
 [ "$(s3 "$ED/copy")" = 'copy me' ] || fail "reaper removed a shared file"
 
-# Rename and append.
-expect 200 -X PUT --data-binary 'rename' "$ED/old"
-expect 200 -X PUT -H 'x-amz-rename-source: /old' "$ED/new?renameObject"
-[ "$(s3 "$ED/new")" = rename ] || fail "rename bytes"
-expect 404 "$ED/old"
-expect 200 -X PUT --data-binary 'token rename' "$ED/old-token"
-expect 200 -X PUT -H 'x-amz-rename-source: /old-token' -H 'x-amz-client-token: token-1' "$ED/new-token?renameObject"
-expect 200 -X PUT -H 'x-amz-rename-source: /old-token' -H 'x-amz-client-token: token-1' "$ED/new-token?renameObject"
-expect 200 -X PUT --data-binary 'other' "$ED/other-token"
-expect 400 -X PUT -H 'x-amz-rename-source: /other-token' -H 'x-amz-client-token: token-1' "$ED/other-dst?renameObject"
-expect 200 -X PUT --data-binary 'base' "$ED/app"
-expect 200 -X PUT -H 'x-amz-write-offset-bytes: 4' --data-binary ' appended' "$ED/app"
-[ "$(s3 "$ED/app")" = 'base appended' ] || fail "append bytes"
-expect 409 -X PUT -H 'x-amz-write-offset-bytes: 1' --data-binary 'x' "$ED/app"
-expect 200 -X PUT --data-binary '' "$ED/empty-spill"
-head -c 100000 /dev/zero > "$TMP/empty-append"
-expect 200 -X PUT -H 'x-amz-write-offset-bytes: 0' --data-binary @"$TMP/empty-append" "$ED/empty-spill"
-[ "$(s3 "$ED/empty-spill" | wc -c)" = 100000 ] || fail "empty inline append spill"
-
 # CRC64NVME / FULL_OBJECT checksum on a single PUT.
 crc64=$(python3 -c 'import base64,struct; print(base64.b64encode(struct.pack(">Q",0xAE8B14860A799888)).decode())')
 expect 200 -X PUT -H "x-amz-checksum-crc64nvme: $crc64" -H 'x-amz-sdk-checksum-algorithm: CRC64NVME' -H 'x-amz-checksum-type: FULL_OBJECT' --data-binary '123456789' "$ED/crc64"
 [ "$(s3 "$ED/crc64")" = 123456789 ] || fail "crc64 body"
 expect 400 -X PUT -H "x-amz-checksum-crc64nvme: AAAAAAAAAAA=" -H 'x-amz-sdk-checksum-algorithm: CRC64NVME' --data-binary '123456789' "$ED/crc64-bad"
 
-# Attributes, multipart copy and multipart listings.
-s3 -H 'x-amz-object-attributes: ETag,ObjectSize,Checksum,ObjectParts,StorageClass' "$ED/app?attributes" | grep -q ObjectSize || fail "attributes"
+# Attributes, UploadPartCopy and multipart listings.
+s3 -H 'x-amz-object-attributes: ETag,ObjectSize,Checksum,ObjectParts,StorageClass' "$ED/copy?attributes" | grep -q ObjectSize || fail "attributes"
 head -c 1048576 /dev/urandom > "$TMP/partcopy"
 expect 200 -X PUT --data-binary @"$TMP/partcopy" "$ED/partcopy.src"
 upc=$(s3 -X POST "$ED/partcopy.dst?uploads")
@@ -204,43 +162,31 @@ expect 200 -X POST --data-binary @"$TMP/upc.xml" "$ED/partcopy.dst?uploadId=$upc
 s3 "$ED/partcopy.dst" -o "$TMP/partcopy.out"
 cmp "$TMP/partcopy" "$TMP/partcopy.out" || fail "upload part copy bytes"
 
-# The same surface through an SDK: session auth, copy, rename, append.
-EXPR="$EXPR" E2E_RUN="$RUN" E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
+# The standard S3 surface through an SDK.
+E2E_RUN="$RUN" E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
 import os, time, urllib.request, boto3
 from botocore.config import Config
-s3=boto3.client('s3', endpoint_url=os.environ['E2E_ENDPOINT'],
-    aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
-    region_name='us-east-1', config=Config(s3={'addressing_style':'virtual'}, retries={'max_attempts':0}))
-b=os.environ['EXPR']
-s3.put_object(Bucket=b, Key='sdk.txt', Body=b'sdk')
-assert s3.get_object(Bucket=b, Key='sdk.txt')['Body'].read()==b'sdk'
-s3.copy_object(Bucket=b, Key='sdk.copy', CopySource={'Bucket':b,'Key':'sdk.txt'})
-assert s3.get_object(Bucket=b, Key='sdk.copy')['Body'].read()==b'sdk'
-s3.rename_object(Bucket=b, Key='sdk.renamed', RenameSource='/sdk.copy')
-s3.put_object(Bucket=b, Key='sdk.renamed', Body=b' appended', WriteOffsetBytes=3)
-assert s3.get_object(Bucket=b, Key='sdk.renamed')['Body'].read()==b'sdk appended'
-assert s3.get_object_attributes(Bucket=b, Key='sdk.renamed', ObjectAttributes=['ObjectSize'])['ObjectSize']==12
 pc=boto3.client('s3', endpoint_url=os.environ['E2E_ENDPOINT'],
     aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
     region_name='us-east-1', config=Config(signature_version='s3v4', s3={'addressing_style':'path'}))
 run=os.environ['E2E_RUN']; gen='pgvs3-contract'
+pc.put_object(Bucket=gen, Key=f'{run}/sdk', Body=b'sdk')
+assert pc.get_object(Bucket=gen, Key=f'{run}/sdk')['Body'].read()==b'sdk'
+pc.copy_object(Bucket=gen, Key=f'{run}/sdk-copy', CopySource={'Bucket':gen,'Key':f'{run}/sdk'})
+assert pc.get_object(Bucket=gen, Key=f'{run}/sdk-copy')['Body'].read()==b'sdk'
 pc.put_object(Bucket=gen, Key=f'{run}/presigned', Body=b'presigned')
 u=pc.generate_presigned_url('get_object', Params={'Bucket':gen,'Key':f'{run}/presigned'}, ExpiresIn=60)
 assert urllib.request.urlopen(u).read()==b'presigned'
 u=pc.generate_presigned_url('put_object', Params={'Bucket':gen,'Key':f'{run}/presigned-put'}, ExpiresIn=60)
 assert urllib.request.urlopen(urllib.request.Request(u,data=b'put',method='PUT')).status==200
-pc.put_object(Bucket=gen, Key=f'{run}/spill', Body=b'a'*60000)
-pc.put_object(Bucket=gen, Key=f'{run}/spill', Body=b'b'*10000, WriteOffsetBytes=60000)
-assert pc.get_object(Bucket=gen, Key=f'{run}/spill')['Body'].read()==b'a'*60000+b'b'*10000
 pc.put_object(Bucket=gen, Key=f'{run}/over-inline', Body=b'old')
 up=pc.create_multipart_upload(Bucket=gen, Key=f'{run}/over-inline')
 part=pc.upload_part(Bucket=gen, Key=f'{run}/over-inline', UploadId=up['UploadId'], PartNumber=1, Body=b'n'*1048576)
 pc.complete_multipart_upload(Bucket=gen, Key=f'{run}/over-inline', UploadId=up['UploadId'], MultipartUpload={'Parts':[{'PartNumber':1,'ETag':part['ETag']}]})
 assert pc.get_object(Bucket=gen, Key=f'{run}/over-inline')['Body'].read()==b'n'*1048576
 up=pc.create_multipart_upload(Bucket=gen, Key=f'{run}/part-crc', ChecksumAlgorithm='SHA256', ChecksumType='COMPOSITE')
-body=b'checksum part'
-part=pc.upload_part(Bucket=gen, Key=f'{run}/part-crc', UploadId=up['UploadId'], PartNumber=1, Body=body, ChecksumAlgorithm='SHA256')
+part=pc.upload_part(Bucket=gen, Key=f'{run}/part-crc', UploadId=up['UploadId'], PartNumber=1, Body=b'checksum part', ChecksumAlgorithm='SHA256')
 pc.complete_multipart_upload(Bucket=gen, Key=f'{run}/part-crc', UploadId=up['UploadId'], MultipartUpload={'Parts':[{'PartNumber':1,'ETag':part['ETag'],'ChecksumSHA256':part['ChecksumSHA256']}]})
 attrs=pc.get_object_attributes(Bucket=gen, Key=f'{run}/part-crc', ObjectAttributes=['Checksum','ObjectParts'])
 assert attrs['ObjectParts']['Parts'][0]['ChecksumSHA256']==part['ChecksumSHA256']
@@ -253,7 +199,7 @@ for i in range(100):
     pc.put_object(Bucket=gen, Key=f'{run}/churn', Body=b'x'*1024)
     if i % 5 == 0:
         pc.delete_object(Bucket=gen, Key=f'{run}/churn')
-print('boto3 express ok')
+print('boto3 ok')
 PY
 
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------

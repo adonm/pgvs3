@@ -2,11 +2,12 @@
 # Disposable PostgreSQL + two local gateways, then one mode:
 #   contract  end-to-end S3, DuckDB 2.0 and DuckLake contract through both gateways
 #   fault     gateway/PostgreSQL failure and churn checks
+#   interop   rclone/restic/boto3/DuckLake/SlateDB compatibility
 #   bench     DuckDB benchmark (parts: s3,compat,tuning)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 mode=${1:-contract}
-case "$mode" in contract | fault | bench) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
+case "$mode" in contract | fault | interop | bench) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
 
 container="pgvs3-$mode-$$"
 pids=()
@@ -58,7 +59,7 @@ print(*ports)
 for entry in "a:$port_a:$peer_a" "b:$port_b:$peer_b"; do
   label=${entry%%:*}; rest=${entry#*:}; port=${rest%%:*}; peer=${rest#*:}
   args=()
-  if [ "$mode" = contract ] || [ "$mode" = fault ]; then
+  if [ "$mode" = contract ] || [ "$mode" = fault ] || [ "$mode" = interop ]; then
     args+=(--peers "127.0.0.1:$peer_a,127.0.0.1:$peer_b" --peer-advertise "127.0.0.1:$peer" --peer-addr "127.0.0.1:$peer" --reap-grace 1s --maintenance-interval 1s)
   fi
   .tmp/pgvs3/pgvs3 --url "$PGVS3_TEST_DB_URL" serve --addr "127.0.0.1:$port" "${args[@]}" \
@@ -89,6 +90,9 @@ contract)
   ;;
 fault)
   bash test/fault.sh
+  ;;
+interop)
+  bash test/interop.sh
   ;;
 bench)
   export PGVS3_CATALOG="dbname=ducklake_catalog host=${pg%:*} port=${pg#*:} user=postgres password=postgres"

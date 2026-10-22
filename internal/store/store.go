@@ -362,7 +362,7 @@ func (s *Store) Init(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, string(schema)); err != nil {
 			return err
 		}
-		// Metadata-only CopyObject/RenameObject share file IDs between object
+		// Metadata-only CopyObject shares file IDs between object
 		// rows. Older v8 databases have a UNIQUE constraint that prevents it;
 		// dropping it is safe because the reaper checks every reference.
 		if _, err := tx.Exec(ctx, "ALTER TABLE s3p.objects DROP CONSTRAINT IF EXISTS objects_file_id_key"); err != nil {
@@ -1816,9 +1816,6 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	}
 	if expired > 0 {
 		s.log.Info("expired multipart uploads", "count", expired)
-	}
-	if _, err := conn.Exec(ctx, "DELETE FROM s3p.rename_tokens WHERE created_at < now() - interval '24 hours'"); err != nil {
-		return err
 	}
 	remaining := reapRows
 	for remaining > 0 {

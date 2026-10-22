@@ -48,6 +48,10 @@ race:
     mise exec go -- go test -race ./...
 
 [group('test')]
+interop:
+    bash deploy/bench/stack.sh interop
+
+[group('test')]
 fault:
     bash deploy/bench/stack.sh fault
 

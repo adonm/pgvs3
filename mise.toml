@@ -7,6 +7,9 @@ ko = "0.19.1"
 uv = "0.13.4"
 python = "3.12.15"
 helm = "4.3.1"
+rclone = "1.75.2"
+restic = "0.19.1"
+rust = "1.99.1"
 
 # DuckDB for `just contract`, `just ducklake` and `just bench`.
 [env]

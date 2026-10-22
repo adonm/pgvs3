@@ -204,23 +204,18 @@ host**. Sources: [performance guide][express-perf], [pricing][express-price],
   PostgreSQL deployment provides; a single primary with no backup or standby
   is a single point of failure.
 
-## Feature parity
+## Scope
 
-The Express data plane is covered: directory buckets, `CreateSession` and
-session auth, ranges, conditional reads/writes, `ListObjectsV2`,
-`DeleteObjects`, multipart (including `UploadPartCopy`), `CopyObject`,
-`RenameObject`, append via `x-amz-write-offset-bytes`, `GetObjectAttributes`,
-`ListParts` and `ListMultipartUploads`.
+pgvs3 implements the standard S3 data plane and is not an S3 Express One Zone
+replacement. Directory buckets, `CreateSession`, `RenameObject` and
+`AppendObject` have been removed to keep the gateway focused on DuckDB,
+DuckLake and ordinary S3 clients.
 
-Still missing for a complete Express replacement:
+Still missing:
 
-- Presigned-URL query authentication.
 - IAM/bucket policies, access points and VPC endpoints.
-- Lifecycle expiration (and lifecycle transitions).
-- `partNumber` on GET/HEAD.
-- `x-amz-checksum-type: FULL_OBJECT` and `CRC64NVME`.
-- Per-part checksums in `GetObjectAttributes`.
-- `x-amz-client-token` idempotency for `RenameObject`.
+- Lifecycle expiration and transitions.
+- Multipart `x-amz-checksum-type: FULL_OBJECT`.
 - 50 TB objects (pgvs3 caps at about 17.4 TB per object and 32 TiB per
   database).
 - The request-rate scale above.
@@ -228,7 +223,7 @@ Still missing for a complete Express replacement:
 Features Express itself does not support — versioning, object tags, Object
 Lock, ACLs, replication, Event Notifications, S3 Select, website hosting,
 access logs, Storage Lens, Transfer Acceleration, SSE-C and DSSE-KMS — are
-also unsupported here, which is correct for parity.
+also unsupported here.
 
 ## Reproduce
 

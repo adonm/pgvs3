@@ -68,13 +68,12 @@ type Published struct {
 }
 
 var (
-	ErrNoBucket           = errors.New("bucket does not exist")
-	ErrNoUpload           = errors.New("upload does not exist")
-	ErrPrecondition       = errors.New("object precondition failed")
-	ErrMissingChecksum    = errors.New("part lacks the upload's checksum")
-	ErrInvalidPart        = errors.New("invalid part")
-	ErrIdempotentMismatch = errors.New("client token was used with different parameters")
-	errAborted            = errors.New("ingest aborted")
+	ErrNoBucket        = errors.New("bucket does not exist")
+	ErrNoUpload        = errors.New("upload does not exist")
+	ErrPrecondition    = errors.New("object precondition failed")
+	ErrMissingChecksum = errors.New("part lacks the upload's checksum")
+	ErrInvalidPart     = errors.New("invalid part")
+	errAborted         = errors.New("ingest aborted")
 )
 
 // rowFramer turns a byte stream into fixed-size binary COPY rows, hashing the
@@ -168,7 +167,7 @@ func (f *rowFramer) digests() (int64, []byte, []byte) {
 }
 
 type writerTarget struct {
-	kind       int // 0 object, 1 part, 2 append data
+	kind       int // 0 object, 1 part
 	bucket     string
 	key        string
 	condition  Condition
@@ -213,13 +212,6 @@ func (s *Store) StartObject(ctx context.Context, bucket, key string, cond Condit
 	})
 }
 
-// StartAppend streams the appended bytes into a fresh file. The file commits
-// on its own; FinishAppend attaches it to the object only if the caller's
-// expected size still matches.
-func (s *Store) StartAppend(ctx context.Context, bucket, key string) (*ChunkWriter, error) {
-	return s.startWriter(ctx, writerTarget{kind: 2, bucket: bucket, key: key})
-}
-
 // StartPart begins a multipart part write. A re-sent part replaces the earlier
 // attempt atomically, rows included.
 func (s *Store) StartPart(ctx context.Context, uploadID, bucket, key string, partNo int32) (*ChunkWriter, error) {
@@ -246,7 +238,7 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 			return fail(err)
 		}
 	}
-	if t.kind == 0 || t.kind == 2 {
+	if t.kind == 0 {
 		if !s.bucketKnown(t.bucket) {
 			var one int
 			err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE", t.bucket).Scan(&one)
@@ -333,9 +325,6 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			w.done <- err
 			return
 		}
-	case 2:
-		// Append data: the chunks commit on their own; the object row is
-		// updated by FinishAppend only after the expected offset is verified.
 	case 1:
 		if t.checksumAl != "" {
 			name := "x-amz-checksum-" + lower(t.checksumAl)

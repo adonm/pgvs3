@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS s3p.buckets (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- file_id is deliberately not UNIQUE: CopyObject/RenameObject share immutable
--- files between object rows, and GC checks every reference before reaping.
+-- file_id is deliberately not UNIQUE: CopyObject shares immutable files
+-- between object rows, and GC checks every reference before reaping.
 -- Small objects (<= 64 KiB) live entirely in inline_data with file_id NULL:
 -- one row read instead of a file_id + chunk lookup.
 -- bucket/key collate "C": S3 lists keys in byte order, so the primary key
@@ -108,15 +108,6 @@ CREATE INDEX IF NOT EXISTS uploads_by_age ON s3p.uploads (created_at, upload_id)
 
 -- A file becomes garbage in the *same transaction* that drops its final
 -- reference. Reads started earlier retain their MVCC snapshot during cleanup.
-CREATE TABLE IF NOT EXISTS s3p.rename_tokens (
-  token      text PRIMARY KEY,
-  bucket     text NOT NULL,
-  source_key text NOT NULL,
-  dest_key   text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS rename_tokens_by_age ON s3p.rename_tokens (created_at);
-
 -- Per-part checksums for completed multipart objects. file_id ties a row to
 -- the current part so stale rows from an overwritten object are ignored.
 CREATE TABLE IF NOT EXISTS s3p.object_part_checksums (

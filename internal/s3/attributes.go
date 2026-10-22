@@ -56,9 +56,6 @@ func (s *Server) getObjectAttributes(w http.ResponseWriter, r *http.Request, buc
 	}
 	if requested["StorageClass"] {
 		out.StorageClass = "STANDARD"
-		if isDirectoryBucket(bucket) {
-			out.StorageClass = "EXPRESS_ONEZONE"
-		}
 	}
 	if requested["Checksum"] {
 		out.Checksum = &checksumXML{
@@ -87,7 +84,6 @@ func (s *Server) getObjectAttributes(w http.ResponseWriter, r *http.Request, buc
 		out.ObjectParts = op
 	}
 	w.Header().Set("Last-Modified", meta.CreatedAt.UTC().Format(http.TimeFormat))
-	s.setDirectoryObjectHeaders(w, bucket)
 	writeXML(w, http.StatusOK, out)
 }
 
@@ -121,9 +117,6 @@ func (s *Server) listParts(w http.ResponseWriter, r *http.Request, bucket, key s
 		return
 	}
 	storageClass := "STANDARD"
-	if isDirectoryBucket(bucket) {
-		storageClass = "EXPRESS_ONEZONE"
-	}
 	out := listPartsResult{
 		Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: uploadID,
 		PartNumberMarker: int(marker), MaxParts: max, IsTruncated: truncated,
@@ -182,9 +175,6 @@ func (s *Server) listMultipartUploads(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 	storageClass := "STANDARD"
-	if isDirectoryBucket(bucket) {
-		storageClass = "EXPRESS_ONEZONE"
-	}
 	delimiter := q.Get("delimiter")
 	out := listMultipartUploadsResult{
 		Xmlns: s3Namespace, Bucket: bucket, Prefix: prefix, KeyMarker: keyMarker,

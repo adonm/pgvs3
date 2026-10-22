@@ -32,10 +32,6 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		writeError(w, r, errInvalidRequest("invalid x-amz-copy-source"), s.log)
 		return
 	}
-	if isDirectoryBucket(bucket) && srcBucket != bucket {
-		writeError(w, r, errInvalidRequest("directory bucket copies must stay in the same bucket"), s.log)
-		return
-	}
 	replace := strings.EqualFold(r.Header.Get("x-amz-metadata-directive"), "REPLACE")
 	var meta []string
 	var ct string
@@ -64,8 +60,6 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 			s.metaError(w, r, srcBucket, err)
 		case errors.Is(err, store.ErrPrecondition):
 			writeError(w, r, errPreconditionFailed(), s.log)
-		case errors.Is(err, store.ErrIdempotentMismatch):
-			writeError(w, r, apiErr("IdempotentParameterMismatch", "The client token was used with different rename parameters.", http.StatusBadRequest), s.log)
 		default:
 			writeError(w, r, errInternal(err, s.log), s.log)
 		}
@@ -74,35 +68,6 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	writeXML(w, http.StatusOK, copyObjectResult{
 		Xmlns: s3Namespace, ETag: quoteETag(out.ETag), LastModified: isoTime(out.CreatedAt),
 	})
-}
-
-func (s *Server) renameObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	src, err := parseRenameSource(r.Header.Get("x-amz-rename-source"), bucket)
-	if err != nil {
-		writeError(w, r, errInvalidRequest("invalid x-amz-rename-source"), s.log)
-		return
-	}
-	err = s.store.Rename(r.Context(), bucket, src, key, store.RenameOptions{
-		SourceIfMatch: r.Header.Get("x-amz-rename-source-if-match"),
-		SourceIfNone:  r.Header.Get("x-amz-rename-source-if-none-match"),
-		DestIfMatch:   r.Header.Get("If-Match"),
-		DestIfNone:    r.Header.Get("If-None-Match"),
-		ClientToken:   r.Header.Get("x-amz-client-token"),
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			writeError(w, r, errNoSuchKey(), s.log)
-		case errors.Is(err, store.ErrPrecondition):
-			writeError(w, r, errPreconditionFailed(), s.log)
-		case errors.Is(err, store.ErrIdempotentMismatch):
-			writeError(w, r, apiErr("IdempotentParameterMismatch", "The client token was used with different rename parameters.", http.StatusBadRequest), s.log)
-		default:
-			writeError(w, r, errInternal(err, s.log), s.log)
-		}
-		return
-	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func parseCopySource(v, defaultBucket string) (string, string, error) {
@@ -122,21 +87,6 @@ func parseCopySource(v, defaultBucket string) (string, string, error) {
 		return defaultBucket, decoded, nil
 	}
 	return bucket, key, nil
-}
-
-func parseRenameSource(v, defaultBucket string) (string, error) {
-	if v == "" {
-		return "", errInvalidRequest("missing x-amz-rename-source")
-	}
-	decoded, err := url.PathUnescape(v)
-	if err != nil {
-		return "", err
-	}
-	decoded = strings.TrimPrefix(decoded, "/")
-	if bucket, key, ok := strings.Cut(decoded, "/"); ok && bucket == defaultBucket {
-		return key, nil
-	}
-	return decoded, nil
 }
 
 type copyPartResult struct {

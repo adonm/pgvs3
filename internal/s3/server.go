@@ -39,27 +39,20 @@ type Server struct {
 	log         *slog.Logger
 	region      string
 	vhostDomain string
-	accountID   string
 	metrics     *metrics
 	readOnly    bool
 	adminOnly   bool
 	draining    atomic.Bool
 }
 
-func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain, accountID string, readOnly bool) *Server {
+func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain string, readOnly bool) *Server {
 	if region == "" {
 		region = "us-east-1"
 	}
-	if accountID == "" {
-		accountID = "000000000000"
-	}
 	auth.VHostDomain = vhostDomain
-	if auth.Sessions == nil {
-		auth.Sessions = NewSessionIssuer([]byte("pgvs3-session:"+auth.SecretKey), 5*time.Minute)
-	}
 	return &Server{
 		store: st, auth: auth, log: log, region: region,
-		vhostDomain: vhostDomain, accountID: accountID, metrics: newMetrics(), readOnly: readOnly,
+		vhostDomain: vhostDomain, metrics: newMetrics(), readOnly: readOnly,
 	}
 }
 
@@ -131,7 +124,7 @@ func (s *Server) AdminHandler() http.Handler {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	info, err := s.auth.Verify(r)
+	_, err := s.auth.Verify(r)
 	if err != nil {
 		writeError(w, r, err, s.log)
 		return
@@ -146,25 +139,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	if q.Has("session") && bucket != "" {
-		if info.Session {
-			writeError(w, r, errAccessDenied("CreateSession requires IAM credentials"), s.log)
-			return
-		}
-		if r.Method != http.MethodGet {
-			s.methodNotAllowed(w, r)
-			return
-		}
-		s.createSession(w, r, bucket)
-		return
-	}
 	switch {
 	case bucket == "":
 		if r.Method == http.MethodGet {
-			if q.Get("x-id") == "ListDirectoryBuckets" || q.Has("directory-buckets") || info.Service == "s3express" {
-				s.listDirectoryBuckets(w, r, q)
-				return
-			}
 			s.listBuckets(w, r)
 			return
 		}
@@ -209,6 +186,11 @@ func (s *Server) objectRequest(w http.ResponseWriter, r *http.Request, bucket, k
 		writeError(w, r, errInvalidRequest("object key exceeds 1024 bytes"), s.log)
 		return
 	}
+	if q.Has("renameObject") || r.Header.Get("x-amz-rename-source") != "" ||
+		r.Header.Get("x-amz-write-offset-bytes") != "" {
+		writeError(w, r, errNotImplemented(), s.log)
+		return
+	}
 	switch r.Method {
 	case http.MethodHead:
 		s.headObject(w, r, bucket, key)
@@ -229,10 +211,6 @@ func (s *Server) objectRequest(w http.ResponseWriter, r *http.Request, bucket, k
 				return
 			}
 			s.uploadPart(w, r, bucket, key, q)
-			return
-		}
-		if q.Has("renameObject") {
-			s.renameObject(w, r, bucket, key)
 			return
 		}
 		if r.Header.Get("x-amz-copy-source") != "" {
@@ -276,16 +254,11 @@ func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket strin
 		return
 	}
 	w.Header().Set("x-amz-bucket-region", s.region)
-	s.setDirectoryHeaders(w, bucket)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	s.log.Debug("create bucket", "bucket", bucket, "content_length", r.ContentLength)
-	if err := s.validateCreateBucket(r, bucket); err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
 	if err := s.store.CreateBucket(r.Context(), bucket); err != nil {
 		s.log.Debug("create bucket failed", "bucket", bucket, "err", err)
 		writeError(w, r, errInternal(err, s.log), s.log)
@@ -293,7 +266,6 @@ func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket str
 	}
 	s.log.Debug("created bucket", "bucket", bucket)
 	w.Header().Set("Location", "/"+bucket)
-	s.setDirectoryHeaders(w, bucket)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -324,9 +296,6 @@ func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 		Owner: ownerXML{ID: "pgvs3", DisplayName: "pgvs3"},
 	}
 	for _, b := range buckets {
-		if isDirectoryBucket(b.Name) {
-			continue
-		}
 		out.Buckets = append(out.Buckets, bucketXML{Name: b.Name, CreationDate: isoTime(b.Created)})
 	}
 	writeXML(w, http.StatusOK, out)
@@ -380,7 +349,6 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		return
 	}
 	setObjectHeaders(w, m)
-	s.setDirectoryObjectHeaders(w, bucket)
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(http.StatusOK)
 }
@@ -445,7 +413,6 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		ContentType: sm.ContentType, CreatedAt: sm.CreatedAt,
 		FileID: sm.FileID, Parts: sm.Parts, PartEnds: sm.PartEnds,
 	})
-	s.setDirectoryObjectHeaders(w, bucket)
 	if partCount > 0 {
 		w.Header().Set("x-amz-mp-parts-count", strconv.Itoa(partCount))
 	}
@@ -467,10 +434,6 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 }
 
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if offset := r.Header.Get("x-amz-write-offset-bytes"); offset != "" {
-		s.appendObject(w, r, bucket, key, offset)
-		return
-	}
 	if r.Header.Get("Content-Encoding") != "" {
 		writeError(w, r, errNotImplemented(), s.log)
 		return
@@ -531,7 +494,6 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 			return
 		}
 		w.Header().Set("ETag", quoteETag(obj.ETag))
-		s.setDirectoryObjectHeaders(w, bucket)
 		setChecksumHeaders(w, checks)
 		w.WriteHeader(http.StatusOK)
 		return
@@ -564,7 +526,6 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		return
 	}
 	w.Header().Set("ETag", quoteETag(pub.ETag))
-	s.setDirectoryObjectHeaders(w, bucket)
 	setChecksumHeaders(w, checks)
 	w.WriteHeader(http.StatusOK)
 }
@@ -684,7 +645,6 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, b
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return
 	}
-	s.setDirectoryObjectHeaders(w, bucket)
 	writeXML(w, http.StatusOK, initiateMultipartUploadResult{
 		Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: id,
 	})
@@ -733,7 +693,6 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 		return
 	}
 	w.Header().Set("ETag", quoteETag(pub.ETag))
-	s.setDirectoryObjectHeaders(w, bucket)
 	if pub.Checksum != nil {
 		w.Header().Set(pub.Checksum.Name, pub.Checksum.Value)
 	}
@@ -895,9 +854,6 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 					display = awsEncode(row.Key, true)
 				}
 				storageClass := "STANDARD"
-				if isDirectoryBucket(bucket) {
-					storageClass = "EXPRESS_ONEZONE"
-				}
 				contents = append(contents, objectXML{
 					Key: display, LastModified: isoTime(row.CreatedAt),
 					ETag: quoteETag(row.ETag), Size: row.Size, StorageClass: storageClass,
