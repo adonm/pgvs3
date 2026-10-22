@@ -63,6 +63,8 @@ func (s *Server) appendObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			writeError(w, r, apiErr("InvalidWriteOffset", "The write offset does not match the object size.", http.StatusConflict), s.log)
 		case errors.Is(err, store.ErrTooManyParts):
 			writeError(w, r, apiErr("TooManyParts", "The object has reached the 10,000 part limit.", http.StatusBadRequest), s.log)
+		case errors.Is(err, store.ErrInlineTooLarge):
+			writeError(w, r, errInvalidRequest("appending would exceed the 64 KiB inline object limit"), s.log)
 		case errors.Is(err, store.ErrPrecondition):
 			writeError(w, r, errPreconditionFailed(), s.log)
 		case errors.Is(err, store.ErrNoBucket):

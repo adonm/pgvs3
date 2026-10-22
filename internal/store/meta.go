@@ -18,6 +18,9 @@ type Meta struct {
 	// Both nil for a single-file object.
 	Parts    []int64
 	PartEnds []int64
+	// Inline is non-nil when the whole object lives in objects.inline_data.
+	// An empty inline object is []byte{}, not nil.
+	Inline []byte
 }
 
 // Segment is a contiguous run of bytes stored under one file ID.

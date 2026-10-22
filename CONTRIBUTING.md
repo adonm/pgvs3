@@ -36,10 +36,10 @@ mise exec go -- gofmt -w cmd internal test
 
 ## Storage layout
 
-`internal/store/schema.sql` is layout v8. The gateway applies one idempotent,
-backwards-compatible change at startup (`DROP CONSTRAINT IF EXISTS
-objects_file_id_key`) so metadata-only copies can share immutable files. The
-reaper checks every object and upload-part reference before deleting a file.
+`internal/store/schema.sql` is layout v9. v9 adds `inline_data` and makes
+`file_id` nullable for objects up to 64 KiB; it is a breaking layout, so use a
+fresh database. The reaper checks every object and upload-part reference before
+deleting a file.
 
 A breaking layout change means:
 

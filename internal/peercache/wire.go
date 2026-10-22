@@ -10,7 +10,7 @@ import (
 
 // The peer cache stores metadata as a compact, versioned byte string. It is
 // much smaller than JSON (no field names) and decodes without reflection.
-const metaVersion = 1
+const metaVersion = 2
 
 func encodeMeta(m *store.Meta) ([]byte, error) {
 	b := make([]byte, 0, 256)
@@ -27,6 +27,14 @@ func encodeMeta(m *store.Meta) ([]byte, error) {
 	}
 	if b, err = appendString(b, m.ContentType); err != nil {
 		return nil, err
+	}
+	if m.Inline != nil {
+		b = append(b, 1)
+		if b, err = appendBytes(b, m.Inline); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, 0)
 	}
 	if len(m.UserMetadata) > 128 {
 		return nil, fmt.Errorf("too many metadata entries")
@@ -80,6 +88,20 @@ func decodeMeta(b []byte) (store.Meta, error) {
 	if err != nil {
 		return store.Meta{}, err
 	}
+	hasInline, err := r.u8()
+	if err != nil {
+		return store.Meta{}, err
+	}
+	var inline []byte
+	if hasInline == 1 {
+		inline, err = r.bytes()
+		if err != nil {
+			return store.Meta{}, err
+		}
+		if inline == nil {
+			inline = []byte{}
+		}
+	}
 	count, err := r.u16()
 	if err != nil {
 		return store.Meta{}, err
@@ -109,7 +131,7 @@ func decodeMeta(b []byte) (store.Meta, error) {
 	return store.Meta{
 		Size: int64(size), FileID: int64(fileID), CreatedAt: time.Unix(0, int64(created)),
 		SHA256: sha, ETag: etag, ContentType: contentType, UserMetadata: userMeta,
-		Parts: parts, PartEnds: ends,
+		Parts: parts, PartEnds: ends, Inline: inline,
 	}, nil
 }
 

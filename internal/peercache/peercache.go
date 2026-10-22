@@ -178,6 +178,15 @@ func (c *groupMetaCache) Get(ctx context.Context, bucket, key string) (store.Met
 // path and pollute peers' main caches with keys they do not own.
 func (c *groupMetaCache) Put(context.Context, string, string, store.Meta) {}
 
+// InvalidatePeers removes the key from the cluster cache. The writer's local
+// entry is already up to date.
+func (c *groupMetaCache) InvalidatePeers(_ context.Context, bucket, key string) {
+	select {
+	case c.queue <- cacheKey(bucket, key):
+	default:
+	}
+}
+
 // Invalidate removes the key locally and from peers. It is queued so a write
 // never waits for a cross-AZ round trip; metadata verifies the object's file
 // ID on read, so a stale entry can only cause one retry, never stale bytes.

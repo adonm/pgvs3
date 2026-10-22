@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 var (
@@ -30,11 +31,14 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 	}
 	var m Meta
 	var epoch float64
+	var file pgtype.Int8
+	var inline []byte
+	var hasInline bool
 	err = tx.QueryRow(ctx, `SELECT file_id, size, sha256, etag, user_metadata, content_type,
-		parts, part_ends, EXTRACT(EPOCH FROM created_at)::float8
+		parts, part_ends, EXTRACT(EPOCH FROM created_at)::float8, inline_data, inline_data IS NOT NULL
 		FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`, bucket, key).
-		Scan(&m.FileID, &m.Size, &m.SHA256, &m.ETag, &m.UserMetadata, &m.ContentType,
-			&m.Parts, &m.PartEnds, &epoch)
+		Scan(&file, &m.Size, &m.SHA256, &m.ETag, &m.UserMetadata, &m.ContentType,
+			&m.Parts, &m.PartEnds, &epoch, &inline, &hasInline)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if cond == IfMatch {
 			return nil, ErrPrecondition
@@ -56,11 +60,21 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 		out := Meta{FileID: fileID, Size: size, SHA256: shaAll[:], ETag: etag,
 			ContentType: "application/octet-stream", CreatedAt: time.Now()}
 		s.cache.Put(ctx, bucket, key, out)
+		s.invalidatePeers(ctx, bucket, key)
 		s.objects.invalidate(bucket, key)
 		return &out, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if file.Valid {
+		m.FileID = file.Int64
+	}
+	if hasInline {
+		if inline == nil {
+			inline = []byte{}
+		}
+		m.Inline = inline
 	}
 	switch cond {
 	case IfAbsent:
@@ -72,6 +86,39 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 	}
 	if offset != m.Size {
 		return nil, ErrInvalidOffset
+	}
+	if m.Inline != nil {
+		if m.Size+size > MaxInlineBytes {
+			return nil, ErrInlineTooLarge
+		}
+		newBytes, err := s.readFileBytes(ctx, fileID)
+		if err != nil {
+			return nil, err
+		}
+		data := make([]byte, 0, len(m.Inline)+len(newBytes))
+		data = append(data, m.Inline...)
+		data = append(data, newBytes...)
+		shaAll := sha256.Sum256(data)
+		etag := randomETag()
+		if _, err := tx.Exec(ctx, `UPDATE s3p.objects SET file_id = NULL, size = $3,
+			sha256 = $4, etag = $5, parts = NULL, part_ends = NULL, inline_data = $6,
+			created_at = now() WHERE bucket = $1 AND key = $2`,
+			bucket, key, len(data), shaAll[:], etag, data); err != nil {
+			return nil, err
+		}
+		if err := queueFiles(ctx, tx, fileID, nil); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		out := m
+		out.Size, out.SHA256, out.ETag, out.Inline = int64(len(data)), shaAll[:], etag, data
+		out.FileID, out.Parts, out.PartEnds, out.CreatedAt = 0, nil, nil, time.Now()
+		s.cache.Put(ctx, bucket, key, out)
+		s.invalidatePeers(ctx, bucket, key)
+		s.objects.invalidate(bucket, key)
+		return &out, nil
 	}
 	parts := m.Parts
 	ends := m.PartEnds
@@ -106,6 +153,7 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 	out.FileID, out.Size, out.SHA256, out.ETag = parts[0], newSize, shaAll.Sum(nil), etag
 	out.Parts, out.PartEnds, out.CreatedAt = parts, ends, time.Now()
 	s.cache.Put(ctx, bucket, key, out)
+	s.invalidatePeers(ctx, bucket, key)
 	s.objects.invalidate(bucket, key)
 	return &out, nil
 }
@@ -121,6 +169,23 @@ func (s *Store) DiscardFile(ctx context.Context, fileID int64) {
 	if queueFiles(ctx, tx, fileID, nil) == nil {
 		_ = tx.Commit(ctx)
 	}
+}
+
+func (s *Store) readFileBytes(ctx context.Context, fileID int64) ([]byte, error) {
+	rows, err := s.pool.Query(ctx, "SELECT data FROM s3p.chunks WHERE file_id = $1 ORDER BY no", fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []byte
+	for rows.Next() {
+		var b []byte
+		if err := rows.Scan(&b); err != nil {
+			return nil, err
+		}
+		out = append(out, b...)
+	}
+	return out, rows.Err()
 }
 
 func randomETag() string {

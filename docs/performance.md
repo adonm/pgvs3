@@ -11,6 +11,7 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 | 8,120-byte payload per row | `RowBytes` in `internal/store/ingest.go` |
 | One row fills one 8 KB page at 99.6% | `toast_tuple_target = 8160`, `STORAGE EXTERNAL` and the 24-byte tuple header: `file_id(8) + no(4) + varlena(4) + 8120 = 8136` data bytes |
 | No TOAST, no detoasting on read | `internal/store/schema.sql`: `data bytea STORAGE EXTERNAL NOT NULL` |
+| Small objects are one row | `s3p.objects.inline_data`, `file_id NULL`, up to 64 KiB; one-round-trip `s3p.put_inline` |
 | Immutable files | A write allocates a new `file_id`; an overwrite publishes it; rows are never updated |
 | `file_id` as a cache version tag | ETags are strong; DuckDB's external file cache keys on the URL and version tag |
 | Ordered listings are index scans | `key COLLATE "C"` primary key; `SET LOCAL enable_indexscan = on` for one listing |
@@ -21,6 +22,8 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 
 ## Read path
 
+- **Up to 64 KiB is one primary-key row.** Inline objects are returned from
+  the metadata lookup; there is no chunk query and no `file_id`.
 - **Up to 64 MiB is one query for a single-file object.** `wholeReadMax = 64 << 20`;
   the query returns whole rows for a contiguous `no` range and checks the
   object's current `file_id`. One query avoids the per-piece planning and
@@ -57,19 +60,17 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 
 ## Small-object cache
 
-Parquet footers, delete files and manifests are small and repeated. The gateway
-caches whole objects up to 256 KiB in Otter (default 64 MiB, 5 s TTL).
+v9 inlines objects up to 64 KiB, so 4 KiB GETs are already a single metadata
+lookup. The Otter byte cache remains for **non-inline** objects from 64 KiB to
+256 KiB (default 64 MiB, 5 s TTL).
 
-- **Single gateway:** local writes invalidate the key; hits are served from RAM
-  with no PostgreSQL round trip. 4 KiB GET p50 drops from 0.76 ms to 0.56 ms,
-  and 64-worker throughput from about 3.9k/s to 6.8k/s on the benchmark host.
-- **Peer mode:** a hit first checks `SELECT file_id, etag FROM s3p.objects`.
-  That costs about as much as reading a 4 KiB row, so the cache mainly saves
-  bytes and PostgreSQL CPU rather than latency. Set
-  `PGVS3_OBJECT_CACHE_REVALIDATE=false` only for an immutable lake with a
-  single writer.
-- **TTL:** five seconds bounds staleness if an invalidation is lost; a
-  revalidated hit does not rely on it.
+- **Single gateway:** local writes invalidate the key; hits are served from RAM.
+- **Peer mode:** a hit checks `file_id`/ETag against `s3p.objects` before
+  serving. That costs about as much as the row read, so peer mode is about
+  correctness rather than a large latency win.
+- **TTL:** five seconds bounds staleness if an invalidation is lost.
+- Peer mode also revalidates inline `GET`s, because an inline object has no
+  chunk `file_id` for the range query to check.
 
 This is not a block cache. Large objects are streamed and left to DuckDB's
 external file cache.
@@ -85,7 +86,7 @@ See [partitioning.md](partitioning.md) for the full key-by-key analysis.
 | --- | ---: | ---: | ---: |
 | GET, 1 worker | 1,104/s | 888/s | 945/s |
 | GET, 16 workers | 3,852/s | 2,784/s | 3,227/s |
-| PUT, 1 worker | 218/s | 187/s | 213/s |
+| PUT, 1 worker (v8, chunked) | 218/s | 187/s | 213/s |
 | PUT, 64 workers | 1,177/s | 1,118/s | 933/s |
 
 A two-level `HASH(file_id) → RANGE(no)` layout (8 hash × 8 row ranges, read in

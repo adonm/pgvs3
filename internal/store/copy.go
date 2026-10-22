@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // CopyOptions controls a metadata-only CopyObject. The bytes are shared; the
@@ -33,21 +34,33 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	}
 	var src Meta
 	var srcEpoch float64
+	var srcFile pgtype.Int8
+	var srcInline []byte
+	var srcHasInline bool
 	err = tx.QueryRow(ctx, `SELECT file_id, size, sha256, etag, user_metadata, content_type,
-		parts, part_ends, EXTRACT(EPOCH FROM created_at)::float8
+		parts, part_ends, EXTRACT(EPOCH FROM created_at)::float8, inline_data, inline_data IS NOT NULL
 		FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`, srcBucket, srcKey).
-		Scan(&src.FileID, &src.Size, &src.SHA256, &src.ETag, &src.UserMetadata, &src.ContentType,
-			&src.Parts, &src.PartEnds, &srcEpoch)
+		Scan(&srcFile, &src.Size, &src.SHA256, &src.ETag, &src.UserMetadata, &src.ContentType,
+			&src.Parts, &src.PartEnds, &srcEpoch, &srcInline, &srcHasInline)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	if srcFile.Valid {
+		src.FileID = srcFile.Int64
+	}
+	if srcHasInline {
+		if srcInline == nil {
+			srcInline = []byte{}
+		}
+		src.Inline = srcInline
+	}
 	if !condOK(opts.SourceIfMatch, opts.SourceIfNone, true, src.ETag) {
 		return nil, ErrPrecondition
 	}
-	var oldFile int64
+	var oldFile pgtype.Int8
 	var oldParts []int64
 	var destETag string
 	err = tx.QueryRow(ctx, `SELECT file_id, parts, etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`,
@@ -63,19 +76,23 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	if opts.ReplaceMetadata {
 		meta, ct = opts.UserMetadata, opts.ContentType
 	}
+	var srcFileVal any
+	if srcFile.Valid {
+		srcFileVal = srcFile.Int64
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO s3p.objects
-		(bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		(bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		ON CONFLICT (bucket, key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size,
 		  sha256 = EXCLUDED.sha256, etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
 		  content_type = EXCLUDED.content_type, parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends,
-		  created_at = now()`,
-		dstBucket, dstKey, src.FileID, src.Size, src.SHA256, src.ETag, meta, ct, src.Parts, src.PartEnds)
+		  inline_data = EXCLUDED.inline_data, created_at = now()`,
+		dstBucket, dstKey, srcFileVal, src.Size, src.SHA256, src.ETag, meta, ct, src.Parts, src.PartEnds, src.Inline)
 	if err != nil {
 		return nil, err
 	}
-	if destExists {
-		if err := queueFiles(ctx, tx, oldFile, oldParts); err != nil {
+	if destExists && oldFile.Valid {
+		if err := queueFiles(ctx, tx, oldFile.Int64, oldParts); err != nil {
 			return nil, err
 		}
 	}
@@ -86,6 +103,7 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	out.UserMetadata, out.ContentType = meta, ct
 	out.CreatedAt = time.Now()
 	s.cache.Put(ctx, dstBucket, dstKey, out)
+	s.invalidatePeers(ctx, dstBucket, dstKey)
 	s.objects.invalidate(dstBucket, dstKey)
 	return &out, nil
 }
@@ -124,7 +142,7 @@ func (s *Store) Rename(ctx context.Context, bucket, srcKey, dstKey string, opts 
 	if !condOK(opts.SourceIfMatch, opts.SourceIfNone, true, etag) {
 		return ErrPrecondition
 	}
-	var oldFile int64
+	var oldFile pgtype.Int8
 	var oldParts []int64
 	var destETag string
 	err = tx.QueryRow(ctx, `SELECT file_id, parts, etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`,
@@ -140,8 +158,10 @@ func (s *Store) Rename(ctx context.Context, bucket, srcKey, dstKey string, opts 
 		if _, err := tx.Exec(ctx, `DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, dstKey); err != nil {
 			return err
 		}
-		if err := queueFiles(ctx, tx, oldFile, oldParts); err != nil {
-			return err
+		if oldFile.Valid {
+			if err := queueFiles(ctx, tx, oldFile.Int64, oldParts); err != nil {
+				return err
+			}
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE s3p.objects SET key = $3 WHERE bucket = $1 AND key = $2`, bucket, srcKey, dstKey); err != nil {

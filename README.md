@@ -6,8 +6,8 @@ catalog in PostgreSQL, and with pgvs3 the data files live there too, so every
 DuckDB that attaches the catalog sees the same tables and the same data.
 
 The gateway is Go, stateless over PostgreSQL, and runs as a distroless static
-container built with [ko](https://ko.build/). It keeps the v8 storage layout, so
-this gateway and the v8 layout are the same storage format.
+container built with [ko](https://ko.build/). It uses the v9 storage layout
+(small objects are stored inline in `s3p.objects`).
 
 **Status: early alpha, no releases.** Any storage layout change requires a fresh
 database; there are no migrations. Use disposable databases only.
@@ -66,10 +66,13 @@ SELECT * FROM lake.events;
 
 The layout is deliberately narrow:
 
-- **One 8 KB page per chunk row.** A chunk is `file_id(8) + no(4) + varlena(4)
-  + 8120` bytes plus the 24-byte tuple header. With `toast_tuple_target = 8160`
-  and `STORAGE EXTERNAL`, one row fills one page at 99.6% occupancy with no
-  TOAST and no detoasting on read.
+- **Small objects are one row.** Objects up to 64 KiB live in
+  `s3p.objects.inline_data` with `file_id = NULL`; a small PUT is one SQL call
+  and a small GET is one primary-key lookup, with no chunk rows.
+- **Larger objects use one 8 KB page per chunk row.** A chunk is
+  `file_id(8) + no(4) + varlena(4) + 8120` bytes plus the 24-byte tuple header.
+  With `toast_tuple_target = 8160` and `STORAGE EXTERNAL`, one row fills one
+  page at 99.6% occupancy with no TOAST and no detoasting on read.
 - **Files are immutable.** A write streams rows under a new `file_id`; an
   overwrite publishes a new `file_id`. `file_id` is the cache version tag, so a
   warm DuckDB never revalidates bytes it already holds.
@@ -93,10 +96,10 @@ The layout is deliberately narrow:
 
 ## Performance
 
-On a shared 6-vCPU loopback host, direct SigV4 load with the small-object cache
-warm gives a 0.56 ms p50 for one 4 KiB GET and about 6.8k 4 KiB GET/s at 64
-workers; without the cache it is 0.76 ms and about 3.9k/s. 8 MiB GETs reach
-1.0 GiB/s and 64 MiB GETs about 0.99 GiB/s. S3 Express One Zone publishes
+On a shared 6-vCPU loopback host, direct SigV4 load on v9 gives a 0.35 ms p50
+for one 4 KiB GET and about 10.4k 4 KiB GET/s at 64 workers. A 4 KiB PUT is
+1.35 ms at one worker and 2.2k/s at 16–64 workers. 8 MiB GETs reach 1.0 GiB/s
+and 64 MiB GETs about 0.99 GiB/s. S3 Express One Zone publishes
 consistent single-digit-millisecond latency and 200k reads / 100k writes per
 second per directory bucket by default. Per-request latency is in the same
 band; the aggregate ceiling is not — pgvs3 is one PostgreSQL, Express is a
@@ -124,9 +127,10 @@ pgvs3 serve --addr 0.0.0.0:8014
 - The hot cache defaults to **100% of the main cache** (groupcache's default is
   1/8, which causes constant cross-AZ fetches for the two-thirds of keys owned
   by other nodes).
-- The peer cache carries **metadata only**. A per-gateway byte cache keeps
-  whole objects up to 256 KiB; large object bytes are already cached by
-  DuckDB's external file cache.
+- The peer cache carries **metadata only**. Objects up to 64 KiB are inline in
+  the database; a per-gateway byte cache covers non-inline objects up to
+  256 KiB. Large object bytes are already cached by DuckDB's external file
+  cache.
 - A single gateway invalidates its byte cache on every local write. When peers
   are configured, cache hits revalidate against `s3p.objects` before serving,
   so a write through another gateway cannot be masked. If several gateways

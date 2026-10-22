@@ -1,4 +1,4 @@
--- Alpha layout v8 (db::LAYOUT_VERSION). Any layout change requires a fresh DB.
+-- Alpha layout v9 (db::LAYOUT_VERSION). Any layout change requires a fresh DB.
 --
 -- Object bytes are fixed-size INLINE rows: 8120-byte payloads stay inline
 -- with toast_tuple_target = 8160 (heaptoast.c only externalises while
@@ -16,12 +16,16 @@ CREATE TABLE IF NOT EXISTS s3p.buckets (
 
 -- file_id is deliberately not UNIQUE: CopyObject/RenameObject share immutable
 -- files between object rows, and GC checks every reference before reaping.
+-- Small objects (<= 64 KiB) live entirely in inline_data with file_id NULL:
+-- one row read instead of a file_id + chunk lookup.
 -- bucket/key collate "C": S3 lists keys in byte order, so the primary key
 -- serves both point lookups and ordered LIST range scans.
+CREATE SEQUENCE IF NOT EXISTS s3p.file_ids CACHE 64;
+
 CREATE TABLE IF NOT EXISTS s3p.objects (
   bucket     text COLLATE "C" NOT NULL,
   key        text COLLATE "C" NOT NULL,
-  file_id    bigserial        NOT NULL,         -- the single file, or the first part
+  file_id    bigint           DEFAULT nextval('s3p.file_ids'),  -- single file or first part
   size       int8             NOT NULL,
   sha256     bytea            NOT NULL,         -- integrity digest; multipart: of the part sha256s
   etag       text             NOT NULL,         -- S3 ETag: MD5, or MD5 of part MD5s + "-count"
@@ -30,6 +34,7 @@ CREATE TABLE IF NOT EXISTS s3p.objects (
   created_at timestamptz      NOT NULL DEFAULT now(),
   parts      int8[],                            -- multipart: part file_ids in order
   part_ends  int8[],                            -- multipart: cumulative end offsets
+  inline_data bytea STORAGE EXTERNAL,           -- small object bytes; file_id is NULL
   PRIMARY KEY (bucket, key),
   FOREIGN KEY (bucket) REFERENCES s3p.buckets (name),
   CONSTRAINT object_shape CHECK (
@@ -37,15 +42,21 @@ CREATE TABLE IF NOT EXISTS s3p.objects (
      etag ~ '^[0-9a-f]{32}(-[1-9][0-9]{0,4})?$' AND
      cardinality(user_metadata) <= 128 AND cardinality(user_metadata) % 2 = 0 AND
      octet_length(content_type) BETWEEN 1 AND 1024 AND
-    ((parts IS NULL AND part_ends IS NULL AND size <= 2147483648::int8 * 8120) OR
-     (parts IS NOT NULL AND part_ends IS NOT NULL AND cardinality(parts) > 0 AND
-      array_ndims(parts) = 1 AND array_ndims(part_ends) = 1 AND
+    ((inline_data IS NOT NULL AND file_id IS NULL AND parts IS NULL AND part_ends IS NULL AND
+      octet_length(inline_data) <= 65536 AND octet_length(inline_data) = size)
+     OR
+     (inline_data IS NULL AND file_id IS NOT NULL AND parts IS NULL AND part_ends IS NULL AND
+      size <= 2147483648::int8 * 8120)
+     OR
+     (inline_data IS NULL AND file_id IS NOT NULL AND parts IS NOT NULL AND part_ends IS NOT NULL AND
+      cardinality(parts) > 0 AND array_ndims(parts) = 1 AND array_ndims(part_ends) = 1 AND
       array_lower(parts, 1) = 1 AND array_lower(part_ends, 1) = 1 AND
       cardinality(parts) = cardinality(part_ends) AND parts[1] = file_id AND
       part_ends[cardinality(part_ends)] = size AND
       array_position(parts, NULL) IS NULL AND array_position(part_ends, NULL) IS NULL))
   )
 ) WITH (autovacuum_vacuum_scale_factor = 0.02);
+ALTER SEQUENCE s3p.file_ids OWNED BY s3p.objects.file_id;
 CREATE INDEX IF NOT EXISTS objects_parts_idx ON s3p.objects USING gin (parts)
   WHERE parts IS NOT NULL;
 
@@ -83,7 +94,7 @@ CREATE INDEX IF NOT EXISTS uploads_by_bucket_key ON s3p.uploads (bucket, key);
 CREATE TABLE IF NOT EXISTS s3p.upload_parts (
   upload_id text  NOT NULL REFERENCES s3p.uploads ON DELETE CASCADE,
   part_no   int4  NOT NULL,
-  file_id   int8  NOT NULL UNIQUE,
+  file_id   int8  NOT NULL,
   size      int8  NOT NULL,
   sha256    bytea NOT NULL,
   md5       bytea NOT NULL,
@@ -102,6 +113,57 @@ CREATE TABLE IF NOT EXISTS s3p.garbage (
   queued_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS garbage_by_age ON s3p.garbage (queued_at, file_id);
+
+-- One-round-trip small PUT. Returns nobucket, precondition or ok; the body is
+-- already verified and hashed by the caller.
+CREATE OR REPLACE FUNCTION s3p.put_inline(
+  p_bucket text, p_key text, p_data bytea, p_sha256 bytea, p_etag text,
+  p_meta text[], p_ct text, p_cond text DEFAULT 'none', p_if_match text DEFAULT NULL
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  old_file bigint;
+  old_parts int8[];
+  old_etag text;
+  found_old boolean;
+BEGIN
+  IF octet_length(p_data) > 65536 THEN
+    RAISE EXCEPTION 'inline object exceeds 64 KiB';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM s3p.buckets WHERE name = p_bucket) THEN
+    RETURN 'nobucket';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(p_bucket, 0) # hashtextextended(p_key, 1));
+  SELECT file_id, parts, etag INTO old_file, old_parts, old_etag
+    FROM s3p.objects WHERE bucket = p_bucket AND key = p_key FOR UPDATE;
+  found_old := FOUND;
+  IF p_cond = 'if_absent' AND found_old THEN
+    RETURN 'precondition';
+  END IF;
+  IF p_cond = 'if_match' AND (NOT found_old OR old_etag <> p_if_match) THEN
+    RETURN 'precondition';
+  END IF;
+  IF found_old THEN
+    INSERT INTO s3p.garbage (file_id)
+    SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
+    WHERE f IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f OR f = ANY(o.parts))
+      AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
+    ON CONFLICT DO NOTHING;
+  END IF;
+  INSERT INTO s3p.objects
+    (bucket, key, file_id, size, sha256, etag, user_metadata, content_type,
+     parts, part_ends, inline_data)
+  VALUES
+    (p_bucket, p_key, NULL, octet_length(p_data), p_sha256, p_etag, p_meta, p_ct,
+     NULL, NULL, p_data)
+  ON CONFLICT (bucket, key) DO UPDATE SET
+    file_id = NULL, size = EXCLUDED.size, sha256 = EXCLUDED.sha256,
+    etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
+    content_type = EXCLUDED.content_type, parts = NULL, part_ends = NULL,
+    inline_data = EXCLUDED.inline_data, created_at = now();
+  PERFORM pg_notify('s3p_invalidate', p_bucket || chr(31) || p_key);
+  RETURN 'ok';
+END $$;
 
 -- Expire whole uploads atomically. A concurrent part writer holds KEY SHARE on
 -- the upload row; Complete/Abort and expiry hold UPDATE on that same row.

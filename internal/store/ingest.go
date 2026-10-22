@@ -235,8 +235,8 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 	if err != nil {
 		return fail(err)
 	}
-	var fileID int64
-	if err := tx.QueryRow(ctx, "SELECT nextval(pg_get_serial_sequence('s3p.objects', 'file_id'))").Scan(&fileID); err != nil {
+	fileID, err := s.nextFileID(ctx)
+	if err != nil {
 		return fail(err)
 	}
 
@@ -316,6 +316,7 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			Size: size, SHA256: sha, ETag: etag, UserMetadata: t.userMeta,
 			ContentType: t.content, CreatedAt: time.Now(), FileID: fileIDOf(w),
 		})
+		w.store.invalidatePeers(ctx, t.bucket, t.key)
 		w.store.objects.invalidate(t.bucket, t.key)
 	}
 	w.mu.Lock()

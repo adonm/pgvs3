@@ -26,7 +26,7 @@ var schemaFS embed.FS
 
 // LayoutVersion is the storage layout this binary reads and writes. There is
 // no in-place migration: a different layout requires a fresh database.
-const LayoutVersion = 8
+const LayoutVersion = 9
 
 const (
 	smallMax  = 8 << 20
@@ -45,15 +45,21 @@ type Options struct {
 	ObjectCacheTTL        time.Duration
 	ObjectCacheRevalidate bool
 	WholeReadMax          int64
+	RevalidateReads       bool
 }
 
 // Store is the PostgreSQL-backed object store.
 type Store struct {
-	pool         *pgxpool.Pool
-	cache        MetaCache
-	objects      *objectCache
-	wholeReadMax int64
-	log          *slog.Logger
+	pool             *pgxpool.Pool
+	cache            MetaCache
+	objects          *objectCache
+	wholeReadMax     int64
+	revalidateInline bool
+	log              *slog.Logger
+
+	fileIDMu   sync.Mutex
+	fileIDNext int64
+	fileIDLeft int64
 }
 
 // Open connects and warms the pool. Remote servers must use TLS; loopback
@@ -163,10 +169,36 @@ SET synchronous_commit = on;`)
 		pool.Close()
 		return nil, err
 	}
-	return &Store{pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, log: log}, nil
+	return &Store{pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, revalidateInline: opts.RevalidateReads, log: log}, nil
 }
 
-func (s *Store) Close()              { s.pool.Close() }
+// nextFileID hands out sequence values in blocks. The sequence itself is
+// CACHE 64; batching here removes a nextval round trip from most writes.
+func (s *Store) nextFileID(ctx context.Context) (int64, error) {
+	s.fileIDMu.Lock()
+	if s.fileIDLeft > 0 {
+		id := s.fileIDNext
+		s.fileIDNext++
+		s.fileIDLeft--
+		s.fileIDMu.Unlock()
+		return id, nil
+	}
+	s.fileIDMu.Unlock()
+	var id int64
+	if err := s.pool.QueryRow(ctx, "SELECT nextval('s3p.file_ids')").Scan(&id); err != nil {
+		return 0, err
+	}
+	s.fileIDMu.Lock()
+	s.fileIDNext = id + 1
+	s.fileIDLeft = 63
+	s.fileIDMu.Unlock()
+	return id, nil
+}
+
+func (s *Store) Close() {
+	s.objects.close()
+	s.pool.Close()
+}
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
 func isLoopback(host string) bool {
@@ -326,7 +358,7 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 	} else if kind != "r" || !hasAll(opts) {
 		return fmt.Errorf("s3p.chunks lacks the expected inline storage and autovacuum settings")
 	}
-	for _, relation := range []string{"s3p.garbage", "s3p.objects_parts_idx", "s3p.upload_parts_file_id_key"} {
+	for _, relation := range []string{"s3p.garbage", "s3p.objects_parts_idx", "s3p.upload_parts"} {
 		var exists bool
 		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", relation).Scan(&exists); err != nil {
 			return err
@@ -367,10 +399,13 @@ func (s *Store) metaFresh(ctx context.Context, bucket, key string) (*Meta, error
 	var m Meta
 	var epoch float64
 	var parts, ends []int64
+	var fileID pgtype.Int8
+	var inline []byte
+	var hasInline bool
 	err := s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
-		parts, part_ends, etag, user_metadata, content_type
+		parts, part_ends, etag, user_metadata, content_type, inline_data, inline_data IS NOT NULL
 		FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, key).
-		Scan(&m.FileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata, &m.ContentType)
+		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata, &m.ContentType, &inline, &hasInline)
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.cache.Invalidate(ctx, bucket, key)
 		return nil, ErrNotFound
@@ -380,6 +415,15 @@ func (s *Store) metaFresh(ctx context.Context, bucket, key string) (*Meta, error
 	}
 	m.CreatedAt = time.Unix(0, int64(epoch*1e9))
 	m.Parts, m.PartEnds = parts, ends
+	if fileID.Valid {
+		m.FileID = fileID.Int64
+	}
+	if hasInline {
+		if inline == nil {
+			inline = []byte{}
+		}
+		m.Inline = inline
+	}
 	s.cache.Put(ctx, bucket, key, m)
 	return &m, nil
 }
@@ -536,6 +580,9 @@ func (s *Store) GetBody(ctx context.Context, bucket, key string, first, last, su
 		if sm.Len() == 0 {
 			return sm, &Body{}, nil
 		}
+		if m.Inline != nil {
+			return sm, bytesBody(m.Inline[sm.Start : sm.End+1]), nil
+		}
 		if attempt == 0 && m.Size <= smallObjectMax && s.objects != nil {
 			if e, ok := s.objects.get(bucket, key); ok {
 				current, err := s.objectCurrent(ctx, bucket, key, e.fileID, e.etag)
@@ -569,7 +616,7 @@ func (s *Store) GetBody(ctx context.Context, bucket, key string, first, last, su
 // objectCurrent is the cheap revalidation query for a byte-cache hit. It
 // returns false when the key was replaced or deleted through any gateway.
 func (s *Store) objectCurrent(ctx context.Context, bucket, key string, fileID int64, etag string) (bool, error) {
-	var curFile int64
+	var curFile pgtype.Int8
 	var curETag string
 	err := s.pool.QueryRow(ctx, "SELECT file_id, etag FROM s3p.objects WHERE bucket = $1 AND key = $2", bucket, key).
 		Scan(&curFile, &curETag)
@@ -579,7 +626,8 @@ func (s *Store) objectCurrent(ctx context.Context, bucket, key string, fileID in
 	if err != nil {
 		return false, err
 	}
-	return curFile == fileID && curETag == etag, nil
+	fileOK := (!curFile.Valid && fileID == 0) || (curFile.Valid && curFile.Int64 == fileID)
+	return fileOK && curETag == etag, nil
 }
 
 // readFullObject buffers one small object for the byte cache. It never calls
@@ -992,15 +1040,15 @@ func (s *Store) Delete(ctx context.Context, bucket, key string) (bool, error) {
 	if err := lockObjectKey(ctx, tx, bucket, key); err != nil {
 		return false, err
 	}
-	var fileID int64
+	var fileID pgtype.Int8
 	var parts []int64
 	err = tx.QueryRow(ctx, "DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2 RETURNING file_id, parts", bucket, key).Scan(&fileID, &parts)
 	found := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return false, err
 	}
-	if found {
-		if err := queueFiles(ctx, tx, fileID, parts); err != nil {
+	if found && fileID.Valid {
+		if err := queueFiles(ctx, tx, fileID.Int64, parts); err != nil {
 			return false, err
 		}
 	}
@@ -1217,6 +1265,7 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 		Size: size, SHA256: shaAll.Sum(nil), ETag: etag, UserMetadata: userMeta,
 		ContentType: contentType, CreatedAt: time.Now(), FileID: ids[0], Parts: ids, PartEnds: ends,
 	})
+	s.invalidatePeers(ctx, bucket, key)
 	s.objects.invalidate(bucket, key)
 	return &Completed{Bucket: bucket, Key: key, ETag: etag, Size: size}, nil
 }

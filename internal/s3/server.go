@@ -373,6 +373,43 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		writeError(w, r, err, s.log)
 		return
 	}
+	if r.ContentLength >= 0 && r.ContentLength <= store.MaxInlineBytes {
+		body := io.ReadCloser(r.Body)
+		if len(in.h) > 0 {
+			body = &integrityReader{r: body, in: in}
+		}
+		data, err := io.ReadAll(io.LimitReader(body, store.MaxInlineBytes+1))
+		if err != nil {
+			writeError(w, r, bodyError(err), s.log)
+			return
+		}
+		if len(data) > store.MaxInlineBytes {
+			writeError(w, r, errInvalidRequest("inline object exceeds 64 KiB"), s.log)
+			return
+		}
+		checks, err := in.verify(r.Trailer)
+		if err != nil {
+			writeError(w, r, err, s.log)
+			return
+		}
+		obj, err := s.store.PutInline(r.Context(), bucket, key, data, cond, ifMatch, meta, ct)
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrNoBucket):
+				writeError(w, r, errNoSuchBucket(), s.log)
+			case errors.Is(err, store.ErrPrecondition):
+				writeError(w, r, errPreconditionFailed(), s.log)
+			default:
+				writeError(w, r, s.ingestError(err), s.log)
+			}
+			return
+		}
+		w.Header().Set("ETag", quoteETag(obj.ETag))
+		s.setDirectoryObjectHeaders(w, bucket)
+		setChecksumHeaders(w, checks)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	writer, err := s.store.StartObject(r.Context(), bucket, key, cond, ifMatch, meta, ct)
 	if err != nil {
 		s.metaError(w, r, bucket, err)

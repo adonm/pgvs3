@@ -64,7 +64,7 @@ func cacheKey(bucket, key string) string { return bucket + "\x00" + key }
 
 // SizeEstimate approximates the heap cost of one metadata entry.
 func (m *Meta) SizeEstimate() int {
-	n := 128 + len(m.ETag) + len(m.SHA256) + len(m.ContentType) + 16*len(m.Parts) + 8*len(m.PartEnds)
+	n := 128 + len(m.ETag) + len(m.SHA256) + len(m.ContentType) + len(m.Inline) + 16*len(m.Parts) + 8*len(m.PartEnds)
 	for _, s := range m.UserMetadata {
 		n += len(s)
 	}
@@ -86,5 +86,15 @@ func (s *Store) SetCache(c MetaCache) {
 func (s *Store) CloseCache() {
 	if s.cache != nil {
 		s.cache.Close()
+	}
+}
+
+// invalidatePeers removes the key from peer caches without dropping the local
+// metadata entry. Used after a local publish when the local cache is current.
+func (s *Store) invalidatePeers(ctx context.Context, bucket, key string) {
+	if p, ok := s.cache.(interface {
+		InvalidatePeers(context.Context, string, string)
+	}); ok {
+		p.InvalidatePeers(ctx, bucket, key)
 	}
 }

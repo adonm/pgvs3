@@ -116,7 +116,7 @@ func serve(args []string) int {
 	st, err := store.Open(ctx, *url, store.Options{
 		MinConns: int32(*poolMin), MaxConns: int32(*poolMax),
 		CAFile: os.Getenv("PGVS3_DB_CA_FILE"), AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
-		ObjectCacheBytes: *objectCache, ObjectCacheTTL: *objectTTL, ObjectCacheRevalidate: *objectCheck, WholeReadMax: *wholeRead,
+		ObjectCacheBytes: *objectCache, ObjectCacheTTL: *objectTTL, ObjectCacheRevalidate: *objectCheck, WholeReadMax: *wholeRead, RevalidateReads: len(peersList) > 0,
 	}, log)
 	if err != nil {
 		log.Error("connecting to PostgreSQL", "err", err)
