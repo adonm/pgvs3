@@ -89,7 +89,14 @@ Same 4 KiB workload, hash-partitioned `s3p.chunks`:
 Partitioning loses on every point-read row and mostly loses on writes. All
 rows of one file hash to one partition, so it cannot parallelize a single-file
 read; planner overhead grows with partition count. DuckLake's single writer
-has no insert contention to spread. The default stays **1 partition**.
+has no insert contention to spread.
+
+A two-level layout — `HASH(file_id)` then `RANGE(no)` into 8×8 leaves — is the
+best alternative key. With 8 MiB parallel pieces it reaches **556 MiB/s** for a
+64 MiB GET at one worker (versus 441 MiB/s unpartitioned), but 4 KiB GET falls
+to 868/s at one worker and 2,628/s at 16 (versus 1,104 and 3,852), and
+16-worker PUTs lose about 10%. Large-read gains do not pay for the small-read
+regression. The default stays **1 partition**.
 
 ## DuckDB 2.0 through the gateway
 

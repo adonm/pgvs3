@@ -6,16 +6,16 @@ import (
 )
 
 func TestPlanPiecesWholeRead(t *testing.T) {
-	m := &Meta{FileID: 1, Size: wholeReadMax}
-	pieces, err := planPieces(m, 0, m.Size-1)
+	m := &Meta{FileID: 1, Size: 64 << 20}
+	pieces, err := planPieces(m, 0, m.Size-1, 64<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pieces) != 1 {
 		t.Fatalf("64 MiB span used %d pieces, want 1", len(pieces))
 	}
-	big := &Meta{FileID: 2, Size: 2 * wholeReadMax}
-	pieces, err = planPieces(big, 0, big.Size-1)
+	big := &Meta{FileID: 2, Size: 2 * 64 << 20}
+	pieces, err = planPieces(big, 0, big.Size-1, 64<<20)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -44,14 +44,16 @@ type Options struct {
 	ObjectCacheBytes      int64
 	ObjectCacheTTL        time.Duration
 	ObjectCacheRevalidate bool
+	WholeReadMax          int64
 }
 
 // Store is the PostgreSQL-backed object store.
 type Store struct {
-	pool    *pgxpool.Pool
-	cache   MetaCache
-	objects *objectCache
-	log     *slog.Logger
+	pool         *pgxpool.Pool
+	cache        MetaCache
+	objects      *objectCache
+	wholeReadMax int64
+	log          *slog.Logger
 }
 
 // Open connects and warms the pool. Remote servers must use TLS; loopback
@@ -60,6 +62,9 @@ func Open(ctx context.Context, url string, opts Options, log *slog.Logger) (*Sto
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, err
+	}
+	if opts.WholeReadMax <= 0 {
+		opts.WholeReadMax = 64 << 20
 	}
 	if opts.MinConns <= 0 {
 		opts.MinConns = 64
@@ -158,7 +163,7 @@ SET synchronous_commit = on;`)
 		pool.Close()
 		return nil, err
 	}
-	return &Store{pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), log: log}, nil
+	return &Store{pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, log: log}, nil
 }
 
 func (s *Store) Close()              { s.pool.Close() }
@@ -310,8 +315,9 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 				'autovacuum_vacuum_scale_factor=0.01',
 				'autovacuum_analyze_scale_factor=0.02',
 				'autovacuum_vacuum_threshold=1000'])
-			FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-			WHERE i.inhparent = 's3p.chunks'::regclass AND c.relkind = 'r'`).Scan(&total, &configured); err != nil {
+			FROM pg_partition_tree('s3p.chunks') t
+			JOIN pg_class c ON c.oid = t.relid
+			WHERE t.isleaf`).Scan(&total, &configured); err != nil {
 			return err
 		}
 		if total == 0 || total != configured {
@@ -660,16 +666,14 @@ type piece struct {
 	lo, hi int32
 }
 
-const wholeReadMax = 64 << 20
-
-func planPieces(m *Meta, start, end int64) ([]piece, error) {
+func planPieces(m *Meta, start, end int64, wholeMax int64) ([]piece, error) {
 	segments, err := m.Segments()
 	if err != nil {
 		return nil, err
 	}
 	// One query for a single-file object up to 64 MiB: PostgreSQL streams the
 	// rows, and avoiding the snapshot/piece machinery wins at low concurrency.
-	if m.Parts == nil && end-start+1 <= wholeReadMax {
+	if m.Parts == nil && end-start+1 <= wholeMax {
 		seg := segments[0]
 		lo := int32((max(start, seg.Base) - seg.Base) / RowBytes)
 		hi := int32((min(end, seg.Base+seg.Length-1) - seg.Base) / RowBytes)
@@ -690,7 +694,7 @@ func planPieces(m *Meta, start, end int64) ([]piece, error) {
 }
 
 func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, bucket, key string, m *Meta, start, end int64) (*Body, error) {
-	pieces, err := planPieces(m, start, end)
+	pieces, err := planPieces(m, start, end, s.wholeReadMax)
 	if err != nil {
 		return nil, err
 	}

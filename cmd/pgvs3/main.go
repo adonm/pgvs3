@@ -94,6 +94,7 @@ func serve(args []string) int {
 		objectCache   = fs.Int64("object-cache-bytes", envInt64("PGVS3_OBJECT_CACHE_BYTES", 64<<20), "small-object byte cache size (0 disables)")
 		objectTTL     = fs.Duration("object-cache-ttl", envDuration("PGVS3_OBJECT_CACHE_TTL", 5*time.Second), "small-object cache TTL")
 		objectCheck   = fs.Bool("object-cache-revalidate", envBoolDefault("PGVS3_OBJECT_CACHE_REVALIDATE", false), "revalidate each small-object cache hit against PostgreSQL")
+		wholeRead     = fs.Int64("whole-read-max", envInt64("PGVS3_WHOLE_READ_MAX", 64<<20), "largest single-file span read in one query")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -115,7 +116,7 @@ func serve(args []string) int {
 	st, err := store.Open(ctx, *url, store.Options{
 		MinConns: int32(*poolMin), MaxConns: int32(*poolMax),
 		CAFile: os.Getenv("PGVS3_DB_CA_FILE"), AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
-		ObjectCacheBytes: *objectCache, ObjectCacheTTL: *objectTTL, ObjectCacheRevalidate: *objectCheck,
+		ObjectCacheBytes: *objectCache, ObjectCacheTTL: *objectTTL, ObjectCacheRevalidate: *objectCheck, WholeReadMax: *wholeRead,
 	}, log)
 	if err != nil {
 		log.Error("connecting to PostgreSQL", "err", err)

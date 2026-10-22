@@ -76,6 +76,8 @@ external file cache.
 
 ## Partitioning
 
+See [partitioning.md](partitioning.md) for the full key-by-key analysis.
+
 `s3p.chunks` is one unpartitioned table by default. Hash-partitioning by
 `file_id` was measured at 16 and 64 partitions:
 
@@ -86,10 +88,18 @@ external file cache.
 | PUT, 1 worker | 218/s | 187/s | 213/s |
 | PUT, 64 workers | 1,177/s | 1,118/s | 933/s |
 
-Partitioning adds planner work to every point read and does not parallelize a
-single file: all rows of one file hash to one partition. With DuckLake's single
-writer there is no insert contention to spread. The one-table layout wins. A
-future multi-writer layout can revisit partitioning, but it is not the default.
+A two-level `HASH(file_id) → RANGE(no)` layout (8 hash × 8 row ranges, read in
+8 MiB parallel pieces) improves a single 64 MiB GET from 441 to 556 MiB/s, but
+still costs 16–21% on 4 KiB GETs and 10% on 16-worker PUTs. It does not make
+partitioning a default win.
+
+The reason is structural: a point read needs `file_id`, so any key that spreads
+a file's rows (`no`, `hash(no)`, `(file_id,no)`) either scans every partition or
+adds range-pruning/planner work. A key that keeps a file together
+(`file_id`, `bucket`) leaves each file in one partition and gains nothing for a
+single-file read. With DuckLake's single writer there is no insert contention
+to spread. The one-table layout wins; a future multi-writer design can revisit
+partitioning.
 
 ## Write path
 
