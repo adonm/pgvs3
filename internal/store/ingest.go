@@ -316,6 +316,7 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			Size: size, SHA256: sha, ETag: etag, UserMetadata: t.userMeta,
 			ContentType: t.content, CreatedAt: time.Now(), FileID: fileIDOf(w),
 		})
+		w.store.objects.invalidate(t.bucket, t.key)
 	}
 	w.mu.Lock()
 	w.published = pub

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -60,6 +61,7 @@ func main() {
 	workers := flag.Int("workers", 16, "concurrent workers")
 	duration := flag.Duration("duration", 5*time.Second, "measurement duration")
 	count := flag.Int("count", 2000, "objects to prefill/read")
+	warmup := flag.Bool("warmup", false, "read every key once before measuring")
 	prefix := flag.String("prefix", "", "key prefix (a unique one is generated if empty)")
 	flag.Parse()
 	if *prefix == "" {
@@ -91,6 +93,24 @@ func main() {
 	default:
 		fmt.Fprintln(os.Stderr, "unknown -op")
 		os.Exit(2)
+	}
+	if *warmup && (*op == "get" || *op == "range") {
+		for i := 0; i < *count; i++ {
+			u := fmt.Sprintf("%s/%s/%s/obj-%06d", base, *bucket, *prefix, i)
+			req, _ := http.NewRequest(http.MethodGet, u, nil)
+			if *op == "range" {
+				req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", *rangeSize-1))
+			}
+			if err := s.sign(req, nil); err != nil {
+				must(err)
+			}
+			resp, err := c.Do(req)
+			if err != nil {
+				must(err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
 	}
 	time.Sleep(300 * time.Millisecond)
 

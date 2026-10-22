@@ -15,8 +15,9 @@ indicative, not capacity planning.
 ## Go gateway, direct S3 load
 
 Each run is 5 seconds. 4 KiB objects use 2,000 pre-created keys; 8 MiB and
-64 MiB reads use 16 and 8 objects; the list case has 2,000 keys and returns
-1,000 per page.
+64 MiB reads use 8 and 4 objects; the list case has 2,000 keys and returns
+1,000 per page. The table below is **cache-off**; the small-object cache is
+measured separately.
 
 | Workload | Workers | Throughput | p50 | p99 |
 | --- | ---: | ---: | ---: | ---: |
@@ -31,9 +32,9 @@ Each run is 5 seconds. 4 KiB objects use 2,000 pre-created keys; 8 MiB and
 | 8 MiB GET | 1 | 422 MiB/s | 18.5 ms | 25.7 ms |
 | 8 MiB GET | 8 | 961 MiB/s | 65.6 ms | 105 ms |
 | 8 MiB GET | 16 | 1,017 MiB/s | 124 ms | 214 ms |
-| 64 MiB GET | 1 | 315 MiB/s | 156 ms | 323 ms |
-| 64 MiB GET | 8 | 756 MiB/s | 677 ms | 810 ms |
-| 64 MiB GET | 16 | 927 MiB/s | 1,084 ms | 1,371 ms |
+| 64 MiB GET | 1 | 441 MiB/s | 139 ms | 179 ms |
+| 64 MiB GET | 8 | 897 MiB/s | 591 ms | 773 ms |
+| 64 MiB GET | 16 | 985 MiB/s | 999 ms | 1,318 ms |
 | 64 MiB PUT | 1 | 81 MiB/s | 607 ms | 616 ms |
 | 64 MiB PUT | 8 | 186 MiB/s | 2,432 ms | 2,996 ms |
 | 8 KiB range from 64 MiB | 64 | 3,564 req/s | 16.2 ms | 54.1 ms |
@@ -49,10 +50,46 @@ Observations:
   synchronous commit. Throughput plateaus near 1.1k/s; more than 16 workers
   adds queueing, not throughput.
 - **Large reads stream well.** 8 MiB reads reach 1 GiB/s at 16 workers; 64 MiB
-  reads reach 927 MiB/s. The 8 KiB range case shows the fixed per-request cost:
-  3.5k/s with a 16 ms p50.
+  reads reach about 0.99 GiB/s. One query for a ≤64 MiB single-file object beat
+  both the old 8 MiB-piece path and parallel pieces at low concurrency. The
+  8 KiB range case shows the fixed per-request cost: 3.5k/s with a 16 ms p50.
 - **Lists are heavier** because one request materialises 1,000 XML entries;
   543/s is about 543,000 keys/s.
+
+## Small-object cache
+
+The cache holds whole objects up to 256 KiB. `-warmup` reads every key once
+before the measurement so the numbers are steady state. Revalidation is the
+safe mode for multiple gateways; local mode is for a single gateway or an
+immutable lake.
+
+| 4 KiB GET | No cache | Revalidated cache | Local cache |
+| --- | ---: | ---: | ---: |
+| 1 worker | 1,104/s · 0.76 ms | 1,112/s · 0.81 ms | 1,646/s · 0.56 ms |
+| 16 workers | 3,196/s · 4.5 ms | 3,166/s · 4.6 ms | 6,436/s · 2.1 ms |
+| 64 workers | 3,853/s · 14.5 ms | 4,118/s · 13.4 ms | 6,773/s · 8.5 ms |
+
+The revalidation query costs about as much as the row read it replaces. Local
+mode is the win: +50% at one worker, +2× at 16–64 workers. Writes through the
+same gateway invalidate the key immediately; peer mode revalidates each hit.
+
+## Partitioning A/B
+
+Same 4 KiB workload, hash-partitioned `s3p.chunks`:
+
+| Workload | 1 partition | 16 partitions | 64 partitions |
+| --- | ---: | ---: | ---: |
+| GET, 1 worker | 1,104/s | 888/s | 945/s |
+| GET, 16 workers | 3,852/s | 2,784/s | 3,227/s |
+| GET, 64 workers | 3,940/s | 3,232/s | 3,281/s |
+| PUT, 1 worker | 218/s | 187/s | 213/s |
+| PUT, 16 workers | 1,051/s | 908/s | 981/s |
+| PUT, 64 workers | 1,177/s | 1,118/s | 933/s |
+
+Partitioning loses on every point-read row and mostly loses on writes. All
+rows of one file hash to one partition, so it cannot parallelize a single-file
+read; planner overhead grows with partition count. DuckLake's single writer
+has no insert contention to spread. The default stays **1 partition**.
 
 ## DuckDB 2.0 through the gateway
 
@@ -96,8 +133,8 @@ host**. Sources: [performance guide][express-perf], [pricing][express-price],
 
 | Dimension | pgvs3 (measured, 6 vCPU) | S3 Express One Zone (published) |
 | --- | --- | --- |
-| 4 KiB GET p50 | 0.76 ms at 1 worker; 3.3 ms at 16 | Consistent single-digit ms |
-| 4 KiB GET throughput | ~4.1k/s | 200k/s default, 2M/s max per bucket |
+| 4 KiB GET p50 | 0.56–3.3 ms at 1–16 workers | Consistent single-digit ms |
+| 4 KiB GET throughput | ~4–7k/s depending on cache | 200k/s default, 2M/s max per bucket |
 | 4 KiB PUT throughput | ~1.2k/s | 100k/s default, 200k/s max per bucket |
 | 8–64 MiB GET | 0.4–1.0 GiB/s | Network/concurrency-bound; elastic |
 | 64 MiB PUT | 81–186 MiB/s | Elastic, distributed |
@@ -109,9 +146,9 @@ host**. Sources: [performance guide][express-perf], [pricing][express-price],
 **What the numbers mean**
 
 - **Per-request latency is competitive.** At one to sixteen workers, pgvs3's
-  4 KiB GET p50 is 0.76–3.3 ms, in the same single-digit-millisecond band as
+  4 KiB GET p50 is 0.56–3.3 ms, in the same single-digit-millisecond band as
   S3 Express. The loopback path removes the network and object-store metadata
-  hops.
+  hops; the small-object cache removes repeated PostgreSQL reads.
 - **Aggregate throughput is not.** Six cores and one PostgreSQL reach about 4k
   GET/s and 1.2k PUT/s. S3 Express's default per-bucket limits are 200k reads
   and 100k writes per second; the ceilings are 2M and 200k. Reaching those
@@ -162,7 +199,8 @@ also unsupported here, which is correct for parity.
 ## Reproduce
 
 ```sh
-just load                 # direct gateway matrix, writes .tmp/pgvs3/load.json
+just load                 # direct gateway matrix, cache off
+OBJECT_CACHE_BYTES=67108864 just load   # direct matrix, small-object cache on
 just bench s3             # DuckDB 2.0 httpfs matrix, writes .tmp/pgvs3/bench.json
 just bench                # plus DuckLake compatibility and tuning
 just contract             # correctness gate before trusting a number

@@ -37,17 +37,21 @@ const (
 
 // Options are the PostgreSQL connection settings.
 type Options struct {
-	MinConns       int32
-	MaxConns       int32
-	CAFile         string
-	AllowPlaintext bool
+	MinConns              int32
+	MaxConns              int32
+	CAFile                string
+	AllowPlaintext        bool
+	ObjectCacheBytes      int64
+	ObjectCacheTTL        time.Duration
+	ObjectCacheRevalidate bool
 }
 
 // Store is the PostgreSQL-backed object store.
 type Store struct {
-	pool  *pgxpool.Pool
-	cache MetaCache
-	log   *slog.Logger
+	pool    *pgxpool.Pool
+	cache   MetaCache
+	objects *objectCache
+	log     *slog.Logger
 }
 
 // Open connects and warms the pool. Remote servers must use TLS; loopback
@@ -154,7 +158,7 @@ SET synchronous_commit = on;`)
 		pool.Close()
 		return nil, err
 	}
-	return &Store{pool: pool, cache: NewLocalMetaCache(64 << 20), log: log}, nil
+	return &Store{pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), log: log}, nil
 }
 
 func (s *Store) Close()              { s.pool.Close() }
@@ -270,17 +274,50 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 		return err
 	}
 	defer conn.Release()
-	var configured bool
-	err = conn.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM pg_class WHERE oid = 's3p.chunks'::regclass AND relkind = 'r'
-		AND reloptions @> ARRAY['toast_tuple_target=8160',
-			'autovacuum_vacuum_scale_factor=0.01',
-			'autovacuum_analyze_scale_factor=0.02',
-			'autovacuum_vacuum_threshold=1000'])`).Scan(&configured)
-	if err != nil {
+	var kind string
+	var opts []string
+	if err := conn.QueryRow(ctx, `SELECT relkind::text, reloptions FROM pg_class WHERE oid = 's3p.chunks'::regclass`).
+		Scan(&kind, &opts); err != nil {
 		return err
 	}
-	if !configured {
+	want := []string{
+		"toast_tuple_target=8160",
+		"autovacuum_vacuum_scale_factor=0.01",
+		"autovacuum_analyze_scale_factor=0.02",
+		"autovacuum_vacuum_threshold=1000",
+	}
+	hasAll := func(have []string) bool {
+		for _, w := range want {
+			found := false
+			for _, h := range have {
+				if h == w {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	if kind == "p" {
+		// Storage parameters are not allowed on a partitioned parent; every
+		// leaf must carry the inline-page and autovacuum settings.
+		var total, configured int
+		if err := conn.QueryRow(ctx, `SELECT count(*),
+			count(*) FILTER (WHERE c.reloptions @> ARRAY['toast_tuple_target=8160',
+				'autovacuum_vacuum_scale_factor=0.01',
+				'autovacuum_analyze_scale_factor=0.02',
+				'autovacuum_vacuum_threshold=1000'])
+			FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+			WHERE i.inhparent = 's3p.chunks'::regclass AND c.relkind = 'r'`).Scan(&total, &configured); err != nil {
+			return err
+		}
+		if total == 0 || total != configured {
+			return fmt.Errorf("s3p.chunks partitions lack the expected inline storage and autovacuum settings")
+		}
+	} else if kind != "r" || !hasAll(opts) {
 		return fmt.Errorf("s3p.chunks lacks the expected inline storage and autovacuum settings")
 	}
 	for _, relation := range []string{"s3p.garbage", "s3p.objects_parts_idx", "s3p.upload_parts_file_id_key"} {
@@ -493,6 +530,21 @@ func (s *Store) GetBody(ctx context.Context, bucket, key string, first, last, su
 		if sm.Len() == 0 {
 			return sm, &Body{}, nil
 		}
+		if attempt == 0 && m.Size <= smallObjectMax && s.objects != nil {
+			if e, ok := s.objects.get(bucket, key); ok {
+				current, err := s.objectCurrent(ctx, bucket, key, e.fileID, e.etag)
+				if err == nil && current {
+					return sm, bytesBody(e.data[sm.Start : sm.End+1]), nil
+				}
+				s.objects.invalidate(bucket, key)
+				s.cache.Invalidate(ctx, bucket, key)
+				continue
+			}
+			if data, err := s.readFullObject(ctx, bucket, key, m); err == nil {
+				s.objects.put(bucket, key, objectEntry{data: data, etag: m.ETag, fileID: m.FileID})
+				return sm, bytesBody(data[sm.Start : sm.End+1]), nil
+			}
+		}
 		streamCtx, cancel := context.WithCancel(ctx)
 		body, err := s.startStream(streamCtx, cancel, bucket, key, m, mstart, mend)
 		if err != nil {
@@ -506,6 +558,41 @@ func (s *Store) GetBody(ctx context.Context, bucket, key string, first, last, su
 		return sm, body, nil
 	}
 	return nil, nil, ErrNotFound
+}
+
+// objectCurrent is the cheap revalidation query for a byte-cache hit. It
+// returns false when the key was replaced or deleted through any gateway.
+func (s *Store) objectCurrent(ctx context.Context, bucket, key string, fileID int64, etag string) (bool, error) {
+	var curFile int64
+	var curETag string
+	err := s.pool.QueryRow(ctx, "SELECT file_id, etag FROM s3p.objects WHERE bucket = $1 AND key = $2", bucket, key).
+		Scan(&curFile, &curETag)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return curFile == fileID && curETag == etag, nil
+}
+
+// readFullObject buffers one small object for the byte cache. It never calls
+// GetBody, so it cannot recurse into the cache path.
+func (s *Store) readFullObject(ctx context.Context, bucket, key string, m *Meta) ([]byte, error) {
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	body, err := s.startStream(streamCtx, cancel, bucket, key, m, 0, m.Size-1)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	return io.ReadAll(body)
+}
+
+func bytesBody(data []byte) *Body {
+	ch := make(chan result)
+	close(ch)
+	return &Body{cur: data, ch: ch}
 }
 
 func (s *Store) metaForRead(ctx context.Context, bucket, key string, cond *ReadCondition, fresh bool) (*Meta, error) {
@@ -573,10 +660,20 @@ type piece struct {
 	lo, hi int32
 }
 
+const wholeReadMax = 64 << 20
+
 func planPieces(m *Meta, start, end int64) ([]piece, error) {
 	segments, err := m.Segments()
 	if err != nil {
 		return nil, err
+	}
+	// One query for a single-file object up to 64 MiB: PostgreSQL streams the
+	// rows, and avoiding the snapshot/piece machinery wins at low concurrency.
+	if m.Parts == nil && end-start+1 <= wholeReadMax {
+		seg := segments[0]
+		lo := int32((max(start, seg.Base) - seg.Base) / RowBytes)
+		hi := int32((min(end, seg.Base+seg.Length-1) - seg.Base) / RowBytes)
+		return []piece{{fileID: seg.FileID, base: seg.Base, lo: lo, hi: hi}}, nil
 	}
 	var out []piece
 	for _, seg := range segments {
@@ -623,6 +720,15 @@ func (s *Store) streamSpan(ctx context.Context, ch chan<- result, bucket, key st
 			return false
 		}
 	}
+	if len(pieces) > 1 && len(pieces) <= maxParallelPieces {
+		if err := s.streamParallel(ctx, ch, bucket, key, rootID, pieces, start, end); err != nil {
+			select {
+			case ch <- result{err: err}:
+			case <-ctx.Done():
+			}
+		}
+		return
+	}
 	if len(pieces) > 1 {
 		if err := s.streamSnapshot(ctx, ch, bucket, key, rootID, pieces, start, end, send); err != nil {
 			select {
@@ -641,6 +747,110 @@ func (s *Store) streamSpan(ctx context.Context, ch chan<- result, bucket, key st
 			return
 		}
 	}
+}
+
+// maxParallelPieces bounds the number of connections one GET may borrow. An
+// 8 MiB piece is one query; DuckLake's 64 MiB files become eight parallel
+// range reads under one exported snapshot.
+const maxParallelPieces = 8
+
+// streamParallel fetches each piece on its own connection under a single
+// exported repeatable-read snapshot. Piece channels are drained in order, so
+// the response stays byte-ordered while PostgreSQL reads the pieces in
+// parallel.
+func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, key string, rootID int64, pieces []piece, start, end int64) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	exportConn, err := s.pool.Acquire(runCtx)
+	if err != nil {
+		return err
+	}
+	defer exportConn.Release()
+	exportTx, err := exportConn.BeginTx(runCtx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return err
+	}
+	defer exportTx.Rollback(context.WithoutCancel(runCtx))
+	var snapshot string
+	if err := exportTx.QueryRow(runCtx, "SELECT pg_export_snapshot()").Scan(&snapshot); err != nil {
+		return err
+	}
+	chans := make([]chan result, len(pieces))
+	for i := range chans {
+		chans[i] = make(chan result, 4)
+	}
+	var wg sync.WaitGroup
+	for i, p := range pieces {
+		wg.Add(1)
+		go func(index int, p piece, ch chan result) {
+			defer wg.Done()
+			defer close(ch)
+			conn, err := s.pool.Acquire(runCtx)
+			if err != nil {
+				select {
+				case ch <- result{err: err}:
+				case <-runCtx.Done():
+				}
+				return
+			}
+			defer conn.Release()
+			tx, err := conn.BeginTx(runCtx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+			if err != nil {
+				select {
+				case ch <- result{err: err}:
+				case <-runCtx.Done():
+				}
+				return
+			}
+			defer tx.Rollback(context.WithoutCancel(runCtx))
+			if _, err := tx.Exec(runCtx, "SET TRANSACTION SNAPSHOT '"+snapshot+"'"); err != nil {
+				select {
+				case ch <- result{err: err}:
+				case <-runCtx.Done():
+				}
+				return
+			}
+			send := func(b []byte) bool {
+				select {
+				case ch <- result{b: b}:
+					return true
+				case <-runCtx.Done():
+					return false
+				}
+			}
+			if err := streamRows(runCtx, tx, ch, bucket, key, rootID, p, start, end, send); err != nil {
+				select {
+				case ch <- result{err: err}:
+				case <-runCtx.Done():
+				}
+				return
+			}
+			if err := tx.Commit(runCtx); err != nil {
+				select {
+				case ch <- result{err: err}:
+				case <-runCtx.Done():
+				}
+			}
+		}(i, p, chans[i])
+	}
+	for _, ch := range chans {
+		for r := range ch {
+			if r.err != nil {
+				cancel()
+				wg.Wait()
+				return r.err
+			}
+			select {
+			case out <- r:
+			case <-runCtx.Done():
+				cancel()
+				wg.Wait()
+				return runCtx.Err()
+			}
+		}
+	}
+	wg.Wait()
+	return nil
 }
 
 func (s *Store) streamSnapshot(ctx context.Context, ch chan<- result, bucket, key string, rootID int64, pieces []piece, start, end int64, send func([]byte) bool) error {
@@ -794,6 +1004,7 @@ func (s *Store) Delete(ctx context.Context, bucket, key string) (bool, error) {
 		return false, err
 	}
 	s.cache.Invalidate(ctx, bucket, key)
+	s.objects.invalidate(bucket, key)
 	return found, nil
 }
 
@@ -816,6 +1027,7 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 	}
 	for _, k := range keys {
 		s.cache.Invalidate(ctx, bucket, k)
+		s.objects.invalidate(bucket, k)
 	}
 	return nil
 }
@@ -1001,6 +1213,7 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 		Size: size, SHA256: shaAll.Sum(nil), ETag: etag, UserMetadata: userMeta,
 		ContentType: contentType, CreatedAt: time.Now(), FileID: ids[0], Parts: ids, PartEnds: ends,
 	})
+	s.objects.invalidate(bucket, key)
 	return &Completed{Bucket: bucket, Key: key, ETag: etag, Size: size}, nil
 }
 

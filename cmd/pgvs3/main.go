@@ -41,6 +41,16 @@ func run() int {
 	return serve(args)
 }
 
+func flagSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 func indexArg(args []string, want string) int {
 	for i, a := range args {
 		if a == want {
@@ -81,9 +91,18 @@ func serve(args []string) int {
 		vhost         = fs.String("vhost-domain", env("PGVS3_VHOST_DOMAIN", ""), "virtual-host suffix, e.g. s3.internal")
 		accountID     = fs.String("account-id", env("PGVS3_ACCOUNT_ID", "000000000000"), "account id in bucket ARNs")
 		sessionKey    = fs.String("session-key", env("PGVS3_SESSION_KEY", ""), "HMAC key for S3 Express session tokens")
+		objectCache   = fs.Int64("object-cache-bytes", envInt64("PGVS3_OBJECT_CACHE_BYTES", 64<<20), "small-object byte cache size (0 disables)")
+		objectTTL     = fs.Duration("object-cache-ttl", envDuration("PGVS3_OBJECT_CACHE_TTL", 5*time.Second), "small-object cache TTL")
+		objectCheck   = fs.Bool("object-cache-revalidate", envBoolDefault("PGVS3_OBJECT_CACHE_REVALIDATE", false), "revalidate each small-object cache hit against PostgreSQL")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	peersList := splitPeers(*peers)
+	// A single gateway invalidates its own cache on write. With peers, another
+	// gateway can overwrite a key at any time, so revalidate cache hits.
+	if os.Getenv("PGVS3_OBJECT_CACHE_REVALIDATE") == "" && !flagSet(fs, "object-cache-revalidate") && len(peersList) > 0 {
+		*objectCheck = true
 	}
 	log := newLogger(*logLevel)
 	if *accessKey == "" || *secretKey == "" {
@@ -96,6 +115,7 @@ func serve(args []string) int {
 	st, err := store.Open(ctx, *url, store.Options{
 		MinConns: int32(*poolMin), MaxConns: int32(*poolMax),
 		CAFile: os.Getenv("PGVS3_DB_CA_FILE"), AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
+		ObjectCacheBytes: *objectCache, ObjectCacheTTL: *objectTTL, ObjectCacheRevalidate: *objectCheck,
 	}, log)
 	if err != nil {
 		log.Error("connecting to PostgreSQL", "err", err)
@@ -112,7 +132,7 @@ func serve(args []string) int {
 	}
 	cache, err := peercache.New(ctx, st, peercache.Options{
 		MainBytes: *cacheMain, HotBytes: *cacheHot, TTL: 10 * time.Second,
-		Peers: splitPeers(*peers), Self: *peerAdvert, ListenAddr: *peerAddr, Secret: *peerSecret,
+		Peers: peersList, Self: *peerAdvert, ListenAddr: *peerAddr, Secret: *peerSecret,
 	}, log)
 	if err != nil {
 		log.Error("starting metadata cache", "err", err)
@@ -135,7 +155,7 @@ func serve(args []string) int {
 		log.Error("configuring listener", "err", err)
 		return 1
 	}
-	log.Info("pgvs3 starting", "version", version, "addr", *addr, "cache_peers", len(splitPeers(*peers)))
+	log.Info("pgvs3 starting", "version", version, "addr", *addr, "cache_peers", len(peersList), "object_cache_revalidate", *objectCheck)
 	if err := s3.Run(ctx, srv, *tlsCert, *tlsKey, log); err != nil {
 		log.Error("serving", "err", err)
 		return 1
@@ -228,6 +248,16 @@ func splitPeers(s string) []string {
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envBoolDefault(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			return b
+		}
 	}
 	return def
 }

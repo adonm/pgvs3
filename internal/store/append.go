@@ -56,6 +56,7 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 		out := Meta{FileID: fileID, Size: size, SHA256: shaAll[:], ETag: etag,
 			ContentType: "application/octet-stream", CreatedAt: time.Now()}
 		s.cache.Put(ctx, bucket, key, out)
+		s.objects.invalidate(bucket, key)
 		return &out, nil
 	}
 	if err != nil {
@@ -105,6 +106,7 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 	out.FileID, out.Size, out.SHA256, out.ETag = parts[0], newSize, shaAll.Sum(nil), etag
 	out.Parts, out.PartEnds, out.CreatedAt = parts, ends, time.Now()
 	s.cache.Put(ctx, bucket, key, out)
+	s.objects.invalidate(bucket, key)
 	return &out, nil
 }
 

@@ -21,11 +21,15 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 
 ## Read path
 
-- **Up to 8 MiB is one query.** `smallMax = 8 << 20`; a query returns whole rows
-  for a contiguous `no` range and checks the object's current `file_id`.
-- **Larger reads share a repeatable-read snapshot.** `streamSnapshot` opens one
-  read-only transaction for all pieces, so a concurrent overwrite cannot remove
-  later rows.
+- **Up to 64 MiB is one query for a single-file object.** `wholeReadMax = 64 << 20`;
+  the query returns whole rows for a contiguous `no` range and checks the
+  object's current `file_id`. One query avoids the per-piece planning and
+  connection overhead that a 64 MiB object would otherwise pay.
+- **Larger and multipart reads split into 8 MiB pieces.** Up to eight pieces are
+  fetched in parallel on separate connections under one exported
+  repeatable-read snapshot, so a concurrent overwrite cannot remove later rows.
+  More than eight pieces fall back to a sequential snapshot to bound connection
+  use.
 - **Rows are cut through to HTTP.** `Body.WriteTo` writes each PostgreSQL chunk
   straight to the response. A bounded channel (32 chunks) backpressures
   PostgreSQL when the client is slow.
@@ -34,6 +38,10 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 - **256 KiB response chunks** amortise syscalls without adding a large copy.
 - **Metadata is cached.** Otter (W-TinyLFU) serves local metadata reads without
   a lock; `HEAD` always reads fresh metadata so size/ETag cannot be stale.
+- **Small objects are cached.** A per-gateway Otter byte cache holds whole
+  objects up to 256 KiB. Single-gateway writes invalidate it locally; with
+  peers, each hit revalidates `file_id`/ETag against `s3p.objects`. See
+  “Small-object cache” below.
 - **Stale entries fail safe.** A range query verifies the current object still
   points at the cached `file_id`; a stale entry causes one fresh retry, never
   stale bytes.
@@ -42,8 +50,46 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
   `304`.
 - **No block read-ahead.** As in pgvfs, DuckDB already merges nearby reads;
   fetching 254 KiB blocks was 30–38% slower cold.
+- **No partitioning by default.** See the measured 16/64-partition regression
+  above.
 - **No index scans for chunk ranges.** PostgreSQL execution was already
   0.01–0.03 ms; the bitmap plan wins on cold pages.
+
+## Small-object cache
+
+Parquet footers, delete files and manifests are small and repeated. The gateway
+caches whole objects up to 256 KiB in Otter (default 64 MiB, 5 s TTL).
+
+- **Single gateway:** local writes invalidate the key; hits are served from RAM
+  with no PostgreSQL round trip. 4 KiB GET p50 drops from 0.76 ms to 0.56 ms,
+  and 64-worker throughput from about 3.9k/s to 6.8k/s on the benchmark host.
+- **Peer mode:** a hit first checks `SELECT file_id, etag FROM s3p.objects`.
+  That costs about as much as reading a 4 KiB row, so the cache mainly saves
+  bytes and PostgreSQL CPU rather than latency. Set
+  `PGVS3_OBJECT_CACHE_REVALIDATE=false` only for an immutable lake with a
+  single writer.
+- **TTL:** five seconds bounds staleness if an invalidation is lost; a
+  revalidated hit does not rely on it.
+
+This is not a block cache. Large objects are streamed and left to DuckDB's
+external file cache.
+
+## Partitioning
+
+`s3p.chunks` is one unpartitioned table by default. Hash-partitioning by
+`file_id` was measured at 16 and 64 partitions:
+
+| 4 KiB workload | 1 partition | 16 | 64 |
+| --- | ---: | ---: | ---: |
+| GET, 1 worker | 1,104/s | 888/s | 945/s |
+| GET, 16 workers | 3,852/s | 2,784/s | 3,227/s |
+| PUT, 1 worker | 218/s | 187/s | 213/s |
+| PUT, 64 workers | 1,177/s | 1,118/s | 933/s |
+
+Partitioning adds planner work to every point read and does not parallelize a
+single file: all rows of one file hash to one partition. With DuckLake's single
+writer there is no insert contention to spread. The one-table layout wins. A
+future multi-writer layout can revisit partitioning, but it is not the default.
 
 ## Write path
 

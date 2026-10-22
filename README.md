@@ -93,14 +93,15 @@ The layout is deliberately narrow:
 
 ## Performance
 
-On a shared 6-vCPU loopback host, direct SigV4 load gives a 0.76 ms p50 for
-one 4 KiB GET and about 3.9k 4 KiB GET/s at 16–64 workers, 1.0 GiB/s for 8 MiB
-GETs and 927 MiB/s for 64 MiB GETs. S3 Express One Zone publishes consistent
-single-digit-millisecond latency and 200k reads / 100k writes per second per
-directory bucket by default. The per-request latency is in the same band; the
-aggregate ceiling is not — pgvs3 is one PostgreSQL, Express is a managed
-service. Full methodology, Go-vs-Express tables and the cost comparison are in
-[docs/benchmarks.md](docs/benchmarks.md).
+On a shared 6-vCPU loopback host, direct SigV4 load with the small-object cache
+warm gives a 0.56 ms p50 for one 4 KiB GET and about 6.8k 4 KiB GET/s at 64
+workers; without the cache it is 0.76 ms and about 3.9k/s. 8 MiB GETs reach
+1.0 GiB/s and 64 MiB GETs about 0.99 GiB/s. S3 Express One Zone publishes
+consistent single-digit-millisecond latency and 200k reads / 100k writes per
+second per directory bucket by default. Per-request latency is in the same
+band; the aggregate ceiling is not — pgvs3 is one PostgreSQL, Express is a
+managed service. Full methodology, Go-vs-Express tables and the cost comparison
+are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Cross-AZ metadata cache
 
@@ -123,9 +124,14 @@ pgvs3 serve --addr 0.0.0.0:8014
 - The hot cache defaults to **100% of the main cache** (groupcache's default is
   1/8, which causes constant cross-AZ fetches for the two-thirds of keys owned
   by other nodes).
-- Only **metadata** is cached. Object bytes are already cached by DuckDB's
-  external file cache; a second gateway-level copy would double memory and add
-  cross-AZ traffic.
+- The peer cache carries **metadata only**. A per-gateway byte cache keeps
+  whole objects up to 256 KiB; large object bytes are already cached by
+  DuckDB's external file cache.
+- A single gateway invalidates its byte cache on every local write. When peers
+  are configured, cache hits revalidate against `s3p.objects` before serving,
+  so a write through another gateway cannot be masked. If several gateways
+  write the same bucket without a peer list, set
+  `PGVS3_OBJECT_CACHE_REVALIDATE=true`.
 - Writes enqueue a best-effort cluster-wide invalidation. A stale entry can
   cause one retry, never stale bytes: the range query checks that the object
   still points at the cached `file_id`.
@@ -199,6 +205,9 @@ A flag overrides the same-named environment variable.
 | `--pool-max` | `PGVS3_POOL_MAX` | 64 | Connections per gateway. Size the fleet against PostgreSQL `max_connections`. |
 | `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long deleted files stay readable. |
 | `--maintenance-interval` | `PGVS3_MAINTENANCE_INTERVAL` | `1m` | Reaper and upload-expiry interval. |
+| `--object-cache-bytes` | `PGVS3_OBJECT_CACHE_BYTES` | 64 MiB | Whole-object cache for objects up to 256 KiB; `0` disables. |
+| `--object-cache-ttl` | `PGVS3_OBJECT_CACHE_TTL` | `5s` | Small-object cache TTL. |
+| `--object-cache-revalidate` | `PGVS3_OBJECT_CACHE_REVALIDATE` | false single gateway; true with peers | Check each cache hit against `s3p.objects`. |
 | `--cache-main-bytes` | `PGVS3_CACHE_MAIN_BYTES` | 64 MiB | Local cache for owned metadata keys. |
 | `--cache-hot-bytes` | `PGVS3_CACHE_HOT_BYTES` | 64 MiB | Local mirror of peer-owned metadata keys. |
 | `--peers` | `PGVS3_PEERS` | unset | Comma-separated `host:port` peer list. |
@@ -237,8 +246,8 @@ The image is about 17 MB. It exposes `8014` (S3) and `8015` (peer cache).
 
 ## Design decisions
 
-- **No row cache.** DuckDB caches immutable file bytes; the gateway caches only
-  metadata.
+- **No block cache.** A small whole-object cache covers repeated footers and
+  metadata (≤256 KiB); larger file bytes are left to DuckDB's external cache.
 - **Connections are reused most-recently-used first** to keep TCP slow-start out
   of the hot path.
 - **Reads up to 8 MiB are one query.** Larger reads share a repeatable-read

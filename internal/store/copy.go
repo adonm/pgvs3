@@ -86,6 +86,7 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	out.UserMetadata, out.ContentType = meta, ct
 	out.CreatedAt = time.Now()
 	s.cache.Put(ctx, dstBucket, dstKey, out)
+	s.objects.invalidate(dstBucket, dstKey)
 	return &out, nil
 }
 
@@ -151,6 +152,8 @@ func (s *Store) Rename(ctx context.Context, bucket, srcKey, dstKey string, opts 
 	}
 	s.cache.Invalidate(ctx, bucket, srcKey)
 	s.cache.Invalidate(ctx, bucket, dstKey)
+	s.objects.invalidate(bucket, srcKey)
+	s.objects.invalidate(bucket, dstKey)
 	return nil
 }
 
