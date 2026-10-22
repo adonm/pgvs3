@@ -148,14 +148,6 @@ BEGIN
   IF p_cond = 'if_match' AND (NOT found_old OR old_etag <> p_if_match) THEN
     RETURN 'precondition';
   END IF;
-  IF found_old THEN
-    INSERT INTO s3p.garbage (file_id)
-    SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
-    WHERE f IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f OR f = ANY(o.parts))
-      AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
-    ON CONFLICT DO NOTHING;
-  END IF;
   INSERT INTO s3p.objects
     (bucket, key, file_id, size, sha256, etag, user_metadata, content_type,
      parts, part_ends, inline_data)
@@ -167,6 +159,14 @@ BEGIN
     etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
     content_type = EXCLUDED.content_type, parts = NULL, part_ends = NULL,
     inline_data = EXCLUDED.inline_data, created_at = now();
+  IF found_old THEN
+    INSERT INTO s3p.garbage (file_id)
+    SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
+    WHERE f IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f OR f = ANY(o.parts))
+      AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
+    ON CONFLICT DO NOTHING;
+  END IF;
   PERFORM pg_notify('s3p_invalidate', p_bucket || chr(31) || p_key);
   RETURN 'ok';
 END $$;

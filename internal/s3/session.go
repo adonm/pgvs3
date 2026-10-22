@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,9 @@ import (
 type SessionIssuer struct {
 	master []byte
 	ttl    time.Duration
+
+	mu       sync.Mutex
+	sessions map[string]*Session
 }
 
 type Session struct {
@@ -33,7 +37,7 @@ func NewSessionIssuer(master []byte, ttl time.Duration) *SessionIssuer {
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
-	return &SessionIssuer{master: master, ttl: ttl}
+	return &SessionIssuer{master: master, ttl: ttl, sessions: make(map[string]*Session)}
 }
 
 func (s *SessionIssuer) Create(bucket, mode string) Session {
@@ -44,7 +48,29 @@ func (s *SessionIssuer) Create(bucket, mode string) Session {
 	var nonce [8]byte
 	_, _ = rand.Read(nonce[:])
 	payload := fmt.Sprintf("v1|%s|%s|%d|%s", bucket, mode, exp.Unix(), hex.EncodeToString(nonce[:]))
-	return s.sessionFor(payload, bucket, mode, exp)
+	out := s.sessionFor(payload, bucket, mode, exp)
+	s.cache(&out)
+	return out
+}
+
+func (s *SessionIssuer) cache(sess *Session) {
+	s.mu.Lock()
+	if len(s.sessions) > 4096 {
+		clear(s.sessions)
+	}
+	s.sessions[sess.Token] = sess
+	s.mu.Unlock()
+}
+
+func (s *SessionIssuer) cached(token string) (*Session, bool) {
+	s.mu.Lock()
+	sess, ok := s.sessions[token]
+	if ok && time.Now().After(sess.Expiry) {
+		delete(s.sessions, token)
+		ok = false
+	}
+	s.mu.Unlock()
+	return sess, ok
 }
 
 func (s *SessionIssuer) sessionFor(payload, bucket, mode string, exp time.Time) Session {
@@ -56,6 +82,12 @@ func (s *SessionIssuer) sessionFor(payload, bucket, mode string, exp time.Time) 
 }
 
 func (s *SessionIssuer) Validate(token, bucket string) (*Session, error) {
+	if sess, ok := s.cached(token); ok {
+		if sess.Bucket != bucket {
+			return nil, fmt.Errorf("session is scoped to another bucket")
+		}
+		return sess, nil
+	}
 	enc, sig, ok := strings.Cut(token, ".")
 	if !ok {
 		return nil, fmt.Errorf("malformed session token")

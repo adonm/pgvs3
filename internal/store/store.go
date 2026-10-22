@@ -48,6 +48,7 @@ type Options struct {
 	WholeReadMax          int64
 	RevalidateReads       bool
 	WriteCommit           string
+	SkipReadVerify        bool
 }
 
 // Store is the PostgreSQL-backed object store.
@@ -58,6 +59,7 @@ type Store struct {
 	wholeReadMax     int64
 	revalidateInline bool
 	writeCommit      string
+	skipReadVerify   bool
 	log              *slog.Logger
 
 	fileIDMu   sync.Mutex
@@ -184,7 +186,7 @@ SET synchronous_commit = on;`)
 		pool.Close()
 		return nil, err
 	}
-	return &Store{bucketCache: make(map[string]time.Time), pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, revalidateInline: opts.RevalidateReads, writeCommit: opts.WriteCommit, log: log}, nil
+	return &Store{bucketCache: make(map[string]time.Time), pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, revalidateInline: opts.RevalidateReads, writeCommit: opts.WriteCommit, skipReadVerify: opts.SkipReadVerify, log: log}, nil
 }
 
 // nextFileID hands out sequence values in blocks. The sequence itself is
@@ -885,7 +887,7 @@ func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, k
 					return false
 				}
 			}
-			if err := streamRows(runCtx, tx, ch, bucket, key, rootID, p, start, end, send); err != nil {
+			if err := streamRows(runCtx, tx, ch, bucket, key, rootID, p, start, end, send, s.skipReadVerify); err != nil {
 				select {
 				case ch <- result{err: err}:
 				case <-runCtx.Done():
@@ -927,7 +929,7 @@ func (s *Store) streamSnapshot(ctx context.Context, ch chan<- result, bucket, ke
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	for _, p := range pieces {
-		if err := streamRows(ctx, tx, ch, bucket, key, rootID, p, start, end, send); err != nil {
+		if err := streamRows(ctx, tx, ch, bucket, key, rootID, p, start, end, send, s.skipReadVerify); err != nil {
 			return err
 		}
 	}
@@ -935,7 +937,7 @@ func (s *Store) streamSnapshot(ctx context.Context, ch chan<- result, bucket, ke
 }
 
 func (s *Store) streamPiece(ctx context.Context, ch chan<- result, bucket, key string, rootID int64, p piece, start, end int64, send func([]byte) bool) error {
-	return streamRows(ctx, s.pool, ch, bucket, key, rootID, p, start, end, send)
+	return streamRows(ctx, s.pool, ch, bucket, key, rootID, p, start, end, send, s.skipReadVerify)
 }
 
 type querier interface {
@@ -946,8 +948,17 @@ const getRangeSQL = `SELECT c.no, c.data FROM s3p.chunks c
 WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3
 AND EXISTS (SELECT 1 FROM s3p.objects o WHERE o.bucket = $4 AND o.key = $5 AND o.file_id = $6)`
 
-func streamRows(ctx context.Context, q querier, ch chan<- result, bucket, key string, rootID int64, p piece, start, end int64, send func([]byte) bool) error {
-	rows, err := q.Query(ctx, getRangeSQL, p.fileID, p.lo, p.hi, bucket, key, rootID)
+const getRangeSQLNoVerify = `SELECT c.no, c.data FROM s3p.chunks c
+WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3`
+
+func streamRows(ctx context.Context, q querier, ch chan<- result, bucket, key string, rootID int64, p piece, start, end int64, send func([]byte) bool, skipVerify bool) error {
+	var rows pgx.Rows
+	var err error
+	if skipVerify {
+		rows, err = q.Query(ctx, getRangeSQLNoVerify, p.fileID, p.lo, p.hi)
+	} else {
+		rows, err = q.Query(ctx, getRangeSQL, p.fileID, p.lo, p.hi, bucket, key, rootID)
+	}
 	if err != nil {
 		return err
 	}

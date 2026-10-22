@@ -57,6 +57,9 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 - **Conditional reads are cheap.** `If-Match` compares the cached ETag first and
   refreshes only on a mismatch. `If-None-Match` reads fresh metadata before a
   `304`.
+- **The `EXISTS` check is optional.** Every chunk range normally re-checks the
+  object row; `PGVS3_VERIFY_READS=false` drops that probe for a single-writer /
+  immutable lake, at the cost of relying on cache invalidation.
 - **No block read-ahead.** As in pgvfs, DuckDB already merges nearby reads;
   fetching 254 KiB blocks was 30–38% slower cold.
 - **No partitioning by default.** See the measured 16/64-partition regression
@@ -143,6 +146,8 @@ partitioning.
   and byte cache entry on receipt. Bucket notifications use a `b:` prefix.
 - **Inline objects** are revalidated on read when peers are configured, because
   they have no chunk `file_id` for the range query to check.
+- **Session tokens** are cached in-process for their five-minute lifetime, so
+  verifying a zonal request does not repeat three HMAC derivations.
 - **TTL** is the backstop: 5 seconds for metadata, 5 seconds for the byte cache,
   30 seconds for buckets.
 
