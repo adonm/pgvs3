@@ -13,6 +13,7 @@ import (
 	"io"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -81,6 +82,7 @@ type rowFramer struct {
 	fileID  int64
 	no      int32
 	pending []byte
+	scratch []byte
 	buf     *bytes.Buffer
 	sha     hash.Hash
 	md5     hash.Hash
@@ -89,10 +91,11 @@ type rowFramer struct {
 
 func newRowFramer(fileID int64) *rowFramer {
 	f := &rowFramer{
-		fileID: fileID,
-		buf:    getFramerBuf(),
-		sha:    sha256.New(),
-		md5:    md5.New(),
+		fileID:  fileID,
+		scratch: make([]byte, RowBytes),
+		buf:     getFramerBuf(),
+		sha:     sha256.New(),
+		md5:     md5.New(),
 	}
 	f.buf.Write(copyHeader)
 	return f
@@ -141,6 +144,7 @@ func (f *rowFramer) release() {
 func (f *rowFramer) frameRows(data []byte) {
 	for start := 0; start < len(data); start += RowBytes {
 		end := min(start+RowBytes, len(data))
+		payload := compressBlock(f.scratch, data[start:end])
 		// field count
 		f.buf.Write([]byte{0, 3})
 		// file_id
@@ -153,10 +157,10 @@ func (f *rowFramer) frameRows(data []byte) {
 		binary.BigEndian.PutUint32(b4[:], uint32(f.no))
 		f.buf.Write([]byte{0, 0, 0, 4})
 		f.buf.Write(b4[:])
-		// data
-		binary.BigEndian.PutUint32(b4[:], uint32(end-start))
+		// data (compressed if smaller than end-start, raw otherwise)
+		binary.BigEndian.PutUint32(b4[:], uint32(len(payload)))
 		f.buf.Write(b4[:])
-		f.buf.Write(data[start:end])
+		f.buf.Write(payload)
 		f.no++
 	}
 }
@@ -172,6 +176,8 @@ type writerTarget struct {
 	key        string
 	condition  Condition
 	ifMatch    string
+	expiresAt  *time.Time
+	keepTTL    bool
 	userMeta   []string
 	content    string
 	uploadID   string
@@ -184,6 +190,7 @@ type Condition int
 const (
 	Unconditional Condition = iota
 	IfAbsent
+	IfPresent
 	IfMatch
 )
 
@@ -219,6 +226,9 @@ func (s *Store) StartPart(ctx context.Context, uploadID, bucket, key string, par
 }
 
 func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, error) {
+	if t.userMeta == nil {
+		t.userMeta = []string{}
+	}
 	sc, err := bucketSQLIdent(t.bucket)
 	if err != nil {
 		return nil, err
@@ -307,6 +317,8 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 		switch t.condition {
 		case IfAbsent:
 			condText = "if_absent"
+		case IfPresent:
+			condText = "if_present"
 		case IfMatch:
 			condText = "if_match"
 		}
@@ -315,8 +327,8 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			match = t.ifMatch
 		}
 		var outcome string
-		err := tx.QueryRow(ctx, "SELECT "+t.schema+".publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-			t.key, fileIDOf(w), size, sha, etag, t.userMeta, t.content, condText, match).Scan(&outcome)
+		err := tx.QueryRow(ctx, "SELECT "+t.schema+".publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+			t.key, fileIDOf(w), size, sha, etag, t.userMeta, t.content, condText, match, t.expiresAt, t.keepTTL).Scan(&outcome)
 		if err == nil && outcome == "precondition" {
 			err = ErrPrecondition
 		}

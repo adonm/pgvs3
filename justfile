@@ -59,6 +59,7 @@ fault:
 fuzz:
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=10s ./internal/s3
     mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=10s ./internal/store
+    mise exec go -- go test -fuzz=FuzzBlockCodec -fuzztime=10s ./internal/store
 
 [group('test')]
 vet:
@@ -134,5 +135,6 @@ ci:
     mise exec go -- go test -race ./...
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=5s ./internal/s3
     mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=5s ./internal/store
+    mise exec go -- go test -fuzz=FuzzBlockCodec -fuzztime=5s ./internal/store
     mise exec helm -- helm lint deploy/charts/pgvs3
     just contract

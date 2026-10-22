@@ -66,6 +66,7 @@ BEGIN
       user_metadata text[] NOT NULL DEFAULT '{}'::text[],
       content_type  text NOT NULL DEFAULT 'application/octet-stream',
       created_at    timestamptz NOT NULL DEFAULT now(),
+      expires_at    timestamptz,
       parts         int8[],
       part_ends     int8[],
       inline_data   bytea STORAGE EXTERNAL,
@@ -75,7 +76,8 @@ BEGIN
         cardinality(user_metadata) <= 128 AND cardinality(user_metadata) %% 2 = 0 AND
         octet_length(content_type) BETWEEN 1 AND 1024 AND
         ((inline_data IS NOT NULL AND file_id IS NULL AND parts IS NULL AND part_ends IS NULL AND
-          octet_length(inline_data) <= 65536 AND octet_length(inline_data) = size)
+          size <= 65536 AND octet_length(inline_data) <= size AND
+          (size = 0 OR octet_length(inline_data) > 0))
          OR
          (inline_data IS NULL AND file_id IS NOT NULL AND parts IS NULL AND part_ends IS NULL AND
           size <= 2147483648::int8 * 8120)
@@ -93,6 +95,8 @@ BEGIN
       WHERE file_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS objects_parts_idx ON %1$I.objects USING gin (parts)
       WHERE parts IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS objects_expires_idx ON %1$I.objects (expires_at)
+      WHERE expires_at IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS %1$I.chunks (
       file_id int8 NOT NULL,
@@ -174,36 +178,50 @@ BEGIN
     CREATE OR REPLACE FUNCTION %1$I.publish_object(
       p_key text, p_file_id int8, p_size int8, p_sha256 bytea,
       p_etag text, p_meta text[], p_ct text, p_cond text DEFAULT 'none',
-      p_if_match text DEFAULT NULL
+      p_if_match text DEFAULT NULL, p_expires_at timestamptz DEFAULT NULL,
+      p_keep_ttl boolean DEFAULT false
     ) RETURNS text LANGUAGE plpgsql AS $body$
     DECLARE
       old_file bigint;
       old_parts int8[];
       old_etag text;
+      old_expires timestamptz;
       found_old boolean;
+      live_old boolean := false;
+      new_expires timestamptz := p_expires_at;
     BEGIN
       PERFORM pg_advisory_xact_lock(%2$L::int8 # hashtextextended(p_key, 1));
-      SELECT file_id, parts, etag INTO old_file, old_parts, old_etag
+      SELECT file_id, parts, etag, expires_at
+        INTO old_file, old_parts, old_etag, old_expires
         FROM %1$I.objects WHERE key = p_key FOR UPDATE;
       found_old := FOUND;
-      IF p_cond = 'if_absent' AND found_old THEN
+      IF found_old AND (old_expires IS NULL OR old_expires > now()) THEN
+        live_old := true;
+      END IF;
+      IF p_cond = 'if_absent' AND live_old THEN
         RETURN 'precondition';
       END IF;
-      IF p_cond = 'if_match' AND (NOT found_old OR old_etag <> p_if_match) THEN
+      IF p_cond = 'if_present' AND NOT live_old THEN
         RETURN 'precondition';
+      END IF;
+      IF p_cond = 'if_match' AND (NOT live_old OR old_etag <> p_if_match) THEN
+        RETURN 'precondition';
+      END IF;
+      IF p_keep_ttl AND live_old THEN
+        new_expires := old_expires;
       END IF;
       DELETE FROM %1$I.object_part_checksums WHERE key = p_key;
       INSERT INTO %1$I.objects
         (key, file_id, size, sha256, etag, user_metadata, content_type,
-         parts, part_ends, inline_data)
+         expires_at, parts, part_ends, inline_data)
       VALUES
         (p_key, p_file_id, p_size, p_sha256, p_etag, p_meta, p_ct,
-         NULL, NULL, NULL)
+         new_expires, NULL, NULL, NULL)
       ON CONFLICT (key) DO UPDATE SET
         file_id = EXCLUDED.file_id, size = EXCLUDED.size, sha256 = EXCLUDED.sha256,
         etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
-        content_type = EXCLUDED.content_type, parts = NULL, part_ends = NULL,
-        inline_data = NULL, created_at = now();
+        content_type = EXCLUDED.content_type, expires_at = EXCLUDED.expires_at,
+        parts = NULL, part_ends = NULL, inline_data = NULL, created_at = now();
       IF found_old AND old_file IS NOT NULL THEN
         INSERT INTO %1$I.garbage (file_id)
         SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
@@ -217,46 +235,61 @@ BEGIN
     END $body$;
 
     CREATE OR REPLACE FUNCTION %1$I.put_inline(
-      p_key text, p_data bytea, p_sha256 bytea, p_etag text,
+      p_key text, p_data bytea, p_size int8, p_sha256 bytea, p_etag text,
       p_meta text[], p_ct text, p_cond text DEFAULT 'none', p_if_match text DEFAULT NULL,
-      p_sync text DEFAULT 'on'
+      p_sync text DEFAULT 'on', p_expires_at timestamptz DEFAULT NULL,
+      p_keep_ttl boolean DEFAULT false
     ) RETURNS text LANGUAGE plpgsql AS $body$
     DECLARE
       old_file bigint;
       old_parts int8[];
       old_etag text;
+      old_expires timestamptz;
       found_old boolean;
+      live_old boolean := false;
+      new_expires timestamptz := p_expires_at;
     BEGIN
       IF p_cond = 'none' AND p_sync IN ('local','off','remote_write','remote_apply') THEN
         PERFORM set_config('synchronous_commit', p_sync, true);
       ELSE
         PERFORM set_config('synchronous_commit', 'on', true);
       END IF;
-      IF octet_length(p_data) > 65536 THEN
+      IF p_size > 65536 OR octet_length(p_data) > p_size THEN
         RAISE EXCEPTION 'inline object exceeds 64 KiB';
       END IF;
       PERFORM pg_advisory_xact_lock(%2$L::int8 # hashtextextended(p_key, 1));
-      SELECT file_id, parts, etag INTO old_file, old_parts, old_etag
+      SELECT file_id, parts, etag, expires_at
+        INTO old_file, old_parts, old_etag, old_expires
         FROM %1$I.objects WHERE key = p_key FOR UPDATE;
       found_old := FOUND;
-      IF p_cond = 'if_absent' AND found_old THEN
+      IF found_old AND (old_expires IS NULL OR old_expires > now()) THEN
+        live_old := true;
+      END IF;
+      IF p_cond = 'if_absent' AND live_old THEN
         RETURN 'precondition';
       END IF;
-      IF p_cond = 'if_match' AND (NOT found_old OR old_etag <> p_if_match) THEN
+      IF p_cond = 'if_present' AND NOT live_old THEN
         RETURN 'precondition';
+      END IF;
+      IF p_cond = 'if_match' AND (NOT live_old OR old_etag <> p_if_match) THEN
+        RETURN 'precondition';
+      END IF;
+      IF p_keep_ttl AND live_old THEN
+        new_expires := old_expires;
       END IF;
       DELETE FROM %1$I.object_part_checksums WHERE key = p_key;
       INSERT INTO %1$I.objects
         (key, file_id, size, sha256, etag, user_metadata, content_type,
-         parts, part_ends, inline_data)
+         expires_at, parts, part_ends, inline_data)
       VALUES
-        (p_key, NULL, octet_length(p_data), p_sha256, p_etag, p_meta, p_ct,
-         NULL, NULL, p_data)
+        (p_key, NULL, p_size, p_sha256, p_etag, p_meta, p_ct,
+         new_expires, NULL, NULL, p_data)
       ON CONFLICT (key) DO UPDATE SET
         file_id = NULL, size = EXCLUDED.size, sha256 = EXCLUDED.sha256,
         etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
-        content_type = EXCLUDED.content_type, parts = NULL, part_ends = NULL,
-        inline_data = EXCLUDED.inline_data, created_at = now();
+        content_type = EXCLUDED.content_type, expires_at = EXCLUDED.expires_at,
+        parts = NULL, part_ends = NULL, inline_data = EXCLUDED.inline_data,
+        created_at = now();
       IF found_old AND old_file IS NOT NULL THEN
         INSERT INTO %1$I.garbage (file_id)
         SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
@@ -267,6 +300,36 @@ BEGIN
         ON CONFLICT DO NOTHING;
       END IF;
       RETURN 'ok';
+    END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.expire_objects(p_max int DEFAULT 256)
+    RETURNS int LANGUAGE plpgsql AS $body$
+    DECLARE
+      removed int := 0;
+    BEGIN
+      WITH victims AS (
+        SELECT key FROM %1$I.objects
+        WHERE expires_at IS NOT NULL AND expires_at <= now()
+        ORDER BY expires_at LIMIT p_max
+        FOR UPDATE SKIP LOCKED
+      ), doomed AS (
+        DELETE FROM %1$I.objects o USING victims v WHERE o.key = v.key
+        RETURNING o.key, o.file_id, o.parts
+      ), dead AS (
+        SELECT file_id FROM doomed WHERE file_id IS NOT NULL
+        UNION ALL
+        SELECT unnest(parts) FROM doomed WHERE parts IS NOT NULL
+      ), queued AS (
+        INSERT INTO %1$I.garbage (file_id)
+        SELECT DISTINCT d.file_id FROM dead d
+        WHERE d.file_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id)
+          AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id])
+          AND NOT EXISTS (SELECT 1 FROM %1$I.upload_parts p WHERE p.file_id = d.file_id)
+        ON CONFLICT DO NOTHING
+      )
+      SELECT count(*)::int INTO removed FROM doomed;
+      RETURN removed;
     END $body$;
 
     CREATE OR REPLACE FUNCTION %1$I.expire_uploads(
@@ -361,9 +424,9 @@ BEGIN
   EXECUTE format($sql$
     INSERT INTO %1$I.objects
       (key, file_id, size, sha256, etag, user_metadata, content_type,
-       created_at, parts, part_ends, inline_data)
+       created_at, expires_at, parts, part_ends, inline_data)
     SELECT key, file_id, size, sha256, etag, user_metadata, content_type,
-           created_at, parts, part_ends, inline_data
+           created_at, expires_at, parts, part_ends, inline_data
     FROM %2$I.objects
   $sql$, v_dst, v_src);
   EXECUTE format($sql$

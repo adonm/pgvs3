@@ -10,8 +10,9 @@ way they are.
 | Mechanism | How it works |
 | --- | --- |
 | **Per-bucket PostgreSQL schema (`s3b_<bucket>`)** | Each bucket gets its own `objects`, `chunks`, `uploads`, and `garbage` tables (32 TiB capacity and independent autovacuum per bucket, instant `DROP SCHEMA CASCADE`, single-bucket `pg_dump -n`). |
-| **Inline small objects (≤64 KiB)** | Stored directly in `objects.inline_data` (`file_id NULL`). Written in one `put_inline` call and read in one primary-key lookup without touching `chunks`. |
-| **8,120-byte chunk rows** | Larger objects split into 8,120-byte rows in `chunks`. With `file_id(8) + no(4) + varlena(4) + 8120` plus the 24-byte tuple header, one row fills an 8 KB page at 99.6% occupancy. |
+| **Inline small objects (≤64 KiB)** | Stored directly in `objects.inline_data` (`file_id NULL`, LZ4-compressed when compressible) with optional `expires_at`. Written in one `put_inline` call and read in one primary-key lookup without touching `chunks`. |
+| **Length-discriminated LZ4 8,120-byte chunk blocks** | Larger objects split into logical 8,120-byte blocks in `chunks` (`internal/store/block.go`). Each block is LZ4-compressed if it shrinks (`len(stored) < wantLen`) or stored raw (`len(stored) == wantLen`) with zero header bytes, so incompressible blocks never exceed the 8,160-byte page budget and logical offsets remain `no × 8,120` for `O(1)` byte-range seeking. |
+| **Dual S3/HTTP + RESP protocol mux** | `internal/s3/serve.go` sniffs the first 5 bytes of each TCP connection on `:8014` and routes RESP2/RESP3 traffic to `internal/s3/resp.go`, coalescing pipelined `GET` and `SET` bursts into single-query `CacheMGet` / `CacheMSet` round trips against `s3b_<bucket>`. |
 | **No TOAST overhead** | `chunks` sets `toast_tuple_target = 8160` and `STORAGE EXTERNAL`, so PostgreSQL never detoasts or chases out-of-line pointers on read. |
 | **Immutable files** | Every write allocates a fresh `file_id`; overwrites swap the pointer on `objects` and queue the old `file_id` for reaping. Chunk rows are never updated in place. |
 | **Strong ETag caching** | `file_id` backs strong ETags so DuckDB's external file cache can reuse local blocks without re-fetching. |

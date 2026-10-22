@@ -21,39 +21,49 @@ objects are served directly from PostgreSQL `shared_buffers`.
 
 | Workload | Workers | 16-core host | p50 | p99 | 6-vCPU VM |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 4 KiB GET | 1 | 4,765 req/s | 0.17 ms | 0.67 ms | 1,970 req/s (0.47 ms) |
-| 4 KiB GET | 16 | 17,817 req/s | 0.78 ms | 2.29 ms | 6,596 req/s (1.98 ms) |
-| 4 KiB GET | 64 | 24,582 req/s | 2.32 ms | 6.93 ms | 8,243 req/s (6.91 ms) |
-| 4 KiB GET | 256 | 32,531 req/s | 6.87 ms | 23.5 ms | 9,756 req/s |
-| HEAD | 1 | 5,711 req/s | 0.15 ms | 0.52 ms | 1,778 req/s (0.47 ms) |
-| HEAD | 16 | 20,984 req/s | 0.65 ms | 2.03 ms | 7,925 req/s (1.66 ms) |
-| HEAD | 64 | 30,223 req/s | 1.85 ms | 5.93 ms | 9,211 req/s (5.95 ms) |
-| 4 KiB PUT | 1 | 1,142 req/s | 0.78 ms | 1.58 ms | 673 req/s (1.37 ms) |
-| 4 KiB PUT | 16 | 10,000 req/s | 1.41 ms | 3.53 ms | 3,610 req/s (3.93 ms) |
-| 4 KiB PUT | 64 | 17,470 req/s | 3.10 ms | 18.9 ms | 3,735 req/s (14.5 ms) |
-| 4 KiB PUT | 256 | 11,406 req/s | 19.6 ms | 61.3 ms | 1,635 req/s (153 ms) |
-| 8 MiB GET | 1 | 1,086 MiB/s | 7.19 ms | 11.4 ms | 417 MiB/s (18.1 ms) |
-| 8 MiB GET | 8 | 2,881 MiB/s | 22.1 ms | 33.7 ms | 1,006 MiB/s (60.9 ms) |
-| 8 MiB GET | 16 | 3,085 MiB/s | 39.9 ms | 75.8 ms | 1,090 MiB/s (118 ms) |
-| 64 MiB GET | 1 | 1,185 MiB/s | 51.4 ms | 101 ms | 316 MiB/s (183 ms) |
-| 64 MiB GET | 8 | 3,307 MiB/s | 152 ms | 204 ms | 971 MiB/s (530 ms) |
-| 64 MiB GET | 16 | 3,455 MiB/s | 288 ms | 427 ms | 1,055 MiB/s (929 ms) |
-| 64 MiB PUT | 1 | 188 MiB/s | 207 ms | 237 ms | 86 MiB/s (577 ms) |
-| 64 MiB PUT | 8 | 458 MiB/s | 962 ms | 1,151 ms | 171 MiB/s (2,391 ms) |
-| 8 KiB range from 64 MiB | 64 | 16,074 req/s | 3.55 ms | 9.83 ms | 6,397 req/s (9.07 ms) |
-| ListObjectsV2 (1,000 keys) | 64 | 1,840 req/s | 30.3 ms | 109 ms | 638 req/s (98.4 ms) |
+| **RESP 4 KiB GET (pipeline 1)** | 1 | **9,850 req/s** | **0.081 ms** | 0.32 ms | — |
+| **RESP 4 KiB GET (pipeline 1)** | 64 | **91,046 req/s** | **0.63 ms** | 1.96 ms | — |
+| **RESP 4 KiB GET (pipeline 16)** | 64 | **459,018 req/s (1.79 GiB/s)** | **0.13 ms** | 0.35 ms | — |
+| **RESP 4 KiB SET (pipeline 1)** | 1 | **1,363 req/s** | **0.68 ms** | 1.40 ms | — |
+| **RESP 4 KiB SET (pipeline 1)** | 64 | **23,866 req/s** | **2.59 ms** | 5.22 ms | — |
+| **RESP 4 KiB SET (pipeline 16)** | 64 | **110,222 req/s (431 MiB/s)** | **0.56 ms** | 1.13 ms | — |
+| 4 KiB GET (S3) | 1 | 4,993 req/s | 0.17 ms | 0.63 ms | 1,970 req/s (0.47 ms) |
+| 4 KiB GET (S3) | 16 | 20,556 req/s | 0.67 ms | 2.04 ms | 6,596 req/s (1.98 ms) |
+| 4 KiB GET (S3) | 64 | 25,284 req/s | 2.27 ms | 6.80 ms | 8,243 req/s (6.91 ms) |
+| 4 KiB GET (S3) | 256 | 35,458 req/s | 6.42 ms | 20.7 ms | 9,756 req/s |
+| HEAD (S3) | 1 | 5,878 req/s | 0.14 ms | 0.52 ms | 1,778 req/s (0.47 ms) |
+| HEAD (S3) | 16 | 17,397 req/s | 0.77 ms | 2.60 ms | 7,925 req/s (1.66 ms) |
+| HEAD (S3) | 64 | 30,009 req/s | 1.84 ms | 6.15 ms | 9,211 req/s (5.95 ms) |
+| 4 KiB PUT (S3) | 1 | 1,114 req/s | 0.82 ms | 1.52 ms | 673 req/s (1.37 ms) |
+| 4 KiB PUT (S3) | 16 | 10,474 req/s | 1.39 ms | 2.61 ms | 3,610 req/s (3.93 ms) |
+| 4 KiB PUT (S3) | 64 | 17,801 req/s | 3.04 ms | 18.6 ms | 3,735 req/s (14.5 ms) |
+| 4 KiB PUT (S3) | 256 | 20,367 req/s | 11.0 ms | 37.9 ms | 1,635 req/s (153 ms) |
+| 8 MiB GET (S3) | 1 | 1,450 MiB/s | 5.36 ms | 7.88 ms | 417 MiB/s (18.1 ms) |
+| 8 MiB GET (S3) | 8 | 3,496 MiB/s | 18.0 ms | 26.9 ms | 1,006 MiB/s (60.9 ms) |
+| 8 MiB GET (S3) | 16 | 3,753 MiB/s | 33.7 ms | 59.4 ms | 1,090 MiB/s (118 ms) |
+| 64 MiB GET (S3) | 1 | 1,269 MiB/s | 46.4 ms | 108 ms | 316 MiB/s (183 ms) |
+| 64 MiB GET (S3) | 8 | 3,837 MiB/s | 129 ms | 219 ms | 971 MiB/s (530 ms) |
+| 64 MiB GET (S3) | 16 | 4,262 MiB/s | 234 ms | 338 ms | 1,055 MiB/s (929 ms) |
+| 64 MiB PUT (S3) | 1 | 220 MiB/s | 183 ms | 223 ms | 86 MiB/s (577 ms) |
+| 64 MiB PUT (S3) | 8 | 509 MiB/s | 820 ms | 1,109 ms | 171 MiB/s (2,391 ms) |
+| 8 KiB range from 64 MiB | 64 | 16,171 req/s | 3.57 ms | 9.67 ms | 6,397 req/s (9.07 ms) |
+| ListObjectsV2 (1,000 keys) | 64 | 2,164 req/s | 25.6 ms | 92.4 ms | 638 req/s (98.4 ms) |
 
 Key takeaways:
 
-- **Sub-millisecond small reads from `shared_buffers`:** A ≤64 KiB `GET` or
-  `HEAD` is a primary-key B-tree lookup in `s3p.objects` (~6 µs in PostgreSQL,
-  0.15–0.17 ms p50 over HTTP at 1 worker, scaling to 32.5k `GET`/s and 30.2k
-  `HEAD`/s on 16 cores).
-- **17.5k/s durable small writes:** A ≤64 KiB `PUT` executes in one SQL call
-  (`s3p.put_inline`) with `synchronous_commit = on`. Removing `pg_notify`
-  eliminated PostgreSQL commit-queue serialization.
-- **Multi-GiB/s large-object reads:** 64 MiB reads stream at 1.19 GiB/s from 1
-  worker and 3.45 GiB/s across 16 workers.
+- **Sub-100 µs RESP cache reads & 459k GET/s pipelined:** Over RESP on `:8014`,
+  a 1-worker 4 KiB `GET` completes in **`0.081 ms` (81 µs) p50** (9,850 req/s),
+  scales to **91.0k `GET`/s** unpipelined at 64 workers, and reaches **459.0k
+  `GET`/s (1.79 GiB/s)** at pipeline depth 16 via `CacheMGet` query coalescing.
+- **110k/s durable pipelined RESP writes:** Pipelined 4 KiB `SET`s coalesce into
+  single-transaction `CacheMSet` upserts with LZ4 block compression, reaching
+  **110.2k durable `SET`/s (431 MiB/s, `0.56 ms` p50)** at pipeline 16 (and
+  **23.9k `SET`/s** unpipelined) with `synchronous_commit = on`.
+- **Sub-millisecond S3 small reads & 20.4k/s durable S3 writes:** S3 4 KiB
+  `GET` reaches **35.5k req/s** (`0.17 ms` p50 at 1 worker) and durable 4 KiB
+  `PUT` reaches **20.4k req/s**.
+- **Multi-GiB/s large-object reads:** 64 MiB reads stream at **1.24 GiB/s** from
+  1 worker and **4.16 GiB/s (4,262 MiB/s)** across 16 workers.
 - **Fast byte ranges and listings:** 8 KiB range reads from 64 MiB objects
   reach 16.1k req/s (3.55 ms p50), and 1,000-key `ListObjectsV2` calls reach
   1,840 req/s (~1.84M keys/s).

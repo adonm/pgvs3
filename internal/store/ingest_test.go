@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"testing"
 )
@@ -44,17 +46,36 @@ func TestRowFramerLayout(t *testing.T) {
 }
 
 func TestRowFramerSplitsAtRowBoundary(t *testing.T) {
+	// Incompressible payload: stays exact raw size (zero header overhead).
+	raw := make([]byte, RowBytes+RowBytes/2)
+	_, _ = rand.Read(raw)
 	f := newRowFramer(1)
-	// One and a half rows: the first row is framed, the rest waits for finish.
-	if _, err := f.push(make([]byte, RowBytes+RowBytes/2)); err != nil {
+	if _, err := f.push(raw); err != nil {
 		t.Fatal(err)
 	}
 	b := f.finish()
 	defer putFramerBuf(b)
 	out := b.Bytes()
-	// 1.5 rows become two rows (8120 + 4060 bytes), each with 26 bytes of
-	// framing, plus the COPY header and trailer.
 	if want := len(copyHeader) + RowBytes + RowBytes/2 + 2*26 + 2; len(out) != want {
-		t.Fatalf("frame length %d, want %d", len(out), want)
+		t.Fatalf("incompressible frame length %d, want %d", len(out), want)
+	}
+
+	// Compressible payload: 12,180 zero bytes compress into two tiny rows and
+	// round-trip through decodeRow.
+	zeros := make([]byte, RowBytes+RowBytes/2)
+	fc := newRowFramer(2)
+	if _, err := fc.push(zeros); err != nil {
+		t.Fatal(err)
+	}
+	bc := fc.finish()
+	defer putFramerBuf(bc)
+	if len(bc.Bytes()) >= 200 {
+		t.Fatalf("expected compressed frame < 200 bytes, got %d", len(bc.Bytes()))
+	}
+	r0Len := int(binary.BigEndian.Uint32(bc.Bytes()[19+22 : 19+26]))
+	r0 := bc.Bytes()[19+26 : 19+26+r0Len]
+	dec0, err := decodeRow(nil, int64(len(zeros)), 0, r0)
+	if err != nil || !bytes.Equal(dec0, zeros[:RowBytes]) {
+		t.Fatalf("row 0 decode failed: %v", err)
 	}
 }

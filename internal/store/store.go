@@ -408,7 +408,7 @@ func (s *Store) Meta(ctx context.Context, bucket, key string) (*Meta, error) {
 	var hasInline bool
 	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
 		parts, part_ends, etag, user_metadata, content_type, inline_data, inline_data IS NOT NULL
-		FROM `+sc+`.objects WHERE key = $1`, key).
+		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`, key).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata, &m.ContentType, &inline, &hasInline)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return nil, ErrNotFound
@@ -422,10 +422,11 @@ func (s *Store) Meta(ctx context.Context, bucket, key string) (*Meta, error) {
 		m.FileID = fileID.Int64
 	}
 	if hasInline {
-		if inline == nil {
-			inline = []byte{}
+		raw, err := decompressBlock(nil, inline, int(m.Size))
+		if err != nil {
+			return nil, err
 		}
-		m.Inline = inline
+		m.Inline = raw
 	}
 	return &m, nil
 }
@@ -442,7 +443,7 @@ func (s *Store) MetaHeader(ctx context.Context, bucket, key string) (*Meta, erro
 	var fileID pgtype.Int8
 	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
 		parts, part_ends, etag, user_metadata, content_type
-		FROM `+sc+`.objects WHERE key = $1`, key).
+		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`, key).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
 			&m.ContentType)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
@@ -622,6 +623,14 @@ func (b *Body) Close() error {
 	return nil
 }
 
+func decodeRow(dst []byte, segLen int64, no int32, stored []byte) ([]byte, error) {
+	want := int(min(int64(RowBytes), segLen-int64(no)*RowBytes))
+	if want < 0 {
+		return nil, fmt.Errorf("row %d beyond segment length %d", no, segLen)
+	}
+	return decompressBlock(dst, stored, want)
+}
+
 // nextChunk pulls rows until it has a response-sized chunk. It preserves the
 // same gap/early-row handling as streamRows while running on the caller's
 // goroutine.
@@ -631,6 +640,7 @@ func (b *Body) nextChunk() ([]byte, error) {
 		capHint = span + RowBytes
 	}
 	out := make([]byte, 0, int(capHint))
+	var decomp [RowBytes]byte
 	for b.rows.Next() {
 		raw := b.rows.RawValues()
 		if len(raw) != 2 || raw[0] == nil || raw[1] == nil {
@@ -647,14 +657,22 @@ func (b *Body) nextChunk() ([]byte, error) {
 			b.early[no] = append([]byte(nil), raw[1]...)
 			continue
 		}
-		appendRow(&out, b.piece.base, no, raw[1], b.spanStart, b.spanEnd)
+		dec, err := decodeRow(decomp[:0], b.piece.segLen, no, raw[1])
+		if err != nil {
+			return nil, err
+		}
+		appendRow(&out, b.piece.base, no, dec, b.spanStart, b.spanEnd)
 		b.next++
 		for {
 			data, ok := b.early[b.next]
 			if !ok {
 				break
 			}
-			appendRow(&out, b.piece.base, b.next, data, b.spanStart, b.spanEnd)
+			dec, err := decodeRow(decomp[:0], b.piece.segLen, b.next, data)
+			if err != nil {
+				return nil, err
+			}
+			appendRow(&out, b.piece.base, b.next, dec, b.spanStart, b.spanEnd)
 			delete(b.early, b.next)
 			b.next++
 		}
@@ -767,6 +785,7 @@ func effRange(size, first, last, suffix int64) (int64, int64) {
 type piece struct {
 	fileID int64
 	base   int64
+	segLen int64
 	lo, hi int32
 }
 
@@ -781,7 +800,7 @@ func planPieces(m *Meta, start, end int64, wholeMax int64) ([]piece, error) {
 		seg := segments[0]
 		lo := int32((max(start, seg.Base) - seg.Base) / RowBytes)
 		hi := int32((min(end, seg.Base+seg.Length-1) - seg.Base) / RowBytes)
-		return []piece{{fileID: seg.FileID, base: seg.Base, lo: lo, hi: hi}}, nil
+		return []piece{{fileID: seg.FileID, base: seg.Base, segLen: seg.Length, lo: lo, hi: hi}}, nil
 	}
 	var out []piece
 	for _, seg := range segments {
@@ -791,7 +810,7 @@ func planPieces(m *Meta, start, end int64, wholeMax int64) ([]piece, error) {
 		lo := int32((max(start, seg.Base) - seg.Base) / RowBytes)
 		hi := int32((min(end, seg.Base+seg.Length-1) - seg.Base) / RowBytes)
 		for r := lo; r <= hi; r += partRows {
-			out = append(out, piece{fileID: seg.FileID, base: seg.Base, lo: r, hi: min(r+partRows-1, hi)})
+			out = append(out, piece{fileID: seg.FileID, base: seg.Base, segLen: seg.Length, lo: r, hi: min(r+partRows-1, hi)})
 		}
 	}
 	return out, nil
@@ -1037,6 +1056,7 @@ func streamRows(ctx context.Context, q querier, schema string, p piece, start, e
 	}
 	out := make([]byte, 0, int(capHint))
 	var early map[int32][]byte
+	var decomp [RowBytes]byte
 	next := p.lo
 	for rows.Next() {
 		raw := rows.RawValues()
@@ -1051,14 +1071,22 @@ func streamRows(ctx context.Context, q querier, schema string, p piece, start, e
 			early[no] = append([]byte(nil), raw[1]...)
 			continue
 		}
-		appendRow(&out, p.base, no, raw[1], start, end)
+		dec, err := decodeRow(decomp[:0], p.segLen, no, raw[1])
+		if err != nil {
+			return err
+		}
+		appendRow(&out, p.base, no, dec, start, end)
 		next++
 		for {
 			data, ok := early[next]
 			if !ok {
 				break
 			}
-			appendRow(&out, p.base, next, data, start, end)
+			dec, err := decodeRow(decomp[:0], p.segLen, next, data)
+			if err != nil {
+				return err
+			}
+			appendRow(&out, p.base, next, dec, start, end)
 			delete(early, next)
 			next++
 		}
@@ -1517,6 +1545,7 @@ func (s *Store) List(ctx context.Context, bucket, prefix, prefixEnd, after strin
 		FROM ` + sc + `.objects
 		WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
 		  AND key COLLATE "C" > $3
+		  AND (expires_at IS NULL OR expires_at > now())
 		ORDER BY key COLLATE "C" LIMIT $4`
 	rows, err := s.pool.Query(ctx, query, prefix, prefixEnd, after, limit)
 	if isMissingBucketSchema(err) {
@@ -1698,6 +1727,10 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 			return err
 		}
 		totalExpired += expired
+		var expiredObjs int
+		if err := conn.QueryRow(ctx, "SELECT "+q+".expire_objects(256)").Scan(&expiredObjs); err != nil && !isMissingBucketSchema(err) {
+			return err
+		}
 	}
 	if totalExpired > 0 {
 		s.log.Info("expired multipart uploads", "count", totalExpired)

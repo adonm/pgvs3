@@ -1,8 +1,9 @@
 # pgvs3 — S3 on PostgreSQL
 
-pgvs3 is a small, fast S3 and HTTP gateway that stores objects as rows in
-PostgreSQL. It is built for [DuckLake](https://ducklake.select/): DuckLake
-already keeps its catalog in PostgreSQL, and with pgvs3 the Parquet files live
+pgvs3 is a small, fast S3, HTTP, and RESP (Redis/Valkey) gateway that stores
+objects and cached values as compressed blocks in PostgreSQL. It is built for
+[DuckLake](https://ducklake.select/) and co-located services: DuckLake keeps
+its catalog in PostgreSQL, and with pgvs3 both lake files and cached blobs live
 there too — one database to run, back up, and replicate.
 
 The gateway is written in Go, holds zero in-process state, and ships as a
@@ -28,11 +29,18 @@ go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_benc
 ```
 
 Buckets are created automatically on first write. The single `:8014` port
-serves both S3 clients and plain HTTP:
+serves S3 clients, plain HTTP, and RESP (Redis/Valkey) clients on the same
+underlying bucket tables:
 
 ```sh
+# S3 / plain HTTP
 curl -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
 curl http://127.0.0.1:8014/lake/README.md
+
+# Redis / Valkey (RESP2 & RESP3 on the same :8014 port)
+redis-cli -p 8014 SET greeting "hello from resp" EX 60
+curl http://127.0.0.1:8014/cache/greeting
+redis-cli -p 8014 GET s3://lake/README.md
 ```
 
 ### Use from DuckDB 2.0+
@@ -68,12 +76,18 @@ SELECT * FROM lake.events;
   - **Single-bucket snapshots & clones:** dump/restore individual buckets with
     `pg_dump -n s3b_<bucket>`, or clone a bucket inside PostgreSQL with
     `pgvs3 clone <src> <dst>` (`PUT /{dst}` with `x-amz-copy-source: /{src}`).
-- **Small objects (≤64 KiB) are one row.** Objects up to 64 KiB live inline in
-  `objects.inline_data`. A small `PUT` is one SQL call; a small `GET` or `HEAD`
-  is a single primary-key B-tree lookup (~6 µs in PostgreSQL `shared_buffers`).
-- **Larger objects pack one row per 8 KB page.** Payloads above 64 KiB are
-  stored in the bucket's `chunks` table as 8,120-byte rows (`STORAGE EXTERNAL`,
-  no TOAST), filling each 8 KB PostgreSQL page at 99.6% occupancy.
+- **Length-discriminated LZ4 block compression.** Every inline object
+  (`≤64 KiB`) and every `8,120`-byte chunk block is compressed with an
+  allocation-free pure-Go LZ4 block codec if it shrinks (`len(stored) < wantLen`),
+  or stored as raw bytes with **zero header bytes** if incompressible
+  (`len(stored) == wantLen`, e.g. Zstd Parquet). Logical chunk offsets remain
+  `no × 8,120`, preserving `O(1)` byte-range seeking and the exact 8,160-byte
+  PostgreSQL page budget (`99.6%` fill, no TOAST).
+- **Unified S3 + HTTP + RESP (Redis/Valkey) protocol mux.** First-byte
+  detection on `:8014` routes HTTP/S3 and RESP2/RESP3 connections to the same
+  `s3b_<bucket>.objects` and `s3b_<bucket>.chunks` tables (including optional
+  per-object `expires_at` TTLs and pipelined `CacheMGet` / `CacheMSet`
+  coalescing).
 - **Immutable files, atomic publish.** Writes stream into `chunks` via
   binary `COPY` under a new `file_id` and publish in the same transaction.
   Interrupted writes leave nothing visible.
@@ -97,12 +111,16 @@ design.
 Measured with `just load` against PostgreSQL 18 in Docker (`shared_buffers=1GB`)
 on a 16-core host (6-vCPU VM numbers in [docs/benchmarks.md](docs/benchmarks.md)):
 
-- **Latency (1 worker):** `0.17 ms` p50 for 4 KiB `GET`, `0.15 ms` for `HEAD`,
-  and `0.78 ms` for durable 4 KiB `PUT` (`synchronous_commit = on`).
-- **Small-object throughput:** **32.5k `GET`/s**, **30.2k `HEAD`/s**, and
-  **17.5k durable 4 KiB `PUT`/s**.
-- **Large-object bandwidth (64 MiB):** **3.45 GiB/s** read (16 workers) and
-  **458 MiB/s** write (8 workers).
+- **Latency (1 worker):** **`0.081 ms` (81 µs)** p50 for 4 KiB RESP `GET`
+  (`0.17 ms` for S3 `GET`, `0.14 ms` for `HEAD`), and **`0.68 ms`** for durable
+  4 KiB RESP `SET` (`0.82 ms` for S3 `PUT`, `synchronous_commit = on`).
+- **RESP cache throughput (4 KiB, 64 workers):** **91.0k `GET`/s** unpipelined
+  and **459.0k `GET`/s (1.79 GiB/s)** at pipeline 16; **23.9k durable `SET`/s**
+  unpipelined and **110.2k durable `SET`/s (431 MiB/s)** at pipeline 16.
+- **S3 throughput (4 KiB):** **35.5k `GET`/s**, **30.0k `HEAD`/s**, and
+  **20.4k durable `PUT`/s**.
+- **Large-object bandwidth (64 MiB S3):** **4.16 GiB/s (4,262 MiB/s)** read
+  (16 workers) and **509 MiB/s** write (8 workers).
 
 **Compared with AWS S3 Express One Zone (`us-east-1`):**
 
@@ -147,6 +165,15 @@ Full tables and DuckDB `httpfs` benchmarks are in
   client or browser. Trailing slashes resolve to `index.html`, plain
   `GET /{bucket}` serves `/{bucket}/index.html` when present, and `Content-Type`
   falls back to the filename extension.
+- **RESP (Redis/Valkey) cache protocol on `:8014`:** supports `GET`, `SET`
+  (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `SETNX`, `SETEX`,
+  `PSETEX`, `GETSET`, `GETDEL`, `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`,
+  `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`,
+  `INCR`, `DECR`, `INCRBY`, `DECRBY`, `STRLEN`, `GETRANGE` (slices compressed
+  8,120-byte blocks without full-object reads), `SELECT <db|bucket>`,
+  `FLUSHDB`, `DBSIZE`, `KEYS`, `INFO`, and `HELLO 2`/`3`. Pipelined `GET` and
+  `SET` bursts automatically coalesce into single-query `CacheMGet` /
+  `CacheMSet` database round trips.
 - **Out of scope:** IAM/bucket policies, versioning, object tags, Object Lock,
   ACLs, lifecycle rules, replication, event notifications, SSE-C/DSSE-KMS, and
   multipart `FULL_OBJECT` checksums.

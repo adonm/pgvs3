@@ -279,6 +279,92 @@ for i in range(100):
 print('boto3 ok')
 PY
 
+# --- RESP (Redis/Valkey) + compressed block storage on the same port --------
+E2E_RUN="$RUN" E2E_ENDPOINT_A="$A" E2E_ENDPOINT_B="$B" E2E_BUCKET="$BUCKET" \
+E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
+mise exec uv -- uv run --quiet --no-project --with redis --with boto3 python - <<'PY'
+import os, time, urllib.request, redis, boto3
+from botocore.config import Config
+
+ep_a = os.environ['E2E_ENDPOINT_A']
+ep_b = os.environ['E2E_ENDPOINT_B']
+host_a, port_a = ep_a.split('://')[1].split(':')
+host_b, port_b = ep_b.split('://')[1].split(':')
+ra = redis.Redis(host=host_a, port=int(port_a), decode_responses=False)
+rb = redis.Redis(host=host_b, port=int(port_b), decode_responses=False)
+
+assert ra.ping() is True
+assert ra.echo(b'hello') == b'hello'
+
+# Basic SET/GET across gateways A and B, plus HTTP read of the same key in `s3b_cache`.
+assert ra.set('greeting', b'hello-from-resp') is True
+assert rb.get('greeting') == b'hello-from-resp'
+assert urllib.request.urlopen(f'{ep_b}/cache/greeting').read() == b'hello-from-resp'
+
+# NX, XX, GET, EX, PX, TTL, PERSIST.
+assert ra.set('greeting', b'nope', nx=True) is None
+assert ra.set('missing-xx', b'nope', xx=True) is None
+old = ra.set('greeting', b'updated-resp', xx=True, get=True)
+assert old == b'hello-from-resp'
+assert rb.get('greeting') == b'updated-resp'
+
+assert ra.set('ttl-key', b'ephemeral', px=3000) is True
+pttl = rb.pttl('ttl-key')
+assert 0 < pttl <= 3000, pttl
+assert ra.persist('ttl-key') is True
+assert rb.ttl('ttl-key') == -1
+
+assert ra.set('short-ttl', b'bye', px=150) is True
+time.sleep(0.25)
+assert rb.get('short-ttl') is None
+assert rb.ttl('short-ttl') == -2
+
+# Atomic INCR / DECR / INCRBY.
+assert ra.incr('counter') == 1
+assert rb.incrby('counter', 41) == 42
+assert ra.decr('counter') == 41
+
+# MSET / MGET / EXISTS / DEL.
+assert ra.mset({'k1': b'v1', 'k2': b'v2', 'k3': b'v3'}) is True
+assert rb.mget(['k1', 'missing', 'k3']) == [b'v1', None, b'v3']
+assert rb.exists('k1', 'k2', 'missing') == 2
+assert ra.delete('k1', 'k2', 'missing') == 2
+assert rb.exists('k1', 'k2') == 0
+
+# Large compressible value (> 64 KiB -> compressed 8,120-byte blocks in `chunks`)
+# and GETRANGE slicing across block boundaries.
+big = (b'0123456789abcdef' * 16384) # 256 KiB
+assert ra.set('big-blob', big) is True
+assert rb.strlen('big-blob') == len(big)
+assert rb.get('big-blob') == big
+assert rb.getrange('big-blob', 8100, 16300) == big[8100:16301]
+assert rb.getrange('big-blob', -32, -1) == big[-32:]
+
+# Pipelined commands (coalesced GET batching).
+pipe = ra.pipeline(transaction=False)
+for i in range(64):
+    pipe.set(f'p:{i}', f'val-{i}'.encode())
+assert all(pipe.execute())
+pipe = rb.pipeline(transaction=False)
+for i in range(64):
+    pipe.get(f'p:{i}')
+assert pipe.execute() == [f'val-{i}'.encode() for i in range(64)]
+
+# Cross-protocol S3 <-> RESP unified bucket access.
+s3c = boto3.client('s3', endpoint_url=ep_a,
+    aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
+    region_name='us-east-1', config=Config(signature_version='s3v4', s3={'addressing_style':'path'}))
+bkt = os.environ['E2E_BUCKET']; run = os.environ['E2E_RUN']
+s3c.put_object(Bucket=bkt, Key=f'{run}/from-s3', Body=b's3-payload-' * 1000)
+assert rb.get(f's3://{bkt}/{run}/from-s3') == b's3-payload-' * 1000
+print('resp ok')
+PY
+
+# Verify that the 256 KiB compressible object in `s3b_cache.chunks` was stored compressed.
+comp_bytes=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
+  'SELECT sum(octet_length(c.data)) FROM "s3b_cache".chunks c JOIN "s3b_cache".objects o ON o.file_id = c.file_id WHERE o.key = '\''big-blob'\''')
+[ "$comp_bytes" -lt 4096 ] || fail "expected 256 KiB compressible chunks < 4096 B, got $comp_bytes"
+
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
 export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY \
        E2E_SECRET=$PGVS3_SECRET_KEY E2E_PG_PORT=$PGVS3_TEST_PG_PORT

@@ -3,19 +3,23 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +29,7 @@ import (
 type result struct {
 	Op       string  `json:"op"`
 	Workers  int     `json:"workers"`
+	Pipeline int     `json:"pipeline,omitempty"`
 	Size     int64   `json:"size"`
 	Count    int     `json:"count"`
 	Requests int64   `json:"requests"`
@@ -55,10 +60,11 @@ func main() {
 	bucket := flag.String("bucket", "bench", "bucket")
 	access := flag.String("access", "testkey", "access key")
 	secret := flag.String("secret", "testsecret", "secret key")
-	op := flag.String("op", "get", "put, get, range or list")
+	op := flag.String("op", "get", "put, get, head, range, list, resp-set or resp-get")
 	size := flag.Int64("size", 4096, "object size for put/get")
 	rangeSize := flag.Int64("range-size", 8192, "range length for -op range")
 	workers := flag.Int("workers", 16, "concurrent workers")
+	pipeline := flag.Int("pipeline", 1, "RESP pipeline depth for resp-set/resp-get")
 	duration := flag.Duration("duration", 5*time.Second, "measurement duration")
 	count := flag.Int("count", 2000, "objects to prefill/read")
 	warmup := flag.Bool("warmup", false, "read every key once before measuring")
@@ -66,6 +72,10 @@ func main() {
 	flag.Parse()
 	if *prefix == "" {
 		*prefix = fmt.Sprintf("bench-%d", time.Now().UnixNano())
+	}
+	if strings.HasPrefix(*op, "resp-") {
+		runRESP(*endpoint, *bucket, *op, *size, *workers, max(*pipeline, 1), *duration, *count, *prefix)
+		return
 	}
 	c := &http.Client{
 		Timeout: 60 * time.Second,
@@ -380,4 +390,168 @@ func awsEncode(s string) string {
 		}
 	}
 	return b.String()
+}
+
+func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, duration time.Duration, count int, prefix string) {
+	u, err := url.Parse(endpoint)
+	must(err)
+	addr := u.Host
+	payload := bytes.Repeat([]byte("pgvs3-compressed-cache-block-"), int(size/29)+1)[:size]
+
+	writeCmd := func(bw *bufio.Writer, args ...[]byte) {
+		fmt.Fprintf(bw, "*%d\r\n", len(args))
+		for _, a := range args {
+			fmt.Fprintf(bw, "$%d\r\n", len(a))
+			_, _ = bw.Write(a)
+			_, _ = bw.WriteString("\r\n")
+		}
+	}
+	readReply := func(br *bufio.Reader) (int64, error) {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return 0, err
+		}
+		if len(line) == 0 {
+			return 0, io.ErrUnexpectedEOF
+		}
+		switch line[0] {
+		case '+':
+			return 0, nil
+		case '-':
+			return 0, errors.New(strings.TrimSpace(line[1:]))
+		case '$':
+			n, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+			if err != nil || n < 0 {
+				return 0, err
+			}
+			if _, err := io.CopyN(io.Discard, br, int64(n)+2); err != nil {
+				return 0, err
+			}
+			return int64(n), nil
+		default:
+			return 0, fmt.Errorf("unexpected RESP reply %q", line)
+		}
+	}
+
+	if op == "resp-get" {
+		conn, err := net.Dial("tcp", addr)
+		must(err)
+		br := bufio.NewReaderSize(conn, 64<<10)
+		bw := bufio.NewWriterSize(conn, 64<<10)
+		writeCmd(bw, []byte("SELECT"), []byte(bucket))
+		must(bw.Flush())
+		_, err = readReply(br)
+		must(err)
+		for i := 0; i < count; i += 32 {
+			end := min(i+32, count)
+			for j := i; j < end; j++ {
+				k := fmt.Sprintf("%s/obj-%06d", prefix, j)
+				writeCmd(bw, []byte("SET"), []byte(k), payload)
+			}
+			must(bw.Flush())
+			for j := i; j < end; j++ {
+				_, err := readReply(br)
+				must(err)
+			}
+		}
+		_ = conn.Close()
+	}
+
+	var (
+		reqs, errs, bytesXfer int64
+		firstErr              atomic.Value
+		start                 = time.Now()
+		deadline              = start.Add(duration)
+		wg                    sync.WaitGroup
+		latMu                 sync.Mutex
+		latencies             []time.Duration
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				atomic.AddInt64(&errs, 1)
+				firstErr.CompareAndSwap(nil, err.Error())
+				return
+			}
+			defer conn.Close()
+			br := bufio.NewReaderSize(conn, 64<<10)
+			bw := bufio.NewWriterSize(conn, 64<<10)
+			writeCmd(bw, []byte("SELECT"), []byte(bucket))
+			_ = bw.Flush()
+			_, _ = readReply(br)
+
+			local := make([]time.Duration, 0, 4096)
+			var seq int64
+			for time.Now().Before(deadline) {
+				t0 := time.Now()
+				for p := 0; p < pipeline; p++ {
+					seq++
+					if op == "resp-set" {
+						k := fmt.Sprintf("%s/w%d-%d", prefix, id, seq)
+						writeCmd(bw, []byte("SET"), []byte(k), payload)
+					} else {
+						k := fmt.Sprintf("%s/obj-%06d", prefix, int(seq)%count)
+						writeCmd(bw, []byte("GET"), []byte(k))
+					}
+				}
+				if err := bw.Flush(); err != nil {
+					atomic.AddInt64(&errs, 1)
+					firstErr.CompareAndSwap(nil, err.Error())
+					return
+				}
+				var batchBytes int64
+				failed := false
+				for p := 0; p < pipeline; p++ {
+					n, err := readReply(br)
+					if err != nil {
+						atomic.AddInt64(&errs, 1)
+						firstErr.CompareAndSwap(nil, err.Error())
+						failed = true
+						break
+					}
+					if op == "resp-set" {
+						batchBytes += size
+					} else {
+						batchBytes += n
+					}
+				}
+				if failed {
+					return
+				}
+				perOp := time.Since(t0) / time.Duration(pipeline)
+				local = append(local, perOp)
+				atomic.AddInt64(&reqs, int64(pipeline))
+				atomic.AddInt64(&bytesXfer, batchBytes)
+			}
+			latMu.Lock()
+			latencies = append(latencies, local...)
+			latMu.Unlock()
+		}(w)
+	}
+	wg.Wait()
+	elapsed := time.Since(start).Seconds()
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	pick := func(q float64) float64 {
+		if len(latencies) == 0 {
+			return 0
+		}
+		i := int(q * float64(len(latencies)-1))
+		return float64(latencies[i].Microseconds()) / 1000
+	}
+	out := result{
+		Op: op, Workers: workers, Pipeline: pipeline, Size: size, Count: count,
+		Requests: reqs, Seconds: elapsed, RPS: float64(reqs) / elapsed,
+		MiBps: float64(bytesXfer) / elapsed / (1 << 20),
+		P50:   pick(.50), P90: pick(.90), P99: pick(.99), Max: pick(1),
+		Errors: errs,
+	}
+	if v := firstErr.Load(); v != nil {
+		out.FirstErr = v.(string)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
 }

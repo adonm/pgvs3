@@ -14,6 +14,10 @@ const MaxInlineBytes = 65536
 // is already verified by the caller; conditions and old-file garbage collection
 // happen inside the bucket schema's put_inline function.
 func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, cond Condition, ifMatch string, userMeta []string, contentType string) (*Meta, error) {
+	return s.PutInlineOpts(ctx, bucket, key, data, cond, ifMatch, userMeta, contentType, nil, false)
+}
+
+func (s *Store) PutInlineOpts(ctx context.Context, bucket, key string, data []byte, cond Condition, ifMatch string, userMeta []string, contentType string, expiresAt *time.Time, keepTTL bool) (*Meta, error) {
 	if int64(len(data)) > MaxInlineBytes {
 		return nil, ErrInlineTooLarge
 	}
@@ -24,10 +28,13 @@ func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, 
 	sumMD5 := md5.Sum(data)
 	sumSHA := sha256.Sum256(data)
 	etag := hex.EncodeToString(sumMD5[:])
+	stored := compressBlock(nil, data)
 	condText := "none"
 	switch cond {
 	case IfAbsent:
 		condText = "if_absent"
+	case IfPresent:
+		condText = "if_present"
 	case IfMatch:
 		condText = "if_match"
 	}
@@ -38,16 +45,16 @@ func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, 
 	if userMeta == nil {
 		userMeta = []string{}
 	}
-	query := "SELECT " + sc + ".put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9)"
+	query := "SELECT " + sc + ".put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"
 	var result string
 	err = s.pool.QueryRow(ctx, query,
-		key, data, sumSHA[:], etag, userMeta, contentType, condText, match, "on").Scan(&result)
+		key, stored, int64(len(data)), sumSHA[:], etag, userMeta, contentType, condText, match, "on", expiresAt, keepTTL).Scan(&result)
 	if isMissingBucketSchema(err) {
 		if err := s.CreateBucket(ctx, bucket); err != nil {
 			return nil, err
 		}
 		err = s.pool.QueryRow(ctx, query,
-			key, data, sumSHA[:], etag, userMeta, contentType, condText, match, "on").Scan(&result)
+			key, stored, int64(len(data)), sumSHA[:], etag, userMeta, contentType, condText, match, "on", expiresAt, keepTTL).Scan(&result)
 	}
 	if err != nil {
 		return nil, err

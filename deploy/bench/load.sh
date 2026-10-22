@@ -67,5 +67,11 @@ done
 # 8 KiB range reads from 64 MiB objects, and listing.
 run -op range -size 67108864 -range-size 8192 -workers 64 -duration 5s -count 8
 run -op list -workers 64 -duration 5s -count 2000
+# RESP (Redis/Valkey) cache protocol on the same listener (unpipelined and pipelined).
+for op in resp-set resp-get; do
+  run -op "$op" -size 4096 -workers 1 -pipeline 1 -duration 5s -count 2000
+  run -op "$op" -size 4096 -workers 64 -pipeline 1 -duration 5s -count 2000
+  run -op "$op" -size 4096 -workers 64 -pipeline 16 -duration 5s -count 2000
+done
 
 echo "wrote $out" >&2
