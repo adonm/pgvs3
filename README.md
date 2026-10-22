@@ -245,7 +245,7 @@ helm install pgvs3 oci://ghcr.io/adonm/charts/pgvs3 --version 0.2.0
 
 just image            # local ko.local image
 just image push=true  # multi-arch ghcr.io/adonm/pgvs3 (amd64 + arm64)
-just chart push=true  # OCI Helm chart oci://ghcr.io/adonm/charts/pgvs3
+CHART_VERSION=v0.3.1 just chart push=true  # OCI chart oci://ghcr.io/adonm/charts/pgvs3
 ```
 
 ## Limits to keep in mind

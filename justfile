@@ -110,13 +110,13 @@ image push="false":
 
 # Lint, package and optionally push the OCI Helm chart to GHCR.
 [group('image')]
-chart push="false" version="":
+chart push="false":
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p .tmp/pgvs3
     args=(-d .tmp/pgvs3)
-    if [ -n "{{ version }}" ]; then
-      v="{{ version }}"
+    if [ -n "${CHART_VERSION:-}" ]; then
+      v="$CHART_VERSION"
       v="${v#v}"
       args+=(--version "$v" --app-version "v$v")
     fi
