@@ -24,9 +24,8 @@ import (
 //go:embed schema.sql
 var schemaFS embed.FS
 
-// LayoutVersion is the storage layout this binary reads and writes. It is
-// deliberately unchanged from the Rust implementation so both can serve the
-// same database during the rewrite.
+// LayoutVersion is the storage layout this binary reads and writes. There is
+// no in-place migration: a different layout requires a fresh database.
 const LayoutVersion = 8
 
 const (
@@ -76,8 +75,8 @@ func Open(ctx context.Context, url string, opts Options, log *slog.Logger) (*Sto
 		}
 	}
 	if cfg.ConnConfig.TLSConfig != nil {
-		// pgx treats sslmode=require as encrypted-but-unverified. Match the Rust
-		// gateway: verify the chain and the hostname against the system CAs.
+		// pgx treats sslmode=require as encrypted-but-unverified. Verify the chain
+		// and hostname against the system CAs instead.
 		cfg.ConnConfig.TLSConfig.InsecureSkipVerify = false
 		if cfg.ConnConfig.TLSConfig.ServerName == "" {
 			cfg.ConnConfig.TLSConfig.ServerName = host
@@ -110,7 +109,7 @@ func Open(ctx context.Context, url string, opts Options, log *slog.Logger) (*Sto
 	cfg.MinConns = opts.MinConns
 	cfg.MaxConnIdleTime = 10 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
-	cfg.MaxConnLifetime = 0 // keep the hot working set, like the Rust pool
+	cfg.MaxConnLifetime = 0 // keep the hot working set for the most-recently-used pool
 	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
 		// Bitmap scans use PostgreSQL 18 read-ahead for cold chunk ranges.
 		// Ordered metadata pages need index scans; listings override that

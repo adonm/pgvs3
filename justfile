@@ -62,6 +62,11 @@ ducklake:
 bench parts="s3,compat,tuning":
     bash deploy/bench/stack.sh bench '{{ parts }}'
 
+# Direct gateway benchmark: small/large PUT/GET, ranges and listings.
+[group('bench')]
+load:
+    bash deploy/bench/load.sh
+
 # Image name for `just image`; CI may override it.
 IMAGE := env("KO_DOCKER_REPO", "ghcr.io/adonm/pgvs3")
 

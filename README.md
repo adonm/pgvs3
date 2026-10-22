@@ -7,7 +7,7 @@ DuckDB that attaches the catalog sees the same tables and the same data.
 
 The gateway is Go, stateless over PostgreSQL, and runs as a distroless static
 container built with [ko](https://ko.build/). It keeps the v8 storage layout, so
-the earlier Rust gateway and this one can serve the same database.
+this gateway and the v8 layout are the same storage format.
 
 **Status: early alpha, no releases.** Any storage layout change requires a fresh
 database; there are no migrations. Use disposable databases only.
@@ -91,6 +91,17 @@ The layout is deliberately narrow:
 
 `docs/performance.md` maps each pgvfs technique to the implementation.
 
+## Performance
+
+On a shared 6-vCPU loopback host, direct SigV4 load gives a 0.76 ms p50 for
+one 4 KiB GET and about 3.9k 4 KiB GET/s at 16–64 workers, 1.0 GiB/s for 8 MiB
+GETs and 927 MiB/s for 64 MiB GETs. S3 Express One Zone publishes consistent
+single-digit-millisecond latency and 200k reads / 100k writes per second per
+directory bucket by default. The per-request latency is in the same band; the
+aggregate ceiling is not — pgvs3 is one PostgreSQL, Express is a managed
+service. Full methodology, Go-vs-Express tables and the cost comparison are in
+[docs/benchmarks.md](docs/benchmarks.md).
+
 ## Cross-AZ metadata cache
 
 Gateways in different AZs can form a peer cache with
@@ -151,14 +162,15 @@ S3 Express One Zone additions:
   `x-amz-server-side-encryption: AES256` are accepted/returned for directory
   buckets. SSE-C and DSSE-KMS are rejected, as Express does.
 
-**Not yet implemented:** `x-amz-checksum-type: FULL_OBJECT` and `CRC64NVME`
-(CRC32, CRC32C, SHA1, SHA256 and MD5 are supported), `partNumber` on GET/HEAD,
-per-part checksums in `GetObjectAttributes`, and `x-amz-client-token`
-idempotency for `RenameObject`. Like Express, pgvs3 has no versioning, object
-tags, Object Lock, ACLs, lifecycle transitions, replication, Event
-Notifications, S3 Select, website hosting, access logs, Storage Lens or
-Transfer Acceleration. ETags are opaque; single PUTs use MD5 and appends use a
-random strong ETag.
+**Not yet implemented:** presigned-URL query authentication,
+`x-amz-checksum-type: FULL_OBJECT` and `CRC64NVME` (CRC32, CRC32C, SHA1, SHA256
+and MD5 are supported), `partNumber` on GET/HEAD, per-part checksums in
+`GetObjectAttributes`, `x-amz-client-token` idempotency for `RenameObject`,
+lifecycle expiration, bucket policies/IAM, and access points. Like Express,
+pgvs3 has no versioning, object tags, Object Lock, ACLs, lifecycle transitions,
+replication, Event Notifications, S3 Select, website hosting, access logs,
+Storage Lens or Transfer Acceleration. ETags are opaque; single PUTs use MD5
+and appends use a random strong ETag.
 
 A known AWS SDK quirk: boto3's `create_bucket` for a directory bucket calls
 `CreateSession` first, and with a custom endpoint it can return `NoSuchBucket`
@@ -201,7 +213,7 @@ logical vs physical size, queued files and the age of the oldest queued file.
 
 ## Storage cost and limits
 
-- **WAL on write is about 1× the bytes**, the same as the Rust gateway.
+- **WAL on write is about 1× the bytes.**
 - **One relation caps at 32 TiB** (`MaxBlockNumber × 8 KB`), about 31.7 TiB of
   object data. A single object or part is capped by `int4` row numbers.
 - **Peak heap** is live data plus files deleted inside the reap grace plus

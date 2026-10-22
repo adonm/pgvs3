@@ -36,12 +36,10 @@ mise exec go -- gofmt -w cmd internal test
 
 ## Storage layout
 
-`internal/store/schema.sql` is layout v8. It is shared with the earlier Rust
-gateway on purpose: both binaries can serve the same database. The Go gateway
-applies one idempotent, backwards-compatible change at startup
-(`DROP CONSTRAINT IF EXISTS objects_file_id_key`) so metadata-only copies can
-share immutable files. The reaper checks every object and upload-part reference
-before deleting a file.
+`internal/store/schema.sql` is layout v8. The gateway applies one idempotent,
+backwards-compatible change at startup (`DROP CONSTRAINT IF EXISTS
+objects_file_id_key`) so metadata-only copies can share immutable files. The
+reaper checks every object and upload-part reference before deleting a file.
 
 A breaking layout change means:
 
