@@ -294,12 +294,14 @@ func (s *Store) checkNamespaceTables(ctx context.Context, conn *pgxpool.Conn) er
 	for _, n := range infos {
 		q := quoteIdent(n.Schema)
 		if n.Kind == ns.Queue {
-			var exists bool
-			if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", q+".messages").Scan(&exists); err != nil {
-				return err
-			}
-			if !exists {
-				return fmt.Errorf("required queue relation %s.messages is missing", n.Schema)
+			for _, rel := range []string{q + ".messages", q + ".messages_ready", q + ".messages_receipt"} {
+				var exists bool
+				if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", rel).Scan(&exists); err != nil {
+					return err
+				}
+				if !exists {
+					return fmt.Errorf("required queue relation %s is missing", rel)
+				}
 			}
 			continue
 		}

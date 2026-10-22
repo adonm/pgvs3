@@ -55,12 +55,12 @@ func (s *Server) serveOrigin(w http.ResponseWriter, r *http.Request, bucket, key
 func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	switch r.Method {
 	case http.MethodHead, http.MethodGet:
-		first, last, suffix, ranged, err := parseRange(r.Header.Get("Range"))
+		first, last, suffix, _, err := parseRange(r.Header.Get("Range"))
 		if err != nil {
 			writeError(w, r, errInvalidRange(), s.log)
 			return
 		}
-		sm, body, err := s.origin.OpenRange(r.Context(), bucket, key, first, last, suffix)
+		obj, err := s.origin.Open(r.Context(), bucket, key, first, last, suffix)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, r, errNoSuchKey(), s.log)
@@ -73,22 +73,19 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			writeError(w, r, errInternal(err, s.log), s.log)
 			return
 		}
-		defer body.Close()
-		if ranged && sm.Len() == 0 && sm.Size > 0 {
-			w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(sm.Size, 10))
-			writeError(w, r, errInvalidRange(), s.log)
-			return
+		defer obj.Body.Close()
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("ETag", quoteETag(obj.ETag))
+		if obj.ContentType != "" {
+			w.Header().Set("Content-Type", obj.ContentType)
 		}
-		m := &store.Meta{
-			Size: sm.Size, ETag: sm.ETag, ContentType: sm.ContentType,
-			CreatedAt: sm.CreatedAt, FileID: sm.FileID,
-			Parts: sm.Parts, PartEnds: sm.PartEnds,
+		if !obj.LastModified.IsZero() {
+			w.Header().Set("Last-Modified", obj.LastModified.UTC().Format(http.TimeFormat))
 		}
-		setObjectHeaders(w, m, key)
-		w.Header().Set("Content-Length", strconv.FormatInt(sm.Len(), 10))
-		if ranged {
-			w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(sm.Start, 10)+"-"+
-				strconv.FormatInt(sm.End, 10)+"/"+strconv.FormatInt(sm.Size, 10))
+		w.Header().Set("Content-Length", strconv.FormatInt(obj.End-obj.Start+1, 10))
+		if obj.Ranged {
+			w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(obj.Start, 10)+"-"+
+				strconv.FormatInt(obj.End, 10)+"/"+strconv.FormatInt(obj.Size, 10))
 			w.WriteHeader(http.StatusPartialContent)
 		} else {
 			w.WriteHeader(http.StatusOK)
@@ -98,7 +95,7 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		}
 		buf := copyBuf()
 		defer putCopyBuf(buf)
-		_, _ = io.CopyBuffer(w, body, buf)
+		_, _ = io.CopyBuffer(w, obj.Body, buf)
 
 	case http.MethodPut:
 		q := r.URL.Query()

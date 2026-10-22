@@ -92,6 +92,8 @@ BEGIN
       ) WITH (fillfactor = 80);
       CREATE INDEX IF NOT EXISTS messages_ready ON %1$I.messages (visible_at, id);
       CREATE INDEX IF NOT EXISTS messages_expiry ON %1$I.messages (expires_at);
+      CREATE INDEX IF NOT EXISTS messages_receipt ON %1$I.messages (receipt)
+        WHERE receipt IS NOT NULL;
     $ddl$, v_schema);
     RETURN v_schema;
   END IF;

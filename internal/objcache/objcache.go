@@ -4,6 +4,8 @@ package objcache
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -141,12 +143,107 @@ func (t *Tier) Ensure(ctx context.Context, bucket, key string) (*store.Meta, err
 	return t.store.MetaKind(ctx, ns.Cache, t.namespace, ck)
 }
 
-// OpenRange serves [first,last] from the cached copy, downloading on a miss.
-func (t *Tier) OpenRange(ctx context.Context, bucket, key string, first, last, suffix int64) (*store.SliceMeta, *store.Body, error) {
-	if _, err := t.Ensure(ctx, bucket, key); err != nil {
-		return nil, nil, err
+// fullCacheMax is the largest object downloaded whole to satisfy a range
+// request. Above it, ranges are passed through to the origin so a footer read
+// never pulls a multi-GB file.
+const fullCacheMax = 8 << 20
+
+// Object is one origin response, served from the cache or passed through.
+type Object struct {
+	Size         int64
+	ETag         string
+	ContentType  string
+	LastModified time.Time
+	Body         io.ReadCloser
+	Start, End   int64
+	Ranged       bool
+	Hit          bool
+}
+
+// Open serves [first,last] (or the whole object) with a cache hit, a whole
+// object download, or a pass-through origin range.
+func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix int64) (*Object, error) {
+	ck := t.key(bucket, key)
+	attrs, err := t.origin.Attributes(ctx, ck)
+	if err != nil {
+		if t.origin.IsObjNotFoundErr(err) {
+			return nil, store.ErrNotFound
+		}
+		return nil, err
 	}
-	return t.store.GetBodyKind(ctx, ns.Cache, t.namespace, t.key(bucket, key), first, last, suffix, nil)
+	size := attrs.Size
+	start, end, ranged := resolveRange(size, first, last, suffix)
+	if size > 0 && (start > end || start >= size) {
+		return nil, store.ErrInvalidRange
+	}
+	if size == 0 {
+		if _, err := t.Ensure(ctx, bucket, key); err != nil {
+			return nil, err
+		}
+		sm, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, ck, 0, -1, -1, nil)
+		if err != nil {
+			return nil, err
+		}
+		return &Object{Size: 0, ETag: sm.ETag, ContentType: sm.ContentType,
+			LastModified: sm.CreatedAt, Body: body}, nil
+	}
+	length := end - start + 1
+	version := fmt.Sprintf("%d-%d", size, attrs.LastModified.UnixNano())
+
+	m, merr := t.store.MetaKind(ctx, ns.Cache, t.namespace, ck)
+	if merr == nil && m.OriginETag != "" && m.OriginETag != version {
+		// Origin moved on: never serve stale bytes.
+		_, _ = t.store.CacheDel(ctx, t.namespace, []string{ck})
+		m, merr = nil, store.ErrNotFound
+	}
+	fresh := merr == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl
+	if fresh || length == size || size <= fullCacheMax {
+		if !fresh {
+			m, err = t.Ensure(ctx, bucket, key)
+			if err != nil {
+				return nil, err
+			}
+		}
+		sm, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, ck, start, end, -1, nil)
+		if err != nil {
+			return nil, err
+		}
+		return &Object{
+			Size: sm.Size, ETag: sm.ETag, ContentType: sm.ContentType,
+			LastModified: sm.CreatedAt, Body: body, Start: sm.Start, End: sm.End,
+			Ranged: ranged, Hit: true,
+		}, nil
+	}
+
+	rc, err := t.origin.GetRange(ctx, ck, start, length)
+	if err != nil {
+		if t.origin.IsObjNotFoundErr(err) {
+			return nil, store.ErrNotFound
+		}
+		return nil, err
+	}
+	return &Object{
+		Size: size, ETag: etagFor(version), ContentType: contentTypeFor(key),
+		LastModified: attrs.LastModified, Body: rc, Start: start, End: end, Ranged: ranged,
+	}, nil
+}
+
+// resolveRange maps S3 range headers onto [start,end].
+func resolveRange(size, first, last, suffix int64) (int64, int64, bool) {
+	if suffix >= 0 {
+		return max(size-suffix, 0), size - 1, true
+	}
+	start := max(first, 0)
+	end := size - 1
+	if last >= 0 {
+		end = min(last, size-1)
+	}
+	return start, end, first > 0 || last >= 0
+}
+
+func etagFor(version string) string {
+	sum := md5.Sum([]byte(version))
+	return hex.EncodeToString(sum[:])
 }
 
 // Upload writes through to the origin and refreshes the cached copy.

@@ -148,7 +148,8 @@ aws --endpoint-url http://127.0.0.1:8014 sqs receive-message \
 Queues store `VisibilityTimeout`, `DelaySeconds`, `MaximumMessageSize`,
 `MessageRetentionPeriod` and `ReceiveMessageWaitTimeSeconds` in
 `s3p.namespaces.attrs`. Receive leases a batch with `FOR UPDATE SKIP LOCKED`;
-`DeleteMessage`/`ChangeMessageVisibility` match on the receipt handle.
+`DeleteMessage`/`ChangeMessageVisibility` match on the receipt handle, which is
+covered by the partial `messages_receipt` index so acks never scan the queue.
 
 ## Cache tier in front of another object store
 
@@ -165,6 +166,9 @@ pgvs3 serve --origin-config origin.yaml --cache-namespace origin --cache-ttl 5m
 ```
 
 Every S3 `GET` is served from `s3c_<namespace>` when the cached size and origin
-mtime still match, and downloaded otherwise. `PUT` writes through to the origin
+mtime still match, and downloaded otherwise. **Ranges of objects larger than
+8 MiB are passed straight through to the origin** (`GetRange`) instead of
+downloading the whole object, which is what DuckDB footer and row-group reads
+need; a full GET still populates the cache. `PUT` writes through to the origin
 and refreshes the cache; `DELETE` removes both. `--cache-retention` evicts idle
 entries. Supported origin types are `s3`, `filesystem` and `inmem`.

@@ -56,6 +56,10 @@ func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 		}
 		q := quoteIdent(n.Schema)
 		if n.Kind == ns.Queue {
+			var hasReceipt bool
+			if err := s.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", q+".messages_receipt").Scan(&hasReceipt); err != nil || !hasReceipt {
+				d.ChunksConfigured = false
+			}
 			var msgs int64
 			if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM "+q+".messages").Scan(&msgs); err == nil {
 				d.Objects += msgs

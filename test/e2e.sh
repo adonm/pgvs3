@@ -402,6 +402,18 @@ except sqs.exceptions.QueueDoesNotExist:
 print('sqs ok')
 PY
 
+# Acks must use the receipt index, never a sequential scan.
+QIDX="qidx-$RUN"
+curl -fsS -X POST -H 'Content-Type: application/x-amz-json-1.0' \
+  -H 'X-Amz-Target: AmazonSQS.CreateQueue' \
+  -d "{\"QueueName\":\"$QIDX\"}" "$A/" >/dev/null
+plan=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c "
+  SET enable_seqscan = off;
+  EXPLAIN (COSTS OFF) DELETE FROM \"s3q_$QIDX\".messages WHERE receipt = 'x';
+")
+echo "$plan" | grep -q "messages_receipt" || fail "SQS ack does not use messages_receipt: $plan"
+.tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --kind queue --force "$QIDX" >/dev/null
+
 # --- S3 cache tier over a filesystem origin (thanos objstore) ---------------
 ORIGIN_DIR="$TMP/origin"
 mkdir -p "$ORIGIN_DIR"
@@ -419,7 +431,8 @@ for _ in $(seq 1 120); do
   curl -fsS --max-time 1 "http://127.0.0.1:$ocache_port/healthz" >/dev/null 2>&1 && break
   sleep .25
 done
-OCACHE_PID=$ocache_pid OCACHE_ENDPOINT="http://127.0.0.1:$ocache_port" OCACHE_DIR="$ORIGIN_DIR" OCACHE_RUN="$RUN" \
+OCACHE="http://127.0.0.1:$ocache_port"
+OCACHE_PID=$ocache_pid OCACHE_ENDPOINT="$OCACHE" OCACHE_DIR="$ORIGIN_DIR" OCACHE_RUN="$RUN" \
 E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
 import os, boto3
@@ -444,6 +457,25 @@ c.delete_object(Bucket=b, Key=k)
 assert not os.path.exists(p)
 print('s3cache ok')
 PY
+
+# A cold range on a large origin object must be passed through, not cached whole.
+python3 - "$ORIGIN_DIR" "$RUN" <<'PY'
+import os, sys
+root, run = sys.argv[1], sys.argv[2]
+p = os.path.join(root, 'edge', run, 'big.bin')
+os.makedirs(os.path.dirname(p), exist_ok=True)
+with open(p, 'wb') as f:
+    f.write(b'0123456789abcdef' * (1 << 20))  # 16 MiB
+PY
+curl -fsS -H 'Range: bytes=1048576-1049599' "$OCACHE/edge/$RUN/big.bin" -o "$TMP/range.part"
+[ "$(wc -c < "$TMP/range.part")" = 1024 ] || fail "cache range length"
+rows=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
+  "SELECT count(*) FROM \"s3c_ocache-$RUN\".objects WHERE key = 'edge/$RUN/big.bin'")
+[ "$rows" = 0 ] || fail "cold range cached the whole object ($rows rows)"
+curl -fsS "$OCACHE/edge/$RUN/big.bin" -o /dev/null
+rows=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
+  "SELECT count(*) FROM \"s3c_ocache-$RUN\".objects WHERE key = 'edge/$RUN/big.bin'")
+[ "$rows" = 1 ] || fail "full GET was not cached ($rows rows)"
 kill "$ocache_pid" 2>/dev/null || true
 
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
