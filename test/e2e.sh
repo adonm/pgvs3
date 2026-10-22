@@ -148,6 +148,32 @@ expect 204 -X DELETE "$ED/src"
 sleep 2
 [ "$(s3 "$ED/copy")" = 'copy me' ] || fail "reaper removed a shared file"
 
+# --- indexed file_id reference checks and multi-pass reaping ----------------
+.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL" >/dev/null || fail "pgvs3 doctor"
+plan=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c "
+  SET enable_seqscan = off;
+  EXPLAIN (COSTS OFF)
+  SELECT f FROM unnest(ARRAY[1,2]::int8[]) AS f
+  WHERE NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
+    AND NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
+    AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f);
+")
+echo "$plan" | grep -q "objects_file_id_idx" || fail "missing objects_file_id_idx in plan: $plan"
+echo "$plan" | grep -q "objects_parts_idx" || fail "missing objects_parts_idx in plan: $plan"
+echo "$plan" | grep -q "upload_parts_file_id_idx" || fail "missing upload_parts_file_id_idx in plan: $plan"
+
+docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -v ON_ERROR_STOP=1 -c "
+  INSERT INTO s3p.chunks (file_id, no, data)
+  SELECT 999999999, g, 'x'::bytea FROM generate_series(0, 69999) AS g;
+  INSERT INTO s3p.garbage (file_id, queued_at) VALUES (999999999, now());
+" >/dev/null
+reap_out=$(.tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s --all)
+echo "$reap_out" | grep -q "reaped_rows=70000" || fail "multi-pass reap rows mismatch: $reap_out"
+echo "$reap_out" | grep -q "reaped_files=1" || fail "multi-pass reap files mismatch: $reap_out"
+left_chunks=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
+  "SELECT count(*) FROM s3p.chunks WHERE file_id = 999999999")
+[ "$left_chunks" = 0 ] || fail "multi-pass reap left $left_chunks chunk rows"
+
 # CRC64NVME / FULL_OBJECT checksum on a single PUT.
 crc64=$(python3 -c 'import base64,struct; print(base64.b64encode(struct.pack(">Q",0xAE8B14860A799888)).decode())')
 expect 200 -X PUT -H "x-amz-checksum-crc64nvme: $crc64" -H 'x-amz-sdk-checksum-algorithm: CRC64NVME' -H 'x-amz-checksum-type: FULL_OBJECT' --data-binary '123456789' "$ED/crc64"

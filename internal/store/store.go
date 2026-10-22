@@ -1503,23 +1503,25 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	}
 	remaining := ReapRows
 	for remaining > 0 {
-		n, err := s.reapOne(ctx, conn.Conn(), grace, remaining)
+		n, done, err := s.reapOne(ctx, conn.Conn(), grace, remaining)
 		if err != nil {
 			return err
 		}
-		if n == 0 {
+		if n == 0 && !done {
 			break
 		}
 		s.reapedRows.Add(int64(n))
-		s.reapedFiles.Add(1)
-		remaining -= n
+		if done {
+			s.reapedFiles.Add(1)
+		}
+		remaining -= max(n, 1)
 	}
 	return nil
 }
-func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, grace time.Duration, budget int) (int, error) {
+func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, grace time.Duration, budget int) (int, bool, error) {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	var fileID int64
@@ -1527,47 +1529,46 @@ func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, grace time.Duration
 		WHERE queued_at <= now() - make_interval(secs => $1)
 		ORDER BY queued_at, file_id LIMIT 1 FOR UPDATE SKIP LOCKED`, grace.Seconds()).Scan(&fileID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil
+		return 0, false, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	var referenced bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM s3p.objects WHERE file_id IS NOT NULL AND file_id = $1)
 		OR EXISTS (SELECT 1 FROM s3p.objects WHERE parts IS NOT NULL AND parts @> ARRAY[$1::int8])
 		OR EXISTS (SELECT 1 FROM s3p.upload_parts WHERE file_id = $1)`, fileID).Scan(&referenced); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if referenced {
 		// A shared CopyObject/UploadPartCopy file can be queued by an older
 		// gateway. Drop the false-positive garbage row instead of wedging the
 		// reaper behind it forever.
 		if _, err := tx.Exec(ctx, "DELETE FROM s3p.garbage WHERE file_id = $1", fileID); err != nil {
-			return 0, err
+			return 0, false, err
 		}
-		return 1, tx.Commit(ctx)
+		return 0, true, tx.Commit(ctx)
 	}
 	tag, err := tx.Exec(ctx, `DELETE FROM s3p.chunks WHERE ctid IN
 		(SELECT ctid FROM s3p.chunks WHERE file_id = $1 LIMIT $2)`, fileID, budget)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	n := int(tag.RowsAffected())
+	done := false
 	if n < budget {
 		var left bool
 		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM s3p.chunks WHERE file_id = $1)", fileID).Scan(&left); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		if !left {
 			if _, err := tx.Exec(ctx, "DELETE FROM s3p.garbage WHERE file_id = $1", fileID); err != nil {
-				return 0, err
+				return 0, false, err
 			}
-			// A zero-byte file has no rows but still frees a garbage entry;
-			// report progress so the reaper moves on to the next file.
-			n = 1
+			done = true
 		}
 	}
-	return n, tx.Commit(ctx)
+	return n, done, tx.Commit(ctx)
 }
 
 func s3ETag(md5sum []byte, parts int) string {

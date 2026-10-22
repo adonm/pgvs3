@@ -196,12 +196,12 @@ func reap(args []string) int {
 		return 1
 	}
 	for i := 0; ; i++ {
-		before := st.ReapedRows()
+		beforeRows, beforeFiles := st.ReapedRows(), st.ReapedFiles()
 		if err := st.Maintain(ctx, *grace); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		if !*all || st.ReapedRows() == before || i >= 1000 {
+		if !*all || (st.ReapedRows() == beforeRows && st.ReapedFiles() == beforeFiles) || i >= 1000 {
 			break
 		}
 	}
@@ -254,7 +254,7 @@ func maintain(ctx context.Context, st *store.Store, grace, interval time.Duratio
 			return
 		case <-t.C:
 			for ctx.Err() == nil {
-				before := st.ReapedRows()
+				beforeRows, beforeFiles := st.ReapedRows(), st.ReapedFiles()
 				runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 				err := st.Maintain(runCtx, grace)
 				cancel()
@@ -264,7 +264,7 @@ func maintain(ctx context.Context, st *store.Store, grace, interval time.Duratio
 					}
 					break
 				}
-				if st.ReapedRows()-before < store.ReapRows {
+				if st.ReapedRows()-beforeRows < store.ReapRows && st.ReapedFiles()-beforeFiles < store.ReapRows {
 					break
 				}
 			}

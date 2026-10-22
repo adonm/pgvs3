@@ -1,6 +1,8 @@
 name: ci
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 permissions:
   contents: read
@@ -16,15 +18,17 @@ jobs:
       - run: mise exec -- just fault
       - run: mise exec -- just interop
 
-  image:
+  publish:
     runs-on: ubuntu-latest
     needs: check
     if: github.event_name == 'push'
     permissions:
-      contents: read
+      contents: write
       packages: write
     env:
       KO_DOCKER_REPO: ghcr.io/${{ github.repository }}
+      CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -34,10 +38,33 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: ko build (amd64 + arm64)
+      - name: Publish container image (amd64 + arm64) and Helm chart to GHCR
         run: |
+          set -euo pipefail
+          mkdir -p .tmp/pgvs3
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF_NAME}"
+            semver="${ver#v}"
+            tags="${ver},${semver},latest"
+          else
+            ver="${GITHUB_SHA::7}"
+            semver="0.1.0"
+            tags="latest,${ver}"
+          fi
           mise exec go ko -- ko build --bare \
             --platform=linux/amd64,linux/arm64 \
-            --tags latest \
-            --ldflags "-s -w -X main.version=${GITHUB_SHA}" \
+            --tags "${tags}" \
+            --ldflags "-s -w -X main.version=${ver}" \
             ./cmd/pgvs3
+          mise exec helm -- helm lint deploy/charts/pgvs3
+          mise exec helm -- helm package deploy/charts/pgvs3 \
+            -d .tmp/pgvs3 --version "${semver}" --app-version "${ver}"
+          mise exec helm -- helm push ".tmp/pgvs3/pgvs3-${semver}.tgz" "${CHART_REPO}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            if gh release view "${ver}" >/dev/null 2>&1; then
+              gh release upload "${ver}" ".tmp/pgvs3/pgvs3-${semver}.tgz" --clobber
+            else
+              gh release create "${ver}" ".tmp/pgvs3/pgvs3-${semver}.tgz" \
+                --title "${ver}" --generate-notes --verify-tag
+            fi
+          fi

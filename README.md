@@ -160,11 +160,16 @@ Subcommands:
 - `pgvs3 reap [--all]` — run garbage collection immediately.
 - `pgvs3 health` — poll `/readyz` for container health checks.
 
-Build the container image with `ko`:
+Build the container image with `ko` or pull the published image and OCI Helm
+chart from GHCR:
 
 ```sh
+docker pull ghcr.io/adonm/pgvs3:v0.1.0
+helm install pgvs3 oci://ghcr.io/adonm/charts/pgvs3 --version 0.1.0
+
 just image            # local ko.local image
 just image push=true  # multi-arch ghcr.io/adonm/pgvs3 (amd64 + arm64)
+just chart push=true  # OCI Helm chart oci://ghcr.io/adonm/charts/pgvs3
 ```
 
 ## Limits to keep in mind

@@ -84,8 +84,9 @@ bench parts="s3,compat,tuning":
 load:
     bash deploy/bench/load.sh
 
-# Image name for `just image`; CI may override it.
+# Image and Helm OCI repositories for `just image` and `just chart`.
 IMAGE := env("KO_DOCKER_REPO", "ghcr.io/adonm/pgvs3")
+CHART_REPO := env("CHART_REPO", "oci://ghcr.io/adonm/charts")
 
 # Local compose stack (build the image first with `just image`).
 [group('dev')]
@@ -97,12 +98,31 @@ compose:
 image push="false":
     #!/usr/bin/env bash
     set -euo pipefail
-    kwargs=(--bare --ldflags "-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)")
+    ver=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+    kwargs=(--bare --ldflags "-s -w -X main.version=$ver")
     if [ "{{ push }}" = "true" ]; then
       KO_DOCKER_REPO="{{ IMAGE }}" mise exec go ko -- ko build "${kwargs[@]}" \
-        --platform=linux/amd64,linux/arm64 --tags latest ./cmd/pgvs3
+        --platform=linux/amd64,linux/arm64 --tags "latest,$ver" ./cmd/pgvs3
     else
       KO_DOCKER_REPO=ko.local mise exec go ko -- ko build "${kwargs[@]}" --local ./cmd/pgvs3
+    fi
+
+# Lint, package and optionally push the OCI Helm chart to GHCR.
+[group('image')]
+chart push="false" version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p .tmp/pgvs3
+    args=(-d .tmp/pgvs3)
+    if [ -n "{{ version }}" ]; then
+      v="{{ version }}"
+      v="${v#v}"
+      args+=(--version "$v" --app-version "v$v")
+    fi
+    mise exec helm -- helm lint deploy/charts/pgvs3
+    pkg=$(mise exec helm -- helm package deploy/charts/pgvs3 "${args[@]}" | awk '{print $NF}')
+    if [ "{{ push }}" = "true" ]; then
+      mise exec helm -- helm push "$pkg" "{{ CHART_REPO }}"
     fi
 
 [group('ci')]
@@ -114,4 +134,5 @@ ci:
     mise exec go -- go test -race ./...
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=5s ./internal/s3
     mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=5s ./internal/store
+    mise exec helm -- helm lint deploy/charts/pgvs3
     just contract
