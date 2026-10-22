@@ -8,6 +8,7 @@ set -euo pipefail
 : "${PGVS3_ACCESS_KEY:?}"
 : "${PGVS3_SECRET_KEY:?}"
 : "${PGVS3_TEST_PG_PORT:?}"
+: "${PGVS3_TEST_WEB_URL:?}"
 
 A=$PGVS3_TEST_ENDPOINT_A
 B=$PGVS3_TEST_ENDPOINT_B
@@ -22,6 +23,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() { local want=$1; shift; local got; got=$(code "$@"); [ "$got" = "$want" ] || fail "expected HTTP $want, got $got: $*"; }
 
 s3 -X PUT "$A/$BUCKET" >/dev/null || fail "create bucket"
+WEB=$PGVS3_TEST_WEB_URL
 
 # --- basic object, cross-gateway read, HEAD, ranges -------------------------
 head -c 1048576 /dev/urandom > "$TMP/one.bin"
@@ -34,6 +36,18 @@ dd if="$TMP/one.bin" of="$TMP/range.want" bs=1 skip=100 count=100 status=none
 cmp "$TMP/range.want" "$TMP/range.out" || fail "range bytes"
 [ "$(s3 -H 'Range: bytes=-100' "$A/$BUCKET/$RUN/one.bin" | wc -c)" = 100 ] || fail "suffix range"
 expect 416 -H 'Range: bytes=99999999-' "$A/$BUCKET/$RUN/one.bin"
+
+# --- plain HTTP static web and no-auth S3 ----------------------------------
+printf '<html>index</html>' > "$TMP/index.html"
+expect 200 -X PUT -H 'Content-Type: text/html' --data-binary @"$TMP/index.html" "$A/$BUCKET/$RUN/web/index.html"
+printf 'asset' > "$TMP/asset.txt"
+expect 200 -X PUT -H 'Content-Type: text/plain' --data-binary @"$TMP/asset.txt" "$A/$BUCKET/$RUN/web/asset.txt"
+[ "$(curl -fsS "$WEB/$BUCKET/$RUN/web/")" = '<html>index</html>' ] || fail "web index"
+[ "$(curl -fsS "$WEB/$BUCKET/$RUN/web/asset.txt")" = asset ] || fail "web asset"
+curl -fsSI "$WEB/$BUCKET/$RUN/web/" | grep -qi 'content-type: text/html' || fail "web content type"
+[ "$(curl -fsS "$B/$BUCKET/$RUN/one.bin" | wc -c)" = 1048576 ] || fail "unsigned no-auth GET"
+curl -fsS -X PUT --data-binary 'unsigned' "$B/$BUCKET/$RUN/noauth" >/dev/null || fail "unsigned no-auth PUT"
+[ "$(s3 "$A/$BUCKET/$RUN/noauth")" = unsigned ] || fail "no-auth PUT body"
 expect 200 -X PUT --data-binary '' "$A/$BUCKET/$RUN/empty"
 [ "$(s3 "$B/$BUCKET/$RUN/empty" | wc -c)" = 0 ] || fail "empty object body"
 [ "$(s3 -I "$A/$BUCKET/$RUN/empty" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')" = 0 ] || fail "empty object HEAD"

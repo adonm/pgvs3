@@ -18,6 +18,7 @@ import (
 
 // Auth verifies AWS Signature Version 4 header authentication.
 type Auth struct {
+	Disabled    bool
 	AccessKey   string
 	SecretKey   string
 	VHostDomain string
@@ -39,6 +40,9 @@ const (
 // the body so its SHA-256 is checked as it is consumed. It does not read the
 // body.
 func (a *Auth) Verify(r *http.Request) (*AuthInfo, error) {
+	if a.Disabled {
+		return &AuthInfo{}, nil
+	}
 	h := r.Header.Get("Authorization")
 	if h == "" {
 		if r.URL.Query().Get("X-Amz-Algorithm") != "" {

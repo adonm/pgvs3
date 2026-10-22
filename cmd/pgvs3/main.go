@@ -109,6 +109,10 @@ func serve(args []string) int {
 		inlineMax     = fs.Int64("inline-max", envInt64("PGVS3_INLINE_MAX", 65536), "largest object stored inline (0 disables, max 65536)")
 		buckets       = fs.String("buckets", env("PGVS3_BUCKETS", ""), "comma-separated buckets to create at startup")
 		readOnly      = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating S3 requests")
+		noAuth        = fs.Bool("no-auth", envBool("PGVS3_NO_AUTH"), "accept unsigned S3 requests (trust the network)")
+		webAddr       = fs.String("web-addr", env("PGVS3_WEB_ADDR", ""), "plain HTTP web/static-site listen address")
+		webIndex      = fs.String("web-index", env("PGVS3_WEB_INDEX", "index.html"), "index object for directory requests")
+		webError      = fs.String("web-error", env("PGVS3_WEB_ERROR", ""), "optional 404 object key")
 		drain         = fs.Duration("drain", envDuration("PGVS3_DRAIN", 5*time.Second), "readiness drain period before shutdown")
 		adminAddr     = fs.String("admin-addr", env("PGVS3_ADMIN_ADDR", ""), "separate health/metrics listen address")
 	)
@@ -176,7 +180,7 @@ func serve(args []string) int {
 		go maintain(ctx, st, *reapGrace, *maintainEvery, log)
 	}
 
-	auth := &s3.Auth{AccessKey: *accessKey, SecretKey: *secretKey}
+	auth := &s3.Auth{AccessKey: *accessKey, SecretKey: *secretKey, Disabled: *noAuth}
 	handler := s3.New(st, auth, log, *region, *vhost, *readOnly)
 	if *adminAddr != "" {
 		handler.SetAdminOnly(true)
@@ -193,6 +197,14 @@ func serve(args []string) int {
 		return 1
 	}
 	log.Info("pgvs3 starting", "version", version, "addr", *addr, "cache_peers", len(peersList), "object_cache_revalidate", *objectCheck)
+	if *webAddr != "" {
+		web := &http.Server{Addr: *webAddr, Handler: handler.WebHandler(*webIndex, *webError), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := s3.Run(ctx, web, "", "", 0, log); err != nil {
+				log.Error("web listener", "err", err)
+			}
+		}()
+	}
 	if *adminAddr != "" {
 		admin := &http.Server{Addr: *adminAddr, Handler: handler.AdminHandler(), ReadHeaderTimeout: 5 * time.Second}
 		go func() {

@@ -15,6 +15,17 @@ For a real deployment put the URL and keys in Secrets and use TLS outside
 loopback; `PGVS3_ALLOW_HTTP` and `PGVS3_DB_ALLOW_PLAINTEXT` are for isolated
 development only.
 
+## Plain HTTP and no-auth
+
+`PGVS3_WEB_ADDR=127.0.0.1:8080` serves objects over unauthenticated plain HTTP
+at `/{bucket}/{key}`. Directory requests append `PGVS3_WEB_INDEX` (default
+`index.html`); `PGVS3_WEB_ERROR` names an optional 404 object. Use it for static
+sites or non-S3 clients. It supports `HEAD`, ranges, ETags and conditional GETs.
+
+`PGVS3_NO_AUTH=true` accepts unsigned requests on the S3 listener. Put either
+listener behind a service mesh or private network; neither mode adds
+authentication by itself.
+
 ## Probes and metrics
 
 - `GET /healthz` — process liveness, no database access.

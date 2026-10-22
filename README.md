@@ -166,8 +166,30 @@ query auth. Presigned URLs use SigV4; with boto3 and a custom endpoint, set
 **Not yet implemented:** multipart `x-amz-checksum-type: FULL_OBJECT`, lifecycle
 expiration, bucket policies/IAM, and access points. pgvs3 has no versioning,
 object tags, Object Lock, ACLs, lifecycle transitions, replication, Event
-Notifications, S3 Select, website hosting, access logs, Storage Lens or
-Transfer Acceleration. ETags are opaque; single PUTs use MD5.
+Notifications, S3 Select, S3 website configuration/redirect rules, access logs,
+Storage Lens or Transfer Acceleration. ETags are opaque; single PUTs use MD5.
+
+## Plain HTTP and static websites
+
+Run a separate unauthenticated HTTP listener for browsers, static sites and
+non-S3 clients:
+
+```sh
+pgvs3 serve --web-addr 127.0.0.1:8080 --web-index index.html
+curl http://127.0.0.1:8080/lake/index.html
+curl http://127.0.0.1:8080/lake/docs/
+```
+
+Requests are path-style (`/{bucket}/{key}`); a trailing slash appends
+`--web-index`. `--web-error 404.html` serves that object as the 404 page.
+Content type is taken from the object metadata, with a filename-extension
+fallback. Range, `HEAD`, ETag and conditional reads work. The web listener is
+unauthenticated and plain HTTP: bind it to a private interface or put it behind
+the service mesh.
+
+For S3 clients that authenticate at a mesh/gateway layer, `--no-auth` /
+`PGVS3_NO_AUTH=true` accepts unsigned S3 requests. Do not expose a no-auth
+listener publicly.
 
 ## Configuration
 
@@ -199,6 +221,10 @@ A flag overrides the same-named environment variable.
 | `--read-only` | `PGVS3_READ_ONLY` | false | Reject mutating methods; skip DDL, reaping and bucket creation. Use against a standby. |
 | `--drain` | `PGVS3_DRAIN` | `5s` | Keep serving while `/readyz` returns 503, then shut down. |
 | `--admin-addr` | `PGVS3_ADMIN_ADDR` | unset | Optional separate listener for `/healthz`, `/readyz` and `/metrics`. |
+| `--no-auth` | `PGVS3_NO_AUTH` | false | Accept unsigned S3 requests. Only for a trusted mesh/private listener. |
+| `--web-addr` | `PGVS3_WEB_ADDR` | unset | Plain HTTP object/static-site listener. |
+| `--web-index` | `PGVS3_WEB_INDEX` | `index.html` | Object appended to directory requests. |
+| `--web-error` | `PGVS3_WEB_ERROR` | unset | Optional bucket-relative 404 object. |
 | `--cache-main-bytes` | `PGVS3_CACHE_MAIN_BYTES` | 64 MiB | Local cache for owned metadata keys. |
 | `--cache-hot-bytes` | `PGVS3_CACHE_HOT_BYTES` | 64 MiB | Local mirror of peer-owned metadata keys. |
 | `--peers` | `PGVS3_PEERS` | unset | Comma-separated `host:port` peer list. |
