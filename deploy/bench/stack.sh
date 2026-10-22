@@ -42,15 +42,15 @@ export PGVS3_TEST_DB_URL="postgres://postgres:postgres@$pg/pgvs3?sslmode=disable
 export PGVS3_ACCESS_KEY="pgvs3-$mode"
 PGVS3_SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
 export PGVS3_SECRET_KEY
-if [ "$mode" != bench ]; then export PGVS3_POOL_MIN=1 PGVS3_POOL_MAX=8; fi
+if [ "$mode" != bench ]; then export PGVS3_POOL_MAX=8; fi
 
 mkdir -p .tmp/pgvs3
 (cd "$(dirname "$0")/../.." && mise exec go -- go build -o .tmp/pgvs3/pgvs3 ./cmd/pgvs3)
 
-read -r port_a port_b web_port < <(python3 -c '
+read -r port_a port_b < <(python3 -c '
 import socket
 ports=[]
-for _ in range(3):
+for _ in range(2):
     with socket.socket() as s:
         s.bind(("127.0.0.1",0))
         ports.append(s.getsockname()[1])
@@ -60,10 +60,7 @@ for entry in "a:$port_a" "b:$port_b"; do
   label=${entry%%:*}; port=${entry#*:}
   args=()
   if [ "$mode" = contract ] || [ "$mode" = fault ] || [ "$mode" = interop ]; then
-    args+=(--reap-grace 1s --maintenance-interval 1s)
-  fi
-  if [ "$label" = a ] && { [ "$mode" = contract ] || [ "$mode" = interop ]; }; then
-    args+=(--web-addr "127.0.0.1:$web_port")
+    args+=(--reap-grace 1s)
   fi
   .tmp/pgvs3/pgvs3 --url "$PGVS3_TEST_DB_URL" serve --addr "127.0.0.1:$port" "${args[@]}" \
     > ".tmp/pgvs3/$mode-$label.log" 2>&1 & pids+=("$!")
@@ -78,22 +75,9 @@ for entry in "a:$port_a" "b:$port_b"; do
 done
 export PGVS3_TEST_ENDPOINT_A="http://127.0.0.1:$port_a"
 export PGVS3_TEST_ENDPOINT_B="http://127.0.0.1:$port_b"
-export PGVS3_TEST_WEB_URL="http://127.0.0.1:$web_port"
 export PGVS3_TEST_PID_A="${pids[0]}"
 export PGVS3_TEST_PID_B="${pids[1]}"
 export PGVS3_TEST_PG_CONTAINER="$container"
-if [ "$mode" = contract ] || [ "$mode" = interop ]; then
-  for i in $(seq 1 120); do
-    curl -fsS --max-time 1 "$PGVS3_TEST_WEB_URL/healthz" >/dev/null 2>&1 && break
-    [ "$i" = 120 ] && { cat .tmp/pgvs3/$mode-a.log >&2; exit 1; }
-    sleep 0.25
-  done
-fi
-for bucket in pgvs3-contract pgvs3-fault bench lake; do
-  curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 \
-    --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
-    -X PUT "$PGVS3_TEST_ENDPOINT_A/$bucket" >/dev/null
-done
 
 case "$mode" in
 contract)

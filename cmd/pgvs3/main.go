@@ -30,9 +30,6 @@ func run() int {
 		fmt.Println(version)
 		return 0
 	}
-	// Accept both `pgvs3 serve --url ...` and the historical
-	// `pgvs3 --url ... serve --addr ...`: strip the verb wherever it appears,
-	// then let flag.Parse see only flags.
 	if i := indexArg(args, "health"); i >= 0 {
 		return health(removeArg(args, i))
 	}
@@ -69,42 +66,22 @@ func removeArg(args []string, i int) []string {
 func serve(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var (
-		url           = fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-		addr          = fs.String("addr", env("PGVS3_ADDR", "127.0.0.1:8014"), "S3 listen address")
-		tlsCert       = fs.String("tls-cert", env("PGVS3_TLS_CERT", ""), "PEM certificate")
-		tlsKey        = fs.String("tls-key", env("PGVS3_TLS_KEY", ""), "PEM private key")
-		allowHTTP     = fs.Bool("allow-http", envBool("PGVS3_ALLOW_HTTP"), "allow plaintext HTTP outside loopback")
-		region        = fs.String("region", env("PGVS3_REGION", "us-east-1"), "S3 region")
-		poolMin       = fs.Int("pool-min", envInt("PGVS3_POOL_MIN", 64), "PostgreSQL connections kept warm")
-		poolMax       = fs.Int("pool-max", envInt("PGVS3_POOL_MAX", 64), "PostgreSQL connections per gateway")
-		reapGrace     = fs.Duration("reap-grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "how long deleted files stay readable")
-		maintainEvery = fs.Duration("maintenance-interval", envDuration("PGVS3_MAINTENANCE_INTERVAL", time.Minute), "maintenance interval")
-		logLevel      = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
-		vhost         = fs.String("vhost-domain", env("PGVS3_VHOST_DOMAIN", ""), "virtual-host suffix, e.g. s3.internal")
-		wholeRead     = fs.Int64("whole-read-max", envInt64("PGVS3_WHOLE_READ_MAX", 64<<20), "largest single-file span read in one query")
-		writeCommit   = fs.String("write-commit", env("PGVS3_WRITE_COMMIT", "on"), "synchronous_commit for unconditional writes: on, local or off")
-		verifyReads   = fs.Bool("verify-reads", envBoolDefault("PGVS3_VERIFY_READS", true), "verify the current object file_id on every chunk range query")
-		inlineMax     = fs.Int64("inline-max", envInt64("PGVS3_INLINE_MAX", 65536), "largest object stored inline (0 disables, max 65536)")
-		buckets       = fs.String("buckets", env("PGVS3_BUCKETS", ""), "comma-separated buckets to create at startup")
-		readOnly      = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating S3 requests")
-		webAddr       = fs.String("web-addr", env("PGVS3_WEB_ADDR", ""), "plain HTTP web/static-site listen address")
-		webIndex      = fs.String("web-index", env("PGVS3_WEB_INDEX", "index.html"), "index object for directory requests")
-		webError      = fs.String("web-error", env("PGVS3_WEB_ERROR", ""), "optional 404 object key")
-		drain         = fs.Duration("drain", envDuration("PGVS3_DRAIN", 5*time.Second), "readiness drain period before shutdown")
-		adminAddr     = fs.String("admin-addr", env("PGVS3_ADMIN_ADDR", ""), "separate health/metrics listen address")
+		url       = fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+		addr      = fs.String("addr", env("PGVS3_ADDR", "0.0.0.0:8014"), "S3 and HTTP listen address")
+		poolMax   = fs.Int("pool-max", envInt("PGVS3_POOL_MAX", 64), "PostgreSQL connections per gateway")
+		reapGrace = fs.Duration("reap-grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "how long deleted files stay readable")
+		readOnly  = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating S3 requests")
+		logLevel  = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+
 	log := newLogger(*logLevel)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, *url, store.Options{
-		MinConns: int32(*poolMin), MaxConns: int32(*poolMax),
-		CAFile: os.Getenv("PGVS3_DB_CA_FILE"), AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
-		WholeReadMax: *wholeRead, WriteCommit: *writeCommit, SkipReadVerify: !*verifyReads, InlineMax: *inlineMax,
-	}, log)
+	st, err := store.Open(ctx, *url, int32(*poolMax), log)
 	if err != nil {
 		log.Error("connecting to PostgreSQL", "err", err)
 		return 1
@@ -124,48 +101,17 @@ func serve(args []string) int {
 			log.Error("checking storage layout", "err", err)
 			return 1
 		}
-		if err := st.EnsureBuckets(ctx, splitList(*buckets)); err != nil {
-			log.Error("creating startup buckets", "err", err)
-			return 1
-		}
-	}
-	if !*readOnly {
-		go maintain(ctx, st, *reapGrace, *maintainEvery, log)
+		go maintain(ctx, st, *reapGrace, min(*reapGrace, time.Minute), log)
 	}
 
-	handler := s3.New(st, log, *region, *vhost, *readOnly)
-	if *adminAddr != "" {
-		handler.SetAdminOnly(true)
-	}
+	handler := s3.New(st, log, *readOnly)
 	go func() {
 		<-ctx.Done()
 		handler.SetDraining(true)
 	}()
-	srv, err := s3.Listen(s3.ServeConfig{
-		Addr: *addr, TLSCert: *tlsCert, TLSKey: *tlsKey, AllowHTTP: *allowHTTP,
-	}, handler, log)
-	if err != nil {
-		log.Error("configuring listener", "err", err)
-		return 1
-	}
+	srv := s3.NewHTTPServer(*addr, handler, log)
 	log.Info("pgvs3 starting", "version", version, "addr", *addr)
-	if *webAddr != "" {
-		web := &http.Server{Addr: *webAddr, Handler: handler.WebHandler(*webIndex, *webError), ReadHeaderTimeout: 10 * time.Second}
-		go func() {
-			if err := s3.Run(ctx, web, "", "", 0, log); err != nil {
-				log.Error("web listener", "err", err)
-			}
-		}()
-	}
-	if *adminAddr != "" {
-		admin := &http.Server{Addr: *adminAddr, Handler: handler.AdminHandler(), ReadHeaderTimeout: 5 * time.Second}
-		go func() {
-			if err := s3.Run(ctx, admin, "", "", 0, log); err != nil {
-				log.Error("admin listener", "err", err)
-			}
-		}()
-	}
-	if err := s3.Run(ctx, srv, *tlsCert, *tlsKey, *drain, log); err != nil {
+	if err := s3.Run(ctx, srv, 5*time.Second, log); err != nil {
 		log.Error("serving", "err", err)
 		return 1
 	}
@@ -181,9 +127,7 @@ func stat(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	st, err := store.Open(ctx, *url, store.Options{
-		MinConns: 1, MaxConns: 2, AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
-	}, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -241,9 +185,7 @@ func reap(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	st, err := store.Open(ctx, *url, store.Options{
-		MinConns: 1, MaxConns: 2, AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
-	}, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -283,9 +225,7 @@ func doctor(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	st, err := store.Open(ctx, *url, store.Options{
-		MinConns: 1, MaxConns: 2, AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
-	}, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	st, err := store.Open(ctx, *url, 2, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -304,19 +244,19 @@ func doctor(args []string) int {
 	return 0
 }
 
-func maintain(ctx context.Context, st *store.Store, grace, every time.Duration, log *slog.Logger) {
-	if every <= 0 {
-		return
+func maintain(ctx context.Context, st *store.Store, grace, interval time.Duration, log *slog.Logger) {
+	if interval <= 0 {
+		interval = time.Minute
 	}
-	t := time.NewTicker(every)
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			runCtx, cancel := context.WithTimeout(ctx, 55*time.Second)
-			if err := st.Maintain(runCtx, grace); err != nil {
+			runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			if err := st.Maintain(runCtx, grace); err != nil && ctx.Err() == nil {
 				log.Error("maintenance", "err", err)
 			}
 			cancel()
@@ -329,7 +269,7 @@ func newLogger(level string) *slog.Logger {
 	switch strings.ToLower(level) {
 	case "debug":
 		l = slog.LevelDebug
-	case "warn":
+	case "warn", "warning":
 		l = slog.LevelWarn
 	case "error":
 		l = slog.LevelError
@@ -339,19 +279,6 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l}))
 }
 
-func splitList(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -359,38 +286,28 @@ func env(key, def string) string {
 	return def
 }
 
-func envBoolDefault(key string, def bool) bool {
+func envBool(key string) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err == nil {
-			return b
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
 		}
 	}
 	return def
 }
 
-func envBool(key string) bool {
-	v, _ := strconv.ParseBool(os.Getenv(key))
-	return v
-}
-
-func envInt(key string, def int) int {
-	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
-		return v
-	}
-	return def
-}
-
-func envInt64(key string, def int64) int64 {
-	if v, err := strconv.ParseInt(os.Getenv(key), 10, 64); err == nil {
-		return v
-	}
-	return def
-}
-
 func envDuration(key string, def time.Duration) time.Duration {
-	if v, err := time.ParseDuration(os.Getenv(key)); err == nil {
-		return v
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return def
 }

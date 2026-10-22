@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,23 +36,16 @@ func putCopyBuf(b []byte) { copyBufPool.Put(&b) }
 // Server is the S3 HTTP front end. It is stateless over PostgreSQL, so any
 // gateway instance can serve any request of any multipart upload.
 type Server struct {
-	store       *store.Store
-	log         *slog.Logger
-	region      string
-	vhostDomain string
-	metrics     *metrics
-	readOnly    bool
-	adminOnly   bool
-	draining    atomic.Bool
+	store    *store.Store
+	log      *slog.Logger
+	metrics  *metrics
+	readOnly bool
+	draining atomic.Bool
 }
 
-func New(st *store.Store, log *slog.Logger, region, vhostDomain string, readOnly bool) *Server {
-	if region == "" {
-		region = "us-east-1"
-	}
+func New(st *store.Store, log *slog.Logger, readOnly bool) *Server {
 	return &Server{
-		store: st, log: log, region: region,
-		vhostDomain: vhostDomain, metrics: newMetrics(), readOnly: readOnly,
+		store: st, log: log, metrics: newMetrics(), readOnly: readOnly,
 	}
 }
 
@@ -77,10 +72,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/metrics" {
-		if s.adminOnly {
-			http.NotFound(w, r)
-			return
-		}
 		s.metrics.write(w, s.store)
 		return
 	}
@@ -92,38 +83,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) SetDraining(v bool) { s.draining.Store(v) }
 
-// SetAdminOnly removes /metrics from the S3 listener when a dedicated admin
-// listener is configured.
-func (s *Server) SetAdminOnly(v bool) { s.adminOnly = v }
-
-// AdminHandler serves health, readiness and metrics on a separate listener.
-func (s *Server) AdminHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok\n")
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if s.draining.Load() {
-			http.Error(w, "draining", http.StatusServiceUnavailable)
-			return
-		}
-		if err := s.store.Ready(r.Context()); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ready\n")
-	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		s.metrics.write(w, s.store)
-	})
-	return mux
-}
-
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	prepareBody(r)
-	bucket, key, err := splitPath(r, s.vhostDomain)
+	bucket, key, err := splitPath(r)
 	if err != nil {
 		writeError(w, r, errInvalidRequest("invalid object path"), s.log)
 		return
@@ -161,6 +123,12 @@ func (s *Server) bucketRequest(w http.ResponseWriter, r *http.Request, bucket st
 			s.getBucketLocation(w, r, bucket)
 		case q.Has("uploads"):
 			s.listMultipartUploads(w, r, bucket, q)
+		case r.URL.RawQuery == "" && r.Header.Get("Authorization") == "" && r.Header.Get("x-amz-date") == "":
+			if _, err := s.store.MetaHeader(r.Context(), bucket, "index.html"); err == nil {
+				s.getObject(w, r, bucket, "index.html")
+				return
+			}
+			s.listObjectsV2(w, r, bucket, q)
 		default:
 			s.listObjectsV2(w, r, bucket, q)
 		}
@@ -238,16 +206,13 @@ func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	ok, err := s.store.BucketExists(r.Context(), bucket)
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
+	if !s.readOnly {
+		if err := s.store.CreateBucket(r.Context(), bucket); err != nil {
+			writeError(w, r, errInternal(err, s.log), s.log)
+			return
+		}
 	}
-	if !ok {
-		writeError(w, r, errNoSuchBucket(), s.log)
-		return
-	}
-	w.Header().Set("x-amz-bucket-region", s.region)
+	w.Header().Set("x-amz-bucket-region", "us-east-1")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -295,21 +260,16 @@ func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 	writeXML(w, http.StatusOK, out)
 }
 
-func (s *Server) getBucketLocation(w http.ResponseWriter, r *http.Request, bucket string) {
-	ok, err := s.store.BucketExists(r.Context(), bucket)
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	if !ok {
-		writeError(w, r, errNoSuchBucket(), s.log)
-		return
-	}
-	writeXML(w, http.StatusOK, locationConstraint{Xmlns: s3Namespace, Value: s.region})
+func (s *Server) getBucketLocation(w http.ResponseWriter, _ *http.Request, _ string) {
+	writeXML(w, http.StatusOK, locationConstraint{Xmlns: s3Namespace, Value: "us-east-1"})
 }
 
 func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	m, err := s.store.MetaHeader(r.Context(), bucket, key)
+	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
+		key += "index.html"
+		m, err = s.store.MetaHeader(r.Context(), bucket, key)
+	}
 	if err != nil {
 		s.metaError(w, r, bucket, err)
 		return
@@ -342,7 +302,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		writeError(w, r, err, s.log)
 		return
 	}
-	setObjectHeaders(w, m)
+	setObjectHeaders(w, m, key)
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(http.StatusOK)
 }
@@ -379,6 +339,10 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	}
 	cond := &store.ReadCondition{IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match")}
 	sm, body, err := s.store.GetBody(r.Context(), bucket, key, first, last, suffix, cond)
+	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
+		key += "index.html"
+		sm, body, err = s.store.GetBody(r.Context(), bucket, key, first, last, suffix, cond)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
@@ -406,7 +370,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		Size: sm.Size, ETag: sm.ETag, UserMetadata: sm.UserMetadata,
 		ContentType: sm.ContentType, CreatedAt: sm.CreatedAt,
 		FileID: sm.FileID, Parts: sm.Parts, PartEnds: sm.PartEnds,
-	})
+	}, key)
 	if partCount > 0 {
 		w.Header().Set("x-amz-mp-parts-count", strconv.Itoa(partCount))
 	}
@@ -456,7 +420,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		writeError(w, r, err, s.log)
 		return
 	}
-	if maxInline := s.store.InlineMax(); maxInline > 0 && r.ContentLength >= 0 && r.ContentLength <= maxInline {
+	if maxInline := int64(store.MaxInlineBytes); r.ContentLength >= 0 && r.ContentLength <= maxInline {
 		body := io.ReadCloser(r.Body)
 		if len(in.h) > 0 {
 			body = &integrityReader{r: body, in: in}
@@ -530,15 +494,6 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		writeError(w, r, errNotImplemented(), s.log)
 		return
 	}
-	ok, err := s.store.BucketExists(r.Context(), bucket)
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	if !ok {
-		writeError(w, r, errNoSuchBucket(), s.log)
-		return
-	}
 	if _, err := s.store.Delete(r.Context(), bucket, key); err != nil {
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return
@@ -547,15 +502,6 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket, ke
 }
 
 func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
-	ok, err := s.store.BucketExists(r.Context(), bucket)
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	if !ok {
-		writeError(w, r, errNoSuchBucket(), s.log)
-		return
-	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
 	if err != nil {
 		writeError(w, r, bodyError(err), s.log)
@@ -765,15 +711,6 @@ func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bu
 }
 
 func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
-	ok, err := s.store.BucketExists(r.Context(), bucket)
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	if !ok {
-		writeError(w, r, errNoSuchBucket(), s.log)
-		return
-	}
 	prefix := q.Get("prefix")
 	delimiter := q.Get("delimiter")
 	maxKeys := 1000
@@ -880,21 +817,12 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 	writeXML(w, http.StatusOK, out)
 }
 
-func (s *Server) metaError(w http.ResponseWriter, r *http.Request, bucket string, err error) {
-	if !errors.Is(err, store.ErrNotFound) {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	ok, berr := s.store.BucketExists(r.Context(), bucket)
-	if berr != nil {
-		writeError(w, r, errInternal(berr, s.log), s.log)
-		return
-	}
-	if ok {
+func (s *Server) metaError(w http.ResponseWriter, r *http.Request, _ string, err error) {
+	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, r, errNoSuchKey(), s.log)
-	} else {
-		writeError(w, r, errNoSuchBucket(), s.log)
+		return
 	}
+	writeError(w, r, errInternal(err, s.log), s.log)
 }
 
 func (s *Server) ingestError(err error) error {
@@ -964,10 +892,19 @@ func etagListMatches(header, etag string) bool {
 	return false
 }
 
-func setObjectHeaders(w http.ResponseWriter, m *store.Meta) {
+func setObjectHeaders(w http.ResponseWriter, m *store.Meta, key string) {
+	ct := m.ContentType
+	if ct == "" || ct == "application/octet-stream" || ct == "application/x-www-form-urlencoded" {
+		if inferred := mime.TypeByExtension(path.Ext(key)); inferred != "" {
+			ct = inferred
+		}
+	}
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("ETag", quoteETag(m.ETag))
-	w.Header().Set("Content-Type", m.ContentType)
+	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Last-Modified", m.CreatedAt.UTC().Format(http.TimeFormat))
 	for k, vs := range metadataHeader(m.UserMetadata) {
 		for _, v := range vs {

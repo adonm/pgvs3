@@ -4,14 +4,12 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
-	"crypto/x509"
 	"embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,34 +28,19 @@ var schemaFS embed.FS
 const LayoutVersion = 9
 
 const (
-	smallMax  = 8 << 20
-	partRows  = smallMax/RowBytes + 2
-	chunkSize = 256 << 10
-	reapRows  = 65536
+	smallMax     = 8 << 20
+	wholeReadMax = 64 << 20
+	partRows     = smallMax/RowBytes + 2
+	chunkSize    = 256 << 10
+	reapRows     = 65536
 )
-
-// Options are the PostgreSQL connection settings.
-type Options struct {
-	MinConns       int32
-	MaxConns       int32
-	CAFile         string
-	AllowPlaintext bool
-	WholeReadMax   int64
-	WriteCommit    string
-	SkipReadVerify bool
-	InlineMax      int64
-}
 
 // Store is the PostgreSQL-backed object store. Metadata and inline objects
 // live in s3p.objects and are served directly from PostgreSQL shared_buffers.
 type Store struct {
-	pool           *pgxpool.Pool
-	chunkPool      *pgxpool.Pool
-	wholeReadMax   int64
-	writeCommit    string
-	skipReadVerify bool
-	maxInline      int64
-	log            *slog.Logger
+	pool      *pgxpool.Pool
+	chunkPool *pgxpool.Pool
+	log       *slog.Logger
 
 	fileIDMu    sync.Mutex
 	fileIDBlock []int64
@@ -68,66 +51,17 @@ type Store struct {
 	maintenanceRuns atomic.Int64
 }
 
-// Open connects and warms the pool. Remote servers must use TLS; loopback
-// servers may use plaintext for local development.
-func Open(ctx context.Context, url string, opts Options, log *slog.Logger) (*Store, error) {
+// Open connects and warms the pool. TLS is configured via standard sslmode
+// parameters in the PostgreSQL URL.
+func Open(ctx context.Context, url string, maxConns int32, log *slog.Logger) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, err
 	}
-	if opts.WholeReadMax <= 0 {
-		opts.WholeReadMax = 64 << 20
+	if maxConns <= 0 {
+		maxConns = 64
 	}
-	if opts.WriteCommit == "" {
-		opts.WriteCommit = "on"
-	}
-	if opts.InlineMax < 0 || opts.InlineMax > MaxInlineBytes {
-		return nil, fmt.Errorf("inline max must be between 0 and %d", MaxInlineBytes)
-	}
-	switch opts.WriteCommit {
-	case "on", "local", "off", "remote_write", "remote_apply":
-	default:
-		return nil, fmt.Errorf("invalid write commit mode %q", opts.WriteCommit)
-	}
-	if opts.MinConns <= 0 {
-		opts.MinConns = 64
-	}
-	if opts.MaxConns <= 0 {
-		opts.MaxConns = 64
-	}
-	if opts.MinConns > opts.MaxConns {
-		opts.MinConns = opts.MaxConns
-	}
-	host := cfg.ConnConfig.Host
-	local := host == "localhost" || strings.HasPrefix(host, "/") || isLoopback(host)
-	mode := sslMode(url)
-	if !local && !opts.AllowPlaintext {
-		if mode != "require" && mode != "verify-ca" && mode != "verify-full" {
-			return nil, fmt.Errorf("remote PostgreSQL requires sslmode=require (or PGVS3_DB_ALLOW_PLAINTEXT=true for an isolated rig)")
-		}
-	}
-	if cfg.ConnConfig.TLSConfig != nil {
-		// pgx treats sslmode=require as encrypted-but-unverified. Verify the chain
-		// and hostname against the system CAs instead.
-		cfg.ConnConfig.TLSConfig.InsecureSkipVerify = false
-		if cfg.ConnConfig.TLSConfig.ServerName == "" {
-			cfg.ConnConfig.TLSConfig.ServerName = host
-		}
-		roots, err := x509.SystemCertPool()
-		if err != nil || roots == nil {
-			roots = x509.NewCertPool()
-		}
-		if opts.CAFile != "" {
-			pem, err := os.ReadFile(opts.CAFile)
-			if err != nil {
-				return nil, fmt.Errorf("reading PostgreSQL CA file: %w", err)
-			}
-			if !roots.AppendCertsFromPEM(pem) {
-				return nil, fmt.Errorf("PostgreSQL CA file contains no certificates")
-			}
-		}
-		cfg.ConnConfig.TLSConfig.RootCAs = roots
-	}
+	minConns := min(maxConns, 8)
 	if cfg.ConnConfig.RuntimeParams == nil {
 		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
@@ -137,8 +71,8 @@ func Open(ctx context.Context, url string, opts Options, log *slog.Logger) (*Sto
 	if cfg.ConnConfig.ConnectTimeout == 0 {
 		cfg.ConnConfig.ConnectTimeout = 10 * time.Second
 	}
-	cfg.MaxConns = opts.MaxConns
-	cfg.MinConns = opts.MinConns
+	cfg.MaxConns = maxConns
+	cfg.MinConns = minConns
 	cfg.MaxConnIdleTime = 10 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
 	cfg.MaxConnLifetime = 0 // keep the hot working set for the most-recently-used pool
@@ -174,8 +108,8 @@ SET synchronous_commit = on;`
 	// Chunk range reads use a separate pool with enable_indexscan = off so
 	// PostgreSQL 18 bitmap heap scans drive the read-ahead stream.
 	chunkCfg := cfg.Copy()
-	chunkCfg.MaxConns = min(opts.MaxConns, 64)
-	chunkCfg.MinConns = min(opts.MinConns, 4)
+	chunkCfg.MaxConns = min(maxConns, 64)
+	chunkCfg.MinConns = min(minConns, 4)
 	chunkCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
 		_, err := conn.Exec(ctx, sessionSQL(false))
 		return err
@@ -192,8 +126,8 @@ SET synchronous_commit = on;`
 	}
 	// Open the warm set up front so a burst does not pay TCP, TLS and SCRAM.
 	var wg sync.WaitGroup
-	errs := make(chan error, opts.MinConns)
-	for i := int32(0); i < opts.MinConns; i++ {
+	errs := make(chan error, minConns)
+	for i := int32(0); i < minConns; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -212,7 +146,7 @@ SET synchronous_commit = on;`
 		chunkPool.Close()
 		return nil, err
 	}
-	return &Store{pool: pool, chunkPool: chunkPool, wholeReadMax: opts.WholeReadMax, writeCommit: opts.WriteCommit, skipReadVerify: opts.SkipReadVerify, maxInline: opts.InlineMax, log: log}, nil
+	return &Store{pool: pool, chunkPool: chunkPool, log: log}, nil
 }
 
 // nextFileID hands out sequence values in blocks. The sequence itself is
@@ -259,41 +193,6 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
-
-// InlineMax is the largest object stored in s3p.objects.inline_data.
-func (s *Store) InlineMax() int64 { return s.maxInline }
-
-func isLoopback(host string) bool {
-	// net.ParseIP is in net; avoid importing it here by checking the common
-	// textual forms and delegating to net in one place.
-	if host == "::1" || host == "[::1]" {
-		return true
-	}
-	parts := strings.Split(host, ".")
-	if len(parts) != 4 || parts[0] != "127" {
-		return false
-	}
-	for _, p := range parts {
-		if p == "" || len(p) > 3 {
-			return false
-		}
-	}
-	return true
-}
-
-func sslMode(raw string) string {
-	i := strings.IndexByte(raw, '?')
-	if i < 0 {
-		return "prefer"
-	}
-	for _, kv := range strings.Split(raw[i+1:], "&") {
-		k, v, _ := strings.Cut(kv, "=")
-		if k == "sslmode" {
-			return v
-		}
-	}
-	return "prefer"
-}
 
 // Init installs the layout once, under a transaction-scoped advisory lock,
 // and refuses any other layout version rather than misreading it.
@@ -386,19 +285,6 @@ func (s *Store) CheckLayout(ctx context.Context) error {
 	}
 	if !version.Valid || version.Int32 != LayoutVersion {
 		return fmt.Errorf("storage layout is %v, want v%d", version.Int32, LayoutVersion)
-	}
-	return nil
-}
-
-// EnsureBuckets idempotently creates the configured startup buckets.
-func (s *Store) EnsureBuckets(ctx context.Context, names []string) error {
-	for _, name := range names {
-		if name == "" {
-			continue
-		}
-		if err := s.CreateBucket(ctx, name); err != nil {
-			return fmt.Errorf("creating bucket %q: %w", name, err)
-		}
 	}
 	return nil
 }
@@ -864,18 +750,12 @@ func planPieces(m *Meta, start, end int64, wholeMax int64) ([]piece, error) {
 	return out, nil
 }
 
-func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc, bucket, key string, rootID int64, p piece, start, end int64) (*Body, error) {
+func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc, p piece, start, end int64) (*Body, error) {
 	conn, err := s.chunkPool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	query := getRangeSQL
-	args := []any{p.fileID, p.lo, p.hi, bucket, key, rootID}
-	if s.skipReadVerify {
-		query = getRangeSQLNoVerify
-		args = args[:3]
-	}
-	rows, err := conn.Query(ctx, query, args...)
+	rows, err := conn.Query(ctx, getRangeSQL, p.fileID, p.lo, p.hi)
 	if err != nil {
 		conn.Release()
 		return nil, err
@@ -894,7 +774,7 @@ func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc
 }
 
 func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, bucket, key string, m *Meta, start, end int64) (*Body, error) {
-	pieces, err := planPieces(m, start, end, s.wholeReadMax)
+	pieces, err := planPieces(m, start, end, wholeReadMax)
 	if err != nil {
 		return nil, err
 	}
@@ -902,7 +782,7 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, buck
 	// cut-through goroutine overlaps PostgreSQL fetch with socket writes and
 	// wins on long single-piece spans.
 	if len(pieces) == 1 && end-start+1 <= 8<<20 {
-		body, err := s.startSingleStream(ctx, cancel, bucket, key, m.FileID, pieces[0], start, end)
+		body, err := s.startSingleStream(ctx, cancel, pieces[0], start, end)
 		if err != nil {
 			return nil, err
 		}
@@ -1032,7 +912,7 @@ func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, k
 					return false
 				}
 			}
-			if err := streamRows(runCtx, tx, ch, bucket, key, rootID, p, start, end, send, s.skipReadVerify); err != nil {
+			if err := streamRows(runCtx, tx, p, start, end, send); err != nil {
 				select {
 				case ch <- result{err: err}:
 				case <-runCtx.Done():
@@ -1074,15 +954,15 @@ func (s *Store) streamSnapshot(ctx context.Context, ch chan<- result, bucket, ke
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	for _, p := range pieces {
-		if err := streamRows(ctx, tx, ch, bucket, key, rootID, p, start, end, send, s.skipReadVerify); err != nil {
+		if err := streamRows(ctx, tx, p, start, end, send); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
 }
 
-func (s *Store) streamPiece(ctx context.Context, ch chan<- result, bucket, key string, rootID int64, p piece, start, end int64, send func([]byte) bool) error {
-	return streamRows(ctx, s.chunkPool, ch, bucket, key, rootID, p, start, end, send, s.skipReadVerify)
+func (s *Store) streamPiece(ctx context.Context, _ chan<- result, _ string, _ string, _ int64, p piece, start, end int64, send func([]byte) bool) error {
+	return streamRows(ctx, s.chunkPool, p, start, end, send)
 }
 
 type querier interface {
@@ -1090,20 +970,10 @@ type querier interface {
 }
 
 const getRangeSQL = `SELECT c.no, c.data FROM s3p.chunks c
-WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3
-AND EXISTS (SELECT 1 FROM s3p.objects o WHERE o.bucket = $4 AND o.key = $5 AND o.file_id = $6)`
-
-const getRangeSQLNoVerify = `SELECT c.no, c.data FROM s3p.chunks c
 WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3`
 
-func streamRows(ctx context.Context, q querier, ch chan<- result, bucket, key string, rootID int64, p piece, start, end int64, send func([]byte) bool, skipVerify bool) error {
-	var rows pgx.Rows
-	var err error
-	if skipVerify {
-		rows, err = q.Query(ctx, getRangeSQLNoVerify, p.fileID, p.lo, p.hi)
-	} else {
-		rows, err = q.Query(ctx, getRangeSQL, p.fileID, p.lo, p.hi, bucket, key, rootID)
-	}
+func streamRows(ctx context.Context, q querier, p piece, start, end int64, send func([]byte) bool) error {
+	rows, err := q.Query(ctx, getRangeSQL, p.fileID, p.lo, p.hi)
 	if err != nil {
 		return err
 	}
@@ -1323,13 +1193,13 @@ func (s *Store) DeleteBucket(ctx context.Context, name string) (BucketDeletion, 
 }
 
 func (s *Store) CreateUpload(ctx context.Context, bucket, key string, userMeta []string, contentType string, checksumAlgorithm *string) (string, error) {
+	if _, err := s.pool.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", bucket); err != nil {
+		return "", err
+	}
 	var id string
 	err := s.pool.QueryRow(ctx, `INSERT INTO s3p.uploads (upload_id, bucket, key, checksum_algorithm, user_metadata, content_type)
-		SELECT gen_random_uuid()::text, name, $2, $3, $4, $5 FROM s3p.buckets WHERE name = $1
+		VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5)
 		RETURNING upload_id`, bucket, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNoBucket
-	}
 	return id, err
 }
 

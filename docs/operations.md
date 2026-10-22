@@ -9,23 +9,17 @@ curl -fsS http://127.0.0.1:8014/healthz
 curl -fsS http://127.0.0.1:8014/readyz
 ```
 
-Compose sets `PGVS3_BUCKETS=lake`, so no bucket bootstrap request is needed.
-
-For a real deployment put the URL and keys in Secrets and use TLS outside
-loopback; `PGVS3_ALLOW_HTTP` and `PGVS3_DB_ALLOW_PLAINTEXT` are for isolated
-development only.
+Buckets are created automatically on first write.
 
 ## Plain HTTP and authentication
 
-`PGVS3_WEB_ADDR=127.0.0.1:8080` serves objects over plain HTTP at
-`/{bucket}/{key}`. Directory requests append `PGVS3_WEB_INDEX` (default
-`index.html`); `PGVS3_WEB_ERROR` names an optional 404 object. Use it for static
-sites or non-S3 clients. It supports `HEAD`, ranges, ETags and conditional GETs.
+`:8014` (`PGVS3_ADDR`, default `0.0.0.0:8014`) serves the S3 API, plain HTTP
+and static websites (`/{bucket}/{key}`, with directory paths resolving to
+`index.html`), plus `/healthz`, `/readyz` and `/metrics`.
 
-Both the S3 and web listeners are unauthenticated. SigV4 headers and presigned
-query parameters are accepted but not verified. The network or service mesh is
-the only access-control boundary: bind listeners privately and do not expose a
-public LoadBalancer or Ingress unless you intend public read/write access.
+The listener is unauthenticated. SigV4 headers and presigned query parameters
+are accepted and ignored. Run the container inside a private network or behind
+a service mesh that enforces access control and TLS.
 
 ## Probes and metrics
 
@@ -39,10 +33,6 @@ public LoadBalancer or Ingress unless you intend public read/write access.
   - `pgvs3_pg_pool_*` and `pgvs3_chunk_pool_*`
   - reaper and maintenance-run counters
 
-Set `PGVS3_ADMIN_ADDR=127.0.0.1:8016` to move probes and metrics to a separate
-listener; `/metrics` is then removed from the S3 listener. Bind any metrics
-listener to a private network.
-
 ## Diagnose
 
 ```sh
@@ -54,8 +44,7 @@ pgvs3 reap   --url "$PGVS3_URL" --all
 `doctor` checks PostgreSQL 18, layout v9 and the chunks table settings without
 changing the database. `stat` reports logical/physical bytes, objects, chunks,
 garbage and the oldest queued file. `reap --all` runs bounded maintenance
-passes until no garbage remains, which is useful before a backup or when all
-gateways are scaled to zero.
+passes until no garbage remains.
 
 ## Layout upgrades
 
@@ -76,16 +65,11 @@ pgvs3 has no separate durable store: back up PostgreSQL.
 - **Restore validation:** run `pgvs3 doctor`, start the gateway, then read a
   known object and compare its SHA-256/ETag before directing clients at it.
 
-`PGVS3_WRITE_COMMIT=off`/`local` acknowledges writes before the local WAL fsync;
-after a crash, recent acknowledged writes may be absent. Keep `on` for anything
-you cannot reproduce.
-
 ## Maintenance
 
-The gateway runs upload expiry and bounded garbage reaping every minute
-(`PGVS3_MAINTENANCE_INTERVAL`). Deleted files remain readable for
-`PGVS3_REAP_GRACE` (10 minutes). One reaper runs per cluster via an advisory
-lock.
+The gateway runs upload expiry and bounded garbage reaping every minute.
+Deleted files remain readable for `PGVS3_REAP_GRACE` (10 minutes). One reaper
+runs per cluster via an advisory lock.
 
 Watch `pgvs3 stat` for garbage age and physical growth. A single PostgreSQL is
 the capacity and write-throughput boundary: 32 TiB per database, about 17.4 TB
@@ -94,10 +78,10 @@ DuckLake writer.
 
 ## Shutdown and read-only gateways
 
-On `SIGTERM`, `/readyz` flips to 503 and the gateway keeps serving for
-`PGVS3_DRAIN` (default 5 s) before `http.Server.Shutdown` waits for in-flight
-requests. Set `PGVS3_READ_ONLY=true` to reject mutating methods, skip DDL and
-reaping, and run against a PostgreSQL standby.
+On `SIGTERM`, `/readyz` flips to 503 and the gateway keeps serving for 5 s
+before `http.Server.Shutdown` waits for in-flight requests. Set
+`PGVS3_READ_ONLY=true` to reject mutating methods, skip DDL and reaping, and
+run against a PostgreSQL standby.
 
 `just fault` exercises peer loss, a PostgreSQL restart during a large PUT, and
 object churn.

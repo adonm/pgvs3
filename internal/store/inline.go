@@ -14,7 +14,7 @@ const MaxInlineBytes = 65536
 // is already verified by the caller; conditions and old-file garbage collection
 // happen inside s3p.put_inline.
 func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, cond Condition, ifMatch string, userMeta []string, contentType string) (*Meta, error) {
-	if int64(len(data)) > s.maxInline {
+	if int64(len(data)) > MaxInlineBytes {
 		return nil, ErrInlineTooLarge
 	}
 	sumMD5 := md5.Sum(data)
@@ -37,7 +37,7 @@ func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, 
 	var result string
 	err := s.pool.QueryRow(ctx,
 		"SELECT s3p.put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-		bucket, key, data, sumSHA[:], etag, userMeta, contentType, condText, match, s.writeCommit).Scan(&result)
+		bucket, key, data, sumSHA[:], etag, userMeta, contentType, condText, match, "on").Scan(&result)
 	if err != nil {
 		return nil, err
 	}

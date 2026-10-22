@@ -26,56 +26,21 @@ spec:
             - name: PGVS3_URL
               valueFrom:
                 secretKeyRef: { name: {{ .Values.urlSecretName | quote }}, key: url }
-            - { name: PGVS3_REGION, value: {{ .Values.region | quote }} }
-            {{- if .Values.vhostDomain }}
-            - { name: PGVS3_VHOST_DOMAIN, value: {{ .Values.vhostDomain | quote }} }
-            {{- end }}
-            {{- if .Values.allowHttp }}
-            - { name: PGVS3_ALLOW_HTTP, value: "true" }
-            {{- end }}
-            {{- if .Values.allowPlaintextDb }}
-            - { name: PGVS3_DB_ALLOW_PLAINTEXT, value: "true" }
-            {{- end }}
-            {{- if .Values.tlsSecretName }}
-            - { name: PGVS3_TLS_CERT, value: /etc/pgvs3/tls/tls.crt }
-            - { name: PGVS3_TLS_KEY, value: /etc/pgvs3/tls/tls.key }
-            {{- end }}
-            - { name: PGVS3_DB_CA_FILE, value: /etc/pgvs3/db-ca/caCert }
             - { name: PGVS3_POOL_MAX, value: {{ .Values.poolMax | quote }} }
-            - { name: PGVS3_POOL_MIN, value: {{ .Values.poolMin | quote }} }
-            {{- if .Values.buckets }}
-            - { name: PGVS3_BUCKETS, value: {{ .Values.buckets | quote }} }
-            {{- end }}
             - { name: GOMEMLIMIT, value: {{ .Values.gomemlimit | quote }} }
           ports:
             - { containerPort: 8014, name: s3 }
-          # Opening a warm pool over TLS to a remote database can be slow.
-          # Do not apply liveness until it is serving.
           startupProbe:
-            httpGet: { path: /healthz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
+            httpGet: { path: /healthz, port: 8014 }
             periodSeconds: 5
             failureThreshold: 36
           readinessProbe:
-            httpGet: { path: /readyz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
+            httpGet: { path: /readyz, port: 8014 }
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
-            httpGet: { path: /healthz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
+            httpGet: { path: /healthz, port: 8014 }
             initialDelaySeconds: 10
             periodSeconds: 15
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          volumeMounts:
-            - { name: db-ca, mountPath: /etc/pgvs3/db-ca, readOnly: true }
-          {{- if .Values.tlsSecretName }}
-            - { name: tls, mountPath: /etc/pgvs3/tls, readOnly: true }
-          {{- end }}
-      volumes:
-        - name: db-ca
-          secret:
-            secretName: {{ .Values.urlSecretName | quote }}
-            items: [{ key: caCert, path: caCert }]
-      {{- if .Values.tlsSecretName }}
-        - name: tls
-          secret: { secretName: {{ .Values.tlsSecretName | quote }} }
-      {{- end }}

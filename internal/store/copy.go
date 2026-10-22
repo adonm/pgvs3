@@ -29,6 +29,9 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 		return nil, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
+	if _, err := tx.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", dstBucket); err != nil {
+		return nil, err
+	}
 	if err := lockTwo(ctx, tx, srcBucket, srcKey, dstBucket, dstKey); err != nil {
 		return nil, err
 	}

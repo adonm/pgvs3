@@ -159,6 +159,7 @@ DECLARE
   old_etag text;
   found_old boolean;
 BEGIN
+  INSERT INTO s3p.buckets (name) VALUES (p_bucket) ON CONFLICT (name) DO NOTHING;
   PERFORM pg_advisory_xact_lock(hashtextextended(p_bucket, 0) # hashtextextended(p_key, 1));
   SELECT file_id, parts, etag INTO old_file, old_parts, old_etag
     FROM s3p.objects WHERE bucket = p_bucket AND key = p_key FOR UPDATE;
@@ -213,9 +214,7 @@ BEGIN
   IF octet_length(p_data) > 65536 THEN
     RAISE EXCEPTION 'inline object exceeds 64 KiB';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM s3p.buckets WHERE name = p_bucket) THEN
-    RETURN 'nobucket';
-  END IF;
+  INSERT INTO s3p.buckets (name) VALUES (p_bucket) ON CONFLICT (name) DO NOTHING;
   PERFORM pg_advisory_xact_lock(hashtextextended(p_bucket, 0) # hashtextextended(p_key, 1));
   SELECT file_id, parts, etag INTO old_file, old_parts, old_etag
     FROM s3p.objects WHERE bucket = p_bucket AND key = p_key FOR UPDATE;

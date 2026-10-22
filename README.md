@@ -27,12 +27,11 @@ Needs [mise](https://mise.jdx.dev/) and Docker (or PostgreSQL 18+ with a
 ```sh
 just setup
 just dev-db                 # PostgreSQL 18 on 127.0.0.1:5432
-go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmode=disable' \
-  serve --addr 127.0.0.1:8014 --buckets lake
+go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmode=disable' serve
 ```
 
-`--buckets lake` creates the bucket idempotently at startup. Write an object
-(the example key is for loopback development only):
+Buckets auto-create on write, and the same `:8014` listener serves both S3 and
+plain HTTP / static websites:
 
 ```sh
 curl -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
@@ -149,62 +148,40 @@ Storage Lens or Transfer Acceleration. ETags are opaque; single PUTs use MD5.
 
 ## Plain HTTP and static websites
 
-Run a separate unauthenticated HTTP listener for browsers, static sites and
-non-S3 clients:
+The single `:8014` listener serves S3 clients, plain HTTP clients and static
+websites at the same `/{bucket}/{key}` URLs:
 
 ```sh
-pgvs3 serve --web-addr 127.0.0.1:8080 --web-index index.html
-curl http://127.0.0.1:8080/lake/index.html
-curl http://127.0.0.1:8080/lake/docs/
+curl http://127.0.0.1:8014/lake/index.html
+curl http://127.0.0.1:8014/lake/docs/
 ```
 
-Requests are path-style (`/{bucket}/{key}`); a trailing slash appends
-`--web-index`. `--web-error 404.html` serves that object as the 404 page.
-Content type is taken from the object metadata, with a filename-extension
-fallback. Range, `HEAD`, ETag and conditional reads work. The web listener is
-unauthenticated and plain HTTP: bind it to a private interface or put it behind
-the service mesh.
+A trailing slash resolves to `index.html`, and plain `GET /{bucket}` without S3
+query parameters or headers serves `/{bucket}/index.html` when present. Content
+type is taken from object metadata with a filename-extension fallback. Range,
+`HEAD`, ETag and conditional reads work identically for S3 and HTTP clients.
 
-The S3 listener is also unauthenticated: any client that can reach it can read,
-write and delete objects. Bind it to a private interface or put it behind a
-service mesh that enforces access control. TLS still protects transport when
-configured, but it is not authentication.
+The listener is unauthenticated and plain HTTP: run the container inside a
+private network or behind a service mesh that enforces access control and TLS.
 
 ## Configuration
 
-A flag overrides the same-named environment variable.
+A flag overrides the same-named environment variable. Buckets auto-create on
+write.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `--url` | `PGVS3_URL` | local dev DB | PostgreSQL URL. Remote hosts require `sslmode=require`; certificates and hostnames are verified against system CAs plus `PGVS3_DB_CA_FILE`. Loopback may use plaintext. |
-| `--addr` | `PGVS3_ADDR` | `127.0.0.1:8014` | S3 listen address. |
-| `--vhost-domain` | `PGVS3_VHOST_DOMAIN` | unset | Virtual-host suffix, e.g. `s3.internal`. |
-| `--tls-cert`, `--tls-key` | `PGVS3_TLS_CERT`, `PGVS3_TLS_KEY` | unset | PEM files for HTTPS on non-loopback addresses. |
-| `--allow-http` | `PGVS3_ALLOW_HTTP` | false | Explicitly permit plaintext HTTP outside loopback. |
-| | `PGVS3_DB_CA_FILE` | unset | Extra PostgreSQL CA bundle. |
-| | `PGVS3_DB_ALLOW_PLAINTEXT` | false | Permit plaintext to a remote PostgreSQL for an isolated rig. |
-| `--pool-min` | `PGVS3_POOL_MIN` | 64 | Connections opened at start and kept warm. |
-| `--pool-max` | `PGVS3_POOL_MAX` | 64 | Connections per gateway. Size the fleet against PostgreSQL `max_connections`. |
-| `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long deleted files stay readable. |
-| `--maintenance-interval` | `PGVS3_MAINTENANCE_INTERVAL` | `1m` | Reaper and upload-expiry interval. |
-| `--whole-read-max` | `PGVS3_WHOLE_READ_MAX` | 64 MiB | Largest single-file span read in one query; larger spans split into pieces. |
-| `--write-commit` | `PGVS3_WRITE_COMMIT` | `on` | `synchronous_commit` for unconditional writes: `on`, `local` or `off`. Conditional writes always use `on`. |
-| `--verify-reads` | `PGVS3_VERIFY_READS` | true | Re-check the object's current `file_id` on every chunk range query. Disable only for a single writer/immutable lake. |
-| `--inline-max` | `PGVS3_INLINE_MAX` | 65536 | Largest object stored inline; `0` stores everything in chunks. |
-| `--buckets` | `PGVS3_BUCKETS` | unset | Comma-separated buckets created idempotently at startup. |
-| `--read-only` | `PGVS3_READ_ONLY` | false | Reject mutating methods; skip DDL, reaping and bucket creation. Use against a standby. |
-| `--drain` | `PGVS3_DRAIN` | `5s` | Keep serving while `/readyz` returns 503, then shut down. |
-| `--admin-addr` | `PGVS3_ADMIN_ADDR` | unset | Optional separate listener for `/healthz`, `/readyz` and `/metrics`. |
-| `--web-addr` | `PGVS3_WEB_ADDR` | unset | Plain HTTP object/static-site listener. |
-| `--web-index` | `PGVS3_WEB_INDEX` | `index.html` | Object appended to directory requests. |
-| `--web-error` | `PGVS3_WEB_ERROR` | unset | Optional bucket-relative 404 object. |
-| `--region` | `PGVS3_REGION` | `us-east-1` | Region returned by bucket location queries. |
+| `--url` | `PGVS3_URL` | `postgres://localhost/pgvs3` | PostgreSQL URL (`sslmode` controls DB TLS). |
+| `--addr` | `PGVS3_ADDR` | `0.0.0.0:8014` | S3, plain HTTP, `/healthz`, `/readyz` and `/metrics` listen address. |
+| `--pool-max` | `PGVS3_POOL_MAX` | `64` | Connections per gateway. Size the fleet against PostgreSQL `max_connections`. |
+| `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long deleted files stay readable before GC. |
+| `--read-only` | `PGVS3_READ_ONLY` | `false` | Reject mutating methods and skip DDL/reaping (use against a standby). |
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 
-`GET /healthz`, `GET /readyz` and `GET /metrics` are unauthenticated. Bind
-those paths (or `--admin-addr`) to a private network. `pgvs3 health` polls
-`/readyz` for container orchestrators. `pgvs3 stat` reports logical vs
-physical size, queued files and the age of the oldest queued file.
+`pgvs3 health` polls `/readyz` for container orchestrators. `pgvs3 stat [--json]`
+reports logical vs physical size, queued files and the age of the oldest queued
+file. `pgvs3 doctor` checks the database layout, and `pgvs3 reap [--all]` runs
+garbage collection on demand.
 
 ## Storage cost and limits
 
@@ -228,7 +205,7 @@ just image            # local ko.local image
 just image push=true  # ghcr.io/adonm/pgvs3, amd64 + arm64
 ```
 
-The image is about 16 MB and exposes `8014` (S3).
+The image is about 14 MB and exposes `8014` (S3 and HTTP).
 
 ## Design decisions
 

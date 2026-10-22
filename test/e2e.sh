@@ -8,7 +8,6 @@ set -euo pipefail
 : "${PGVS3_ACCESS_KEY:?}"
 : "${PGVS3_SECRET_KEY:?}"
 : "${PGVS3_TEST_PG_PORT:?}"
-: "${PGVS3_TEST_WEB_URL:?}"
 
 A=$PGVS3_TEST_ENDPOINT_A
 B=$PGVS3_TEST_ENDPOINT_B
@@ -22,8 +21,7 @@ code() { s3 -o /dev/null -w '%{http_code}' "$@"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() { local want=$1; shift; local got; got=$(code "$@"); [ "$got" = "$want" ] || fail "expected HTTP $want, got $got: $*"; }
 
-s3 -X PUT "$A/$BUCKET" >/dev/null || fail "create bucket"
-WEB=$PGVS3_TEST_WEB_URL
+WEB=$A
 
 # --- basic object, cross-gateway read, HEAD, ranges -------------------------
 head -c 1048576 /dev/urandom > "$TMP/one.bin"
@@ -39,7 +37,7 @@ expect 416 -H 'Range: bytes=99999999-' "$A/$BUCKET/$RUN/one.bin"
 
 # --- plain HTTP static web and unsigned S3 ----------------------------------
 printf '<html>index</html>' > "$TMP/index.html"
-expect 200 -X PUT -H 'Content-Type: text/html' --data-binary @"$TMP/index.html" "$A/$BUCKET/$RUN/web/index.html"
+expect 200 -X PUT --data-binary @"$TMP/index.html" "$A/$BUCKET/$RUN/web/index.html"
 printf 'asset' > "$TMP/asset.txt"
 expect 200 -X PUT -H 'Content-Type: text/plain' --data-binary @"$TMP/asset.txt" "$A/$BUCKET/$RUN/web/asset.txt"
 [ "$(curl -fsS "$WEB/$BUCKET/$RUN/web/")" = '<html>index</html>' ] || fail "web index"

@@ -1,23 +1,12 @@
 replicas: 3
 image: ghcr.io/adonm/pgvs3:latest
-# Secret with `url` (and `caCert`, possibly empty, for a private database CA).
-# The URL never enters Helm values or release history.
+# Secret with a `url` key (standard libpq/pgx URL; sslmode controls DB TLS).
 urlSecretName: pgvs3-db
-region: us-east-1
-# Idempotently created at startup; avoids a manual bucket bootstrap.
-buckets: "lake"
 # Keep below the container memory limit; Go uses it as a soft heap ceiling.
 gomemlimit: "3Gi"
-vhostDomain: ""
-# Configure a TLS Secret for non-loopback deployments. Plaintext is an explicit
-# opt-in for isolated test clusters only.
-tlsSecretName: ""
-allowHttp: false
-allowPlaintextDb: false
 # A per-replica ceiling. Size PostgreSQL max_connections for the whole fleet,
 # including rollout headroom and other clients.
 poolMax: 64
-poolMin: 64
 # Spread stateless gateway replicas across zones.
 topologySpread:
   enabled: true

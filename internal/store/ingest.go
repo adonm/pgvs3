@@ -232,18 +232,8 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 		conn.Release()
 		return nil, err
 	}
-	if t.kind == 0 && t.condition == Unconditional && s.writeCommit != "on" {
-		if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = "+s.writeCommit); err != nil {
-			return fail(err)
-		}
-	}
-	if t.kind == 0 {
-		var one int
-		err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE", t.bucket).Scan(&one)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return fail(ErrNoBucket)
-		}
-	} else {
+	if t.kind != 0 {
+
 		var alg *string
 		err = tx.QueryRow(ctx,
 			"SELECT checksum_algorithm FROM s3p.uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3 FOR KEY SHARE",
@@ -425,6 +415,9 @@ func swapObject(ctx context.Context, tx pgx.Tx, t writerTarget, fileID, size int
 }
 
 func swapObjectParts(ctx context.Context, tx pgx.Tx, bucket, key string, t *writerTarget, fileID, size int64, sha []byte, etag string, userMeta []string, content string, parts, ends []int64) error {
+	if _, err := tx.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", bucket); err != nil {
+		return err
+	}
 	if err := lockObjectKey(ctx, tx, bucket, key); err != nil {
 		return err
 	}
