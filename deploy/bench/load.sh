@@ -28,7 +28,6 @@ mise exec go -- go build -o .tmp/pgvs3/pgvs3 ./cmd/pgvs3
 read -r port < <(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 PGVS3_URL="$url" PGVS3_ACCESS_KEY=bench PGVS3_SECRET_KEY=bench-secret \
   PGVS3_POOL_MIN=8 PGVS3_POOL_MAX=128 PGVS3_LOG_LEVEL=warn \
-  PGVS3_OBJECT_CACHE_BYTES="${OBJECT_CACHE_BYTES:-0}" \
   .tmp/pgvs3/pgvs3 serve --addr "127.0.0.1:$port" > .tmp/pgvs3/load-gateway.log 2>&1 &
 pid=$!
 for i in $(seq 1 120); do

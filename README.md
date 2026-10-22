@@ -96,55 +96,28 @@ The layout is deliberately narrow:
 
 `docs/performance.md` maps each pgvfs technique to the implementation.
 
-## Performance
+## Performance and multi-gateway caching
 
-On a shared 6-vCPU loopback host, direct S3 load on the current v9 build
-gives a 0.28 ms p50 for one 4 KiB GET and about 18.4k 4 KiB GET/s at 256
-workers; cached HEAD is 0.24 ms at one worker and 17.6k/s at 64. A 4 KiB PUT
-is 1.32 ms at one worker (2.1k/s at 16; async commit reaches 3.97k/s in an
-earlier run). 8 MiB GETs reach 1.09 GiB/s and 64 MiB GETs 1.06 GiB/s at 16
-workers.
+PostgreSQL's `shared_buffers` on `s3p.objects` is the single shared cache
+across all gateways:
+
+- Metadata and small objects (≤64 KiB) live in `s3p.objects`, indexed by
+  `(bucket, key)`. A primary-key `Index Scan` in `shared_buffers` takes ~6 µs
+  inside PostgreSQL (~0.47 ms p50 end-to-end over HTTP, reaching ~8.2k 4 KiB
+  GET/s and ~9.2k HEAD/s at 64 workers).
+- Removing `LISTEN/NOTIFY` and in-process caches eliminates commit-time
+  notification lock contention in PostgreSQL: durable 4 KiB PUTs reach **3.7k/s**
+  at 64 workers (`synchronous_commit = on`).
+- Gateways hold **zero in-process object or metadata state**. Any number of
+  gateway containers can run behind a load balancer or Kubernetes `Deployment`
+  with strict MVCC consistency and zero invalidation lag; `--read-only`
+  gateways can point at PostgreSQL streaming standbys for local-AZ read scale.
+
 For context, S3 Express One Zone publishes single-digit-millisecond latency and
 200k reads / 100k writes per directory bucket by default. Per-request latency
 is in the same band; the aggregate ceiling is not — pgvs3 is one PostgreSQL.
 Full methodology and the published-service comparison are in
 [docs/benchmarks.md](docs/benchmarks.md).
-
-## Cross-AZ metadata cache
-
-Gateways in different AZs can form a peer cache with
-[`groupcache-go/v3`](https://github.com/groupcache/groupcache-go) and
-[Otter](https://github.com/maypok86/otter) (W-TinyLFU). Each key has one owner;
-concurrent misses cluster-wide are coalesced into one PostgreSQL read. A peer
-that fetches a remotely-owned key mirrors it in a local hot cache, so repeated
-reads in that AZ stay in local RAM.
-
-```sh
-PGVS3_PEERS='10.0.1.10:8015,10.0.2.10:8015,10.0.3.10:8015' \
-PGVS3_PEER_ADVERTISE='10.0.1.10:8015' \
-PGVS3_PEER_ADDR='0.0.0.0:8015' \
-PGVS3_CACHE_MAIN_BYTES=$((64<<20)) \
-PGVS3_CACHE_HOT_BYTES=$((64<<20)) \
-pgvs3 serve --addr 0.0.0.0:8014
-```
-
-- The hot cache defaults to **100% of the main cache** (groupcache's default is
-  1/8, which causes constant cross-AZ fetches for the two-thirds of keys owned
-  by other nodes).
-- The peer cache carries **metadata only**. Objects up to 64 KiB are inline in
-  the database; a per-gateway byte cache covers non-inline objects up to
-  256 KiB. Large object bytes are already cached by DuckDB's external file
-  cache.
-- A single gateway invalidates its byte cache on every local write. When peers
-  are configured, cache hits revalidate against `s3p.objects` before serving,
-  so a write through another gateway cannot be masked. If several gateways
-  write the same bucket without a peer list, set
-  `PGVS3_OBJECT_CACHE_REVALIDATE=true`.
-- Writes enqueue a best-effort cluster-wide invalidation. A stale entry can
-  cause one retry, never stale bytes: the range query checks that the object
-  still points at the cached `file_id`.
-- `PGVS3_PEER_SECRET` adds a shared header to peer requests. Keep the peer port
-  on a private network either way.
 
 ## S3 surface
 
@@ -214,9 +187,6 @@ A flag overrides the same-named environment variable.
 | `--pool-max` | `PGVS3_POOL_MAX` | 64 | Connections per gateway. Size the fleet against PostgreSQL `max_connections`. |
 | `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long deleted files stay readable. |
 | `--maintenance-interval` | `PGVS3_MAINTENANCE_INTERVAL` | `1m` | Reaper and upload-expiry interval. |
-| `--object-cache-bytes` | `PGVS3_OBJECT_CACHE_BYTES` | 64 MiB | Whole-object cache for objects up to 256 KiB; `0` disables. |
-| `--object-cache-ttl` | `PGVS3_OBJECT_CACHE_TTL` | `5s` | Small-object cache TTL. |
-| `--object-cache-revalidate` | `PGVS3_OBJECT_CACHE_REVALIDATE` | false single gateway; true with peers | Check each cache hit against `s3p.objects`. |
 | `--whole-read-max` | `PGVS3_WHOLE_READ_MAX` | 64 MiB | Largest single-file span read in one query; larger spans split into pieces. |
 | `--write-commit` | `PGVS3_WRITE_COMMIT` | `on` | `synchronous_commit` for unconditional writes: `on`, `local` or `off`. Conditional writes always use `on`. |
 | `--verify-reads` | `PGVS3_VERIFY_READS` | true | Re-check the object's current `file_id` on every chunk range query. Disable only for a single writer/immutable lake. |
@@ -228,12 +198,6 @@ A flag overrides the same-named environment variable.
 | `--web-addr` | `PGVS3_WEB_ADDR` | unset | Plain HTTP object/static-site listener. |
 | `--web-index` | `PGVS3_WEB_INDEX` | `index.html` | Object appended to directory requests. |
 | `--web-error` | `PGVS3_WEB_ERROR` | unset | Optional bucket-relative 404 object. |
-| `--cache-main-bytes` | `PGVS3_CACHE_MAIN_BYTES` | 64 MiB | Local cache for owned metadata keys. |
-| `--cache-hot-bytes` | `PGVS3_CACHE_HOT_BYTES` | 64 MiB | Local mirror of peer-owned metadata keys. |
-| `--peers` | `PGVS3_PEERS` | unset | Comma-separated `host:port` peer list. |
-| `--peer-addr` | `PGVS3_PEER_ADDR` | `0.0.0.0:8015` | Peer cache listen address. |
-| `--peer-advertise` | `PGVS3_PEER_ADVERTISE` | required with peers | This gateway's address as peers see it; must be in `PGVS3_PEERS`. |
-| `--peer-secret` | `PGVS3_PEER_SECRET` | unset | Shared secret header for peer requests. |
 | `--region` | `PGVS3_REGION` | `us-east-1` | Region returned by bucket location queries. |
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 
@@ -264,12 +228,14 @@ just image            # local ko.local image
 just image push=true  # ghcr.io/adonm/pgvs3, amd64 + arm64
 ```
 
-The image is about 17 MB. It exposes `8014` (S3) and `8015` (peer cache).
+The image is about 16 MB and exposes `8014` (S3).
 
 ## Design decisions
 
-- **No block cache.** A small whole-object cache covers repeated footers and
-  metadata (≤256 KiB); larger file bytes are left to DuckDB's external cache.
+- **PostgreSQL `shared_buffers` is the shared cache.** Gateways keep no
+  in-process metadata or object cache; `s3p.objects` serves metadata and ≤64 KiB
+  inline objects directly from PostgreSQL RAM, and DuckDB caches larger file
+  bytes client-side.
 - **Connections are reused most-recently-used first** to keep TCP slow-start out
   of the hot path.
 - **Single-file reads up to 64 MiB are one query.** Larger/multipart reads use
@@ -296,7 +262,7 @@ just bench      # DuckDB S3 benchmark, DuckLake checks and row-group tuning
 
 Every recipe starts a disposable PostgreSQL 18 in Docker and two local
 gateways, then removes them. `just contract` covers conditional writes,
-pagination, multipart, byte ranges, cross-gateway reads, peer invalidation,
+pagination, multipart, byte ranges, cross-gateway consistency,
 copy, attributes, multipart and both DuckDB 2.0 and
 `duckdb-object-storage` on 1.5.6. `just interop` drives rclone, restic, boto3,
 DuckLake and a small SlateDB Rust program against the same gateway. DuckDB 2.0
@@ -310,13 +276,12 @@ historical numbers.
 - `internal/store/`: schema, PostgreSQL pool, streaming COPY/GET, multipart,
   copy, maintenance.
 - `internal/s3/`: S3 routing, XML, ranges, checksums and multipart.
-- `internal/peercache/`: groupcache + Otter cross-AZ metadata cache.
 - `test/e2e.sh`: the S3 contract.
 - `test/interop.sh`: rclone, restic, boto3, DuckLake and SlateDB.
 - `test/slatedb/`: the SlateDB Rust smoke program.
 - `deploy/bench/`: disposable stack and DuckDB benchmark.
 - `deploy/compose.yaml`: local PostgreSQL + gateway stack.
-- `deploy/charts/pgvs3/`: Helm chart (3-AZ topology and peer cache).
+- `deploy/charts/pgvs3/`: Helm chart (stateless multi-AZ Deployment).
 - `docs/operations.md`: probes, metrics, backup/restore and failure behavior.
 - `docs/partitioning.md`: why the chunks table stays unpartitioned.
 - `justfile`, `.ko.yaml`, `mise.toml`: toolchain and build.

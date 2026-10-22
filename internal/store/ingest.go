@@ -13,7 +13,6 @@ import (
 	"io"
 	"math"
 	"sync"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -239,15 +238,10 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 		}
 	}
 	if t.kind == 0 {
-		if !s.bucketKnown(t.bucket) {
-			var one int
-			err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE", t.bucket).Scan(&one)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return fail(ErrNoBucket)
-			}
-			if err == nil {
-				s.markBucket(t.bucket)
-			}
+		var one int
+		err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE", t.bucket).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fail(ErrNoBucket)
 		}
 	} else {
 		var alg *string
@@ -353,14 +347,6 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 		return
 	}
 	pub := Published{FileID: fileIDOf(w), Size: size, ETag: etag, SHA256: sha, MD5: md5, Checksum: checksum}
-	if t.kind == 0 {
-		w.store.cache.Put(ctx, t.bucket, t.key, Meta{
-			Size: size, SHA256: sha, ETag: etag, UserMetadata: t.userMeta,
-			ContentType: t.content, CreatedAt: time.Now(), FileID: fileIDOf(w),
-		})
-		w.store.invalidatePeers(ctx, t.bucket, t.key)
-		w.store.objects.invalidate(t.bucket, t.key)
-	}
 	w.mu.Lock()
 	w.published = pub
 	w.mu.Unlock()

@@ -18,18 +18,7 @@ allowPlaintextDb: false
 # including rollout headroom and other clients.
 poolMax: 64
 poolMin: 64
-# Cross-AZ metadata cache. Static membership: the peer list is generated from
-# `replicas` and the StatefulSet's ordinal DNS names. Do not combine with an
-# HPA that changes the replica count without updating the peer list.
-peerCache:
-  enabled: true
-  port: 8015
-  mainBytes: 67108864
-  hotBytes: 67108864
-  # Optional Secret with a `token` key, sent on peer HTTP requests.
-  secretName: ""
-# One gateway per zone. Increase replicas in multiples of the number of zones
-# if you need more.
+# Spread stateless gateway replicas across zones.
 topologySpread:
   enabled: true
   maxSkew: 1
@@ -37,8 +26,6 @@ topologySpread:
 resources:
   requests: { cpu: 250m, memory: 256Mi }
   limits: { memory: 4Gi }
-# HPA is off by default because the peer list is static. Enable only with
-# peerCache disabled or an external peer discovery controller.
 podDisruptionBudget:
   enabled: true
   minAvailable: 1

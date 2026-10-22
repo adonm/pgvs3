@@ -189,7 +189,6 @@ BEGIN
       AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
     ON CONFLICT DO NOTHING;
   END IF;
-  PERFORM pg_notify('s3p_invalidate', p_bucket || chr(31) || p_key);
   RETURN 'ok';
 END $$;
 
@@ -247,7 +246,6 @@ BEGIN
       AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f)
     ON CONFLICT DO NOTHING;
   END IF;
-  PERFORM pg_notify('s3p_invalidate', p_bucket || chr(31) || p_key);
   RETURN 'ok';
 END $$;
 

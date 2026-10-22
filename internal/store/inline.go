@@ -55,9 +55,6 @@ func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, 
 		UserMetadata: userMeta, ContentType: contentType, CreatedAt: time.Now(),
 		Inline: data,
 	}
-	s.cache.Put(ctx, bucket, key, m)
-	s.invalidatePeers(ctx, bucket, key)
-	s.objects.invalidate(bucket, key)
 	return &m, nil
 }
 

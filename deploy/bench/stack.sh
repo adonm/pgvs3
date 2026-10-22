@@ -47,20 +47,20 @@ if [ "$mode" != bench ]; then export PGVS3_POOL_MIN=1 PGVS3_POOL_MAX=8; fi
 mkdir -p .tmp/pgvs3
 (cd "$(dirname "$0")/../.." && mise exec go -- go build -o .tmp/pgvs3/pgvs3 ./cmd/pgvs3)
 
-read -r port_a port_b peer_a peer_b web_port < <(python3 -c '
+read -r port_a port_b web_port < <(python3 -c '
 import socket
 ports=[]
-for _ in range(5):
+for _ in range(3):
     with socket.socket() as s:
         s.bind(("127.0.0.1",0))
         ports.append(s.getsockname()[1])
 print(*ports)
 ')
-for entry in "a:$port_a:$peer_a" "b:$port_b:$peer_b"; do
-  label=${entry%%:*}; rest=${entry#*:}; port=${rest%%:*}; peer=${rest#*:}
+for entry in "a:$port_a" "b:$port_b"; do
+  label=${entry%%:*}; port=${entry#*:}
   args=()
   if [ "$mode" = contract ] || [ "$mode" = fault ] || [ "$mode" = interop ]; then
-    args+=(--peers "127.0.0.1:$peer_a,127.0.0.1:$peer_b" --peer-advertise "127.0.0.1:$peer" --peer-addr "127.0.0.1:$peer" --reap-grace 1s --maintenance-interval 1s)
+    args+=(--reap-grace 1s --maintenance-interval 1s)
   fi
   if [ "$label" = a ] && { [ "$mode" = contract ] || [ "$mode" = interop ]; }; then
     args+=(--web-addr "127.0.0.1:$web_port")

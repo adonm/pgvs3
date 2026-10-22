@@ -1,13 +1,12 @@
 package s3
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 )
 
 // APIError is an S3 error response.
@@ -91,12 +90,10 @@ func writeError(w http.ResponseWriter, r *http.Request, err error, log *slog.Log
 	_, _ = w.Write(body)
 }
 
+var reqSeq atomic.Uint64
+
 func requestID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "00000000000000000000000000000000"
-	}
-	return hex.EncodeToString(b[:])
+	return fmt.Sprintf("%016x", reqSeq.Add(1))
 }
 
 func requestIDHeader() string { return requestID() }

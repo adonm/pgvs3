@@ -45,52 +45,28 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 - **Checksums cover modern SDKs.** CRC64NVME and FULL_OBJECT are accepted on
   single PUTs; multipart uses per-part CRC32/CRC32C/SHA1/SHA256/CRC64NVME
   checksums and a composite ETag.
-- **Metadata is cached.** Otter (W-TinyLFU) serves metadata reads without a
-  lock, with a 5-second TTL. `HEAD` uses the cache; on a miss it fetches and
-  caches the full row, including inline bytes, so a later GET cannot see a
-  header-only entry. `LISTEN/NOTIFY` drops the entry as soon as a write commits
-  anywhere in the cluster.
-- **Buckets are cached.** A positive bucket lookup is remembered for 30 seconds
-  and dropped on create/delete or NOTIFY, removing a query from `HEAD`, `LIST`
-  and `DELETE`.
-- **Cold small reads are coalesced.** `singleflight` collapses concurrent
-  misses for the same non-inline small object into one PostgreSQL read.
-- **Small objects are cached.** A per-gateway Otter byte cache holds whole
-  objects up to 256 KiB. Single-gateway writes invalidate it locally; with
-  peers, each hit revalidates `file_id`/ETag against `s3p.objects`. See
-  “Small-object cache” below.
-- **Stale entries fail safe.** A range query verifies the current object still
-  points at the cached `file_id`; a stale entry causes one fresh retry, never
-  stale bytes.
-- **Conditional reads are cheap.** `If-Match` compares the cached ETag first and
-  refreshes only on a mismatch. `If-None-Match` reads fresh metadata before a
-  `304`.
+- **PostgreSQL `shared_buffers` is the shared cache.** Gateways keep no
+  in-process metadata or object cache. `s3p.objects` holds both metadata and
+  ≤64 KiB inline objects; with `enable_indexscan = on` on the main pool, a
+  primary-key `Index Scan` from `shared_buffers` takes ~6 µs inside PostgreSQL
+  (~0.47 ms p50 end-to-end over HTTP) and is strictly MVCC-consistent across
+  any number of gateways.
+- **`HEAD` never transfers `inline_data`.** Because there is no local cache to
+  populate, `MetaHeader` projects only the header columns.
+- **Concurrent overwrites fail safe.** A chunk range query verifies the current
+  object still points at `file_id`; a concurrent replacement between `Meta` and
+  `startStream` causes one fresh retry, never stale bytes.
 - **The `EXISTS` check is optional.** Every chunk range normally re-checks the
   object row; `PGVS3_VERIFY_READS=false` drops that probe for a single-writer /
-  immutable lake, at the cost of relying on cache invalidation.
+  immutable lake.
 - **No block read-ahead.** As in pgvfs, DuckDB already merges nearby reads;
   fetching 254 KiB blocks was 30–38% slower cold.
 - **No partitioning by default.** See the measured 16/64-partition regression
   above.
-- **No index scans for chunk ranges.** PostgreSQL execution was already
-  0.01–0.03 ms; the bitmap plan wins on cold pages.
-
-## Small-object cache
-
-v9 inlines objects up to 64 KiB, so 4 KiB GETs are already a single metadata
-lookup. The Otter byte cache remains for **non-inline** objects from 64 KiB to
-256 KiB (default 64 MiB, 5 s TTL).
-
-- **Single gateway:** local writes invalidate the key; hits are served from RAM.
-- **Peer mode:** a hit checks `file_id`/ETag against `s3p.objects` before
-  serving. That costs about as much as the row read, so peer mode is about
-  correctness rather than a large latency win.
-- **TTL:** five seconds bounds staleness if an invalidation is lost.
-- Peer mode also revalidates inline `GET`s, because an inline object has no
-  chunk `file_id` for the range query to check.
-
-This is not a block cache. Large objects are streamed and left to DuckDB's
-external file cache.
+- **Split pools for index vs bitmap scans.** The main pool keeps
+  `enable_indexscan = on` for `s3p.objects`, `s3p.buckets`, `s3p.uploads` and
+  `ListObjectsV2`; a dedicated `chunkPool` sets `enable_indexscan = off` so
+  `s3p.chunks` range reads use PostgreSQL 18's bitmap heap scan read-ahead.
 
 ## Partitioning
 
@@ -137,23 +113,23 @@ default stays 64 KiB. 8 KiB behaves the same either way.
 
 - **Small objects are one SQL call.** `s3p.put_inline` checks the bucket,
   serialises the key, evaluates `If-Match`/`If-None-Match`, queues replaced
-  files, upserts the inline row and sends a cache NOTIFY in one round trip.
-  A 4 KiB PUT is 1.24 ms at one worker; async commit (`PGVS3_WRITE_COMMIT=off`)
-  reaches 3.97k/s at 16.
+  files and upserts the inline row in one round trip. Removing `pg_notify`
+  and keeping `enable_indexscan = on` on the main pool reaches 3.7k durable
+  4 KiB PUT/s at 64 workers (`synchronous_commit = on`).
 - **One binary `COPY` per larger PUT or part.** `internal/store/ingest.go` frames
   4 MiB batches; the body is hashed (SHA-256 for integrity, MD5 for the ETag) in
   the same pass.
 - **Publish in one SQL call.** After `COPY`, `s3p.publish_object` takes the
-  advisory lock, evaluates conditions, swaps the object row, queues replaced
-  files and sends NOTIFY. Chunks and metadata commit together; an interrupted
+  advisory lock, evaluates conditions, swaps the object row and queues replaced
+  files. Chunks and metadata commit together; an interrupted
   write publishes nothing.
 - **The COPY framer reuses 4 MiB buffers.** A `sync.Pool` removes per-flush
   allocations under concurrent large writes; `commit_part` replaces an old
   part and queues it in one SQL call.
 - **Batch deletes take one query.** `DeleteMany` locks all keys, deletes the
-  rows, queues only unreferenced shared files and emits every NOTIFY in two
-  statements instead of 1,000 round trips. The reaper self-heals false-positive
-  garbage rows left by older gateways.
+  rows and queues only unreferenced shared files in two statements instead of
+  1,000 round trips. The reaper self-heals false-positive garbage rows left by
+  older gateways.
 - **Multipart parts are separate files.** Parts upload in parallel with no
   staging; Complete publishes the ordered part list. It validates ETags and
   checksums but moves no data.
@@ -167,19 +143,16 @@ default stays 64 KiB. 8 KiB behaves the same either way.
   hold already-compressed Parquet.
 - **No `full_page_writes = off`.** That risks the whole cluster.
 
-## Cross-gateway coherence
+## Multi-gateway consistency
 
-- **Writes** call `pg_notify('s3p_invalidate', bucket || chr(31) || key)` in the
-  same transaction, so the notification is delivered only on commit.
-- **Every gateway with `poolMax > 1`** keeps one `LISTEN` connection and drops
-  the local metadata and byte cache entry on receipt, even when no peer list is
-  configured. Bucket notifications use a `b:` prefix.
-- **Inline objects** are revalidated on read when peers are configured, because
-  they have no chunk `file_id` for the range query to check.
-- **Session tokens** are cached in-process for their five-minute lifetime, so
-  verifying a zonal request does not repeat three HMAC derivations.
-- **TTL** is the backstop: 5 seconds for metadata, 5 seconds for the byte cache,
-  30 seconds for buckets.
+- **Zero gateway state.** Gateways hold no metadata, object or bucket cache.
+  Every read queries PostgreSQL directly, so a write committed through any
+  gateway is immediately visible on every other gateway with no `LISTEN/NOTIFY`
+  channel and no TTL staleness window.
+- **Scale-out via stateless replicas.** Gateways can run as an ordinary
+  Kubernetes `Deployment` behind a load balancer or service mesh. For cross-AZ
+  read locality, run `--read-only` gateways against local-AZ PostgreSQL
+  streaming standbys.
 
 ## Commit modes
 
@@ -196,12 +169,13 @@ remain durable.
 - **Warm minimum.** `PGVS3_POOL_MIN` connections are opened at startup; opening
   one (TCP, TLS, SCRAM, session `SET`s) costs about 10 ms.
 - **No ping on checkout.** A dead connection fails its query and is discarded.
-- **Session settings** are applied once per connection: bitmap scans for chunks,
-  `work_mem = 64MB`, read-ahead concurrency, TCP keepalives, a 5-minute
+- **Session settings** are applied once per connection: `work_mem = 64MB`,
+  read-ahead concurrency, TCP keepalives, a 5-minute
   `idle_in_transaction_session_timeout`, and synchronous commit.
-- **Listings use a small dedicated pool.** Its sessions enable index scans, so
-  ordered metadata pages do not force that planner hint onto chunk reads.
-  `List` is one query with no BEGIN/SET/COMMIT round trips.
+- **Main pool vs chunk pool.** The main pool keeps `enable_indexscan = on` so
+  `s3p.objects` point lookups, writes and `ListObjectsV2` use B-tree index
+  scans; `chunkPool` sets `enable_indexscan = off` so `s3p.chunks` range reads
+  use PostgreSQL 18 bitmap heap scans.
 
 ## Reaping and vacuum
 
@@ -217,26 +191,6 @@ remain durable.
 - **Long transactions hold pages.** A reader with an old snapshot, or a long
   write, prevents vacuum from freeing pages of files dropped during it. Plain
   `VACUUM` does not return them to the operating system.
-
-## Cross-AZ metadata cache
-
-- **Consistent hashing.** Every metadata key has one owner among the peers.
-- **Global singleflight.** Concurrent misses for one key are coalesced on the
-  owner, so PostgreSQL sees one fill even when all three AZs miss together.
-- **Otter hot cache.** A gateway mirrors remotely-owned keys after fetching
-  them. The default hot cache is 100% of the main cache; size it from the
-  working set, not the lake size.
-- **Best-effort invalidation.** Writes enqueue `Remove` in the background. If a
-  removal is lost, the 10-second TTL plus the `file_id` check bounds it to one
-  retry.
-- **Why not object bytes.** DuckDB already caches file bytes keyed by ETag.
-  Caching them again in the gateway doubles memory and sends the same object
-  across the AZ boundary twice.
-
-The 3-AZ penalty is real: two-thirds of keys are owned by another node. A
-metadata hit in the local hot cache avoids the cross-AZ hop; the first read of
-a remotely-owned key pays it once. Measure with `PGVS3_LOG_LEVEL=debug` or the
-groupcache stats before sizing the caches.
 
 ## Client-side settings
 

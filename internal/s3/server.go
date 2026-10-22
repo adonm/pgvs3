@@ -364,7 +364,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 			writeError(w, r, errInvalidRequest("partNumber and Range are mutually exclusive"), s.log)
 			return
 		}
-		m, err := s.store.Meta(r.Context(), bucket, key, true)
+		m, err := s.store.MetaHeader(r.Context(), bucket, key)
 		if err != nil {
 			s.metaError(w, r, bucket, err)
 			return

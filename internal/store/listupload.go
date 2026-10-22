@@ -19,7 +19,7 @@ type PartInfo struct {
 
 // Attributes returns metadata plus per-part sizes for GetObjectAttributes.
 func (s *Store) Attributes(ctx context.Context, bucket, key string) (*Meta, []PartInfo, error) {
-	m, err := s.Meta(ctx, bucket, key, true)
+	m, err := s.Meta(ctx, bucket, key)
 	if err != nil {
 		return nil, nil, err
 	}

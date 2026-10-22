@@ -14,7 +14,7 @@ import (
 // object, without moving bytes. It returns ok=false when the source is inline,
 // multipart, a range, or uses a checksum we cannot reproduce.
 func (s *Store) CopyPart(ctx context.Context, uploadID, bucket, key string, partNo int32, srcBucket, srcKey string) (*Published, bool, error) {
-	src, err := s.Meta(ctx, srcBucket, srcKey, true)
+	src, err := s.Meta(ctx, srcBucket, srcKey)
 	if err != nil {
 		return nil, false, err
 	}

@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/adonm/pgvs3/internal/peercache"
 	"github.com/adonm/pgvs3/internal/s3"
 	"github.com/adonm/pgvs3/internal/store"
 )
@@ -52,16 +51,6 @@ func run() int {
 	return serve(args)
 }
 
-func flagSet(fs *flag.FlagSet, name string) bool {
-	found := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
-		}
-	})
-	return found
-}
-
 func indexArg(args []string, want string) int {
 	for i, a := range args {
 		if a == want {
@@ -90,17 +79,8 @@ func serve(args []string) int {
 		poolMax       = fs.Int("pool-max", envInt("PGVS3_POOL_MAX", 64), "PostgreSQL connections per gateway")
 		reapGrace     = fs.Duration("reap-grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "how long deleted files stay readable")
 		maintainEvery = fs.Duration("maintenance-interval", envDuration("PGVS3_MAINTENANCE_INTERVAL", time.Minute), "maintenance interval")
-		cacheMain     = fs.Int64("cache-main-bytes", envInt64("PGVS3_CACHE_MAIN_BYTES", 64<<20), "owned metadata cache bytes")
-		cacheHot      = fs.Int64("cache-hot-bytes", envInt64("PGVS3_CACHE_HOT_BYTES", 64<<20), "mirrored peer metadata cache bytes")
-		peers         = fs.String("peers", env("PGVS3_PEERS", ""), "comma-separated peer addresses for the cross-AZ cache")
-		peerAddr      = fs.String("peer-addr", env("PGVS3_PEER_ADDR", "0.0.0.0:8015"), "cross-AZ cache listen address")
-		peerAdvert    = fs.String("peer-advertise", env("PGVS3_PEER_ADVERTISE", ""), "this gateway's address as its peers see it")
-		peerSecret    = fs.String("peer-secret", env("PGVS3_PEER_SECRET", ""), "shared secret for peer cache requests")
 		logLevel      = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
 		vhost         = fs.String("vhost-domain", env("PGVS3_VHOST_DOMAIN", ""), "virtual-host suffix, e.g. s3.internal")
-		objectCache   = fs.Int64("object-cache-bytes", envInt64("PGVS3_OBJECT_CACHE_BYTES", 64<<20), "small-object byte cache size (0 disables)")
-		objectTTL     = fs.Duration("object-cache-ttl", envDuration("PGVS3_OBJECT_CACHE_TTL", 5*time.Second), "small-object cache TTL")
-		objectCheck   = fs.Bool("object-cache-revalidate", envBoolDefault("PGVS3_OBJECT_CACHE_REVALIDATE", false), "revalidate each small-object cache hit against PostgreSQL")
 		wholeRead     = fs.Int64("whole-read-max", envInt64("PGVS3_WHOLE_READ_MAX", 64<<20), "largest single-file span read in one query")
 		writeCommit   = fs.String("write-commit", env("PGVS3_WRITE_COMMIT", "on"), "synchronous_commit for unconditional writes: on, local or off")
 		verifyReads   = fs.Bool("verify-reads", envBoolDefault("PGVS3_VERIFY_READS", true), "verify the current object file_id on every chunk range query")
@@ -116,12 +96,6 @@ func serve(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	peersList := splitList(*peers)
-	// A single gateway invalidates its own cache on write. With peers, another
-	// gateway can overwrite a key at any time, so revalidate cache hits.
-	if os.Getenv("PGVS3_OBJECT_CACHE_REVALIDATE") == "" && !flagSet(fs, "object-cache-revalidate") && len(peersList) > 0 {
-		*objectCheck = true
-	}
 	log := newLogger(*logLevel)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -129,7 +103,7 @@ func serve(args []string) int {
 	st, err := store.Open(ctx, *url, store.Options{
 		MinConns: int32(*poolMin), MaxConns: int32(*poolMax),
 		CAFile: os.Getenv("PGVS3_DB_CA_FILE"), AllowPlaintext: envBool("PGVS3_DB_ALLOW_PLAINTEXT"),
-		ObjectCacheBytes: *objectCache, ObjectCacheTTL: *objectTTL, ObjectCacheRevalidate: *objectCheck, WholeReadMax: *wholeRead, RevalidateReads: len(peersList) > 0, WriteCommit: *writeCommit, SkipReadVerify: !*verifyReads, InlineMax: *inlineMax,
+		WholeReadMax: *wholeRead, WriteCommit: *writeCommit, SkipReadVerify: !*verifyReads, InlineMax: *inlineMax,
 	}, log)
 	if err != nil {
 		log.Error("connecting to PostgreSQL", "err", err)
@@ -155,20 +129,6 @@ func serve(args []string) int {
 			return 1
 		}
 	}
-	cache, err := peercache.New(ctx, st, peercache.Options{
-		MainBytes: *cacheMain, HotBytes: *cacheHot, TTL: 10 * time.Second,
-		Peers: peersList, Self: *peerAdvert, ListenAddr: *peerAddr, Secret: *peerSecret,
-	}, log)
-	if err != nil {
-		log.Error("starting metadata cache", "err", err)
-		return 1
-	}
-	st.SetCache(cache)
-	defer st.CloseCache()
-	if *poolMax > 1 {
-		go st.StartNotify(ctx)
-	}
-
 	if !*readOnly {
 		go maintain(ctx, st, *reapGrace, *maintainEvery, log)
 	}
@@ -188,7 +148,7 @@ func serve(args []string) int {
 		log.Error("configuring listener", "err", err)
 		return 1
 	}
-	log.Info("pgvs3 starting", "version", version, "addr", *addr, "cache_peers", len(peersList), "object_cache_revalidate", *objectCheck)
+	log.Info("pgvs3 starting", "version", version, "addr", *addr)
 	if *webAddr != "" {
 		web := &http.Server{Addr: *webAddr, Handler: handler.WebHandler(*webIndex, *webError), ReadHeaderTimeout: 10 * time.Second}
 		go func() {

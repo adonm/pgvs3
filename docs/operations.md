@@ -36,13 +36,12 @@ public LoadBalancer or Ingress unless you intend public read/write access.
   - `pgvs3_requests_total{method,code}`
   - `pgvs3_request_duration_seconds_sum` / `_count` and latency buckets
   - `pgvs3_response_bytes_total`
-  - `pgvs3_pg_pool_*` and `pgvs3_list_pool_*`
-  - `pgvs3_meta_cache_*` and `pgvs3_object_cache_*`
-  - reaper, maintenance-run and NOTIFY reconnect counters
+  - `pgvs3_pg_pool_*` and `pgvs3_chunk_pool_*`
+  - reaper and maintenance-run counters
 
 Set `PGVS3_ADMIN_ADDR=127.0.0.1:8016` to move probes and metrics to a separate
-listener; `/metrics` is then removed from the S3 listener. Bind the peer port (`8015`) and any metrics listener to a private
-network; neither uses S3 authentication. SigV4 is not validated on either listener.
+listener; `/metrics` is then removed from the S3 listener. Bind any metrics
+listener to a private network.
 
 ## Diagnose
 
@@ -107,15 +106,13 @@ object churn.
 
 - **PostgreSQL restart:** reads retry once on a fresh connection; a write that
   loses its connection publishes nothing.
-- **Peer gateway down:** the cross-AZ metadata cache falls back to PostgreSQL;
-  writes continue.
-- **Lost NOTIFY:** cache TTLs bound staleness (5 s metadata, 30 s buckets).
-  Inline peer reads revalidate against `s3p.objects`.
+- **Gateway replica down:** gateways hold no state; remaining pods continue
+  serving immediately from PostgreSQL.
 - **Full disk:** writes fail; the gateway does not acknowledge partial objects.
   Reclaim with `VACUUM`/`pg_repack` or restore capacity.
 
 ## Kubernetes
 
-The Helm chart runs a 3-pod StatefulSet, one pod per zone, with a static peer
-list and a headless service. Keep `peerCache.enabled=false` if you scale with an
-HPA or use more than the configured replica count without updating peers.
+The Helm chart runs a stateless multi-AZ `Deployment` and can scale freely with
+an HPA (`autoscaling.enabled=true`) as long as PostgreSQL `max_connections` is
+sized for the replica ceiling.

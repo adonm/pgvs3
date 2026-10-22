@@ -110,18 +110,12 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 			return nil, err
 		}
 	}
-	if err := notifyTx(ctx, tx, dstBucket, dstKey); err != nil {
-		return nil, err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	out := src
 	out.UserMetadata, out.ContentType = meta, ct
 	out.CreatedAt = time.Now()
-	s.cache.Put(ctx, dstBucket, dstKey, out)
-	s.invalidatePeers(ctx, dstBucket, dstKey)
-	s.objects.invalidate(dstBucket, dstKey)
 	return &out, nil
 }
 

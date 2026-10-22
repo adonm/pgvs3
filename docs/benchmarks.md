@@ -9,28 +9,27 @@ Two harnesses:
 
 Everything runs on a disposable PostgreSQL 18 in Docker. The host for the
 numbers below is a shared **6-vCPU / 11 GiB** Linux VM; the gateway uses
-`PGVS3_POOL_MAX=128`, no peer cache, and loopback networking. Treat these as
+`PGVS3_POOL_MAX=128` and loopback networking. Treat these as
 indicative, not capacity planning.
 
 ## Go gateway, direct S3 load
 
 Each run is 5 seconds. 4 KiB objects use 2,000 pre-created keys; 8 MiB and
 64 MiB reads use 8 and 4 objects; the list case has 2,000 keys and returns
-1,000 per page. The table below is **cache-off**; the small-object cache is
-measured separately.
+1,000 per page. Gateways hold no in-process cache; metadata and inline objects
+are served directly from PostgreSQL `shared_buffers`.
 
 | Workload | Workers | Throughput | p50 | p99 |
 | --- | ---: | ---: | ---: | ---: |
-| 4 KiB GET | 1 | 2,965 req/s | 0.28 ms | 0.81 ms |
-| 4 KiB GET | 16 | 12,969 req/s | 0.92 ms | 4.92 ms |
-| 4 KiB GET | 64 | 15,141 req/s | 3.17 ms | 16.8 ms |
-| 4 KiB GET | 256 | 18,387 req/s | 10.4 ms | 52.0 ms |
-| HEAD | 1 | 3,320 req/s | 0.24 ms | 0.81 ms |
-| HEAD | 16 | 14,431 req/s | 0.79 ms | 4.28 ms |
-| HEAD | 64 | 17,610 req/s | 2.40 ms | 15.6 ms |
-| 4 KiB PUT | 1 | 707 req/s | 1.32 ms | 2.81 ms |
-| 4 KiB PUT | 16 | 2,142 req/s | 6.88 ms | 22.1 ms |
-| 4 KiB PUT | 64 | 1,802 req/s | 32.9 ms | 62.9 ms |
+| 4 KiB GET | 1 | 1,970 req/s | 0.47 ms | 1.06 ms |
+| 4 KiB GET | 16 | 6,596 req/s | 1.98 ms | 9.09 ms |
+| 4 KiB GET | 64 | 8,243 req/s | 6.91 ms | 22.9 ms |
+| HEAD | 1 | 1,778 req/s | 0.47 ms | 3.00 ms |
+| HEAD | 16 | 7,925 req/s | 1.66 ms | 6.77 ms |
+| HEAD | 64 | 9,211 req/s | 5.95 ms | 23.7 ms |
+| 4 KiB PUT | 1 | 673 req/s | 1.37 ms | 2.97 ms |
+| 4 KiB PUT | 16 | 3,610 req/s | 3.93 ms | 13.4 ms |
+| 4 KiB PUT | 64 | 3,735 req/s | 14.5 ms | 57.9 ms |
 | 4 KiB PUT | 256 | 1,635 req/s | 153 ms | 305 ms |
 | 8 MiB GET | 1 | 417 MiB/s | 18.1 ms | 30.7 ms |
 | 8 MiB GET | 8 | 1,006 MiB/s | 60.9 ms | 111 ms |
@@ -45,16 +44,17 @@ measured separately.
 
 Observations:
 
-- **Small reads are the strongest path.** v9 stores ≤64 KiB objects inline
-  and caches metadata/HEAD. One worker gets a 0.28 ms GET p50 and 0.24 ms HEAD
-  p50; the gateway reaches 18.4k 4 KiB GET/s at 256 workers and 17.6k HEAD/s at
-  64. `MetaHeader` now fills the cache with the full inline row, so a repeated
-  HEAD does not keep paying the metadata query and a following GET hits too.
-  Latency rises with queueing rather than per-request work.
-- **Small writes are one SQL call.** A ≤64 KiB PUT is `s3p.put_inline`, which
-  locks, checks conditions, queues replaced files, upserts the inline row and
-  notifies caches in one round trip. 707/s at one worker, 2.1k/s at 16.
-  Larger writes still use COPY and are PostgreSQL commit-bound.
+- **Small reads come straight from PostgreSQL `shared_buffers`.** v9 stores
+  ≤64 KiB objects inline in `s3p.objects`. With `enable_indexscan = on` on the
+  main pool, a primary-key `Index Scan` takes ~6 µs inside PostgreSQL (~0.47 ms
+  p50 end-to-end over HTTP, reaching 8.2k 4 KiB GET/s and 9.2k HEAD/s at 64
+  workers) with zero gateway cache state and zero invalidation lag across
+  multiple gateways.
+- **Small writes are one SQL call and doubled at concurrency.** A ≤64 KiB PUT
+  is `s3p.put_inline`. Removing `pg_notify` (which previously serialized
+  commits on PostgreSQL's notification queue) and keeping `enable_indexscan = on`
+  on the main pool raised durable 4 KiB PUT throughput from 1.8k/s to **3.7k/s**
+  at 64 workers (`synchronous_commit = on`).
 - **Large reads stream well.** 8 MiB reads reach 1.09 GiB/s and 64 MiB reads
   1.06 GiB/s at 16 workers. Single-stream 64 MiB throughput varies with host
   contention (316–441 MiB/s across runs); the 8-way snapshot path sustains
@@ -91,14 +91,6 @@ writes still force `on`. With `off`:
 This trades crash durability for throughput; the acknowledged write is in
 PostgreSQL's WAL but the local fsync may lag. Keep `on` unless the workload is
 replaceable.
-
-## Small-object cache
-
-v9 inlines objects up to 64 KiB, so the 4 KiB numbers above already bypass the
-chunk table and do not use the byte cache. The Otter cache remains for
-non-inline objects between 64 KiB and 256 KiB; a single gateway invalidates
-locally, while peer mode revalidates each hit. The earlier v8 4 KiB cache
-measurements are obsolete and are not shown here.
 
 ## Partitioning A/B
 
@@ -228,8 +220,7 @@ also unsupported here.
 ## Reproduce
 
 ```sh
-just load                 # direct gateway matrix, cache off
-OBJECT_CACHE_BYTES=67108864 just load   # direct matrix, small-object cache on
+just load                 # direct gateway matrix
 just bench s3             # DuckDB 2.0 httpfs matrix, writes .tmp/pgvs3/bench.json
 just bench                # plus DuckLake compatibility and tuning
 just contract             # correctness gate before trusting a number

@@ -20,7 +20,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/sync/singleflight"
 )
 
 //go:embed schema.sql
@@ -39,45 +38,34 @@ const (
 
 // Options are the PostgreSQL connection settings.
 type Options struct {
-	MinConns              int32
-	MaxConns              int32
-	CAFile                string
-	AllowPlaintext        bool
-	ObjectCacheBytes      int64
-	ObjectCacheTTL        time.Duration
-	ObjectCacheRevalidate bool
-	WholeReadMax          int64
-	RevalidateReads       bool
-	WriteCommit           string
-	SkipReadVerify        bool
-	InlineMax             int64
+	MinConns       int32
+	MaxConns       int32
+	CAFile         string
+	AllowPlaintext bool
+	WholeReadMax   int64
+	WriteCommit    string
+	SkipReadVerify bool
+	InlineMax      int64
 }
 
-// Store is the PostgreSQL-backed object store.
+// Store is the PostgreSQL-backed object store. Metadata and inline objects
+// live in s3p.objects and are served directly from PostgreSQL shared_buffers.
 type Store struct {
-	pool             *pgxpool.Pool
-	listPool         *pgxpool.Pool
-	cache            MetaCache
-	objects          *objectCache
-	wholeReadMax     int64
-	revalidateInline bool
-	writeCommit      string
-	skipReadVerify   bool
-	maxInline        int64
-	log              *slog.Logger
+	pool           *pgxpool.Pool
+	chunkPool      *pgxpool.Pool
+	wholeReadMax   int64
+	writeCommit    string
+	skipReadVerify bool
+	maxInline      int64
+	log            *slog.Logger
 
 	fileIDMu    sync.Mutex
 	fileIDBlock []int64
 	fileIDPos   int
 
-	bucketMu    sync.RWMutex
-	bucketCache map[string]time.Time
-	reads       singleflight.Group
-
-	reapedRows       atomic.Int64
-	reapedFiles      atomic.Int64
-	maintenanceRuns  atomic.Int64
-	notifyReconnects atomic.Int64
+	reapedRows      atomic.Int64
+	reapedFiles     atomic.Int64
+	maintenanceRuns atomic.Int64
 }
 
 // Open connects and warms the pool. Remote servers must use TLS; loopback
@@ -169,8 +157,9 @@ SET idle_in_transaction_session_timeout = '5min';
 SET synchronous_commit = on;`
 	}
 	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		// Bitmap scans use PostgreSQL 18 read-ahead for cold chunk ranges.
-		_, err := conn.Exec(ctx, sessionSQL(false))
+		// Index scans keep s3p.objects / s3p.buckets point lookups and ordered
+		// listings at ~6 us in PostgreSQL shared_buffers.
+		_, err := conn.Exec(ctx, sessionSQL(true))
 		return err
 	}
 
@@ -182,23 +171,23 @@ SET synchronous_commit = on;`
 		pool.Close()
 		return nil, err
 	}
-	// Ordered listings need the primary-key index; dedicated connections keep
-	// that planner hint from slowing down bitmap-scanned chunk reads.
-	listCfg := cfg.Copy()
-	listCfg.MaxConns = 4
-	listCfg.MinConns = 1
-	listCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, sessionSQL(true))
+	// Chunk range reads use a separate pool with enable_indexscan = off so
+	// PostgreSQL 18 bitmap heap scans drive the read-ahead stream.
+	chunkCfg := cfg.Copy()
+	chunkCfg.MaxConns = min(opts.MaxConns, 64)
+	chunkCfg.MinConns = min(opts.MinConns, 4)
+	chunkCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, sessionSQL(false))
 		return err
 	}
-	listPool, err := pgxpool.NewWithConfig(ctx, listCfg)
+	chunkPool, err := pgxpool.NewWithConfig(ctx, chunkCfg)
 	if err != nil {
 		pool.Close()
 		return nil, err
 	}
-	if err := listPool.Ping(ctx); err != nil {
+	if err := chunkPool.Ping(ctx); err != nil {
 		pool.Close()
-		listPool.Close()
+		chunkPool.Close()
 		return nil, err
 	}
 	// Open the warm set up front so a burst does not pay TCP, TLS and SCRAM.
@@ -220,10 +209,10 @@ SET synchronous_commit = on;`
 	close(errs)
 	for err := range errs {
 		pool.Close()
-		listPool.Close()
+		chunkPool.Close()
 		return nil, err
 	}
-	return &Store{bucketCache: make(map[string]time.Time), pool: pool, listPool: listPool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, revalidateInline: opts.RevalidateReads, writeCommit: opts.WriteCommit, skipReadVerify: opts.SkipReadVerify, maxInline: opts.InlineMax, log: log}, nil
+	return &Store{pool: pool, chunkPool: chunkPool, wholeReadMax: opts.WholeReadMax, writeCommit: opts.WriteCommit, skipReadVerify: opts.SkipReadVerify, maxInline: opts.InlineMax, log: log}, nil
 }
 
 // nextFileID hands out sequence values in blocks. The sequence itself is
@@ -264,9 +253,8 @@ func (s *Store) nextFileID(ctx context.Context) (int64, error) {
 }
 
 func (s *Store) Close() {
-	s.objects.close()
-	if s.listPool != nil {
-		s.listPool.Close()
+	if s.chunkPool != nil {
+		s.chunkPool.Close()
 	}
 	s.pool.Close()
 }
@@ -480,72 +468,9 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 	return nil
 }
 
-// Meta returns cached metadata, or reads it from PostgreSQL. HEAD uses fresh
-// metadata so it never reports a stale size or ETag.
-func (s *Store) Meta(ctx context.Context, bucket, key string, fresh bool) (*Meta, error) {
-	if !fresh {
-		m, ok, err := s.cache.Get(ctx, bucket, key)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return &m, nil
-		}
-	}
-	m, err := s.metaFresh(ctx, bucket, key)
-	if err != nil {
-		return nil, err
-	}
-	return m, nil
-}
-
-// MetaHeader returns metadata without transferring inline_data on a cache miss.
-// It deliberately does not populate the cache, because a header-only entry
-// would break a later inline GET.
-func (s *Store) MetaHeader(ctx context.Context, bucket, key string) (*Meta, error) {
-	if m, ok, err := s.cache.Get(ctx, bucket, key); err != nil {
-		return nil, err
-	} else if ok {
-		return &m, nil
-	}
-	var m Meta
-	var epoch float64
-	var parts, ends []int64
-	var fileID pgtype.Int8
-	var inline []byte
-	var hasInline bool
-	err := s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
-		parts, part_ends, etag, user_metadata, content_type, inline_data, inline_data IS NOT NULL
-		FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, key).
-		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
-			&m.ContentType, &inline, &hasInline)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	m.CreatedAt = time.Unix(0, int64(epoch*1e9))
-	m.Parts, m.PartEnds = parts, ends
-	if fileID.Valid {
-		m.FileID = fileID.Int64
-	}
-	if hasInline {
-		m.Inline = inline
-	}
-	// A full metadata row (including inline bytes) is safe to cache; a
-	// header-only entry would hide inline_data from a later GET.
-	s.cache.Put(ctx, bucket, key, m)
-	return &m, nil
-}
-
-// FreshMeta bypasses the cache and reads s3p.objects directly. The peer-cache
-// getter uses it on the key's owner; retries after a stale entry use it too.
-func (s *Store) FreshMeta(ctx context.Context, bucket, key string) (*Meta, error) {
-	return s.metaFresh(ctx, bucket, key)
-}
-
-func (s *Store) metaFresh(ctx context.Context, bucket, key string) (*Meta, error) {
+// Meta reads object metadata (and inline bytes for objects <= 64 KiB) from
+// s3p.objects in PostgreSQL shared_buffers.
+func (s *Store) Meta(ctx context.Context, bucket, key string) (*Meta, error) {
 	var m Meta
 	var epoch float64
 	var parts, ends []int64
@@ -557,7 +482,6 @@ func (s *Store) metaFresh(ctx context.Context, bucket, key string) (*Meta, error
 		FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, key).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata, &m.ContentType, &inline, &hasInline)
 	if errors.Is(err, pgx.ErrNoRows) {
-		s.cache.Invalidate(ctx, bucket, key)
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -574,7 +498,31 @@ func (s *Store) metaFresh(ctx context.Context, bucket, key string) (*Meta, error
 		}
 		m.Inline = inline
 	}
-	s.cache.Put(ctx, bucket, key, m)
+	return &m, nil
+}
+
+// MetaHeader reads object metadata without transferring inline_data.
+func (s *Store) MetaHeader(ctx context.Context, bucket, key string) (*Meta, error) {
+	var m Meta
+	var epoch float64
+	var parts, ends []int64
+	var fileID pgtype.Int8
+	err := s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
+		parts, part_ends, etag, user_metadata, content_type
+		FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, key).
+		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
+			&m.ContentType)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	m.CreatedAt = time.Unix(0, int64(epoch*1e9))
+	m.Parts, m.PartEnds = parts, ends
+	if fileID.Valid {
+		m.FileID = fileID.Int64
+	}
 	return &m, nil
 }
 
@@ -798,16 +746,12 @@ func (b *Body) nextChunk() ([]byte, error) {
 // ErrPrecondition and ErrNotModified before any bytes are sent.
 func (s *Store) GetBody(ctx context.Context, bucket, key string, first, last, suffix int64, cond *ReadCondition) (*SliceMeta, *Body, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		m, err := s.metaForRead(ctx, bucket, key, cond, attempt == 1)
+		m, err := s.metaForRead(ctx, bucket, key, cond)
 		if err != nil {
 			return nil, nil, err
 		}
 		mstart, mend := effRange(m.Size, first, last, suffix)
 		if m.Size > 0 && (mstart > mend || mstart >= m.Size) {
-			if attempt == 0 {
-				s.cache.Invalidate(ctx, bucket, key)
-				continue
-			}
 			return nil, nil, ErrInvalidRange
 		}
 		sm := &SliceMeta{
@@ -816,43 +760,17 @@ func (s *Store) GetBody(ctx context.Context, bucket, key string, first, last, su
 			FileID: m.FileID, Parts: m.Parts, PartEnds: m.PartEnds,
 			Start: mstart, End: mend,
 		}
-		if m.Size == 0 {
-			if attempt == 0 {
-				// A stale zero-size entry could hide a replacement made through
-				// another gateway; re-read once before serving an empty body.
-				s.cache.Invalidate(ctx, bucket, key)
-				continue
-			}
-			return sm, bytesBody(nil), nil
-		}
-		if sm.Len() == 0 {
+		if m.Size == 0 || sm.Len() == 0 {
 			return sm, bytesBody(nil), nil
 		}
 		if m.Inline != nil {
 			return sm, bytesBody(m.Inline[sm.Start : sm.End+1]), nil
-		}
-		if attempt == 0 && m.Size <= smallObjectMax && s.objects != nil {
-			if e, ok := s.objects.get(bucket, key); ok {
-				current, err := s.objectCurrent(ctx, bucket, key, e.fileID, e.etag)
-				if err == nil && current {
-					return sm, bytesBody(e.data[sm.Start : sm.End+1]), nil
-				}
-				s.objects.invalidate(bucket, key)
-				s.cache.Invalidate(ctx, bucket, key)
-				continue
-			}
-			s.objects.miss()
-			if data, err := s.readFullObject(ctx, bucket, key, m); err == nil {
-				s.objects.put(bucket, key, objectEntry{data: data, etag: m.ETag, fileID: m.FileID})
-				return sm, bytesBody(data[sm.Start : sm.End+1]), nil
-			}
 		}
 		streamCtx, cancel := context.WithCancel(ctx)
 		body, err := s.startStream(streamCtx, cancel, bucket, key, m, mstart, mend)
 		if err != nil {
 			cancel()
 			if attempt == 0 {
-				s.cache.Invalidate(ctx, bucket, key)
 				continue
 			}
 			return nil, nil, err
@@ -862,66 +780,22 @@ func (s *Store) GetBody(ctx context.Context, bucket, key string, first, last, su
 	return nil, nil, ErrNotFound
 }
 
-// objectCurrent is the cheap revalidation query for a byte-cache hit. It
-// returns false when the key was replaced or deleted through any gateway.
-func (s *Store) objectCurrent(ctx context.Context, bucket, key string, fileID int64, etag string) (bool, error) {
-	var curFile pgtype.Int8
-	var curETag string
-	err := s.pool.QueryRow(ctx, "SELECT file_id, etag FROM s3p.objects WHERE bucket = $1 AND key = $2", bucket, key).
-		Scan(&curFile, &curETag)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	fileOK := (!curFile.Valid && fileID == 0) || (curFile.Valid && curFile.Int64 == fileID)
-	return fileOK && curETag == etag, nil
-}
-
-// readFullObject buffers one small object for the byte cache. It never calls
-// GetBody, so it cannot recurse into the cache path.
-func (s *Store) readFullObject(ctx context.Context, bucket, key string, m *Meta) ([]byte, error) {
-	streamCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	body, err := s.startStream(streamCtx, cancel, bucket, key, m, 0, m.Size-1)
-	if err != nil {
-		return nil, err
-	}
-	defer body.Close()
-	return io.ReadAll(body)
-}
-
 func bytesBody(data []byte) *Body {
 	ch := make(chan result)
 	close(ch)
 	return &Body{cur: data, ch: ch}
 }
 
-func (s *Store) metaForRead(ctx context.Context, bucket, key string, cond *ReadCondition, fresh bool) (*Meta, error) {
-	if cond != nil && cond.IfNoneMatch != "" {
-		fresh = true
-	}
-	var m *Meta
-	var err error
-	if !fresh {
-		m, err = s.Meta(ctx, bucket, key, false)
-	} else {
-		m, err = s.Meta(ctx, bucket, key, true)
-	}
+func (s *Store) metaForRead(ctx context.Context, bucket, key string, cond *ReadCondition) (*Meta, error) {
+	m, err := s.Meta(ctx, bucket, key)
 	if err != nil {
 		return nil, err
 	}
 	if cond == nil {
 		return m, nil
 	}
-	if cond.IfMatch != "" {
-		if !etagMatches(cond.IfMatch, m.ETag) {
-			if !fresh {
-				return s.metaForRead(ctx, bucket, key, cond, true)
-			}
-			return nil, ErrPrecondition
-		}
+	if cond.IfMatch != "" && !etagMatches(cond.IfMatch, m.ETag) {
+		return nil, ErrPrecondition
 	}
 	if cond.IfNoneMatch != "" && etagMatches(cond.IfNoneMatch, m.ETag) {
 		return nil, ErrNotModified
@@ -991,7 +865,7 @@ func planPieces(m *Meta, start, end int64, wholeMax int64) ([]piece, error) {
 }
 
 func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc, bucket, key string, rootID int64, p piece, start, end int64) (*Body, error) {
-	conn, err := s.pool.Acquire(ctx)
+	conn, err := s.chunkPool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1101,7 +975,7 @@ const maxParallelPieces = 8
 func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, key string, rootID int64, pieces []piece, start, end int64) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	exportConn, err := s.pool.Acquire(runCtx)
+	exportConn, err := s.chunkPool.Acquire(runCtx)
 	if err != nil {
 		return err
 	}
@@ -1125,7 +999,7 @@ func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, k
 		go func(index int, p piece, ch chan result) {
 			defer wg.Done()
 			defer close(ch)
-			conn, err := s.pool.Acquire(runCtx)
+			conn, err := s.chunkPool.Acquire(runCtx)
 			if err != nil {
 				select {
 				case ch <- result{err: err}:
@@ -1194,7 +1068,7 @@ func (s *Store) streamParallel(ctx context.Context, out chan<- result, bucket, k
 }
 
 func (s *Store) streamSnapshot(ctx context.Context, ch chan<- result, bucket, key string, rootID int64, pieces []piece, start, end int64, send func([]byte) bool) error {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tx, err := s.chunkPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
 	}
@@ -1208,7 +1082,7 @@ func (s *Store) streamSnapshot(ctx context.Context, ch chan<- result, bucket, ke
 }
 
 func (s *Store) streamPiece(ctx context.Context, ch chan<- result, bucket, key string, rootID int64, p piece, start, end int64, send func([]byte) bool) error {
-	return streamRows(ctx, s.pool, ch, bucket, key, rootID, p, start, end, send, s.skipReadVerify)
+	return streamRows(ctx, s.chunkPool, ch, bucket, key, rootID, p, start, end, send, s.skipReadVerify)
 }
 
 type querier interface {
@@ -1356,14 +1230,9 @@ func (s *Store) Delete(ctx context.Context, bucket, key string) (bool, error) {
 			return false, err
 		}
 	}
-	if err := notifyTx(ctx, tx, bucket, key); err != nil {
-		return false, err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
-	s.cache.Invalidate(ctx, bucket, key)
-	s.objects.invalidate(bucket, key)
 	return found, nil
 }
 
@@ -1400,68 +1269,19 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify('s3p_invalidate', $1 || chr(31) || k)
-		FROM unnest($2::text[]) AS k`, bucket, keys); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	for _, k := range keys {
-		s.cache.Invalidate(ctx, bucket, k)
-		s.objects.invalidate(bucket, k)
-	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) CreateBucket(ctx context.Context, name string) error {
 	_, err := s.pool.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", name)
-	if err == nil {
-		s.markBucket(name)
-		_, _ = s.pool.Exec(ctx, "SELECT pg_notify('s3p_invalidate', $1)", "b:"+name)
-	}
 	return err
 }
 
-func (s *Store) bucketKnown(name string) bool {
-	s.bucketMu.RLock()
-	exp, ok := s.bucketCache[name]
-	s.bucketMu.RUnlock()
-	if !ok {
-		return false
-	}
-	if time.Now().After(exp) {
-		s.bucketMu.Lock()
-		delete(s.bucketCache, name)
-		s.bucketMu.Unlock()
-		return false
-	}
-	return true
-}
-
-func (s *Store) markBucket(name string) {
-	s.bucketMu.Lock()
-	s.bucketCache[name] = time.Now().Add(30 * time.Second)
-	s.bucketMu.Unlock()
-}
-
-func (s *Store) dropBucket(name string) {
-	s.bucketMu.Lock()
-	delete(s.bucketCache, name)
-	s.bucketMu.Unlock()
-}
-
 func (s *Store) BucketExists(ctx context.Context, name string) (bool, error) {
-	if s.bucketKnown(name) {
-		return true, nil
-	}
 	var one int
 	err := s.pool.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1", name).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
-	}
-	if err == nil {
-		s.markBucket(name)
 	}
 	return err == nil, err
 }
@@ -1642,18 +1462,9 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 	if err := queueFileIDs(ctx, tx, unused); err != nil {
 		return nil, err
 	}
-	if err := notifyTx(ctx, tx, bucket, key); err != nil {
-		return nil, err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	s.cache.Put(ctx, bucket, key, Meta{
-		Size: size, SHA256: shaAll.Sum(nil), ETag: etag, UserMetadata: userMeta,
-		ContentType: contentType, CreatedAt: time.Now(), FileID: ids[0], Parts: ids, PartEnds: ends,
-	})
-	s.invalidatePeers(ctx, bucket, key)
-	s.objects.invalidate(bucket, key)
 	return &Completed{Bucket: bucket, Key: key, ETag: etag, Size: size}, nil
 }
 
@@ -1708,13 +1519,7 @@ func (s *Store) List(ctx context.Context, bucket, prefix, prefixEnd, after strin
 		WHERE bucket = $1 AND key COLLATE "C" >= $2 AND key COLLATE "C" < $3
 		  AND key COLLATE "C" > $4
 		ORDER BY key COLLATE "C" LIMIT $5`
-	var rows pgx.Rows
-	var err error
-	if s.listPool != nil {
-		rows, err = s.listPool.Query(ctx, query, bucket, prefix, prefixEnd, after, limit)
-	} else {
-		rows, err = s.pool.Query(ctx, query, bucket, prefix, prefixEnd, after, limit)
-	}
+	rows, err := s.pool.Query(ctx, query, bucket, prefix, prefixEnd, after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1909,33 +1714,22 @@ func (s *Store) Ready(ctx context.Context) error {
 	return nil
 }
 
-// WriteMetrics writes pool, cache and maintenance counters in Prometheus text.
+// WriteMetrics writes pool and maintenance counters in Prometheus text.
 func (s *Store) WriteMetrics(w io.Writer) {
 	st := s.pool.Stat()
 	fmt.Fprintf(w, "pgvs3_pg_pool_total_conns %d\n", st.TotalConns())
 	fmt.Fprintf(w, "pgvs3_pg_pool_acquired_conns %d\n", st.AcquiredConns())
 	fmt.Fprintf(w, "pgvs3_pg_pool_idle_conns %d\n", st.IdleConns())
 	fmt.Fprintf(w, "pgvs3_pg_pool_max_conns %d\n", st.MaxConns())
-	if s.listPool != nil {
-		ls := s.listPool.Stat()
-		fmt.Fprintf(w, "pgvs3_list_pool_total_conns %d\n", ls.TotalConns())
-		fmt.Fprintf(w, "pgvs3_list_pool_acquired_conns %d\n", ls.AcquiredConns())
-		fmt.Fprintf(w, "pgvs3_list_pool_idle_conns %d\n", ls.IdleConns())
+	if s.chunkPool != nil {
+		cs := s.chunkPool.Stat()
+		fmt.Fprintf(w, "pgvs3_chunk_pool_total_conns %d\n", cs.TotalConns())
+		fmt.Fprintf(w, "pgvs3_chunk_pool_acquired_conns %d\n", cs.AcquiredConns())
+		fmt.Fprintf(w, "pgvs3_chunk_pool_idle_conns %d\n", cs.IdleConns())
 	}
 	fmt.Fprintf(w, "pgvs3_reaped_rows_total %d\n", s.reapedRows.Load())
 	fmt.Fprintf(w, "pgvs3_reaped_files_total %d\n", s.reapedFiles.Load())
 	fmt.Fprintf(w, "pgvs3_maintenance_runs_total %d\n", s.maintenanceRuns.Load())
-	fmt.Fprintf(w, "pgvs3_notify_reconnects_total %d\n", s.notifyReconnects.Load())
-	if s.objects != nil {
-		fmt.Fprintf(w, "pgvs3_object_cache_hits_total %d\n", s.objects.hits.Load())
-		fmt.Fprintf(w, "pgvs3_object_cache_misses_total %d\n", s.objects.misses.Load())
-	}
-	if c, ok := s.cache.(interface{ Stats() (int64, int64, int64) }); ok {
-		hits, misses, evicted := c.Stats()
-		fmt.Fprintf(w, "pgvs3_meta_cache_hits_total %d\n", hits)
-		fmt.Fprintf(w, "pgvs3_meta_cache_misses_total %d\n", misses)
-		fmt.Fprintf(w, "pgvs3_meta_cache_evicted_total %d\n", evicted)
-	}
 }
 
 func (s *Store) ReapedRows() int64  { return s.reapedRows.Load() }
