@@ -49,8 +49,8 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
   in-process metadata or object cache. `s3p.objects` holds both metadata and
   ≤64 KiB inline objects; with `enable_indexscan = on` on the main pool, a
   primary-key `Index Scan` from `shared_buffers` takes ~6 µs inside PostgreSQL
-  (~0.47 ms p50 end-to-end over HTTP) and is strictly MVCC-consistent across
-  any number of gateways.
+  (0.17–0.47 ms p50 end-to-end over HTTP) and is strictly MVCC-consistent
+  across any number of gateways.
 - **`HEAD` never transfers `inline_data`.** Because there is no local cache to
   populate, `MetaHeader` projects only the header columns.
 - **Concurrent overwrites fail safe.** A chunk range query verifies the current
@@ -114,8 +114,9 @@ default stays 64 KiB. 8 KiB behaves the same either way.
 - **Small objects are one SQL call.** `s3p.put_inline` checks the bucket,
   serialises the key, evaluates `If-Match`/`If-None-Match`, queues replaced
   files and upserts the inline row in one round trip. Removing `pg_notify`
-  and keeping `enable_indexscan = on` on the main pool reaches 3.7k durable
-  4 KiB PUT/s at 64 workers (`synchronous_commit = on`).
+  and keeping `enable_indexscan = on` on the main pool reaches 17.5k durable
+  4 KiB PUT/s at 64 workers on 16 cores (3.7k/s on 6 vCPU,
+  `synchronous_commit = on`).
 - **One binary `COPY` per larger PUT or part.** `internal/store/ingest.go` frames
   4 MiB batches; the body is hashed (SHA-256 for integrity, MD5 for the ETag) in
   the same pass.

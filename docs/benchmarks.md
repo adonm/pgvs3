@@ -7,63 +7,62 @@ Two harnesses:
 - **`just bench`** drives DuckDB 2.0 / DuckLake through `httpfs`, which is the
   real client path and includes DuckDB's own request handling.
 
-Everything runs on a disposable PostgreSQL 18 in Docker. The host for the
-numbers below is a shared **6-vCPU / 11 GiB** Linux VM; the gateway uses
-`PGVS3_POOL_MAX=128` and loopback networking. Treat these as
-indicative, not capacity planning.
+Everything runs on a disposable PostgreSQL 18 in Docker (`shared_buffers=1GB`,
+`PGVS3_POOL_MAX=128`, loopback networking). Numbers below are from a **16-core
+local host** (Intel Core Ultra X7 358H, 62 GiB RAM), with earlier **6-vCPU /
+11 GiB VM** figures noted for comparison. Treat these as indicative, not
+capacity planning.
 
 ## Go gateway, direct S3 load
 
 Each run is 5 seconds. 4 KiB objects use 2,000 pre-created keys; 8 MiB and
-64 MiB reads use 8 and 4 objects; the list case has 2,000 keys and returns
+64 MiB reads use 16 and 8 objects; the list case has 2,000 keys and returns
 1,000 per page. Gateways hold no in-process cache; metadata and inline objects
 are served directly from PostgreSQL `shared_buffers`.
 
-| Workload | Workers | Throughput | p50 | p99 |
-| --- | ---: | ---: | ---: | ---: |
-| 4 KiB GET | 1 | 1,970 req/s | 0.47 ms | 1.06 ms |
-| 4 KiB GET | 16 | 6,596 req/s | 1.98 ms | 9.09 ms |
-| 4 KiB GET | 64 | 8,243 req/s | 6.91 ms | 22.9 ms |
-| HEAD | 1 | 1,778 req/s | 0.47 ms | 3.00 ms |
-| HEAD | 16 | 7,925 req/s | 1.66 ms | 6.77 ms |
-| HEAD | 64 | 9,211 req/s | 5.95 ms | 23.7 ms |
-| 4 KiB PUT | 1 | 673 req/s | 1.37 ms | 2.97 ms |
-| 4 KiB PUT | 16 | 3,610 req/s | 3.93 ms | 13.4 ms |
-| 4 KiB PUT | 64 | 3,735 req/s | 14.5 ms | 57.9 ms |
-| 4 KiB PUT | 256 | 1,635 req/s | 153 ms | 305 ms |
-| 8 MiB GET | 1 | 417 MiB/s | 18.1 ms | 30.7 ms |
-| 8 MiB GET | 8 | 1,006 MiB/s | 60.9 ms | 111 ms |
-| 8 MiB GET | 16 | 1,090 MiB/s | 118 ms | 207 ms |
-| 64 MiB GET | 1 | 316 MiB/s | 183 ms | 337 ms |
-| 64 MiB GET | 8 | 971 MiB/s | 530 ms | 715 ms |
-| 64 MiB GET | 16 | 1,055 MiB/s | 929 ms | 1,279 ms |
-| 64 MiB PUT | 1 | 86 MiB/s | 577 ms | 605 ms |
-| 64 MiB PUT | 8 | 171 MiB/s | 2,391 ms | 3,052 ms |
-| 8 KiB range from 64 MiB | 64 | 6,397 req/s | 9.07 ms | 27.4 ms |
-| ListObjectsV2 (1,000 keys) | 64 | 638 req/s | 98.4 ms | 127 ms |
+| Workload | Workers | 16-core host | p50 | p99 | 6-vCPU VM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 KiB GET | 1 | 4,765 req/s | 0.17 ms | 0.67 ms | 1,970 req/s (0.47 ms) |
+| 4 KiB GET | 16 | 17,817 req/s | 0.78 ms | 2.29 ms | 6,596 req/s (1.98 ms) |
+| 4 KiB GET | 64 | 24,582 req/s | 2.32 ms | 6.93 ms | 8,243 req/s (6.91 ms) |
+| 4 KiB GET | 256 | 32,531 req/s | 6.87 ms | 23.5 ms | 9,756 req/s |
+| HEAD | 1 | 5,711 req/s | 0.15 ms | 0.52 ms | 1,778 req/s (0.47 ms) |
+| HEAD | 16 | 20,984 req/s | 0.65 ms | 2.03 ms | 7,925 req/s (1.66 ms) |
+| HEAD | 64 | 30,223 req/s | 1.85 ms | 5.93 ms | 9,211 req/s (5.95 ms) |
+| 4 KiB PUT | 1 | 1,142 req/s | 0.78 ms | 1.58 ms | 673 req/s (1.37 ms) |
+| 4 KiB PUT | 16 | 10,000 req/s | 1.41 ms | 3.53 ms | 3,610 req/s (3.93 ms) |
+| 4 KiB PUT | 64 | 17,470 req/s | 3.10 ms | 18.9 ms | 3,735 req/s (14.5 ms) |
+| 4 KiB PUT | 256 | 11,406 req/s | 19.6 ms | 61.3 ms | 1,635 req/s (153 ms) |
+| 8 MiB GET | 1 | 1,086 MiB/s | 7.19 ms | 11.4 ms | 417 MiB/s (18.1 ms) |
+| 8 MiB GET | 8 | 2,881 MiB/s | 22.1 ms | 33.7 ms | 1,006 MiB/s (60.9 ms) |
+| 8 MiB GET | 16 | 3,085 MiB/s | 39.9 ms | 75.8 ms | 1,090 MiB/s (118 ms) |
+| 64 MiB GET | 1 | 1,185 MiB/s | 51.4 ms | 101 ms | 316 MiB/s (183 ms) |
+| 64 MiB GET | 8 | 3,307 MiB/s | 152 ms | 204 ms | 971 MiB/s (530 ms) |
+| 64 MiB GET | 16 | 3,455 MiB/s | 288 ms | 427 ms | 1,055 MiB/s (929 ms) |
+| 64 MiB PUT | 1 | 188 MiB/s | 207 ms | 237 ms | 86 MiB/s (577 ms) |
+| 64 MiB PUT | 8 | 458 MiB/s | 962 ms | 1,151 ms | 171 MiB/s (2,391 ms) |
+| 8 KiB range from 64 MiB | 64 | 16,074 req/s | 3.55 ms | 9.83 ms | 6,397 req/s (9.07 ms) |
+| ListObjectsV2 (1,000 keys) | 64 | 1,840 req/s | 30.3 ms | 109 ms | 638 req/s (98.4 ms) |
 
 Observations:
 
 - **Small reads come straight from PostgreSQL `shared_buffers`.** v9 stores
   ≤64 KiB objects inline in `s3p.objects`. With `enable_indexscan = on` on the
-  main pool, a primary-key `Index Scan` takes ~6 µs inside PostgreSQL (~0.47 ms
-  p50 end-to-end over HTTP, reaching 8.2k 4 KiB GET/s and 9.2k HEAD/s at 64
-  workers) with zero gateway cache state and zero invalidation lag across
-  multiple gateways.
-- **Small writes are one SQL call and doubled at concurrency.** A ≤64 KiB PUT
-  is `s3p.put_inline`. Removing `pg_notify` (which previously serialized
-  commits on PostgreSQL's notification queue) and keeping `enable_indexscan = on`
-  on the main pool raised durable 4 KiB PUT throughput from 1.8k/s to **3.7k/s**
-  at 64 workers (`synchronous_commit = on`).
-- **Large reads stream well.** 8 MiB reads reach 1.09 GiB/s and 64 MiB reads
-  1.06 GiB/s at 16 workers. Single-stream 64 MiB throughput varies with host
-  contention (316–441 MiB/s across runs); the 8-way snapshot path sustains
-  ~1 GiB/s. Responses up to 8 MiB use synchronous rows; longer spans keep the
+  main pool and no per-request `BucketExists` probe, a primary-key `Index Scan`
+  takes ~6 µs inside PostgreSQL (0.17 ms GET / 0.15 ms HEAD p50 end-to-end over
+  HTTP at 1 worker, reaching 32.5k GET/s and 30.2k HEAD/s on 16 cores) with
+  zero gateway cache state and zero invalidation lag across multiple gateways.
+- **Small writes are one SQL call.** A ≤64 KiB PUT is `s3p.put_inline`.
+  Removing `pg_notify` and keeping `enable_indexscan = on` on the main pool
+  reaches **17.5k durable 4 KiB PUT/s** at 64 workers on 16 cores (3.7k/s on the
+  6-vCPU VM) with `synchronous_commit = on`.
+- **Large reads stream at multi-GiB/s from cache.** 64 MiB reads reach
+  1.19 GiB/s at 1 worker and 3.45 GiB/s at 16 workers on 16 cores (~1.06 GiB/s
+  on 6 vCPU). Responses up to 8 MiB use synchronous rows; longer spans keep the
   cut-through goroutine so the database fetch overlaps socket writes.
-- **Ranges are cheap after the single-piece path.** An 8 KiB range from a
-  64 MiB object reaches 6.4k/s at a 9.1 ms p50.
-- **Lists improved with a dedicated index-scan pool.** 638/s is about 638,000
-  keys/s; each request still materialises 1,000 XML entries.
+- **Ranges and listings scale with the index-scan pool.** An 8 KiB range from a
+  64 MiB object reaches 16.1k/s at 3.55 ms p50; `ListObjectsV2` reaches 1,840
+  req/s (~1.84M keys/s) at 64 workers.
 
 ## Inline threshold
 
@@ -157,44 +156,25 @@ host**. Sources: [performance guide][express-perf], [pricing][express-price],
 
 ## Contrast
 
-| Dimension | pgvs3 (measured, 6 vCPU) | S3 Express One Zone (published) |
+| Dimension | pgvs3 (16-core local / 6-vCPU VM) | S3 Express One Zone (published) |
 | --- | --- | --- |
-| 4 KiB GET p50 | 0.28–3.2 ms at 1–64 workers | Consistent single-digit ms |
-| 4 KiB GET throughput | ~18.4k/s at 256 workers | 200k/s default, 2M/s max per bucket |
-| 4 KiB PUT throughput | ~2.2k/s (4k/s async at 16) | 100k/s default, 200k/s max per bucket |
-| 8–64 MiB GET | 0.3–1.1 GiB/s | Network/concurrency-bound; elastic |
-| 64 MiB PUT | 86–171 MiB/s | Elastic, distributed |
+| 4 KiB GET / PUT p50 (1w) | 0.17 ms GET, 0.78 ms PUT (0.47 / 1.37 ms on 6 vCPU) | Consistent single-digit ms |
+| 4 KiB GET throughput | 32.5k/s (9.8k/s on 6 vCPU) | 200k/s default, 2M/s max per bucket |
+| 4 KiB PUT throughput | 17.5k/s durable at 64w (3.7k/s on 6 vCPU) | 100k/s default, 200k/s max per bucket |
+| 8–64 MiB GET | 1.1–3.45 GiB/s (0.3–1.1 GiB/s on 6 vCPU) | Network/concurrency-bound; elastic |
+| 64 MiB PUT | 188–458 MiB/s (86–171 MiB/s on 6 vCPU) | Elastic, distributed |
 | Capacity | 32 TiB per database; ~17.4 TB per object | Unlimited storage; 50 TB per object |
-| Availability | Whatever PostgreSQL/your deployment provides | 99.95% designed, 99.9% SLA |
-| Durability | PostgreSQL replication/backups chosen by the operator | 11 nines within one AZ; AZ loss risk |
-| Price model | Hardware + PostgreSQL; no per-request fee | $0.11/GB-month + per-request + per-GB |
+| Availability / durability | PostgreSQL replication/backups chosen by the operator | 99.95% designed (99.9% SLA); 11 nines in one AZ |
+| Price model (`us-east-1`) | Hardware + gp3 ($0.08/GB-mo); $0 request/transfer fees | $0.11/GB-mo + $1.13/M PUT + $0.03/M GET + $3.80/TB R+W |
 
-**What the numbers mean**
+**Top 6 takeaways**
 
-- **Per-request latency is competitive.** At one to sixteen workers, pgvs3's
-  4 KiB GET p50 is 0.28–0.92 ms, below S3 Express's single-digit-millisecond
-  target. The loopback path removes the network and object-store metadata
-  hops; inline objects remove the chunk lookup entirely.
-- **Aggregate throughput is not.** Six cores and one PostgreSQL reach about 4k
-  GET/s and 1.2k PUT/s. S3 Express's default per-bucket limits are 200k reads
-  and 100k writes per second; the ceilings are 2M and 200k. Reaching those
-  numbers needs a fleet and a much larger PostgreSQL, not one gateway.
-- **Large-object reads are bandwidth-bound in both systems.** pgvs3 reaches
-  about 1 GiB/s on loopback at 16 readers. S3 Express's per-stream throughput
-  depends on the client's network path and concurrency; AWS does not publish a
-  single-stream number.
-- **Writes are the local bottleneck.** 4 KiB PUTs pay a synchronous PostgreSQL
-  commit per object; 64 MiB PUTs reach 186 MiB/s at eight workers. S3 Express
-  spreads writes across its directory bucket.
-- **Cost flips with request volume.** 1 TB on Express is $112.64/month. One
-  billion 4 KiB GETs is about $30; one billion 4 KiB PUTs is about $1,130.
-  pgvs3 has no request bill, so request-heavy workloads can be much cheaper if
-  the PostgreSQL hardware is already paid for. Low-volume or spiky workloads
-  usually favor the managed service.
-- **Durability and blast radius differ.** Express replicates within one AZ and
-  can lose data if that AZ is lost. pgvs3's durability is whatever your
-  PostgreSQL deployment provides; a single primary with no backup or standby
-  is a single point of failure.
+1. **Latency:** pgvs3 serves a 4 KiB GET in 0.17 ms and a durable PUT in 0.78 ms p50, ~10× faster than S3 Express's single-digit milliseconds.
+2. **Small-object reads:** pgvs3 peaks at 32.5k GET/s on one 16-core node, ~6× below S3 Express's 200k/s default bucket quota (2M/s max).
+3. **Small-object writes:** pgvs3 reaches 17.5k durable 4 KiB PUT/s, ~6× below S3 Express's 100k/s default quota (200k/s max).
+4. **Large-object bandwidth:** pgvs3 streams 64 MiB reads at 3.45 GiB/s and writes at 458 MiB/s in cache/NVMe (125–1,000 MiB/s on cold gp3), while S3 Express scales elastically with client network.
+5. **500 GB large-file cost (7,450 × 64 MiB, 1× W+R/mo):** S3 Express costs ~$57/mo vs ~$100–200/mo for a dedicated pgvs3 node, or $40/mo in gp3 disk on an existing PostgreSQL.
+6. **500 GB small-object cost (122M × 4 KiB, 1× W+R/mo):** S3 Express costs ~$199/mo due to $1.13/M PUT fees, while pgvs3 charges $0 per request and stays at ~$165/mo dedicated or $40/mo on an existing PostgreSQL.
 
 ## Scope
 

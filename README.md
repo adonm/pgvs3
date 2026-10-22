@@ -102,20 +102,26 @@ across all gateways:
 
 - Metadata and small objects (≤64 KiB) live in `s3p.objects`, indexed by
   `(bucket, key)`. A primary-key `Index Scan` in `shared_buffers` takes ~6 µs
-  inside PostgreSQL (~0.47 ms p50 end-to-end over HTTP, reaching ~8.2k 4 KiB
-  GET/s and ~9.2k HEAD/s at 64 workers).
+  inside PostgreSQL (**0.17 ms GET / 0.15 ms HEAD p50** over HTTP at 1 worker,
+  reaching **32.5k GET/s** and **30.2k HEAD/s** on 16 cores; 0.47 ms and
+  8.2k–9.2k/s on a 6-vCPU VM).
 - Removing `LISTEN/NOTIFY` and in-process caches eliminates commit-time
-  notification lock contention in PostgreSQL: durable 4 KiB PUTs reach **3.7k/s**
-  at 64 workers (`synchronous_commit = on`).
+  notification lock contention in PostgreSQL: durable 4 KiB PUTs reach
+  **17.5k/s** at 64 workers on 16 cores (**3.7k/s** on 6 vCPU,
+  `synchronous_commit = on`); 64 MiB reads stream at **3.45 GiB/s** and writes
+  at **458 MiB/s**.
 - Gateways hold **zero in-process object or metadata state**. Any number of
   gateway containers can run behind a load balancer or Kubernetes `Deployment`
   with strict MVCC consistency and zero invalidation lag; `--read-only`
   gateways can point at PostgreSQL streaming standbys for local-AZ read scale.
 
-For context, S3 Express One Zone publishes single-digit-millisecond latency and
-200k reads / 100k writes per directory bucket by default. Per-request latency
-is in the same band; the aggregate ceiling is not — pgvs3 is one PostgreSQL.
-Full methodology and the published-service comparison are in
+Versus S3 Express One Zone (`us-east-1`), pgvs3 is ~10× lower latency on
+loopback/LAN (0.17 ms vs single-digit ms) and charges $0 per request, while
+one 16-core node is ~6× below Express's 200k GET/s and 100k PUT/s default
+bucket quotas. For 500 GB written and read once a month, Express is cheaper on
+64 MiB Parquet files ($57/mo vs $100–200/mo dedicated, or $40/mo gp3 on an
+existing Postgres), while pgvs3 wins on 122M 4 KiB objects ($165/mo dedicated
+or $40/mo existing vs $199/mo on Express due to $1.13/M PUT fees). See
 [docs/benchmarks.md](docs/benchmarks.md).
 
 ## S3 surface
