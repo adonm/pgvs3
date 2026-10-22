@@ -13,6 +13,7 @@ jobs:
       - uses: jdx/mise-action@v2
       - run: mise install
       - run: mise exec -- just ci
+      - run: mise exec -- just fault
 
   image:
     runs-on: ubuntu-latest

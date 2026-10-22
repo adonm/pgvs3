@@ -34,6 +34,9 @@ dd if="$TMP/one.bin" of="$TMP/range.want" bs=1 skip=100 count=100 status=none
 cmp "$TMP/range.want" "$TMP/range.out" || fail "range bytes"
 [ "$(s3 -H 'Range: bytes=-100' "$A/$BUCKET/$RUN/one.bin" | wc -c)" = 100 ] || fail "suffix range"
 expect 416 -H 'Range: bytes=99999999-' "$A/$BUCKET/$RUN/one.bin"
+expect 200 -X PUT --data-binary '' "$A/$BUCKET/$RUN/empty"
+[ "$(s3 "$B/$BUCKET/$RUN/empty" | wc -c)" = 0 ] || fail "empty object body"
+[ "$(s3 -I "$A/$BUCKET/$RUN/empty" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')" = 0 ] || fail "empty object HEAD"
 
 # --- conditional writes and reads ------------------------------------------
 expect 200 -X PUT -H 'If-None-Match: *' --data-binary 'created' "$A/$BUCKET/$RUN/if.txt"
@@ -209,6 +212,10 @@ u=pc.generate_presigned_url('get_object', Params={'Bucket':gen,'Key':f'{run}/pre
 assert urllib.request.urlopen(u).read()==b'presigned'
 u=pc.generate_presigned_url('put_object', Params={'Bucket':gen,'Key':f'{run}/presigned-put'}, ExpiresIn=60)
 assert urllib.request.urlopen(urllib.request.Request(u,data=b'put',method='PUT')).status==200
+for i in range(100):
+    pc.put_object(Bucket=gen, Key=f'{run}/churn', Body=b'x'*1024)
+    if i % 5 == 0:
+        pc.delete_object(Bucket=gen, Key=f'{run}/churn')
 print('boto3 express ok')
 PY
 

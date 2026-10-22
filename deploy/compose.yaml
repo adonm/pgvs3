@@ -31,8 +31,14 @@ services:
       PGVS3_DB_ALLOW_PLAINTEXT: "true"
       PGVS3_POOL_MIN: "8"
       PGVS3_POOL_MAX: "64"
+      PGVS3_BUCKETS: lake
     ports:
       - "8014:8014"
+    healthcheck:
+      test: ["CMD", "/ko-app/pgvs3", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   pgdata:

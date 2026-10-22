@@ -21,42 +21,49 @@ measured separately.
 
 | Workload | Workers | Throughput | p50 | p99 |
 | --- | ---: | ---: | ---: | ---: |
-| 4 KiB GET | 1 | 3,345 req/s | 0.25 ms | 0.69 ms |
-| 4 KiB GET | 16 | 8,978 req/s | 1.20 ms | 8.66 ms |
-| 4 KiB GET | 64 | 18,386 req/s | 2.58 ms | 13.7 ms |
-| HEAD | 1 | 3,540 req/s | 0.23 ms | 0.74 ms |
-| HEAD | 16 | 15,185 req/s | 0.73 ms | 3.94 ms |
-| HEAD | 64 | 20,287 req/s | 2.06 ms | 13.4 ms |
-| 4 KiB PUT | 1 | 777 req/s | 1.24 ms | 2.10 ms |
-| 4 KiB PUT | 16 | 2,201 req/s | 6.89 ms | 13.5 ms |
-| 4 KiB PUT | 64 | 1,844 req/s | 33.0 ms | 76.7 ms |
-| 8 MiB GET | 1 | 422 MiB/s | 18.5 ms | 25.7 ms |
-| 8 MiB GET | 8 | 961 MiB/s | 65.6 ms | 105 ms |
-| 8 MiB GET | 16 | 1,017 MiB/s | 124 ms | 214 ms |
-| 64 MiB GET | 1 | 441 MiB/s | 139 ms | 179 ms |
-| 64 MiB GET | 8 | 897 MiB/s | 591 ms | 773 ms |
-| 64 MiB GET | 16 | 985 MiB/s | 999 ms | 1,318 ms |
-| 64 MiB PUT | 1 | 81 MiB/s | 607 ms | 616 ms |
-| 64 MiB PUT | 8 | 186 MiB/s | 2,432 ms | 2,996 ms |
-| 8 KiB range from 64 MiB | 64 | 3,564 req/s | 16.2 ms | 54.1 ms |
-| ListObjectsV2 (1,000 keys) | 64 | 543 req/s | 107 ms | 314 ms |
+| 4 KiB GET | 1 | 2,965 req/s | 0.28 ms | 0.81 ms |
+| 4 KiB GET | 16 | 12,969 req/s | 0.92 ms | 4.92 ms |
+| 4 KiB GET | 64 | 15,141 req/s | 3.17 ms | 16.8 ms |
+| 4 KiB GET | 256 | 18,387 req/s | 10.4 ms | 52.0 ms |
+| HEAD | 1 | 3,320 req/s | 0.24 ms | 0.81 ms |
+| HEAD | 16 | 14,431 req/s | 0.79 ms | 4.28 ms |
+| HEAD | 64 | 17,610 req/s | 2.40 ms | 15.6 ms |
+| 4 KiB PUT | 1 | 707 req/s | 1.32 ms | 2.81 ms |
+| 4 KiB PUT | 16 | 2,142 req/s | 6.88 ms | 22.1 ms |
+| 4 KiB PUT | 64 | 1,802 req/s | 32.9 ms | 62.9 ms |
+| 4 KiB PUT | 256 | 1,635 req/s | 153 ms | 305 ms |
+| 8 MiB GET | 1 | 417 MiB/s | 18.1 ms | 30.7 ms |
+| 8 MiB GET | 8 | 1,006 MiB/s | 60.9 ms | 111 ms |
+| 8 MiB GET | 16 | 1,090 MiB/s | 118 ms | 207 ms |
+| 64 MiB GET | 1 | 316 MiB/s | 183 ms | 337 ms |
+| 64 MiB GET | 8 | 971 MiB/s | 530 ms | 715 ms |
+| 64 MiB GET | 16 | 1,055 MiB/s | 929 ms | 1,279 ms |
+| 64 MiB PUT | 1 | 86 MiB/s | 577 ms | 605 ms |
+| 64 MiB PUT | 8 | 171 MiB/s | 2,391 ms | 3,052 ms |
+| 8 KiB range from 64 MiB | 64 | 6,397 req/s | 9.07 ms | 27.4 ms |
+| ListObjectsV2 (1,000 keys) | 64 | 638 req/s | 98.4 ms | 127 ms |
 
 Observations:
 
 - **Small reads are the strongest path.** v9 stores ≤64 KiB objects inline
-  and caches metadata/HEAD. One worker gets a 0.25 ms GET p50 and 0.23 ms HEAD
-  p50; the gateway reaches 18.4k 4 KiB GET/s and 20.3k HEAD/s on six cores.
+  and caches metadata/HEAD. One worker gets a 0.28 ms GET p50 and 0.24 ms HEAD
+  p50; the gateway reaches 18.4k 4 KiB GET/s at 256 workers and 17.6k HEAD/s at
+  64. `MetaHeader` now fills the cache with the full inline row, so a repeated
+  HEAD does not keep paying the metadata query and a following GET hits too.
   Latency rises with queueing rather than per-request work.
 - **Small writes are one SQL call.** A ≤64 KiB PUT is `s3p.put_inline`, which
   locks, checks conditions, queues replaced files, upserts the inline row and
-  notifies caches in one round trip. 777/s at one worker, 2.2k/s at 16.
+  notifies caches in one round trip. 707/s at one worker, 2.1k/s at 16.
   Larger writes still use COPY and are PostgreSQL commit-bound.
-- **Large reads stream well.** 8 MiB reads reach 1 GiB/s at 16 workers; 64 MiB
-  reads reach about 0.99 GiB/s. One query for a ≤64 MiB single-file object beat
-  both the old 8 MiB-piece path and parallel pieces at low concurrency. The
-  8 KiB range case shows the fixed per-request cost: 3.5k/s with a 16 ms p50.
-- **Lists are heavier** because one request materialises 1,000 XML entries;
-  543/s is about 543,000 keys/s.
+- **Large reads stream well.** 8 MiB reads reach 1.09 GiB/s and 64 MiB reads
+  1.06 GiB/s at 16 workers. Single-stream 64 MiB throughput varies with host
+  contention (316–441 MiB/s across runs); the 8-way snapshot path sustains
+  ~1 GiB/s. Responses up to 8 MiB use synchronous rows; longer spans keep the
+  cut-through goroutine so the database fetch overlaps socket writes.
+- **Ranges are cheap after the single-piece path.** An 8 KiB range from a
+  64 MiB object reaches 6.4k/s at a 9.1 ms p50.
+- **Lists improved with a dedicated index-scan pool.** 638/s is about 638,000
+  keys/s; each request still materialises 1,000 XML entries.
 
 ## Inline threshold
 
@@ -120,15 +127,15 @@ regression. The default stays **1 partition**.
 
 ## DuckDB 2.0 through the gateway
 
-`just bench s3`, same host:
+`just bench s3`, same host, 2,000 four-KiB and 128 eight-MiB objects:
 
 | Workload | Workers | Result | p50 |
 | --- | ---: | ---: | ---: |
-| 4 KiB GET | 64 | 1,265 req/s | 47.9 ms |
-| 4 KiB GET, first read | 64 | 1,359 req/s | 45.3 ms |
-| 4 KiB PUT | 64 | 440 req/s | 138 ms |
-| 64 MiB GET | 16 | 599 MiB/s | 202 ms |
-| 64 MiB PUT | 16 | 117 MiB/s | 990 ms |
+| 4 KiB GET | 64 | 1,838 req/s | 32.8 ms |
+| 4 KiB GET, first read | 64 | 1,467 req/s | 40.5 ms |
+| 4 KiB PUT | 64 | 668 req/s | 87.5 ms |
+| 8 MiB GET | 16 | 674 MiB/s | 181 ms |
+| 8 MiB PUT | 16 | 120 MiB/s | 996 ms |
 
 DuckDB's httpfs client adds request scheduling, HTTP parsing and its own
 connection pool; the direct numbers above show the gateway's ceiling without
@@ -160,11 +167,11 @@ host**. Sources: [performance guide][express-perf], [pricing][express-price],
 
 | Dimension | pgvs3 (measured, 6 vCPU) | S3 Express One Zone (published) |
 | --- | --- | --- |
-| 4 KiB GET p50 | 0.35–1.2 ms at 1–16 workers | Consistent single-digit ms |
-| 4 KiB GET throughput | ~18.4k/s | 200k/s default, 2M/s max per bucket |
+| 4 KiB GET p50 | 0.28–3.2 ms at 1–64 workers | Consistent single-digit ms |
+| 4 KiB GET throughput | ~18.4k/s at 256 workers | 200k/s default, 2M/s max per bucket |
 | 4 KiB PUT throughput | ~2.2k/s (4k/s async at 16) | 100k/s default, 200k/s max per bucket |
-| 8–64 MiB GET | 0.4–1.0 GiB/s | Network/concurrency-bound; elastic |
-| 64 MiB PUT | 81–186 MiB/s | Elastic, distributed |
+| 8–64 MiB GET | 0.3–1.1 GiB/s | Network/concurrency-bound; elastic |
+| 64 MiB PUT | 86–171 MiB/s | Elastic, distributed |
 | Capacity | 32 TiB per database; ~17.4 TB per object | Unlimited storage; 50 TB per object |
 | Availability | Whatever PostgreSQL/your deployment provides | 99.95% designed, 99.9% SLA |
 | Durability | PostgreSQL replication/backups chosen by the operator | 11 nines within one AZ; AZ loss risk |
@@ -173,7 +180,7 @@ host**. Sources: [performance guide][express-perf], [pricing][express-price],
 **What the numbers mean**
 
 - **Per-request latency is competitive.** At one to sixteen workers, pgvs3's
-  4 KiB GET p50 is 0.35–1.2 ms, below S3 Express's single-digit-millisecond
+  4 KiB GET p50 is 0.28–0.92 ms, below S3 Express's single-digit-millisecond
   target. The loopback path removes the network and object-store metadata
   hops; inline objects remove the chunk lookup entirely.
 - **Aggregate throughput is not.** Six cores and one PostgreSQL reach about 4k

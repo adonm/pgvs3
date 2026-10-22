@@ -74,6 +74,12 @@ func (c *objectCache) get(bucket, key string) (objectEntry, bool) {
 	return e, true
 }
 
+func (c *objectCache) miss() {
+	if c != nil {
+		c.misses.Add(1)
+	}
+}
+
 func (c *objectCache) put(bucket, key string, e objectEntry) {
 	if c == nil || int64(len(e.data)) > c.maxObject {
 		return

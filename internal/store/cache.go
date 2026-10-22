@@ -74,6 +74,12 @@ func (c *LocalMetaCache) Invalidate(_ context.Context, bucket, key string) {
 
 func (c *LocalMetaCache) Close() { c.c.Close() }
 
+// Stats returns cache hits, misses and evictions since startup.
+func (c *LocalMetaCache) Stats() (hits, misses, evicted int64) {
+	st := c.c.Stats()
+	return st.Hits(), st.Misses(), st.EvictedCount()
+}
+
 func cacheKey(bucket, key string) string { return bucket + "\x00" + key }
 
 // SizeEstimate approximates the heap cost of one metadata entry.

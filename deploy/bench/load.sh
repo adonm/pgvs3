@@ -7,7 +7,7 @@ container="pgvs3-load-$$"
 pid=""
 cleanup() {
   [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  docker rm -f "$container" >/dev/null 2>&1 || true
+  docker rm -fv "$container" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -49,6 +49,10 @@ for op in put get; do
   for w in 1 16 64 256; do
     run -op "$op" -size 4096 -workers "$w" -duration 5s -count 2000
   done
+done
+# Cached HEAD metadata path.
+for w in 1 16 64; do
+  run -op head -size 4096 -workers "$w" -duration 5s -count 2000
 done
 # 8 MiB and 64 MiB reads; 64 MiB writes.
 for size in 8388608 67108864; do

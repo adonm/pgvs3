@@ -49,7 +49,7 @@ func Listen(cfg ServeConfig, handler http.Handler, log *slog.Logger) (*http.Serv
 }
 
 // Run starts the server and shuts it down when ctx is cancelled.
-func Run(ctx context.Context, srv *http.Server, cert, key string, log *slog.Logger) error {
+func Run(ctx context.Context, srv *http.Server, cert, key string, drain time.Duration, log *slog.Logger) error {
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		return err
@@ -69,6 +69,9 @@ func Run(ctx context.Context, srv *http.Server, cert, key string, log *slog.Logg
 	log.Info("serving", "scheme", scheme, "addr", ln.Addr().String())
 	select {
 	case <-ctx.Done():
+		if drain > 0 {
+			time.Sleep(drain)
+		}
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdown)

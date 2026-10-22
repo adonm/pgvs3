@@ -10,6 +10,10 @@ s3SecretName: pgvs3-s3
 sessionKeySecretName: ""
 region: us-east-1
 accountId: "000000000000"
+# Idempotently created at startup; avoids a manual bucket bootstrap.
+buckets: "lake"
+# Keep below the container memory limit; Go uses it as a soft heap ceiling.
+gomemlimit: "3Gi"
 vhostDomain: ""
 # Configure a TLS Secret for non-loopback deployments. Plaintext is an explicit
 # opt-in for isolated test clusters only.
@@ -41,6 +45,9 @@ resources:
   limits: { memory: 4Gi }
 # HPA is off by default because the peer list is static. Enable only with
 # peerCache disabled or an external peer discovery controller.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
 autoscaling:
   enabled: false
   minReplicas: 3

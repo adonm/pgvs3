@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"time"
@@ -40,9 +41,12 @@ type Server struct {
 	vhostDomain string
 	accountID   string
 	metrics     *metrics
+	readOnly    bool
+	adminOnly   bool
+	draining    atomic.Bool
 }
 
-func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain, accountID string) *Server {
+func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain, accountID string, readOnly bool) *Server {
 	if region == "" {
 		region = "us-east-1"
 	}
@@ -55,7 +59,7 @@ func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain, acc
 	}
 	return &Server{
 		store: st, auth: auth, log: log, region: region,
-		vhostDomain: vhostDomain, accountID: accountID, metrics: newMetrics(),
+		vhostDomain: vhostDomain, accountID: accountID, metrics: newMetrics(), readOnly: readOnly,
 	}
 }
 
@@ -69,6 +73,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/readyz" {
+		if s.draining.Load() {
+			http.Error(w, "draining", http.StatusServiceUnavailable)
+			return
+		}
 		if err := s.store.Ready(r.Context()); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
@@ -78,13 +86,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/metrics" {
-		s.metrics.write(w)
+		if s.adminOnly {
+			http.NotFound(w, r)
+			return
+		}
+		s.metrics.write(w, s.store)
 		return
 	}
 	defer func() { s.metrics.observe(r.Method, rw.status, time.Since(start), rw.n) }()
 	w.Header().Set("x-amz-request-id", requestIDHeader())
 	s.log.Debug("request", "method", r.Method, "host", r.Host, "path", r.URL.Path, "query", r.URL.RawQuery)
 	s.serve(rw, r)
+}
+
+func (s *Server) SetDraining(v bool) { s.draining.Store(v) }
+
+// SetAdminOnly removes /metrics from the S3 listener when a dedicated admin
+// listener is configured.
+func (s *Server) SetAdminOnly(v bool) { s.adminOnly = v }
+
+// AdminHandler serves health, readiness and metrics on a separate listener.
+func (s *Server) AdminHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok\n")
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if s.draining.Load() {
+			http.Error(w, "draining", http.StatusServiceUnavailable)
+			return
+		}
+		if err := s.store.Ready(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ready\n")
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		s.metrics.write(w, s.store)
+	})
+	return mux
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +139,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	bucket, key, err := splitPath(r, s.vhostDomain)
 	if err != nil {
 		writeError(w, r, errInvalidRequest("invalid object path"), s.log)
+		return
+	}
+	if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, r, errAccessDenied("gateway is read-only"), s.log)
 		return
 	}
 	q := r.URL.Query()

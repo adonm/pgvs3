@@ -48,8 +48,14 @@ race:
     mise exec go -- go test -race ./...
 
 [group('test')]
+fault:
+    bash deploy/bench/stack.sh fault
+
+[group('test')]
 fuzz:
-    mise exec go -- go test -fuzz=Fuzz -fuzztime=30s ./internal/s3 ./internal/store
+    mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=10s ./internal/s3
+    mise exec go -- go test -fuzz=FuzzCanonicalQuery -fuzztime=10s ./internal/s3
+    mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=10s ./internal/store
 
 [group('test')]
 vet:
@@ -78,12 +84,12 @@ load:
 # Image name for `just image`; CI may override it.
 IMAGE := env("KO_DOCKER_REPO", "ghcr.io/adonm/pgvs3")
 
-# ko builds a distroless static image directly from source: amd64 + arm64.
 # Local compose stack (build the image first with `just image`).
 [group('dev')]
 compose:
     docker compose -f deploy/compose.yaml up
 
+# ko builds a distroless static image directly from source: amd64 + arm64.
 [group('image')]
 image push="false":
     #!/usr/bin/env bash
@@ -103,4 +109,7 @@ ci:
     test -z "$(mise exec go -- gofmt -l cmd internal test)" || { mise exec go -- gofmt -l cmd internal test; exit 1; }
     mise exec go -- go vet ./...
     mise exec go -- go test -race ./...
+    mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=5s ./internal/s3
+    mise exec go -- go test -fuzz=FuzzCanonicalQuery -fuzztime=5s ./internal/s3
+    mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=5s ./internal/store
     just contract

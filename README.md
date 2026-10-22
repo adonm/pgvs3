@@ -24,16 +24,14 @@ Needs [mise](https://mise.jdx.dev/) and Docker (or PostgreSQL 18+ with a
 just setup
 just dev-db                 # PostgreSQL 18 on 127.0.0.1:5432
 go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmode=disable' \
-  serve --addr 127.0.0.1:8014
+  serve --addr 127.0.0.1:8014 --buckets lake
 ```
 
-Create a bucket and write an object (the example key is for loopback
-development only):
+`--buckets lake` creates the bucket idempotently at startup. Write an object
+(the example key is for loopback development only):
 
 ```sh
 export PGVS3_ACCESS_KEY=pgvs3 PGVS3_SECRET_KEY=pgvs3-local-only
-curl --aws-sigv4 aws:amz:us-east-1:s3 --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
-     -X PUT http://127.0.0.1:8014/lake
 curl --aws-sigv4 aws:amz:us-east-1:s3 --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
      -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
 ```
@@ -76,9 +74,11 @@ The layout is deliberately narrow:
 - **Files are immutable.** A write streams rows under a new `file_id`; an
   overwrite publishes a new `file_id`. `file_id` is the cache version tag, so a
   warm DuckDB never revalidates bytes it already holds.
-- **Reads are primary-key range queries.** Up to 8 MiB is one query; longer
-  reads use one repeatable-read snapshot so an overwrite cannot remove later
-  rows mid-response. Rows stream straight into the HTTP response.
+- **Reads are primary-key range queries.** A single-file read up to 64 MiB is
+  one query; responses up to 8 MiB stream synchronously, while longer reads use
+  a cut-through goroutine so PostgreSQL fetch overlaps socket writes. Larger
+  spans/multipart reads use one repeatable-read snapshot so an overwrite cannot
+  remove later rows mid-response.
 - **Writes are one binary `COPY`.** The body is hashed and framed as it
   arrives; chunks and the object row commit in the same transaction. A failed
   or abandoned write publishes nothing.
@@ -96,12 +96,13 @@ The layout is deliberately narrow:
 
 ## Performance
 
-On a shared 6-vCPU loopback host, direct SigV4 load on v9 gives a 0.25 ms p50
-for one 4 KiB GET and about 18.4k 4 KiB GET/s at 64 workers; cached HEAD is
-0.23 ms at one worker and 20.3k/s at 64. A 4 KiB PUT is 1.24 ms at one worker
-(3.97k/s at 16 with `PGVS3_WRITE_COMMIT=off`). 8 MiB GETs reach 1.0 GiB/s and
-64 MiB GETs about 0.99 GiB/s. S3 Express One Zone publishes
-consistent single-digit-millisecond latency and 200k reads / 100k writes per
+On a shared 6-vCPU loopback host, direct SigV4 load on the current v9 build
+gives a 0.28 ms p50 for one 4 KiB GET and about 18.4k 4 KiB GET/s at 256
+workers; cached HEAD is 0.24 ms at one worker and 17.6k/s at 64. A 4 KiB PUT
+is 1.32 ms at one worker (2.1k/s at 16; async commit reaches 3.97k/s in an
+earlier run). 8 MiB GETs reach 1.09 GiB/s and 64 MiB GETs 1.06 GiB/s at 16
+workers.
+S3 Express One Zone publishes consistent single-digit-millisecond latency and 200k reads / 100k writes per
 second per directory bucket by default. Per-request latency is in the same
 band; the aggregate ceiling is not — pgvs3 is one PostgreSQL, Express is a
 managed service. Full methodology, Go-vs-Express tables and the cost comparison
@@ -218,6 +219,10 @@ A flag overrides the same-named environment variable.
 | `--write-commit` | `PGVS3_WRITE_COMMIT` | `on` | `synchronous_commit` for unconditional writes: `on`, `local` or `off`. Conditional writes always use `on`. |
 | `--verify-reads` | `PGVS3_VERIFY_READS` | true | Re-check the object's current `file_id` on every chunk range query. Disable only for a single writer/immutable lake. |
 | `--inline-max` | `PGVS3_INLINE_MAX` | 65536 | Largest object stored inline; `0` stores everything in chunks. |
+| `--buckets` | `PGVS3_BUCKETS` | unset | Comma-separated buckets created idempotently at startup. |
+| `--read-only` | `PGVS3_READ_ONLY` | false | Reject mutating methods; skip DDL, reaping and bucket creation. Use against a standby. |
+| `--drain` | `PGVS3_DRAIN` | `5s` | Keep serving while `/readyz` returns 503, then shut down. |
+| `--admin-addr` | `PGVS3_ADMIN_ADDR` | unset | Optional separate listener for `/healthz`, `/readyz` and `/metrics`. |
 | `--cache-main-bytes` | `PGVS3_CACHE_MAIN_BYTES` | 64 MiB | Local cache for owned metadata keys. |
 | `--cache-hot-bytes` | `PGVS3_CACHE_HOT_BYTES` | 64 MiB | Local mirror of peer-owned metadata keys. |
 | `--peers` | `PGVS3_PEERS` | unset | Comma-separated `host:port` peer list. |
@@ -227,8 +232,10 @@ A flag overrides the same-named environment variable.
 | `--region` | `PGVS3_REGION` | `us-east-1` | SigV4 region and bucket ARN region. |
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 
-`GET /healthz` is an unauthenticated liveness probe. `pgvs3 stat` reports
-logical vs physical size, queued files and the age of the oldest queued file.
+`GET /healthz`, `GET /readyz` and `GET /metrics` are unauthenticated. Bind
+those paths (or `--admin-addr`) to a private network. `pgvs3 health` polls
+`/readyz` for container orchestrators. `pgvs3 stat` reports logical vs
+physical size, queued files and the age of the oldest queued file.
 
 ## Storage cost and limits
 
@@ -290,7 +297,7 @@ historical numbers.
 
 ## Repo layout
 
-- `cmd/pgvs3/`: CLI (`serve`, `stat --json`, `doctor`).
+- `cmd/pgvs3/`: CLI (`serve`, `stat --json`, `doctor`, `health`).
 - `internal/store/`: schema, PostgreSQL pool, streaming COPY/GET, multipart,
   copy/rename/append, maintenance.
 - `internal/s3/`: S3 routing, SigV4, sessions, XML, ranges, checksums, Express

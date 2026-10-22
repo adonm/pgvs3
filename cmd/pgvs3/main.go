@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -33,6 +34,9 @@ func run() int {
 	// Accept both `pgvs3 serve --url ...` and the historical
 	// `pgvs3 --url ... serve --addr ...`: strip the verb wherever it appears,
 	// then let flag.Parse see only flags.
+	if i := indexArg(args, "health"); i >= 0 {
+		return health(removeArg(args, i))
+	}
 	if i := indexArg(args, "doctor"); i >= 0 {
 		return doctor(removeArg(args, i))
 	}
@@ -102,11 +106,15 @@ func serve(args []string) int {
 		writeCommit   = fs.String("write-commit", env("PGVS3_WRITE_COMMIT", "on"), "synchronous_commit for unconditional writes: on, local or off")
 		verifyReads   = fs.Bool("verify-reads", envBoolDefault("PGVS3_VERIFY_READS", true), "verify the current object file_id on every chunk range query")
 		inlineMax     = fs.Int64("inline-max", envInt64("PGVS3_INLINE_MAX", 65536), "largest object stored inline (0 disables, max 65536)")
+		buckets       = fs.String("buckets", env("PGVS3_BUCKETS", ""), "comma-separated buckets to create at startup")
+		readOnly      = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating S3 requests")
+		drain         = fs.Duration("drain", envDuration("PGVS3_DRAIN", 5*time.Second), "readiness drain period before shutdown")
+		adminAddr     = fs.String("admin-addr", env("PGVS3_ADMIN_ADDR", ""), "separate health/metrics listen address")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	peersList := splitPeers(*peers)
+	peersList := splitList(*peers)
 	// A single gateway invalidates its own cache on write. With peers, another
 	// gateway can overwrite a key at any time, so revalidate cache hits.
 	if os.Getenv("PGVS3_OBJECT_CACHE_REVALIDATE") == "" && !flagSet(fs, "object-cache-revalidate") && len(peersList) > 0 {
@@ -130,13 +138,24 @@ func serve(args []string) int {
 		return 1
 	}
 	defer st.Close()
-	if err := st.Init(ctx); err != nil {
-		log.Error("initialising storage layout", "err", err)
-		return 1
-	}
-	if err := st.EnsureMaintenance(ctx); err != nil {
-		log.Error("checking storage layout", "err", err)
-		return 1
+	if *readOnly {
+		if err := st.CheckLayout(ctx); err != nil {
+			log.Error("checking storage layout", "err", err)
+			return 1
+		}
+	} else {
+		if err := st.Init(ctx); err != nil {
+			log.Error("initialising storage layout", "err", err)
+			return 1
+		}
+		if err := st.EnsureMaintenance(ctx); err != nil {
+			log.Error("checking storage layout", "err", err)
+			return 1
+		}
+		if err := st.EnsureBuckets(ctx, splitList(*buckets)); err != nil {
+			log.Error("creating startup buckets", "err", err)
+			return 1
+		}
 	}
 	cache, err := peercache.New(ctx, st, peercache.Options{
 		MainBytes: *cacheMain, HotBytes: *cacheHot, TTL: 10 * time.Second,
@@ -148,17 +167,26 @@ func serve(args []string) int {
 	}
 	st.SetCache(cache)
 	defer st.CloseCache()
-	if len(peersList) > 0 && *poolMax > 1 {
+	if *poolMax > 1 {
 		go st.StartNotify(ctx)
 	}
 
-	go maintain(ctx, st, *reapGrace, *maintainEvery, log)
+	if !*readOnly {
+		go maintain(ctx, st, *reapGrace, *maintainEvery, log)
+	}
 
 	auth := &s3.Auth{AccessKey: *accessKey, SecretKey: *secretKey}
 	if *sessionKey != "" {
 		auth.Sessions = s3.NewSessionIssuer([]byte(*sessionKey), 5*time.Minute)
 	}
-	handler := s3.New(st, auth, log, *region, *vhost, *accountID)
+	handler := s3.New(st, auth, log, *region, *vhost, *accountID, *readOnly)
+	if *adminAddr != "" {
+		handler.SetAdminOnly(true)
+	}
+	go func() {
+		<-ctx.Done()
+		handler.SetDraining(true)
+	}()
 	srv, err := s3.Listen(s3.ServeConfig{
 		Addr: *addr, TLSCert: *tlsCert, TLSKey: *tlsKey, AllowHTTP: *allowHTTP,
 	}, handler, log)
@@ -167,7 +195,15 @@ func serve(args []string) int {
 		return 1
 	}
 	log.Info("pgvs3 starting", "version", version, "addr", *addr, "cache_peers", len(peersList), "object_cache_revalidate", *objectCheck)
-	if err := s3.Run(ctx, srv, *tlsCert, *tlsKey, log); err != nil {
+	if *adminAddr != "" {
+		admin := &http.Server{Addr: *adminAddr, Handler: handler.AdminHandler(), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := s3.Run(ctx, admin, "", "", 0, log); err != nil {
+				log.Error("admin listener", "err", err)
+			}
+		}()
+	}
+	if err := s3.Run(ctx, srv, *tlsCert, *tlsKey, *drain, log); err != nil {
 		log.Error("serving", "err", err)
 		return 1
 	}
@@ -212,6 +248,24 @@ func stat(args []string) int {
 	}
 	fmt.Printf("objects=%d chunks=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
 		s.Objects, s.Chunks, s.LogicalBytes>>20, s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
+	return 0
+}
+
+func health(args []string) int {
+	fs := flag.NewFlagSet("health", flag.ContinueOnError)
+	url := fs.String("url", env("PGVS3_HEALTH_URL", "http://127.0.0.1:8014/readyz"), "readiness URL")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(*url)
+	if err != nil {
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 1
+	}
 	return 0
 }
 
@@ -279,7 +333,7 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l}))
 }
 
-func splitPeers(s string) []string {
+func splitList(s string) []string {
 	if strings.TrimSpace(s) == "" {
 		return nil
 	}

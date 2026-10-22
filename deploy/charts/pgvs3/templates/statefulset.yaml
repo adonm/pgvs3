@@ -57,6 +57,10 @@ spec:
             - { name: PGVS3_DB_CA_FILE, value: /etc/pgvs3/db-ca/caCert }
             - { name: PGVS3_POOL_MAX, value: {{ .Values.poolMax | quote }} }
             - { name: PGVS3_POOL_MIN, value: {{ .Values.poolMin | quote }} }
+            {{- if .Values.buckets }}
+            - { name: PGVS3_BUCKETS, value: {{ .Values.buckets | quote }} }
+            {{- end }}
+            - { name: GOMEMLIMIT, value: {{ .Values.gomemlimit | quote }} }
             {{- if .Values.peerCache.enabled }}
             - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
             - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
@@ -84,7 +88,7 @@ spec:
             periodSeconds: 5
             failureThreshold: 36
           readinessProbe:
-            httpGet: { path: /healthz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
+            httpGet: { path: /readyz, port: 8014, scheme: {{ if .Values.tlsSecretName }}HTTPS{{ else }}HTTP{{ end }} }
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:

@@ -33,15 +33,20 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
   repeatable-read snapshot, so a concurrent overwrite cannot remove later rows.
   More than eight pieces fall back to a sequential snapshot to bound connection
   use.
-- **Rows are cut through to HTTP.** `Body.WriteTo` writes each PostgreSQL chunk
-  straight to the response. A bounded channel (32 chunks) backpressures
-  PostgreSQL when the client is slow.
+- **Small single-piece reads are synchronous.** Up to 8 MiB, rows are pulled on
+  the HTTP goroutine with no channel hop; the first chunk is prefetched before
+  headers are sent.
+- **Long reads are cut through to HTTP.** Above 8 MiB, `Body.WriteTo` writes
+  each PostgreSQL chunk straight to the response while a bounded channel (32
+  chunks) overlaps the database fetch and backpressures a slow client.
 - **Out-of-order rows are held.** Bitmap scans return TID order; `streamRows`
   buffers the few rows that run ahead and emits `no` order.
 - **256 KiB response chunks** amortise syscalls without adding a large copy.
 - **Metadata is cached.** Otter (W-TinyLFU) serves metadata reads without a
-  lock, with a 5-second TTL. `HEAD` uses the cache; `LISTEN/NOTIFY` drops the
-  entry as soon as a write commits anywhere in the cluster.
+  lock, with a 5-second TTL. `HEAD` uses the cache; on a miss it fetches and
+  caches the full row, including inline bytes, so a later GET cannot see a
+  header-only entry. `LISTEN/NOTIFY` drops the entry as soon as a write commits
+  anywhere in the cluster.
 - **Buckets are cached.** A positive bucket lookup is remembered for 30 seconds
   and dropped on create/delete or NOTIFY, removing a query from `HEAD`, `LIST`
   and `DELETE`.
@@ -135,8 +140,10 @@ default stays 64 KiB. 8 KiB behaves the same either way.
 - **One binary `COPY` per larger PUT or part.** `internal/store/ingest.go` frames
   4 MiB batches; the body is hashed (SHA-256 for integrity, MD5 for the ETag) in
   the same pass.
-- **Publish in the same transaction.** Chunks and the `s3p.objects` row commit
-  together. An interrupted or failed write publishes nothing.
+- **Publish in one SQL call.** After `COPY`, `s3p.publish_object` takes the
+  advisory lock, evaluates conditions, swaps the object row, queues replaced
+  files and sends NOTIFY. Chunks and metadata commit together; an interrupted
+  write publishes nothing.
 - **Multipart parts are separate files.** Parts upload in parallel with no
   staging; Complete publishes the ordered part list. It validates ETags and
   checksums but moves no data.
@@ -156,8 +163,9 @@ default stays 64 KiB. 8 KiB behaves the same either way.
 
 - **Writes** call `pg_notify('s3p_invalidate', bucket || chr(31) || key)` in the
   same transaction, so the notification is delivered only on commit.
-- **Every gateway** keeps one `LISTEN` connection and drops the local metadata
-  and byte cache entry on receipt. Bucket notifications use a `b:` prefix.
+- **Every gateway with `poolMax > 1`** keeps one `LISTEN` connection and drops
+  the local metadata and byte cache entry on receipt, even when no peer list is
+  configured. Bucket notifications use a `b:` prefix.
 - **Inline objects** are revalidated on read when peers are configured, because
   they have no chunk `file_id` for the range query to check.
 - **Session tokens** are cached in-process for their five-minute lifetime, so
@@ -183,6 +191,9 @@ remain durable.
 - **Session settings** are applied once per connection: bitmap scans for chunks,
   `work_mem = 64MB`, read-ahead concurrency, TCP keepalives, a 5-minute
   `idle_in_transaction_session_timeout`, and synchronous commit.
+- **Listings use a small dedicated pool.** Its sessions enable index scans, so
+  ordered metadata pages do not force that planner hint onto chunk reads.
+  `List` is one query with no BEGIN/SET/COMMIT round trips.
 
 ## Reaping and vacuum
 

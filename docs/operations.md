@@ -6,15 +6,10 @@
 just image                    # ko.local:latest
 docker compose -f deploy/compose.yaml up
 curl -fsS http://127.0.0.1:8014/healthz
+curl -fsS http://127.0.0.1:8014/readyz
 ```
 
-Create a bucket once (compose uses the development credentials):
-
-```sh
-export PGVS3_ACCESS_KEY=pgvs3 PGVS3_SECRET_KEY=pgvs3-local-only
-curl --aws-sigv4 aws:amz:us-east-1:s3 --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
-     -X PUT http://127.0.0.1:8014/lake
-```
+Compose sets `PGVS3_BUCKETS=lake`, so no bucket bootstrap request is needed.
 
 For a real deployment put the URL and keys in Secrets and use TLS outside
 loopback; `PGVS3_ALLOW_HTTP` and `PGVS3_DB_ALLOW_PLAINTEXT` are for isolated
@@ -24,14 +19,18 @@ development only.
 
 - `GET /healthz` — process liveness, no database access.
 - `GET /readyz` — database reachable and layout version matches; returns 503
-  otherwise.
+  while draining or during a database outage.
 - `GET /metrics` — Prometheus text:
   - `pgvs3_requests_total{method,code}`
-  - `pgvs3_request_duration_seconds_sum` / `_count`
+  - `pgvs3_request_duration_seconds_sum` / `_count` and latency buckets
   - `pgvs3_response_bytes_total`
+  - `pgvs3_pg_pool_*` and `pgvs3_list_pool_*`
+  - `pgvs3_meta_cache_*` and `pgvs3_object_cache_*`
+  - reaper, maintenance-run and NOTIFY reconnect counters
 
-Bind the peer port (`8015`) and `/metrics` to a private network. Neither uses
-S3 authentication.
+Set `PGVS3_ADMIN_ADDR=127.0.0.1:8016` to move probes and metrics to a separate
+listener; `/metrics` is then removed from the S3 listener. Bind the peer port (`8015`) and any metrics listener to a private
+network; neither uses S3 authentication.
 
 ## Diagnose
 
@@ -78,6 +77,16 @@ Watch `pgvs3 stat` for garbage age and physical growth. A single PostgreSQL is
 the capacity and write-throughput boundary: 32 TiB per database, about 17.4 TB
 per object. Add DuckDB readers rather than more writers; the design assumes one
 DuckLake writer.
+
+## Shutdown and read-only gateways
+
+On `SIGTERM`, `/readyz` flips to 503 and the gateway keeps serving for
+`PGVS3_DRAIN` (default 5 s) before `http.Server.Shutdown` waits for in-flight
+requests. Set `PGVS3_READ_ONLY=true` to reject mutating methods, skip DDL and
+reaping, and run against a PostgreSQL standby.
+
+`just fault` exercises peer loss, a PostgreSQL restart during a large PUT, and
+object churn.
 
 ## Failure behavior
 
