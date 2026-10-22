@@ -38,7 +38,8 @@ func (s *Server) appendObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	if len(in.h) > 0 {
 		body = &integrityReader{r: body, in: in}
 	}
-	buf := make([]byte, ioChunk)
+	buf := copyBuf()
+	defer putCopyBuf(buf)
 	if _, err := io.CopyBuffer(writer, body, buf); err != nil {
 		writer.Abort()
 		writeError(w, r, bodyError(err), s.log)

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/maypok86/otter"
 )
@@ -18,7 +19,13 @@ type MetaCache interface {
 // LocalMetaCache is the single-process Otter (W-TinyLFU) cache. Otter reads
 // are lock-free in the common case, which matters at thousands of GETs/s.
 type LocalMetaCache struct {
-	c otter.Cache[string, Meta]
+	c   otter.Cache[string, localEntry]
+	ttl time.Duration
+}
+
+type localEntry struct {
+	m       Meta
+	expires time.Time
 }
 
 func NewLocalMetaCache(bytes int64) *LocalMetaCache {
@@ -28,12 +35,12 @@ func NewLocalMetaCache(bytes int64) *LocalMetaCache {
 	if bytes > 1<<40 {
 		bytes = 1 << 40
 	}
-	b, err := otter.NewBuilder[string, Meta](int(bytes))
+	b, err := otter.NewBuilder[string, localEntry](int(bytes))
 	if err != nil {
 		panic(err)
 	}
-	c, err := b.Cost(func(key string, m Meta) uint32 {
-		n := 64 + len(key) + m.SizeEstimate()
+	c, err := b.Cost(func(key string, e localEntry) uint32 {
+		n := 64 + len(key) + e.m.SizeEstimate()
 		if n > int(^uint32(0)) {
 			return ^uint32(0)
 		}
@@ -42,16 +49,23 @@ func NewLocalMetaCache(bytes int64) *LocalMetaCache {
 	if err != nil {
 		panic(err)
 	}
-	return &LocalMetaCache{c: c}
+	return &LocalMetaCache{c: c, ttl: 5 * time.Second}
 }
 
 func (c *LocalMetaCache) Get(_ context.Context, bucket, key string) (Meta, bool, error) {
-	m, ok := c.c.Get(cacheKey(bucket, key))
-	return m, ok, nil
+	e, ok := c.c.Get(cacheKey(bucket, key))
+	if !ok {
+		return Meta{}, false, nil
+	}
+	if time.Now().After(e.expires) {
+		c.c.Delete(cacheKey(bucket, key))
+		return Meta{}, false, nil
+	}
+	return e.m, true, nil
 }
 
 func (c *LocalMetaCache) Put(_ context.Context, bucket, key string, m Meta) {
-	c.c.Set(cacheKey(bucket, key), m)
+	c.c.Set(cacheKey(bucket, key), localEntry{m: m, expires: time.Now().Add(c.ttl)})
 }
 
 func (c *LocalMetaCache) Invalidate(_ context.Context, bucket, key string) {

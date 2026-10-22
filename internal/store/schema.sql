@@ -118,7 +118,8 @@ CREATE INDEX IF NOT EXISTS garbage_by_age ON s3p.garbage (queued_at, file_id);
 -- already verified and hashed by the caller.
 CREATE OR REPLACE FUNCTION s3p.put_inline(
   p_bucket text, p_key text, p_data bytea, p_sha256 bytea, p_etag text,
-  p_meta text[], p_ct text, p_cond text DEFAULT 'none', p_if_match text DEFAULT NULL
+  p_meta text[], p_ct text, p_cond text DEFAULT 'none', p_if_match text DEFAULT NULL,
+  p_sync text DEFAULT 'on'
 ) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
   old_file bigint;
@@ -126,6 +127,11 @@ DECLARE
   old_etag text;
   found_old boolean;
 BEGIN
+  IF p_cond = 'none' AND p_sync IN ('local','off','remote_write','remote_apply') THEN
+    PERFORM set_config('synchronous_commit', p_sync, true);
+  ELSE
+    PERFORM set_config('synchronous_commit', 'on', true);
+  END IF;
   IF octet_length(p_data) > 65536 THEN
     RAISE EXCEPTION 'inline object exceeds 64 KiB';
   END IF;

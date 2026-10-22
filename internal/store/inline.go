@@ -36,8 +36,8 @@ func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, 
 	}
 	var result string
 	err := s.pool.QueryRow(ctx,
-		"SELECT s3p.put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-		bucket, key, data, sumSHA[:], etag, userMeta, contentType, condText, match).Scan(&result)
+		"SELECT s3p.put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+		bucket, key, data, sumSHA[:], etag, userMeta, contentType, condText, match, s.writeCommit).Scan(&result)
 	if err != nil {
 		return nil, err
 	}

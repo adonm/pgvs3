@@ -12,12 +12,21 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/store"
 )
 
 const ioChunk = 256 << 10
+
+var copyBufPool = sync.Pool{New: func() any {
+	b := make([]byte, ioChunk)
+	return &b
+}}
+
+func copyBuf() []byte     { return *(copyBufPool.Get().(*[]byte)) }
+func putCopyBuf(b []byte) { copyBufPool.Put(&b) }
 
 // Server is the S3 HTTP front end. It is stateless over PostgreSQL, so any
 // gateway instance can serve any request of any multipart upload.
@@ -267,7 +276,7 @@ func (s *Server) getBucketLocation(w http.ResponseWriter, r *http.Request, bucke
 }
 
 func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	m, err := s.store.Meta(r.Context(), bucket, key, true)
+	m, err := s.store.Meta(r.Context(), bucket, key, false)
 	if err != nil {
 		s.metaError(w, r, bucket, err)
 		return
@@ -334,7 +343,8 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	buf := make([]byte, ioChunk)
+	buf := copyBuf()
+	defer putCopyBuf(buf)
 	if _, err := io.CopyBuffer(w, body, buf); err != nil {
 		s.log.Debug("GET body interrupted", "bucket", bucket, "key", key, "err", err)
 	}
@@ -419,7 +429,8 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	if len(in.h) > 0 {
 		body = &integrityReader{r: body, in: in}
 	}
-	buf := make([]byte, ioChunk)
+	buf := copyBuf()
+	defer putCopyBuf(buf)
 	if _, err := io.CopyBuffer(writer, body, buf); err != nil {
 		writer.Abort()
 		writeError(w, r, bodyError(err), s.log)
@@ -587,7 +598,8 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 	if len(in.h) > 0 {
 		body = &integrityReader{r: body, in: in}
 	}
-	buf := make([]byte, ioChunk)
+	buf := copyBuf()
+	defer putCopyBuf(buf)
 	if _, err := io.CopyBuffer(writer, body, buf); err != nil {
 		writer.Abort()
 		writeError(w, r, bodyError(err), s.log)

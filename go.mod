@@ -6,6 +6,7 @@ require (
 	github.com/groupcache/groupcache-go/v3 v3.5.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/maypok86/otter v1.2.4
+	golang.org/x/sync v0.24.0
 )
 
 require (
@@ -26,7 +27,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	golang.org/x/net v0.61.0 // indirect
-	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )

@@ -96,10 +96,11 @@ The layout is deliberately narrow:
 
 ## Performance
 
-On a shared 6-vCPU loopback host, direct SigV4 load on v9 gives a 0.35 ms p50
-for one 4 KiB GET and about 10.4k 4 KiB GET/s at 64 workers. A 4 KiB PUT is
-1.35 ms at one worker and 2.2k/s at 16–64 workers. 8 MiB GETs reach 1.0 GiB/s
-and 64 MiB GETs about 0.99 GiB/s. S3 Express One Zone publishes
+On a shared 6-vCPU loopback host, direct SigV4 load on v9 gives a 0.25 ms p50
+for one 4 KiB GET and about 18.4k 4 KiB GET/s at 64 workers; cached HEAD is
+0.23 ms at one worker and 20.3k/s at 64. A 4 KiB PUT is 1.24 ms at one worker
+(3.97k/s at 16 with `PGVS3_WRITE_COMMIT=off`). 8 MiB GETs reach 1.0 GiB/s and
+64 MiB GETs about 0.99 GiB/s. S3 Express One Zone publishes
 consistent single-digit-millisecond latency and 200k reads / 100k writes per
 second per directory bucket by default. Per-request latency is in the same
 band; the aggregate ceiling is not — pgvs3 is one PostgreSQL, Express is a
@@ -213,6 +214,7 @@ A flag overrides the same-named environment variable.
 | `--object-cache-ttl` | `PGVS3_OBJECT_CACHE_TTL` | `5s` | Small-object cache TTL. |
 | `--object-cache-revalidate` | `PGVS3_OBJECT_CACHE_REVALIDATE` | false single gateway; true with peers | Check each cache hit against `s3p.objects`. |
 | `--whole-read-max` | `PGVS3_WHOLE_READ_MAX` | 64 MiB | Largest single-file span read in one query; larger spans split into pieces. |
+| `--write-commit` | `PGVS3_WRITE_COMMIT` | `on` | `synchronous_commit` for unconditional writes: `on`, `local` or `off`. Conditional writes always use `on`. |
 | `--cache-main-bytes` | `PGVS3_CACHE_MAIN_BYTES` | 64 MiB | Local cache for owned metadata keys. |
 | `--cache-hot-bytes` | `PGVS3_CACHE_HOT_BYTES` | 64 MiB | Local mirror of peer-owned metadata keys. |
 | `--peers` | `PGVS3_PEERS` | unset | Comma-separated `host:port` peer list. |

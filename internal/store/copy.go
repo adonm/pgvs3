@@ -96,6 +96,9 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 			return nil, err
 		}
 	}
+	if err := notifyTx(ctx, tx, dstBucket, dstKey); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -165,6 +168,12 @@ func (s *Store) Rename(ctx context.Context, bucket, srcKey, dstKey string, opts 
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE s3p.objects SET key = $3 WHERE bucket = $1 AND key = $2`, bucket, srcKey, dstKey); err != nil {
+		return err
+	}
+	if err := notifyTx(ctx, tx, bucket, srcKey); err != nil {
+		return err
+	}
+	if err := notifyTx(ctx, tx, bucket, dstKey); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

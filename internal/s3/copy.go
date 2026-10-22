@@ -152,6 +152,28 @@ func (s *Server) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, 
 		writeError(w, r, errInvalidRequest("invalid x-amz-copy-source"), s.log)
 		return
 	}
+	if r.Header.Get("x-amz-copy-source-range") == "" &&
+		r.Header.Get("x-amz-copy-source-if-match") == "" &&
+		r.Header.Get("x-amz-copy-source-if-none-match") == "" {
+		pub, ok, err := s.store.CopyPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo), srcBucket, srcKey)
+		if err != nil {
+			if errors.Is(err, store.ErrNoUpload) {
+				writeError(w, r, errNoSuchUpload(), s.log)
+			} else if errors.Is(err, store.ErrNotFound) {
+				writeError(w, r, errNoSuchKey(), s.log)
+			} else {
+				writeError(w, r, errInternal(err, s.log), s.log)
+			}
+			return
+		}
+		if ok {
+			w.Header().Set("ETag", quoteETag(pub.ETag))
+			writeXML(w, http.StatusOK, copyPartResult{
+				Xmlns: s3Namespace, ETag: quoteETag(pub.ETag), LastModified: isoTime(time.Now()),
+			})
+			return
+		}
+	}
 	first, last := int64(0), int64(-1)
 	if v := r.Header.Get("x-amz-copy-source-range"); v != "" {
 		f, l, _, _, err := parseRange(v)
@@ -201,7 +223,8 @@ func (s *Server) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, 
 		src = io.TeeReader(body, h)
 		_ = header
 	}
-	buf := make([]byte, ioChunk)
+	buf := copyBuf()
+	defer putCopyBuf(buf)
 	if _, err := io.CopyBuffer(writer, src, buf); err != nil {
 		writer.Abort()
 		writeError(w, r, bodyError(err), s.log)

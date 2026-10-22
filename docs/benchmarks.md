@@ -21,14 +21,15 @@ measured separately.
 
 | Workload | Workers | Throughput | p50 | p99 |
 | --- | ---: | ---: | ---: | ---: |
-| 4 KiB GET | 1 | 2,471 req/s | 0.35 ms | 1.21 ms |
+| 4 KiB GET | 1 | 3,345 req/s | 0.25 ms | 0.69 ms |
 | 4 KiB GET | 16 | 8,978 req/s | 1.20 ms | 8.66 ms |
-| 4 KiB GET | 64 | 10,399 req/s | 5.05 ms | 21.7 ms |
-| 4 KiB GET | 256 | 9,388 req/s | 18.6 ms | 131 ms |
-| 4 KiB PUT | 1 | 704 req/s | 1.35 ms | 2.56 ms |
+| 4 KiB GET | 64 | 18,386 req/s | 2.58 ms | 13.7 ms |
+| HEAD | 1 | 3,540 req/s | 0.23 ms | 0.74 ms |
+| HEAD | 16 | 15,185 req/s | 0.73 ms | 3.94 ms |
+| HEAD | 64 | 20,287 req/s | 2.06 ms | 13.4 ms |
+| 4 KiB PUT | 1 | 777 req/s | 1.24 ms | 2.10 ms |
 | 4 KiB PUT | 16 | 2,201 req/s | 6.89 ms | 13.5 ms |
-| 4 KiB PUT | 64 | 2,204 req/s | 28.0 ms | 43.4 ms |
-| 4 KiB PUT | 256 | 1,939 req/s | 126 ms | 227 ms |
+| 4 KiB PUT | 64 | 1,844 req/s | 33.0 ms | 76.7 ms |
 | 8 MiB GET | 1 | 422 MiB/s | 18.5 ms | 25.7 ms |
 | 8 MiB GET | 8 | 961 MiB/s | 65.6 ms | 105 ms |
 | 8 MiB GET | 16 | 1,017 MiB/s | 124 ms | 214 ms |
@@ -42,12 +43,13 @@ measured separately.
 
 Observations:
 
-- **Small reads are the strongest path.** v9 stores ≤64 KiB objects inline;
-  one worker gets a 0.35 ms p50 and the gateway reaches about 10.4k 4 KiB
-  GET/s on six cores. Latency rises with queueing rather than per-request work.
+- **Small reads are the strongest path.** v9 stores ≤64 KiB objects inline
+  and caches metadata/HEAD. One worker gets a 0.25 ms GET p50 and 0.23 ms HEAD
+  p50; the gateway reaches 18.4k 4 KiB GET/s and 20.3k HEAD/s on six cores.
+  Latency rises with queueing rather than per-request work.
 - **Small writes are one SQL call.** A ≤64 KiB PUT is `s3p.put_inline`, which
   locks, checks conditions, queues replaced files, upserts the inline row and
-  notifies caches in one round trip. 704/s at one worker, 2.2k/s at 16–64.
+  notifies caches in one round trip. 777/s at one worker, 2.2k/s at 16.
   Larger writes still use COPY and are PostgreSQL commit-bound.
 - **Large reads stream well.** 8 MiB reads reach 1 GiB/s at 16 workers; 64 MiB
   reads reach about 0.99 GiB/s. One query for a ≤64 MiB single-file object beat
@@ -55,6 +57,21 @@ Observations:
   8 KiB range case shows the fixed per-request cost: 3.5k/s with a 16 ms p50.
 - **Lists are heavier** because one request materialises 1,000 XML entries;
   543/s is about 543,000 keys/s.
+
+## Async commit
+
+Unconditional writes can use `PGVS3_WRITE_COMMIT=off`/`local`; conditional
+writes still force `on`. With `off`:
+
+| 4 KiB PUT | `on` | `off` |
+| --- | ---: | ---: |
+| 1 worker | 777/s · 1.24 ms | 983/s · 0.94 ms |
+| 16 workers | 2,201/s · 6.89 ms | 3,970/s · 3.75 ms |
+| 64 workers | 1,844/s · 33.0 ms | 2,736/s · 21.9 ms |
+
+This trades crash durability for throughput; the acknowledged write is in
+PostgreSQL's WAL but the local fsync may lag. Keep `on` unless the workload is
+replaceable.
 
 ## Small-object cache
 
@@ -132,8 +149,8 @@ host**. Sources: [performance guide][express-perf], [pricing][express-price],
 | Dimension | pgvs3 (measured, 6 vCPU) | S3 Express One Zone (published) |
 | --- | --- | --- |
 | 4 KiB GET p50 | 0.35–1.2 ms at 1–16 workers | Consistent single-digit ms |
-| 4 KiB GET throughput | ~10.4k/s | 200k/s default, 2M/s max per bucket |
-| 4 KiB PUT throughput | ~2.2k/s | 100k/s default, 200k/s max per bucket |
+| 4 KiB GET throughput | ~18.4k/s | 200k/s default, 2M/s max per bucket |
+| 4 KiB PUT throughput | ~2.2k/s (4k/s async at 16) | 100k/s default, 200k/s max per bucket |
 | 8–64 MiB GET | 0.4–1.0 GiB/s | Network/concurrency-bound; elastic |
 | 64 MiB PUT | 81–186 MiB/s | Elastic, distributed |
 | Capacity | 32 TiB per database; ~17.4 TB per object | Unlimited storage; 50 TB per object |

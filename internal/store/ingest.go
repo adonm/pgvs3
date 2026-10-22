@@ -214,6 +214,11 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 		conn.Release()
 		return nil, err
 	}
+	if t.kind == 0 && t.condition == Unconditional && s.writeCommit != "on" {
+		if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = "+s.writeCommit); err != nil {
+			return fail(err)
+		}
+	}
 	if t.kind == 0 || t.kind == 2 {
 		var one int
 		err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE", t.bucket).Scan(&one)
@@ -301,6 +306,13 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			}
 		}
 		if err := commitPart(ctx, tx, t.uploadID, t.partNo, fileIDOf(w), size, sha, md5, checksum); err != nil {
+			_ = tx.Rollback(ctx)
+			w.done <- err
+			return
+		}
+	}
+	if t.kind == 0 {
+		if err := notifyTx(ctx, tx, t.bucket, t.key); err != nil {
 			_ = tx.Rollback(ctx)
 			w.done <- err
 			return

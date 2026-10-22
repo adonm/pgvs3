@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 )
 
 //go:embed schema.sql
@@ -46,6 +47,7 @@ type Options struct {
 	ObjectCacheRevalidate bool
 	WholeReadMax          int64
 	RevalidateReads       bool
+	WriteCommit           string
 }
 
 // Store is the PostgreSQL-backed object store.
@@ -55,11 +57,16 @@ type Store struct {
 	objects          *objectCache
 	wholeReadMax     int64
 	revalidateInline bool
+	writeCommit      string
 	log              *slog.Logger
 
 	fileIDMu   sync.Mutex
 	fileIDNext int64
 	fileIDLeft int64
+
+	bucketMu    sync.RWMutex
+	bucketCache map[string]time.Time
+	reads       singleflight.Group
 }
 
 // Open connects and warms the pool. Remote servers must use TLS; loopback
@@ -71,6 +78,14 @@ func Open(ctx context.Context, url string, opts Options, log *slog.Logger) (*Sto
 	}
 	if opts.WholeReadMax <= 0 {
 		opts.WholeReadMax = 64 << 20
+	}
+	if opts.WriteCommit == "" {
+		opts.WriteCommit = "on"
+	}
+	switch opts.WriteCommit {
+	case "on", "local", "off", "remote_write", "remote_apply":
+	default:
+		return nil, fmt.Errorf("invalid write commit mode %q", opts.WriteCommit)
 	}
 	if opts.MinConns <= 0 {
 		opts.MinConns = 64
@@ -169,7 +184,7 @@ SET synchronous_commit = on;`)
 		pool.Close()
 		return nil, err
 	}
-	return &Store{pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, revalidateInline: opts.RevalidateReads, log: log}, nil
+	return &Store{bucketCache: make(map[string]time.Time), pool: pool, cache: NewLocalMetaCache(64 << 20), objects: newObjectCache(opts.ObjectCacheBytes, opts.ObjectCacheTTL, opts.ObjectCacheRevalidate), wholeReadMax: opts.WholeReadMax, revalidateInline: opts.RevalidateReads, writeCommit: opts.WriteCommit, log: log}, nil
 }
 
 // nextFileID hands out sequence values in blocks. The sequence itself is
@@ -937,8 +952,12 @@ func streamRows(ctx context.Context, q querier, ch chan<- result, bucket, key st
 		return err
 	}
 	defer rows.Close()
-	out := make([]byte, 0, chunkSize+RowBytes)
-	early := make(map[int32][]byte)
+	capHint := int64(chunkSize + RowBytes)
+	if span := end - start + 1; span < capHint {
+		capHint = span + RowBytes
+	}
+	out := make([]byte, 0, int(capHint))
+	var early map[int32][]byte
 	next := p.lo
 	for rows.Next() {
 		raw := rows.RawValues()
@@ -947,6 +966,9 @@ func streamRows(ctx context.Context, q querier, ch chan<- result, bucket, key st
 		}
 		no := int32(uint32(raw[0][0])<<24 | uint32(raw[0][1])<<16 | uint32(raw[0][2])<<8 | uint32(raw[0][3]))
 		if no != next {
+			if early == nil {
+				early = make(map[int32][]byte)
+			}
 			early[no] = append([]byte(nil), raw[1]...)
 			continue
 		}
@@ -965,7 +987,7 @@ func streamRows(ctx context.Context, q querier, ch chan<- result, bucket, key st
 			if !send(out) {
 				return ctx.Err()
 			}
-			out = make([]byte, 0, chunkSize+RowBytes)
+			out = make([]byte, 0, int(capHint))
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -1052,6 +1074,9 @@ func (s *Store) Delete(ctx context.Context, bucket, key string) (bool, error) {
 			return false, err
 		}
 	}
+	if err := notifyTx(ctx, tx, bucket, key); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
@@ -1066,7 +1091,17 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 	if len(keys) == 0 {
 		return nil
 	}
-	_, err := s.pool.Exec(ctx, `WITH doomed AS (
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	for _, k := range keys {
+		if err := notifyTx(ctx, tx, bucket, k); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(ctx, `WITH doomed AS (
 		DELETE FROM s3p.objects WHERE bucket = $1 AND key = ANY($2::text[])
 		RETURNING file_id, parts
 	), dead AS (
@@ -1075,6 +1110,9 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 	INSERT INTO s3p.garbage (file_id) SELECT DISTINCT file_id FROM dead WHERE file_id IS NOT NULL
 	ON CONFLICT DO NOTHING`, bucket, keys)
 	if err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	for _, k := range keys {
@@ -1086,14 +1124,52 @@ func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) er
 
 func (s *Store) CreateBucket(ctx context.Context, name string) error {
 	_, err := s.pool.Exec(ctx, "INSERT INTO s3p.buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", name)
+	if err == nil {
+		s.markBucket(name)
+		_, _ = s.pool.Exec(ctx, "SELECT pg_notify('s3p_invalidate', $1)", "b:"+name)
+	}
 	return err
 }
 
+func (s *Store) bucketKnown(name string) bool {
+	s.bucketMu.RLock()
+	exp, ok := s.bucketCache[name]
+	s.bucketMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		s.bucketMu.Lock()
+		delete(s.bucketCache, name)
+		s.bucketMu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (s *Store) markBucket(name string) {
+	s.bucketMu.Lock()
+	s.bucketCache[name] = time.Now().Add(30 * time.Second)
+	s.bucketMu.Unlock()
+}
+
+func (s *Store) dropBucket(name string) {
+	s.bucketMu.Lock()
+	delete(s.bucketCache, name)
+	s.bucketMu.Unlock()
+}
+
 func (s *Store) BucketExists(ctx context.Context, name string) (bool, error) {
+	if s.bucketKnown(name) {
+		return true, nil
+	}
 	var one int
 	err := s.pool.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1", name).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
+	}
+	if err == nil {
+		s.markBucket(name)
 	}
 	return err == nil, err
 }
@@ -1256,6 +1332,9 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 		}
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM s3p.uploads WHERE upload_id = $1", uploadID); err != nil {
+		return nil, err
+	}
+	if err := notifyTx(ctx, tx, bucket, key); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

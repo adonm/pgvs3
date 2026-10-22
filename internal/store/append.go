@@ -54,6 +54,9 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 			bucket, key, fileID, size, shaAll[:], etag); err != nil {
 			return nil, err
 		}
+		if err := notifyTx(ctx, tx, bucket, key); err != nil {
+			return nil, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
@@ -109,6 +112,9 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 		if err := queueFiles(ctx, tx, fileID, nil); err != nil {
 			return nil, err
 		}
+		if err := notifyTx(ctx, tx, bucket, key); err != nil {
+			return nil, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
@@ -144,6 +150,9 @@ func (s *Store) FinishAppend(ctx context.Context, bucket, key string, offset, fi
 		WHERE bucket = $1 AND key = $2`,
 		bucket, key, parts[0], newSize, shaAll.Sum(nil), etag, parts, ends)
 	if err != nil {
+		return nil, err
+	}
+	if err := notifyTx(ctx, tx, bucket, key); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

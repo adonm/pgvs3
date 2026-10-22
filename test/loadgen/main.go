@@ -83,7 +83,7 @@ func main() {
 
 	switch *op {
 	case "put":
-	case "get", "range":
+	case "get", "range", "head":
 		payload := make([]byte, *size)
 		_, _ = rand.Read(payload)
 		prefill(c, s, base, *bucket, *prefix, *count, payload, 16)
@@ -94,7 +94,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "unknown -op")
 		os.Exit(2)
 	}
-	if *warmup && (*op == "get" || *op == "range") {
+	if *warmup && (*op == "get" || *op == "range" || *op == "head") {
 		for i := 0; i < *count; i++ {
 			u := fmt.Sprintf("%s/%s/%s/obj-%06d", base, *bucket, *prefix, i)
 			req, _ := http.NewRequest(http.MethodGet, u, nil)
@@ -139,6 +139,8 @@ func main() {
 					want   = http.StatusOK
 				)
 				switch *op {
+				case "head":
+					method = http.MethodHead
 				case "put":
 					method = http.MethodPut
 					urlStr = fmt.Sprintf("%s/%s/%s/w%d-%d", base, *bucket, *prefix, id, seq)
@@ -191,7 +193,7 @@ func main() {
 				atomic.AddInt64(&reqs, 1)
 				if *op == "put" {
 					atomic.AddInt64(&bytesRead, *size)
-				} else {
+				} else if *op != "head" {
 					atomic.AddInt64(&bytesRead, got)
 				}
 			}

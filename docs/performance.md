@@ -39,8 +39,14 @@ path; pgvs3 adds an HTTP boundary and multipart semantics.
 - **Out-of-order rows are held.** Bitmap scans return TID order; `streamRows`
   buffers the few rows that run ahead and emits `no` order.
 - **256 KiB response chunks** amortise syscalls without adding a large copy.
-- **Metadata is cached.** Otter (W-TinyLFU) serves local metadata reads without
-  a lock; `HEAD` always reads fresh metadata so size/ETag cannot be stale.
+- **Metadata is cached.** Otter (W-TinyLFU) serves metadata reads without a
+  lock, with a 5-second TTL. `HEAD` uses the cache; `LISTEN/NOTIFY` drops the
+  entry as soon as a write commits anywhere in the cluster.
+- **Buckets are cached.** A positive bucket lookup is remembered for 30 seconds
+  and dropped on create/delete or NOTIFY, removing a query from `HEAD`, `LIST`
+  and `DELETE`.
+- **Cold small reads are coalesced.** `singleflight` collapses concurrent
+  misses for the same non-inline small object into one PostgreSQL read.
 - **Small objects are cached.** A per-gateway Otter byte cache holds whole
   objects up to 256 KiB. Single-gateway writes invalidate it locally; with
   peers, each hit revalidates `file_id`/ETag against `s3p.objects`. See
@@ -104,7 +110,12 @@ partitioning.
 
 ## Write path
 
-- **One binary `COPY` per PUT or part.** `internal/store/ingest.go` frames
+- **Small objects are one SQL call.** `s3p.put_inline` checks the bucket,
+  serialises the key, evaluates `If-Match`/`If-None-Match`, queues replaced
+  files, upserts the inline row and sends a cache NOTIFY in one round trip.
+  A 4 KiB PUT is 1.24 ms at one worker; async commit (`PGVS3_WRITE_COMMIT=off`)
+  reaches 3.97k/s at 16.
+- **One binary `COPY` per larger PUT or part.** `internal/store/ingest.go` frames
   4 MiB batches; the body is hashed (SHA-256 for integrity, MD5 for the ETag) in
   the same pass.
 - **Publish in the same transaction.** Chunks and the `s3p.objects` row commit
@@ -123,6 +134,25 @@ partitioning.
 - **No `wal_compression`.** It only compresses full-page images, and the pages
   hold already-compressed Parquet.
 - **No `full_page_writes = off`.** That risks the whole cluster.
+
+## Cross-gateway coherence
+
+- **Writes** call `pg_notify('s3p_invalidate', bucket || chr(31) || key)` in the
+  same transaction, so the notification is delivered only on commit.
+- **Every gateway** keeps one `LISTEN` connection and drops the local metadata
+  and byte cache entry on receipt. Bucket notifications use a `b:` prefix.
+- **Inline objects** are revalidated on read when peers are configured, because
+  they have no chunk `file_id` for the range query to check.
+- **TTL** is the backstop: 5 seconds for metadata, 5 seconds for the byte cache,
+  30 seconds for buckets.
+
+## Commit modes
+
+`PGVS3_WRITE_COMMIT` defaults to `on`. `local`/`off` (or `remote_write`/
+`remote_apply`) let unconditional writes return before the local WAL fsyncs;
+this trades crash durability for write throughput. Conditional writes always
+force `on`, so SlateDB manifest/WAL fencing and `If-Match`/`If-None-Match`
+remain durable.
 
 ## Connections
 
