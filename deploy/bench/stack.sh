@@ -66,7 +66,7 @@ for entry in "a:$port_a:$peer_a" "b:$port_b:$peer_b"; do
     args+=(--web-addr "127.0.0.1:$web_port")
   fi
   if [ "$label" = b ] && [ "$mode" = contract ]; then
-    args+=(--no-auth)
+    args+=(--no-auth --access-key "" --secret-key "")
   fi
   .tmp/pgvs3/pgvs3 --url "$PGVS3_TEST_DB_URL" serve --addr "127.0.0.1:$port" "${args[@]}" \
     > ".tmp/pgvs3/$mode-$label.log" 2>&1 & pids+=("$!")

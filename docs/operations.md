@@ -22,7 +22,8 @@ at `/{bucket}/{key}`. Directory requests append `PGVS3_WEB_INDEX` (default
 `index.html`); `PGVS3_WEB_ERROR` names an optional 404 object. Use it for static
 sites or non-S3 clients. It supports `HEAD`, ranges, ETags and conditional GETs.
 
-`PGVS3_NO_AUTH=true` accepts unsigned requests on the S3 listener. Put either
+`PGVS3_NO_AUTH=true` accepts unsigned requests on the S3 listener and does not
+require access/secret keys. Put either
 listener behind a service mesh or private network; neither mode adds
 authentication by itself.
 

@@ -126,9 +126,12 @@ func serve(args []string) int {
 		*objectCheck = true
 	}
 	log := newLogger(*logLevel)
-	if *accessKey == "" || *secretKey == "" {
-		log.Error("PGVS3_ACCESS_KEY and PGVS3_SECRET_KEY are required")
+	if !*noAuth && (*accessKey == "" || *secretKey == "") {
+		log.Error("PGVS3_ACCESS_KEY and PGVS3_SECRET_KEY are required unless --no-auth is set")
 		return 2
+	}
+	if *noAuth {
+		log.Warn("authentication disabled; any client that can reach this listener can read and write objects")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

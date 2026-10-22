@@ -199,8 +199,8 @@ A flag overrides the same-named environment variable.
 | --- | --- | --- | --- |
 | `--url` | `PGVS3_URL` | local dev DB | PostgreSQL URL. Remote hosts require `sslmode=require`; certificates and hostnames are verified against system CAs plus `PGVS3_DB_CA_FILE`. Loopback may use plaintext. |
 | `--addr` | `PGVS3_ADDR` | `127.0.0.1:8014` | S3 listen address. |
-| `--access-key` | `PGVS3_ACCESS_KEY` | required | SigV4 access key. |
-| `--secret-key` | `PGVS3_SECRET_KEY` | required | SigV4 secret key. |
+| `--access-key` | `PGVS3_ACCESS_KEY` | required unless `--no-auth` | SigV4 access key. |
+| `--secret-key` | `PGVS3_SECRET_KEY` | required unless `--no-auth` | SigV4 secret key. |
 | `--vhost-domain` | `PGVS3_VHOST_DOMAIN` | unset | Virtual-host suffix, e.g. `s3.internal`. |
 | `--tls-cert`, `--tls-key` | `PGVS3_TLS_CERT`, `PGVS3_TLS_KEY` | unset | PEM files for HTTPS on non-loopback addresses. |
 | `--allow-http` | `PGVS3_ALLOW_HTTP` | false | Explicitly permit plaintext HTTP outside loopback. |
