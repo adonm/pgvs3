@@ -1,15 +1,13 @@
 # Toolchain pins: `mise install` before just recipes, locally and in CI.
-# System packages only bootstrap Docker and native build prerequisites; mise
-# owns Rust, Helm (chart lint), uv and the Cargo build cache (mbx).
+# System packages only bootstrap Docker.
 [tools]
 just = "1"
-rust = "stable"
-mr-boxington = "1.17.0"
-hk = "2.1.0"
+go = "1.27"
+ko = "0.19"
 uv = "0.12.1"
 python = "3.12.14"
 helm = "4"
 
-# DuckDB for `just ducklake` and `just bench`: a stable release.
+# DuckDB for `just contract`, `just ducklake` and `just bench`.
 [env]
-DUCKDB_PY = "1.5.6"
+DUCKDB_PY = "2.0.0"

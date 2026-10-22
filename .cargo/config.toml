@@ -1,8 +1,0 @@
-# Keep peak build load modest on shared workstations: cargo defaults to
-# every logical core, which saturates machines that also run clusters and
-# services. Half the cores is barely slower for this crate.
-#
-# The same image runs on different CPU generations. Use portable codegen;
-# sha2 and s3s checksum implementations dispatch to supported CPU features.
-[build]
-jobs = 8

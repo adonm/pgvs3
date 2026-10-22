@@ -1,0 +1,14 @@
+# ko builds the gateway from source: no Dockerfile, no shell, no libc.
+# distroless/static includes CA certificates for PostgreSQL TLS and runs as
+# the nonroot user (65532). The binary is static because CGO is disabled.
+defaultBaseImage: gcr.io/distroless/static-debian12:nonroot
+
+builds:
+  - id: pgvs3
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w

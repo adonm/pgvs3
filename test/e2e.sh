@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# End-to-end S3 contract against two live gateways sharing one PostgreSQL.
+# Requires: curl, python3, uv (DuckDB 2.0), docker (DuckDB 1.5.6 extension).
+set -euo pipefail
+: "${PGVS3_TEST_DB_URL:?}"
+: "${PGVS3_TEST_ENDPOINT_A:?}"
+: "${PGVS3_TEST_ENDPOINT_B:?}"
+: "${PGVS3_ACCESS_KEY:?}"
+: "${PGVS3_SECRET_KEY:?}"
+: "${PGVS3_TEST_PG_PORT:?}"
+
+A=$PGVS3_TEST_ENDPOINT_A
+B=$PGVS3_TEST_ENDPOINT_B
+BUCKET=pgvs3-contract
+RUN="e2e-$(date +%s)-$$"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+s3() { curl -sS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" "$@"; }
+code() { s3 -o /dev/null -w '%{http_code}' "$@"; }
+fail() { echo "FAIL: $*" >&2; exit 1; }
+expect() { local want=$1; shift; local got; got=$(code "$@"); [ "$got" = "$want" ] || fail "expected HTTP $want, got $got: $*"; }
+
+s3 -X PUT "$A/$BUCKET" >/dev/null || fail "create bucket"
+
+# --- basic object, cross-gateway read, HEAD, ranges -------------------------
+head -c 1048576 /dev/urandom > "$TMP/one.bin"
+expect 200 -X PUT --data-binary @"$TMP/one.bin" "$A/$BUCKET/$RUN/one.bin"
+s3 "$B/$BUCKET/$RUN/one.bin" -o "$TMP/one.out"
+cmp "$TMP/one.bin" "$TMP/one.out" || fail "cross-gateway GET differs"
+[ "$(s3 -I "$A/$BUCKET/$RUN/one.bin" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')" = 1048576 ] || fail "HEAD length"
+s3 -H 'Range: bytes=100-199' "$B/$BUCKET/$RUN/one.bin" -o "$TMP/range.out"
+dd if="$TMP/one.bin" of="$TMP/range.want" bs=1 skip=100 count=100 status=none
+cmp "$TMP/range.want" "$TMP/range.out" || fail "range bytes"
+[ "$(s3 -H 'Range: bytes=-100' "$A/$BUCKET/$RUN/one.bin" | wc -c)" = 100 ] || fail "suffix range"
+expect 416 -H 'Range: bytes=99999999-' "$A/$BUCKET/$RUN/one.bin"
+
+# --- conditional writes and reads ------------------------------------------
+expect 200 -X PUT -H 'If-None-Match: *' --data-binary 'created' "$A/$BUCKET/$RUN/if.txt"
+expect 412 -X PUT -H 'If-None-Match: *' --data-binary 'again' "$A/$BUCKET/$RUN/if.txt"
+etag=$(s3 -I "$A/$BUCKET/$RUN/if.txt" | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+expect 200 -X PUT -H "If-Match: $etag" --data-binary 'updated' "$A/$BUCKET/$RUN/if.txt"
+etag2=$(s3 -I "$A/$BUCKET/$RUN/if.txt" | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+[ "$etag2" != "$etag" ] || fail "conditional update did not change the ETag"
+expect 412 -X PUT -H "If-Match: $etag" --data-binary 'stale' "$A/$BUCKET/$RUN/if.txt"
+expect 200 -H "If-Match: $etag2" "$A/$BUCKET/$RUN/if.txt"
+expect 412 -H 'If-Match: "00000000000000000000000000000000"' "$A/$BUCKET/$RUN/if.txt"
+expect 304 -H "If-None-Match: $etag2" "$A/$BUCKET/$RUN/if.txt"
+
+# Concurrent create-if-absent: exactly one winner, no torn object.
+for i in $(seq 1 8); do
+  ( curl -sS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
+      -o /dev/null -w '%{http_code}\n' -X PUT -H 'If-None-Match: *' \
+      --data-binary "race-$i" "$A/$BUCKET/$RUN/race.txt" > "$TMP/race.$i" ) &
+done
+wait
+cat "$TMP"/race.* > "$TMP/race.codes"
+[ "$(grep -c '^200$' "$TMP/race.codes")" = 1 ] || fail "exactly one conditional create must win"
+[ "$(grep -c '^412$' "$TMP/race.codes")" = 7 ] || fail "other conditional creates must be 412"
+s3 "$B/$BUCKET/$RUN/race.txt" | grep -Eq '^race-[0-9]+$' || fail "torn race object"
+
+# --- listing, pagination and encoding --------------------------------------
+for i in 0 1 2 3 4; do
+  expect 200 -X PUT --data-binary "page-$i" "$A/$BUCKET/$RUN/page/$i"
+done
+expect 200 -X PUT --data-binary 'space' "$A/$BUCKET/$RUN/page/with%20space%2Bplus"
+
+python3 - "$A" "$BUCKET" "$RUN" "$PGVS3_ACCESS_KEY" "$PGVS3_SECRET_KEY" <<'PY'
+import sys, urllib.parse, xml.etree.ElementTree as ET
+import subprocess, json
+endpoint, bucket, run, key, secret = sys.argv[1:6]
+def s3(url):
+    out = subprocess.check_output(["curl","-sS","--aws-sigv4","aws:amz:us-east-1:s3",
+        "--user",f"{key}:{secret}",url])
+    return out
+seen=[]; token=None
+for _ in range(10):
+    url=f"{endpoint}/{bucket}?list-type=2&prefix={urllib.parse.quote(run+'/page')}&max-keys=2&encoding-type=url"
+    if token: url += "&continuation-token="+urllib.parse.quote(token)
+    root=ET.fromstring(s3(url))
+    ns={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+    for c in root.findall("s3:Contents",ns):
+        seen.append(urllib.parse.unquote(c.findtext("s3:Key",namespaces=ns)))
+    trunc=root.findtext("s3:IsTruncated",namespaces=ns)=="true"
+    if not trunc: break
+    token=root.findtext("s3:NextContinuationToken",namespaces=ns)
+    assert token, "truncated listing without a token"
+assert len(seen)==6, seen
+assert run+"/page/with space+plus" in seen, seen
+PY
+
+# --- batch delete ----------------------------------------------------------
+cat > "$TMP/delete.xml" <<XML
+<Delete><Object><Key>$RUN/page/0</Key></Object><Object><Key>$RUN/page/1</Key></Object><Object><Key>$RUN/page/2</Key></Object></Delete>
+XML
+expect 200 -X POST --data-binary @"$TMP/delete.xml" "$A/$BUCKET?delete"
+expect 404 "$B/$BUCKET/$RUN/page/0"
+expect 404 "$B/$BUCKET/$RUN/page/1"
+
+# --- multipart -------------------------------------------------------------
+head -c 5242880 /dev/urandom > "$TMP/p1"
+head -c 1048576 /dev/urandom > "$TMP/p2"
+init=$(s3 -X POST "$A/$BUCKET/$RUN/multi.bin?uploads")
+uid=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("UploadId")][0])' <<<"$init")
+e1=$(s3 -D - -o /dev/null -X PUT --data-binary @"$TMP/p1" "$A/$BUCKET/$RUN/multi.bin?partNumber=1&uploadId=$uid" | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+e2=$(s3 -D - -o /dev/null -X PUT --data-binary @"$TMP/p2" "$A/$BUCKET/$RUN/multi.bin?partNumber=2&uploadId=$uid" | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+cat > "$TMP/complete.xml" <<XML
+<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>$e1</ETag></Part><Part><PartNumber>2</PartNumber><ETag>$e2</ETag></Part></CompleteMultipartUpload>
+XML
+expect 200 -X POST --data-binary @"$TMP/complete.xml" "$A/$BUCKET/$RUN/multi.bin?uploadId=$uid"
+cat "$TMP/p1" "$TMP/p2" > "$TMP/multi.want"
+s3 "$B/$BUCKET/$RUN/multi.bin" -o "$TMP/multi.out"
+cmp "$TMP/multi.want" "$TMP/multi.out" || fail "multipart bytes"
+[ "$(s3 -H 'Range: bytes=5242880-' "$A/$BUCKET/$RUN/multi.bin" | wc -c)" = 1048576 ] || fail "multipart range"
+
+# --- overwrite through A, read through B (peer cache invalidation) ----------
+expect 200 -X PUT --data-binary 'version-one' "$A/$BUCKET/$RUN/over.txt"
+[ "$(s3 "$B/$BUCKET/$RUN/over.txt")" = version-one ] || fail "peer read v1"
+expect 200 -X PUT --data-binary 'version-two' "$A/$BUCKET/$RUN/over.txt"
+[ "$(s3 "$B/$BUCKET/$RUN/over.txt")" = version-two ] || fail "peer read v2"
+
+# --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
+export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY \
+       E2E_SECRET=$PGVS3_SECRET_KEY E2E_PG_PORT=$PGVS3_TEST_PG_PORT
+mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python - <<'PY'
+import os, duckdb
+c=duckdb.connect()
+c.execute("INSTALL httpfs; LOAD httpfs;")
+c.execute("INSTALL ducklake; INSTALL postgres; LOAD ducklake; LOAD postgres;")
+b=os.environ["E2E_BUCKET"]; run=os.environ["E2E_RUN"]; ep=os.environ["E2E_ENDPOINT"]
+c.execute(f"""CREATE SECRET s3s (TYPE S3, KEY_ID '{os.environ['E2E_KEY']}',
+ SECRET '{os.environ['E2E_SECRET']}', REGION 'us-east-1', ENDPOINT '{ep[7:]}',
+ URL_STYLE 'path', USE_SSL false)""")
+c.execute(f"COPY (SELECT range AS i FROM range(10000)) TO 's3://{b}/{run}/duck.parquet' (FORMAT PARQUET)")
+assert c.execute(f"SELECT count(*), sum(i) FROM 's3://{b}/{run}/duck.parquet'").fetchone()==(10000, 49995000)
+c.execute(f"""CREATE SECRET (TYPE POSTGRES, HOST '127.0.0.1', PORT {os.environ['E2E_PG_PORT']},
+ DATABASE 'ducklake_catalog', USER 'postgres', PASSWORD 'postgres')""")
+c.execute(f"ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 's3://{b}/{run}/lake/')")
+c.execute(f"CREATE TABLE lake.t_{run.replace('-','_')}(i INTEGER)")
+c.execute(f"INSERT INTO lake.t_{run.replace('-','_')} SELECT range FROM range(1000)")
+assert c.execute(f"SELECT count(*) FROM lake.t_{run.replace('-','_')}").fetchone()[0]==1000
+print("duckdb 2.0 ok")
+PY
+
+# --- duckdb-object-storage (1.5.6) on the same gateway ---------------------
+mise exec uv -- uv run --quiet --no-project --with duckdb==1.5.6 python - <<'PY'
+import os, duckdb
+c=duckdb.connect()
+c.execute("INSTALL cache_httpfs FROM community; LOAD cache_httpfs;")
+c.execute("INSTALL duckdb_object_storage FROM community; LOAD duckdb_object_storage;")
+b=os.environ["E2E_BUCKET"]; run=os.environ["E2E_RUN"]; ep=os.environ["E2E_ENDPOINT"][7:]
+c.execute(f"""CREATE OR REPLACE SECRET objfs_s3 (TYPE S3, PROVIDER CONFIG,
+ KEY_ID '{os.environ['E2E_KEY']}', SECRET '{os.environ['E2E_SECRET']}',
+ REGION 'us-east-1', ENDPOINT '{ep}', USE_SSL false, URL_STYLE 'path',
+ SCOPE 's3://{b}/{run}/objfs')""")
+c.execute("SET duckdb_objfs_backend='s3'")
+c.execute(f"SET duckdb_objfs_bucket='{b}'")
+c.execute(f"SET duckdb_objfs_root='{run}/objfs'")
+c.execute("ATTACH 'duckdb_objfs://contract.db' AS o")
+c.execute("CREATE TABLE o.items(i INTEGER, s VARCHAR)")
+c.execute("INSERT INTO o.items VALUES (1,'one'),(2,'two'),(3,'three')")
+c.execute("CHECKPOINT o")
+assert c.execute("SELECT count(*), sum(i) FROM o.items").fetchone()==(3,6)
+c.execute("DETACH o")
+c.execute("ATTACH 'duckdb_objfs://contract.db' AS o (READ_ONLY)")
+assert c.execute("SELECT count(*) FROM o.items").fetchone()[0]==3
+print("duckdb_object_storage ok")
+PY
+
+echo "contract ok"
