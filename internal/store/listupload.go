@@ -11,8 +11,10 @@ import (
 )
 
 type PartInfo struct {
-	Number int32
-	Size   int64
+	Number   int32
+	Size     int64
+	FileID   int64
+	Checksum *Checksum
 }
 
 // Attributes returns metadata plus per-part sizes for GetObjectAttributes.
@@ -23,9 +25,42 @@ func (s *Store) Attributes(ctx context.Context, bucket, key string) (*Meta, []Pa
 	}
 	var parts []PartInfo
 	if m.Parts != nil {
+		type partCheck struct {
+			fileID int64
+			c      *Checksum
+		}
+		checks := map[int32]partCheck{}
+		rows, err := s.pool.Query(ctx, `SELECT part_no, file_id, algorithm, value
+			FROM s3p.object_part_checksums WHERE bucket = $1 AND key = $2`, bucket, key)
+		if err != nil {
+			return nil, nil, err
+		}
+		for rows.Next() {
+			var no int32
+			var fileID int64
+			var alg, value string
+			if err := rows.Scan(&no, &fileID, &alg, &value); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			checks[no] = partCheck{fileID: fileID, c: &Checksum{Name: alg, Value: value}}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, nil, err
+		}
 		var prev int64
 		for i, end := range m.PartEnds {
-			parts = append(parts, PartInfo{Number: int32(i + 1), Size: end - prev})
+			no := int32(i + 1)
+			p := PartInfo{Number: no, Size: end - prev}
+			if i < len(m.Parts) {
+				p.FileID = m.Parts[i]
+			}
+			if c, ok := checks[no]; ok && c.fileID == p.FileID {
+				// Ignore a stale row whose file was replaced by this object.
+				p.Checksum = c.c
+			}
+			parts = append(parts, p)
 			prev = end
 		}
 	}

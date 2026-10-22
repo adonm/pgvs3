@@ -108,6 +108,29 @@ CREATE INDEX IF NOT EXISTS uploads_by_age ON s3p.uploads (created_at, upload_id)
 
 -- A file becomes garbage in the *same transaction* that drops its final
 -- reference. Reads started earlier retain their MVCC snapshot during cleanup.
+CREATE TABLE IF NOT EXISTS s3p.rename_tokens (
+  token      text PRIMARY KEY,
+  bucket     text NOT NULL,
+  source_key text NOT NULL,
+  dest_key   text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS rename_tokens_by_age ON s3p.rename_tokens (created_at);
+
+-- Per-part checksums for completed multipart objects. file_id ties a row to
+-- the current part so stale rows from an overwritten object are ignored.
+CREATE TABLE IF NOT EXISTS s3p.object_part_checksums (
+  bucket     text COLLATE "C" NOT NULL,
+  key        text COLLATE "C" NOT NULL,
+  part_no    int4 NOT NULL,
+  file_id    int8 NOT NULL,
+  algorithm  text NOT NULL,
+  value      text NOT NULL,
+  PRIMARY KEY (bucket, key, part_no),
+  FOREIGN KEY (bucket, key) REFERENCES s3p.objects (bucket, key)
+    ON UPDATE CASCADE ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS s3p.garbage (
   file_id   int8 PRIMARY KEY,
   queued_at timestamptz NOT NULL DEFAULT now()
@@ -155,6 +178,7 @@ BEGIN
   IF p_cond = 'if_match' AND (NOT found_old OR old_etag <> p_if_match) THEN
     RETURN 'precondition';
   END IF;
+  DELETE FROM s3p.object_part_checksums WHERE bucket = p_bucket AND key = p_key;
   INSERT INTO s3p.objects
     (bucket, key, file_id, size, sha256, etag, user_metadata, content_type,
      parts, part_ends, inline_data)
@@ -212,6 +236,7 @@ BEGIN
   IF p_cond = 'if_match' AND (NOT found_old OR old_etag <> p_if_match) THEN
     RETURN 'precondition';
   END IF;
+  DELETE FROM s3p.object_part_checksums WHERE bucket = p_bucket AND key = p_key;
   INSERT INTO s3p.objects
     (bucket, key, file_id, size, sha256, etag, user_metadata, content_type,
      parts, part_ends, inline_data)

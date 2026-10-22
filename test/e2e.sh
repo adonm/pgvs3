@@ -164,6 +164,11 @@ expect 200 -X PUT --data-binary 'rename' "$ED/old"
 expect 200 -X PUT -H 'x-amz-rename-source: /old' "$ED/new?renameObject"
 [ "$(s3 "$ED/new")" = rename ] || fail "rename bytes"
 expect 404 "$ED/old"
+expect 200 -X PUT --data-binary 'token rename' "$ED/old-token"
+expect 200 -X PUT -H 'x-amz-rename-source: /old-token' -H 'x-amz-client-token: token-1' "$ED/new-token?renameObject"
+expect 200 -X PUT -H 'x-amz-rename-source: /old-token' -H 'x-amz-client-token: token-1' "$ED/new-token?renameObject"
+expect 200 -X PUT --data-binary 'other' "$ED/other-token"
+expect 400 -X PUT -H 'x-amz-rename-source: /other-token' -H 'x-amz-client-token: token-1' "$ED/other-dst?renameObject"
 expect 200 -X PUT --data-binary 'base' "$ED/app"
 expect 200 -X PUT -H 'x-amz-write-offset-bytes: 4' --data-binary ' appended' "$ED/app"
 [ "$(s3 "$ED/app")" = 'base appended' ] || fail "append bytes"
@@ -233,6 +238,12 @@ up=pc.create_multipart_upload(Bucket=gen, Key=f'{run}/over-inline')
 part=pc.upload_part(Bucket=gen, Key=f'{run}/over-inline', UploadId=up['UploadId'], PartNumber=1, Body=b'n'*1048576)
 pc.complete_multipart_upload(Bucket=gen, Key=f'{run}/over-inline', UploadId=up['UploadId'], MultipartUpload={'Parts':[{'PartNumber':1,'ETag':part['ETag']}]})
 assert pc.get_object(Bucket=gen, Key=f'{run}/over-inline')['Body'].read()==b'n'*1048576
+up=pc.create_multipart_upload(Bucket=gen, Key=f'{run}/part-crc', ChecksumAlgorithm='SHA256', ChecksumType='COMPOSITE')
+body=b'checksum part'
+part=pc.upload_part(Bucket=gen, Key=f'{run}/part-crc', UploadId=up['UploadId'], PartNumber=1, Body=body, ChecksumAlgorithm='SHA256')
+pc.complete_multipart_upload(Bucket=gen, Key=f'{run}/part-crc', UploadId=up['UploadId'], MultipartUpload={'Parts':[{'PartNumber':1,'ETag':part['ETag'],'ChecksumSHA256':part['ChecksumSHA256']}]})
+attrs=pc.get_object_attributes(Bucket=gen, Key=f'{run}/part-crc', ObjectAttributes=['Checksum','ObjectParts'])
+assert attrs['ObjectParts']['Parts'][0]['ChecksumSHA256']==part['ChecksumSHA256']
 pc.put_object(Bucket=gen, Key=f'{run}/shared-src', Body=b'shared')
 pc.copy_object(Bucket=gen, Key=f'{run}/shared-copy', CopySource={'Bucket':gen,'Key':f'{run}/shared-src'})
 pc.delete_objects(Bucket=gen, Delete={'Objects':[{'Key':f'{run}/shared-src'},{'Key':f'{run}/presigned'}]})

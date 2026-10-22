@@ -1586,6 +1586,12 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 	var ids, ends []int64
 	var size int64
 	var unused []int64
+	type selectedCheck struct {
+		no       int32
+		fileID   int64
+		checksum string
+	}
+	var selectedChecks []selectedCheck
 	shaAll := sha256.New()
 	md5All := md5.New()
 	for _, p := range parts {
@@ -1609,6 +1615,9 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 		size += p.size
 		ids = append(ids, p.fileID)
 		ends = append(ends, size)
+		if algorithm.Valid && p.checksum.Valid {
+			selectedChecks = append(selectedChecks, selectedCheck{no: p.no, fileID: p.fileID, checksum: p.checksum.String})
+		}
 		want++
 	}
 	if want != len(listed) {
@@ -1617,6 +1626,15 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 	etag := s3ETag(md5All.Sum(nil), len(ids))
 	if err := swapObjectParts(ctx, tx, bucket, key, nil, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
 		return nil, err
+	}
+	for _, c := range selectedChecks {
+		if _, err := tx.Exec(ctx, `INSERT INTO s3p.object_part_checksums
+			(bucket, key, part_no, file_id, algorithm, value) VALUES ($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (bucket, key, part_no) DO UPDATE SET file_id = EXCLUDED.file_id,
+			  algorithm = EXCLUDED.algorithm, value = EXCLUDED.value`,
+			bucket, key, c.no, c.fileID, algorithm.String, c.checksum); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM s3p.uploads WHERE upload_id = $1", uploadID); err != nil {
 		return nil, err
@@ -1798,6 +1816,9 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	}
 	if expired > 0 {
 		s.log.Info("expired multipart uploads", "count", expired)
+	}
+	if _, err := conn.Exec(ctx, "DELETE FROM s3p.rename_tokens WHERE created_at < now() - interval '24 hours'"); err != nil {
+		return err
 	}
 	remaining := reapRows
 	for remaining > 0 {

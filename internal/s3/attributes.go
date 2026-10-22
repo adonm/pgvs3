@@ -80,7 +80,9 @@ func (s *Server) getObjectAttributes(w http.ResponseWriter, r *http.Request, buc
 				op.NextPartNumberMarker = int(op.Parts[len(op.Parts)-1].PartNumber)
 				break
 			}
-			op.Parts = append(op.Parts, partXML{PartNumber: int(p.Number), Size: p.Size})
+			part := partXML{PartNumber: int(p.Number), Size: p.Size}
+			setPartChecksum(&part, p.Checksum)
+			op.Parts = append(op.Parts, part)
 		}
 		out.ObjectParts = op
 	}
@@ -137,23 +139,28 @@ func (s *Server) listParts(w http.ResponseWriter, r *http.Request, bucket, key s
 			PartNumber: int(p.Number), Size: p.Size, LastModified: isoTime(p.LastModified),
 			ETag: quoteETag(p.ETag),
 		}
-		if p.Checksum != nil {
-			switch p.Checksum.Name {
-			case "CRC32":
-				part.ChecksumCRC32 = p.Checksum.Value
-			case "CRC32C":
-				part.ChecksumCRC32C = p.Checksum.Value
-			case "CRC64NVME":
-				part.ChecksumCRC64NVME = p.Checksum.Value
-			case "SHA1":
-				part.ChecksumSHA1 = p.Checksum.Value
-			case "SHA256":
-				part.ChecksumSHA256 = p.Checksum.Value
-			}
-		}
+		setPartChecksum(&part, p.Checksum)
 		out.Parts = append(out.Parts, part)
 	}
 	writeXML(w, http.StatusOK, out)
+}
+
+func setPartChecksum(part *partXML, c *store.Checksum) {
+	if c == nil {
+		return
+	}
+	switch c.Name {
+	case "CRC32":
+		part.ChecksumCRC32 = c.Value
+	case "CRC32C":
+		part.ChecksumCRC32C = c.Value
+	case "CRC64NVME":
+		part.ChecksumCRC64NVME = c.Value
+	case "SHA1":
+		part.ChecksumSHA1 = c.Value
+	case "SHA256":
+		part.ChecksumSHA256 = c.Value
+	}
 }
 
 func (s *Server) listMultipartUploads(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {

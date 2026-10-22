@@ -80,6 +80,9 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 	if srcFile.Valid {
 		srcFileVal = srcFile.Int64
 	}
+	if _, err := tx.Exec(ctx, "DELETE FROM s3p.object_part_checksums WHERE bucket = $1 AND key = $2", dstBucket, dstKey); err != nil {
+		return nil, err
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO s3p.objects
 		(bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -90,6 +93,17 @@ func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey s
 		dstBucket, dstKey, srcFileVal, src.Size, src.SHA256, src.ETag, meta, ct, src.Parts, src.PartEnds, src.Inline)
 	if err != nil {
 		return nil, err
+	}
+	if srcBucket != dstBucket || srcKey != dstKey {
+		if _, err := tx.Exec(ctx, `INSERT INTO s3p.object_part_checksums
+			(bucket, key, part_no, file_id, algorithm, value)
+			SELECT $3, $4, part_no, file_id, algorithm, value
+			FROM s3p.object_part_checksums WHERE bucket = $1 AND key = $2
+			ON CONFLICT (bucket, key, part_no) DO UPDATE SET file_id = EXCLUDED.file_id,
+			  algorithm = EXCLUDED.algorithm, value = EXCLUDED.value`,
+			srcBucket, srcKey, dstBucket, dstKey); err != nil {
+			return nil, err
+		}
 	}
 	if destExists && oldFile.Valid {
 		if err := queueFiles(ctx, tx, oldFile.Int64, oldParts); err != nil {
@@ -117,6 +131,7 @@ type RenameOptions struct {
 	SourceIfNone  string
 	DestIfMatch   string
 	DestIfNone    string
+	ClientToken   string
 }
 
 // Rename moves an object's metadata to a new key in the same bucket without
@@ -132,6 +147,24 @@ func (s *Store) Rename(ctx context.Context, bucket, srcKey, dstKey string, opts 
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	if err := lockTwo(ctx, tx, bucket, srcKey, bucket, dstKey); err != nil {
 		return err
+	}
+	if opts.ClientToken != "" {
+		tag, err := tx.Exec(ctx, `INSERT INTO s3p.rename_tokens (token, bucket, source_key, dest_key)
+			VALUES ($1,$2,$3,$4) ON CONFLICT (token) DO NOTHING`, opts.ClientToken, bucket, srcKey, dstKey)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			var b, s, d string
+			if err := tx.QueryRow(ctx, `SELECT bucket, source_key, dest_key FROM s3p.rename_tokens WHERE token = $1`, opts.ClientToken).Scan(&b, &s, &d); err != nil {
+				return err
+			}
+			if b != bucket || s != srcKey || d != dstKey {
+				return ErrIdempotentMismatch
+			}
+			// The rename and token committed atomically on the first attempt.
+			return tx.Commit(ctx)
+		}
 	}
 	var etag string
 	err = tx.QueryRow(ctx, `SELECT etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`,

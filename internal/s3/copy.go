@@ -64,6 +64,8 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 			s.metaError(w, r, srcBucket, err)
 		case errors.Is(err, store.ErrPrecondition):
 			writeError(w, r, errPreconditionFailed(), s.log)
+		case errors.Is(err, store.ErrIdempotentMismatch):
+			writeError(w, r, apiErr("IdempotentParameterMismatch", "The client token was used with different rename parameters.", http.StatusBadRequest), s.log)
 		default:
 			writeError(w, r, errInternal(err, s.log), s.log)
 		}
@@ -85,6 +87,7 @@ func (s *Server) renameObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		SourceIfNone:  r.Header.Get("x-amz-rename-source-if-none-match"),
 		DestIfMatch:   r.Header.Get("If-Match"),
 		DestIfNone:    r.Header.Get("If-None-Match"),
+		ClientToken:   r.Header.Get("x-amz-client-token"),
 	})
 	if err != nil {
 		switch {
@@ -92,6 +95,8 @@ func (s *Server) renameObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			writeError(w, r, errNoSuchKey(), s.log)
 		case errors.Is(err, store.ErrPrecondition):
 			writeError(w, r, errPreconditionFailed(), s.log)
+		case errors.Is(err, store.ErrIdempotentMismatch):
+			writeError(w, r, apiErr("IdempotentParameterMismatch", "The client token was used with different rename parameters.", http.StatusBadRequest), s.log)
 		default:
 			writeError(w, r, errInternal(err, s.log), s.log)
 		}

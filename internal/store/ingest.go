@@ -68,12 +68,13 @@ type Published struct {
 }
 
 var (
-	ErrNoBucket        = errors.New("bucket does not exist")
-	ErrNoUpload        = errors.New("upload does not exist")
-	ErrPrecondition    = errors.New("object precondition failed")
-	ErrMissingChecksum = errors.New("part lacks the upload's checksum")
-	ErrInvalidPart     = errors.New("invalid part")
-	errAborted         = errors.New("ingest aborted")
+	ErrNoBucket           = errors.New("bucket does not exist")
+	ErrNoUpload           = errors.New("upload does not exist")
+	ErrPrecondition       = errors.New("object precondition failed")
+	ErrMissingChecksum    = errors.New("part lacks the upload's checksum")
+	ErrInvalidPart        = errors.New("invalid part")
+	ErrIdempotentMismatch = errors.New("client token was used with different parameters")
+	errAborted            = errors.New("ingest aborted")
 )
 
 // rowFramer turns a byte stream into fixed-size binary COPY rows, hashing the
@@ -474,6 +475,9 @@ func swapObjectParts(ctx context.Context, tx pgx.Tx, bucket, key string, t *writ
 				return ErrPrecondition
 			}
 		}
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM s3p.object_part_checksums WHERE bucket = $1 AND key = $2", bucket, key); err != nil {
+		return err
 	}
 	_, err = tx.Exec(ctx,
 		`INSERT INTO s3p.objects (bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
