@@ -1,0 +1,199 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// CopyOptions controls a metadata-only CopyObject. The bytes are shared; the
+// GC keeps a file while any object still references it.
+type CopyOptions struct {
+	ReplaceMetadata bool
+	UserMetadata    []string
+	ContentType     string
+	SourceIfMatch   string
+	SourceIfNone    string
+	DestIfMatch     string
+	DestIfNone      string
+}
+
+// Copy creates or replaces dst with src's bytes. No chunk rows move.
+func (s *Store) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, opts CopyOptions) (*Meta, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	if err := lockTwo(ctx, tx, srcBucket, srcKey, dstBucket, dstKey); err != nil {
+		return nil, err
+	}
+	var src Meta
+	var srcEpoch float64
+	err = tx.QueryRow(ctx, `SELECT file_id, size, sha256, etag, user_metadata, content_type,
+		parts, part_ends, EXTRACT(EPOCH FROM created_at)::float8
+		FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`, srcBucket, srcKey).
+		Scan(&src.FileID, &src.Size, &src.SHA256, &src.ETag, &src.UserMetadata, &src.ContentType,
+			&src.Parts, &src.PartEnds, &srcEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !condOK(opts.SourceIfMatch, opts.SourceIfNone, true, src.ETag) {
+		return nil, ErrPrecondition
+	}
+	var oldFile int64
+	var oldParts []int64
+	var destETag string
+	err = tx.QueryRow(ctx, `SELECT file_id, parts, etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`,
+		dstBucket, dstKey).Scan(&oldFile, &oldParts, &destETag)
+	destExists := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	if !condOK(opts.DestIfMatch, opts.DestIfNone, destExists, destETag) {
+		return nil, ErrPrecondition
+	}
+	meta, ct := src.UserMetadata, src.ContentType
+	if opts.ReplaceMetadata {
+		meta, ct = opts.UserMetadata, opts.ContentType
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO s3p.objects
+		(bucket, key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (bucket, key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size,
+		  sha256 = EXCLUDED.sha256, etag = EXCLUDED.etag, user_metadata = EXCLUDED.user_metadata,
+		  content_type = EXCLUDED.content_type, parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends,
+		  created_at = now()`,
+		dstBucket, dstKey, src.FileID, src.Size, src.SHA256, src.ETag, meta, ct, src.Parts, src.PartEnds)
+	if err != nil {
+		return nil, err
+	}
+	if destExists {
+		if err := queueFiles(ctx, tx, oldFile, oldParts); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	out := src
+	out.UserMetadata, out.ContentType = meta, ct
+	out.CreatedAt = time.Now()
+	s.cache.Put(ctx, dstBucket, dstKey, out)
+	return &out, nil
+}
+
+// RenameOptions controls RenameObject.
+type RenameOptions struct {
+	SourceIfMatch string
+	SourceIfNone  string
+	DestIfMatch   string
+	DestIfNone    string
+}
+
+// Rename moves an object's metadata to a new key in the same bucket without
+// moving bytes. The source and destination rows are locked in a stable order.
+func (s *Store) Rename(ctx context.Context, bucket, srcKey, dstKey string, opts RenameOptions) error {
+	if srcKey == dstKey {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	if err := lockTwo(ctx, tx, bucket, srcKey, bucket, dstKey); err != nil {
+		return err
+	}
+	var etag string
+	err = tx.QueryRow(ctx, `SELECT etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`,
+		bucket, srcKey).Scan(&etag)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if !condOK(opts.SourceIfMatch, opts.SourceIfNone, true, etag) {
+		return ErrPrecondition
+	}
+	var oldFile int64
+	var oldParts []int64
+	var destETag string
+	err = tx.QueryRow(ctx, `SELECT file_id, parts, etag FROM s3p.objects WHERE bucket = $1 AND key = $2 FOR UPDATE`,
+		bucket, dstKey).Scan(&oldFile, &oldParts, &destETag)
+	destExists := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if !condOK(opts.DestIfMatch, opts.DestIfNone, destExists, destETag) {
+		return ErrPrecondition
+	}
+	if destExists {
+		if _, err := tx.Exec(ctx, `DELETE FROM s3p.objects WHERE bucket = $1 AND key = $2`, bucket, dstKey); err != nil {
+			return err
+		}
+		if err := queueFiles(ctx, tx, oldFile, oldParts); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE s3p.objects SET key = $3 WHERE bucket = $1 AND key = $2`, bucket, srcKey, dstKey); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.cache.Invalidate(ctx, bucket, srcKey)
+	s.cache.Invalidate(ctx, bucket, dstKey)
+	return nil
+}
+
+// lockTwo takes the two key locks in a deterministic order so concurrent
+// renames/copies in opposite directions cannot deadlock.
+func lockTwo(ctx context.Context, tx pgx.Tx, b1, k1, b2, k2 string) error {
+	if b1+"\x00"+k1 > b2+"\x00"+k2 {
+		b1, b2, k1, k2 = b2, b1, k2, k1
+	}
+	if err := lockObjectKey(ctx, tx, b1, k1); err != nil {
+		return err
+	}
+	if b1 == b2 && k1 == k2 {
+		return nil
+	}
+	return lockObjectKey(ctx, tx, b2, k2)
+}
+
+// condOK evaluates the destination/source conditional headers. ETag matching
+// is intentionally opaque; only equality and "*" matter.
+func condOK(ifMatch, ifNone string, exists bool, etag string) bool {
+	if ifMatch != "" {
+		if !exists || !etagListMatch(ifMatch, etag) {
+			return false
+		}
+	}
+	if ifNone != "" {
+		if strings.TrimSpace(ifNone) == "*" && exists {
+			return false
+		}
+		if exists && etagListMatch(ifNone, etag) {
+			return false
+		}
+	}
+	return true
+}
+
+func etagListMatch(header, etag string) bool {
+	for _, want := range strings.Split(header, ",") {
+		want = strings.Trim(strings.TrimPrefix(strings.TrimSpace(want), "W/"), `"`)
+		if want == etag {
+			return true
+		}
+	}
+	return false
+}

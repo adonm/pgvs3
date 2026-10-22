@@ -78,6 +78,9 @@ func serve(args []string) int {
 		peerAdvert    = fs.String("peer-advertise", env("PGVS3_PEER_ADVERTISE", ""), "this gateway's address as its peers see it")
 		peerSecret    = fs.String("peer-secret", env("PGVS3_PEER_SECRET", ""), "shared secret for peer cache requests")
 		logLevel      = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
+		vhost         = fs.String("vhost-domain", env("PGVS3_VHOST_DOMAIN", ""), "virtual-host suffix, e.g. s3.internal")
+		accountID     = fs.String("account-id", env("PGVS3_ACCOUNT_ID", "000000000000"), "account id in bucket ARNs")
+		sessionKey    = fs.String("session-key", env("PGVS3_SESSION_KEY", ""), "HMAC key for S3 Express session tokens")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -120,7 +123,11 @@ func serve(args []string) int {
 
 	go maintain(ctx, st, *reapGrace, *maintainEvery, log)
 
-	handler := s3.New(st, &s3.Auth{AccessKey: *accessKey, SecretKey: *secretKey}, log, *region)
+	auth := &s3.Auth{AccessKey: *accessKey, SecretKey: *secretKey}
+	if *sessionKey != "" {
+		auth.Sessions = s3.NewSessionIssuer([]byte(*sessionKey), 5*time.Minute)
+	}
+	handler := s3.New(st, auth, log, *region, *vhost, *accountID)
 	srv, err := s3.Listen(s3.ServeConfig{
 		Addr: *addr, TLSCert: *tlsCert, TLSKey: *tlsKey, AllowHTTP: *allowHTTP,
 	}, handler, log)

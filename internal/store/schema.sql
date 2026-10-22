@@ -14,12 +14,14 @@ CREATE TABLE IF NOT EXISTS s3p.buckets (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- file_id is deliberately not UNIQUE: CopyObject/RenameObject share immutable
+-- files between object rows, and GC checks every reference before reaping.
 -- bucket/key collate "C": S3 lists keys in byte order, so the primary key
 -- serves both point lookups and ordered LIST range scans.
 CREATE TABLE IF NOT EXISTS s3p.objects (
   bucket     text COLLATE "C" NOT NULL,
   key        text COLLATE "C" NOT NULL,
-  file_id    bigserial        NOT NULL UNIQUE,  -- the single file, or the first part
+  file_id    bigserial        NOT NULL,         -- the single file, or the first part
   size       int8             NOT NULL,
   sha256     bytea            NOT NULL,         -- integrity digest; multipart: of the part sha256s
   etag       text             NOT NULL,         -- S3 ETag: MD5, or MD5 of part MD5s + "-count"

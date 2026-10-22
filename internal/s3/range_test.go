@@ -53,7 +53,7 @@ func TestPrefixEndUTF8(t *testing.T) {
 func TestSplitPathKeepsDoubleEncodedSlash(t *testing.T) {
 	// SlateDB uses a literal %2F inside a key, so the wire path has %252F.
 	r := httptest.NewRequest("GET", "http://x/bucket/objfs/analytics%252Freport.db/manifest/1", nil)
-	bucket, key, err := splitPath(r)
+	bucket, key, err := splitPath(r, "")
 	if err != nil {
 		t.Fatal(err)
 	}

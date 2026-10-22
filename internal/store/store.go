@@ -238,6 +238,12 @@ func (s *Store) Init(ctx context.Context) error {
 		if !found.Valid || found.Int32 != LayoutVersion {
 			return fmt.Errorf("s3p holds storage layout %v; this pgvs3 reads v%d (migrate explicitly, or use a fresh database)", found.Int32, LayoutVersion)
 		}
+		// Metadata-only CopyObject/RenameObject share file IDs between object
+		// rows. Older v8 databases have a UNIQUE constraint that prevents it;
+		// dropping it is safe because the reaper checks every reference.
+		if _, err := tx.Exec(ctx, "ALTER TABLE s3p.objects DROP CONSTRAINT IF EXISTS objects_file_id_key"); err != nil {
+			return err
+		}
 		return tx.Commit(ctx)
 	}
 	if marked {

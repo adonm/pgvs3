@@ -119,6 +119,85 @@ expect 200 -X PUT --data-binary 'version-one' "$A/$BUCKET/$RUN/over.txt"
 expect 200 -X PUT --data-binary 'version-two' "$A/$BUCKET/$RUN/over.txt"
 [ "$(s3 "$B/$BUCKET/$RUN/over.txt")" = version-two ] || fail "peer read v2"
 
+# --- S3 Express One Zone surface -------------------------------------------
+EXPR="demo-$RUN--use1-az1--x-s3"
+ED="$A/$EXPR"
+cat > "$TMP/bucket.xml" <<'XML'
+<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Location><Type>AvailabilityZone</Type><Name>use1-az1</Name></Location><Bucket><Type>Directory</Type><DataRedundancy>SingleAvailabilityZone</DataRedundancy></Bucket></CreateBucketConfiguration>
+XML
+expect 200 -X PUT --data-binary @"$TMP/bucket.xml" "$ED"
+s3 -I "$ED" | tr -d '\r' | grep -qi 'x-amz-bucket-location-type: AvailabilityZone' || fail "directory bucket headers"
+
+# CreateSession and short-lived session credentials.
+session=$(s3 "$ED?session")
+sak=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("AccessKeyId")][0])' <<<"$session")
+ssk=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("SecretAccessKey")][0])' <<<"$session")
+stok=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("SessionToken")][0])' <<<"$session")
+sesscode() { local ak=$1 sk=$2 tok=$3; shift 3; curl -sS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$ak:$sk" -H "x-amz-s3session-token: $tok" -o /dev/null -w '%{http_code}' "$@"; }
+[ "$(sesscode "$sak" "$ssk" "$stok" -X PUT --data-binary 'session' "$ED/session.txt")" = 200 ] || fail "session PUT"
+[ "$(sesscode "$sak" "$ssk" "$stok" "$ED/session.txt")" = 200 ] || fail "session GET"
+ro=$(s3 -H 'x-amz-create-session-mode: ReadOnly' "$ED?session")
+rak=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("AccessKeyId")][0])' <<<"$ro")
+rsk=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("SecretAccessKey")][0])' <<<"$ro")
+rtok=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("SessionToken")][0])' <<<"$ro")
+[ "$(sesscode "$rak" "$rsk" "$rtok" -X PUT --data-binary 'no' "$ED/ro.txt")" = 403 ] || fail "read-only session wrote"
+[ "$(sesscode "$rak" "$rsk" "$rtok" "$ED/session.txt")" = 200 ] || fail "read-only session read"
+
+# Copy, delete the source, and let the reaper run; the shared file must survive.
+expect 200 -X PUT --data-binary 'copy me' "$ED/src"
+expect 200 -X PUT -H 'x-amz-copy-source: /src' "$ED/copy"
+[ "$(s3 "$ED/copy")" = 'copy me' ] || fail "copy bytes"
+expect 204 -X DELETE "$ED/src"
+sleep 2
+[ "$(s3 "$ED/copy")" = 'copy me' ] || fail "reaper removed a shared file"
+
+# Rename and append.
+expect 200 -X PUT --data-binary 'rename' "$ED/old"
+expect 200 -X PUT -H 'x-amz-rename-source: /old' "$ED/new?renameObject"
+[ "$(s3 "$ED/new")" = rename ] || fail "rename bytes"
+expect 404 "$ED/old"
+expect 200 -X PUT --data-binary 'base' "$ED/app"
+expect 200 -X PUT -H 'x-amz-write-offset-bytes: 4' --data-binary ' appended' "$ED/app"
+[ "$(s3 "$ED/app")" = 'base appended' ] || fail "append bytes"
+expect 409 -X PUT -H 'x-amz-write-offset-bytes: 1' --data-binary 'x' "$ED/app"
+
+# Attributes, multipart copy and multipart listings.
+s3 -H 'x-amz-object-attributes: ETag,ObjectSize,Checksum,ObjectParts,StorageClass' "$ED/app?attributes" | grep -q ObjectSize || fail "attributes"
+head -c 1048576 /dev/urandom > "$TMP/partcopy"
+expect 200 -X PUT --data-binary @"$TMP/partcopy" "$ED/partcopy.src"
+upc=$(s3 -X POST "$ED/partcopy.dst?uploads")
+upc_id=$(python3 -c 'import sys,xml.etree.ElementTree as E; r=E.fromstring(sys.stdin.read()); print([e.text for e in r.iter() if e.tag.endswith("UploadId")][0])' <<<"$upc")
+ce=$(s3 -D - -o /dev/null -X PUT -H 'x-amz-copy-source: /partcopy.src' -H 'x-amz-copy-source-range: bytes=0-1048575' "$ED/partcopy.dst?partNumber=1&uploadId=$upc_id" | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+[ -n "$ce" ] || fail "upload part copy etag"
+s3 "$ED/partcopy.dst?uploadId=$upc_id" | grep -q '<PartNumber>1</PartNumber>' || fail "list parts"
+s3 "$ED?uploads" | grep -q '<UploadId>' || fail "list multipart uploads"
+cat > "$TMP/upc.xml" <<XML
+<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>$ce</ETag></Part></CompleteMultipartUpload>
+XML
+expect 200 -X POST --data-binary @"$TMP/upc.xml" "$ED/partcopy.dst?uploadId=$upc_id"
+s3 "$ED/partcopy.dst" -o "$TMP/partcopy.out"
+cmp "$TMP/partcopy" "$TMP/partcopy.out" || fail "upload part copy bytes"
+
+# The same surface through an SDK: session auth, copy, rename, append.
+EXPR="$EXPR" E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
+mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
+import os, boto3
+from botocore.config import Config
+s3=boto3.client('s3', endpoint_url=os.environ['E2E_ENDPOINT'],
+    aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
+    region_name='us-east-1', config=Config(s3={'addressing_style':'virtual'}, retries={'max_attempts':0}))
+b=os.environ['EXPR']
+s3.put_object(Bucket=b, Key='sdk.txt', Body=b'sdk')
+assert s3.get_object(Bucket=b, Key='sdk.txt')['Body'].read()==b'sdk'
+s3.copy_object(Bucket=b, Key='sdk.copy', CopySource={'Bucket':b,'Key':'sdk.txt'})
+assert s3.get_object(Bucket=b, Key='sdk.copy')['Body'].read()==b'sdk'
+s3.rename_object(Bucket=b, Key='sdk.renamed', RenameSource='/sdk.copy')
+s3.put_object(Bucket=b, Key='sdk.renamed', Body=b' appended', WriteOffsetBytes=3)
+assert s3.get_object(Bucket=b, Key='sdk.renamed')['Body'].read()==b'sdk appended'
+assert s3.get_object_attributes(Bucket=b, Key='sdk.renamed', ObjectAttributes=['ObjectSize'])['ObjectSize']==12
+print('boto3 express ok')
+PY
+
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
 export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY \
        E2E_SECRET=$PGVS3_SECRET_KEY E2E_PG_PORT=$PGVS3_TEST_PG_PORT

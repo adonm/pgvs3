@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/adonm/pgvs3/internal/store"
 )
@@ -21,40 +22,70 @@ const ioChunk = 256 << 10
 // Server is the S3 HTTP front end. It is stateless over PostgreSQL, so any
 // gateway instance can serve any request of any multipart upload.
 type Server struct {
-	store  *store.Store
-	auth   *Auth
-	log    *slog.Logger
-	region string
+	store       *store.Store
+	auth        *Auth
+	log         *slog.Logger
+	region      string
+	vhostDomain string
+	accountID   string
 }
 
-func New(st *store.Store, auth *Auth, log *slog.Logger, region string) *Server {
+func New(st *store.Store, auth *Auth, log *slog.Logger, region, vhostDomain, accountID string) *Server {
 	if region == "" {
 		region = "us-east-1"
 	}
-	return &Server{store: st, auth: auth, log: log, region: region}
+	if accountID == "" {
+		accountID = "000000000000"
+	}
+	auth.VHostDomain = vhostDomain
+	if auth.Sessions == nil {
+		auth.Sessions = NewSessionIssuer([]byte("pgvs3-session:"+auth.SecretKey), 5*time.Minute)
+	}
+	return &Server{
+		store: st, auth: auth, log: log, region: region,
+		vhostDomain: vhostDomain, accountID: accountID,
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("x-amz-request-id", requestIDHeader())
+	s.log.Debug("request", "method", r.Method, "host", r.Host, "path", r.URL.Path, "query", r.URL.RawQuery)
 	if r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
 		return
 	}
-	if err := s.auth.Verify(r); err != nil {
+	info, err := s.auth.Verify(r)
+	if err != nil {
 		writeError(w, r, err, s.log)
 		return
 	}
-	bucket, key, err := splitPath(r)
+	bucket, key, err := splitPath(r, s.vhostDomain)
 	if err != nil {
 		writeError(w, r, errInvalidRequest("invalid object path"), s.log)
 		return
 	}
 	q := r.URL.Query()
+	if q.Has("session") && bucket != "" {
+		if info.Session {
+			writeError(w, r, errAccessDenied("CreateSession requires IAM credentials"), s.log)
+			return
+		}
+		if r.Method != http.MethodGet {
+			s.methodNotAllowed(w, r)
+			return
+		}
+		s.createSession(w, r, bucket)
+		return
+	}
 	switch {
 	case bucket == "":
 		if r.Method == http.MethodGet {
+			if q.Get("x-id") == "ListDirectoryBuckets" || q.Has("directory-buckets") || info.Service == "s3express" {
+				s.listDirectoryBuckets(w, r, q)
+				return
+			}
 			s.listBuckets(w, r)
 			return
 		}
@@ -79,7 +110,7 @@ func (s *Server) bucketRequest(w http.ResponseWriter, r *http.Request, bucket st
 		case q.Has("location"):
 			s.getBucketLocation(w, r, bucket)
 		case q.Has("uploads"):
-			s.listMultipartUploads(w, r, bucket)
+			s.listMultipartUploads(w, r, bucket, q)
 		default:
 			s.listObjectsV2(w, r, bucket, q)
 		}
@@ -103,18 +134,30 @@ func (s *Server) objectRequest(w http.ResponseWriter, r *http.Request, bucket, k
 	case http.MethodHead:
 		s.headObject(w, r, bucket, key)
 	case http.MethodGet:
+		if q.Has("attributes") {
+			s.getObjectAttributes(w, r, bucket, key)
+			return
+		}
 		if q.Has("uploadId") {
-			writeError(w, r, errNotImplemented(), s.log)
+			s.listParts(w, r, bucket, key, q)
 			return
 		}
 		s.getObject(w, r, bucket, key)
 	case http.MethodPut:
 		if q.Has("partNumber") && q.Has("uploadId") {
+			if r.Header.Get("x-amz-copy-source") != "" {
+				s.uploadPartCopy(w, r, bucket, key, q)
+				return
+			}
 			s.uploadPart(w, r, bucket, key, q)
 			return
 		}
+		if q.Has("renameObject") {
+			s.renameObject(w, r, bucket, key)
+			return
+		}
 		if r.Header.Get("x-amz-copy-source") != "" {
-			writeError(w, r, errNotImplemented(), s.log)
+			s.copyObject(w, r, bucket, key)
 			return
 		}
 		s.putObject(w, r, bucket, key)
@@ -154,15 +197,24 @@ func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket strin
 		return
 	}
 	w.Header().Set("x-amz-bucket-region", s.region)
+	s.setDirectoryHeaders(w, bucket)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	s.log.Debug("create bucket", "bucket", bucket, "content_length", r.ContentLength)
+	if err := s.validateCreateBucket(r, bucket); err != nil {
+		writeError(w, r, err, s.log)
+		return
+	}
 	if err := s.store.CreateBucket(r.Context(), bucket); err != nil {
+		s.log.Debug("create bucket failed", "bucket", bucket, "err", err)
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return
 	}
+	s.log.Debug("created bucket", "bucket", bucket)
 	w.Header().Set("Location", "/"+bucket)
+	s.setDirectoryHeaders(w, bucket)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -193,6 +245,9 @@ func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 		Owner: ownerXML{ID: "pgvs3", DisplayName: "pgvs3"},
 	}
 	for _, b := range buckets {
+		if isDirectoryBucket(b.Name) {
+			continue
+		}
 		out.Buckets = append(out.Buckets, bucketXML{Name: b.Name, CreationDate: isoTime(b.Created)})
 	}
 	writeXML(w, http.StatusOK, out)
@@ -211,21 +266,6 @@ func (s *Server) getBucketLocation(w http.ResponseWriter, r *http.Request, bucke
 	writeXML(w, http.StatusOK, locationConstraint{Xmlns: s3Namespace, Value: s.region})
 }
 
-func (s *Server) listMultipartUploads(w http.ResponseWriter, r *http.Request, bucket string) {
-	ok, err := s.store.BucketExists(r.Context(), bucket)
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	if !ok {
-		writeError(w, r, errNoSuchBucket(), s.log)
-		return
-	}
-	writeXML(w, http.StatusOK, listMultipartUploadsResult{
-		Xmlns: s3Namespace, Bucket: bucket, MaxUploads: 1000, IsTruncated: false,
-	})
-}
-
 func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	m, err := s.store.Meta(r.Context(), bucket, key, true)
 	if err != nil {
@@ -242,6 +282,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		return
 	}
 	setObjectHeaders(w, m)
+	s.setDirectoryObjectHeaders(w, bucket)
 	w.Header().Set("Content-Length", strconv.FormatInt(m.Size, 10))
 	w.WriteHeader(http.StatusOK)
 }
@@ -282,6 +323,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		ContentType: sm.ContentType, CreatedAt: sm.CreatedAt,
 		FileID: sm.FileID, Parts: sm.Parts, PartEnds: sm.PartEnds,
 	})
+	s.setDirectoryObjectHeaders(w, bucket)
 	w.Header().Set("Content-Length", strconv.FormatInt(sm.Len(), 10))
 	if ranged {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", sm.Start, sm.End, sm.Size))
@@ -299,9 +341,16 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 }
 
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if r.Header.Get("Content-Encoding") != "" || r.Header.Get("x-amz-server-side-encryption") != "" ||
-		r.Header.Get("x-amz-server-side-encryption-customer-algorithm") != "" {
+	if offset := r.Header.Get("x-amz-write-offset-bytes"); offset != "" {
+		s.appendObject(w, r, bucket, key, offset)
+		return
+	}
+	if r.Header.Get("Content-Encoding") != "" {
 		writeError(w, r, errNotImplemented(), s.log)
+		return
+	}
+	if err := validateSSE(r); err != nil {
+		writeError(w, r, err, s.log)
 		return
 	}
 	meta, err := parseMetadata(r.Header)
@@ -351,6 +400,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		return
 	}
 	w.Header().Set("ETag", quoteETag(pub.ETag))
+	s.setDirectoryObjectHeaders(w, bucket)
 	setChecksumHeaders(w, checks)
 	w.WriteHeader(http.StatusOK)
 }
@@ -430,8 +480,12 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket st
 }
 
 func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if r.Header.Get("Content-Encoding") != "" || r.Header.Get("x-amz-server-side-encryption") != "" {
+	if r.Header.Get("Content-Encoding") != "" {
 		writeError(w, r, errNotImplemented(), s.log)
+		return
+	}
+	if err := validateSSE(r); err != nil {
+		writeError(w, r, err, s.log)
 		return
 	}
 	algorithm := r.Header.Get("x-amz-checksum-algorithm")
@@ -466,6 +520,7 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, b
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return
 	}
+	s.setDirectoryObjectHeaders(w, bucket)
 	writeXML(w, http.StatusOK, initiateMultipartUploadResult{
 		Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: id,
 	})
@@ -513,6 +568,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 		return
 	}
 	w.Header().Set("ETag", quoteETag(pub.ETag))
+	s.setDirectoryObjectHeaders(w, bucket)
 	if pub.Checksum != nil {
 		w.Header().Set(pub.Checksum.Name, pub.Checksum.Value)
 	}
@@ -673,9 +729,13 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 				if encode {
 					display = awsEncode(row.Key, true)
 				}
+				storageClass := "STANDARD"
+				if isDirectoryBucket(bucket) {
+					storageClass = "EXPRESS_ONEZONE"
+				}
 				contents = append(contents, objectXML{
 					Key: display, LastModified: isoTime(row.CreatedAt),
-					ETag: quoteETag(row.ETag), Size: row.Size, StorageClass: "STANDARD",
+					ETag: quoteETag(row.ETag), Size: row.Size, StorageClass: storageClass,
 				})
 				after = row.Key
 			}
@@ -821,20 +881,4 @@ func smSize(sm *store.SliceMeta) int64 {
 		return 0
 	}
 	return sm.Size
-}
-
-// splitPath decodes the URL path exactly once, then splits bucket from key.
-// Double-encoded keys (the SlateDB extension uses %252F) become a literal
-// %2F in the key, not a path separator.
-func splitPath(r *http.Request) (string, string, error) {
-	decoded, err := url.PathUnescape(r.URL.EscapedPath())
-	if err != nil {
-		return "", "", err
-	}
-	decoded = strings.TrimPrefix(decoded, "/")
-	if decoded == "" {
-		return "", "", nil
-	}
-	bucket, key, _ := strings.Cut(decoded, "/")
-	return bucket, key, nil
 }

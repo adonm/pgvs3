@@ -18,9 +18,19 @@ import (
 
 // Auth verifies AWS Signature Version 4 header authentication.
 type Auth struct {
-	AccessKey string
-	SecretKey string
-	Now       func() time.Time
+	AccessKey   string
+	SecretKey   string
+	Sessions    *SessionIssuer
+	VHostDomain string
+	Now         func() time.Time
+}
+
+// AuthInfo describes how a request was authenticated.
+type AuthInfo struct {
+	Session bool
+	Mode    string
+	Bucket  string
+	Service string
 }
 
 const (
@@ -31,14 +41,14 @@ const (
 
 // Verify checks the request signature and, for non-unsigned payloads, wraps
 // the body so its SHA-256 is checked as it is consumed. It does not read the
-// body.
-func (a *Auth) Verify(r *http.Request) error {
+// body. S3 Express session tokens select the temporary session secret.
+func (a *Auth) Verify(r *http.Request) (*AuthInfo, error) {
 	h := r.Header.Get("Authorization")
 	if h == "" {
-		return errAccessDenied("missing Authorization header")
+		return nil, errAccessDenied("missing Authorization header")
 	}
 	if !strings.HasPrefix(h, "AWS4-HMAC-SHA256 ") {
-		return errAccessDenied("unsupported authorization algorithm")
+		return nil, errAccessDenied("unsupported authorization algorithm")
 	}
 	fields := map[string]string{}
 	for _, part := range strings.Split(strings.TrimPrefix(h, "AWS4-HMAC-SHA256 "), ",") {
@@ -51,15 +61,35 @@ func (a *Auth) Verify(r *http.Request) error {
 	signedHeaders := fields["SignedHeaders"]
 	signature := fields["Signature"]
 	if cred == "" || signedHeaders == "" || signature == "" {
-		return errAuthorizationHeaderMalformed()
+		return nil, errAuthorizationHeaderMalformed()
 	}
 	scopeParts := strings.Split(cred, "/")
-	if len(scopeParts) != 5 || scopeParts[4] != "aws4_request" || scopeParts[3] != "s3" {
-		return errAuthorizationHeaderMalformed()
+	if len(scopeParts) != 5 || scopeParts[4] != "aws4_request" ||
+		(scopeParts[3] != "s3" && scopeParts[3] != "s3express") {
+		return nil, errAuthorizationHeaderMalformed()
 	}
-	accessKey, date, region := scopeParts[0], scopeParts[1], scopeParts[2]
-	if subtle.ConstantTimeCompare([]byte(accessKey), []byte(a.AccessKey)) != 1 {
-		return &APIError{Code: "InvalidAccessKeyId", Message: "The AWS access key ID you provided does not exist.", Status: 403}
+	accessKey, date, region, service := scopeParts[0], scopeParts[1], scopeParts[2], scopeParts[3]
+	secret := a.SecretKey
+	info := &AuthInfo{Service: service}
+	if token := r.Header.Get("x-amz-s3session-token"); token != "" {
+		if a.Sessions == nil {
+			return nil, errAccessDenied("session authentication is not configured")
+		}
+		bucket, _, _ := splitPath(r, a.VHostDomain)
+		sess, err := a.Sessions.Validate(token, bucket)
+		if err != nil {
+			return nil, errAccessDenied(err.Error())
+		}
+		if subtle.ConstantTimeCompare([]byte(accessKey), []byte(sess.AccessKey)) != 1 {
+			return nil, &APIError{Code: "InvalidAccessKeyId", Message: "The AWS access key ID you provided does not exist.", Status: 403}
+		}
+		if sess.Mode == "ReadOnly" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			return nil, errAccessDenied("read-only session cannot modify the bucket")
+		}
+		secret = sess.SecretKey
+		info = &AuthInfo{Session: true, Mode: sess.Mode, Bucket: sess.Bucket}
+	} else if subtle.ConstantTimeCompare([]byte(accessKey), []byte(a.AccessKey)) != 1 {
+		return nil, &APIError{Code: "InvalidAccessKeyId", Message: "The AWS access key ID you provided does not exist.", Status: 403}
 	}
 	amzDate := r.Header.Get("x-amz-date")
 	if amzDate == "" {
@@ -67,52 +97,52 @@ func (a *Auth) Verify(r *http.Request) error {
 	}
 	t, err := time.Parse("20060102T150405Z", amzDate)
 	if err != nil {
-		return &APIError{Code: "AccessDenied", Message: "invalid x-amz-date", Status: 403}
+		return nil, &APIError{Code: "AccessDenied", Message: "invalid x-amz-date", Status: 403}
 	}
 	now := time.Now
 	if a.Now != nil {
 		now = a.Now
 	}
 	if d := now().Sub(t); d > maxSkew || d < -maxSkew {
-		return &APIError{Code: "RequestTimeTooSkewed", Message: "The difference between the request time and the server's time is too large.", Status: 403}
+		return nil, &APIError{Code: "RequestTimeTooSkewed", Message: "The difference between the request time and the server's time is too large.", Status: 403}
 	}
 	payloadHash := r.Header.Get("x-amz-content-sha256")
 	if payloadHash == "" {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodDelete {
 			// Older clients omit the header on bodyless requests; S3 treats the
 			// canonical payload as UNSIGNED-PAYLOAD. Try the empty hash too.
-			if a.check(r, signedHeaders, amzDate, region, emptySHA256, signature) != nil &&
-				a.check(r, signedHeaders, amzDate, region, unsignedPayload, signature) != nil {
-				return &APIError{Code: "SignatureDoesNotMatch", Message: "The request signature we calculated does not match the signature you provided.", Status: 403}
+			if a.check(r, secret, signedHeaders, amzDate, region, service, emptySHA256, signature) != nil &&
+				a.check(r, secret, signedHeaders, amzDate, region, service, unsignedPayload, signature) != nil {
+				return nil, &APIError{Code: "SignatureDoesNotMatch", Message: "The request signature we calculated does not match the signature you provided.", Status: 403}
 			}
-			return nil
+			return info, nil
 		}
-		return &APIError{Code: "InvalidRequest", Message: "missing x-amz-content-sha256", Status: 400}
+		return nil, &APIError{Code: "InvalidRequest", Message: "missing x-amz-content-sha256", Status: 400}
 	}
-	if err := a.check(r, signedHeaders, amzDate, region, payloadHash, signature); err != nil {
-		return err
+	if err := a.check(r, secret, signedHeaders, amzDate, region, service, payloadHash, signature); err != nil {
+		return nil, err
 	}
 	switch {
 	case payloadHash == unsignedPayload:
-		return nil
+		return info, nil
 	case strings.HasPrefix(payloadHash, "STREAMING-"):
-		return a.wrapStreaming(r, amzDate, region, signature)
+		return info, a.wrapStreaming(r, secret, amzDate, region, service, signature)
 	case len(payloadHash) == 64:
 		r.Body = &payloadHashReader{r: r.Body, h: sha256.New(), want: payloadHash}
-		return nil
+		return info, nil
 	default:
-		return &APIError{Code: "InvalidRequest", Message: "unsupported x-amz-content-sha256", Status: 400}
+		return nil, &APIError{Code: "InvalidRequest", Message: "unsupported x-amz-content-sha256", Status: 400}
 	}
 }
 
-func (a *Auth) check(r *http.Request, signedHeaders, amzDate, region, payloadHash, signature string) error {
+func (a *Auth) check(r *http.Request, secret, signedHeaders, amzDate, region, service, payloadHash, signature string) error {
 	canonical, err := canonicalRequest(r, signedHeaders, payloadHash)
 	if err != nil {
 		return err
 	}
-	scope := amzDate[:8] + "/" + region + "/s3/aws4_request"
+	scope := amzDate[:8] + "/" + region + "/" + service + "/aws4_request"
 	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hexSHA256([]byte(canonical))
-	key := signingKey(a.SecretKey, amzDate[:8], region, "s3")
+	key := signingKey(secret, amzDate[:8], region, service)
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(stringToSign))
 	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(mac.Sum(nil))), []byte(signature)) != 1 {

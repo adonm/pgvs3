@@ -16,9 +16,9 @@ import (
 // signature. DuckDB and OpenDAL use UNSIGNED-PAYLOAD, but the AWS CLI and
 // other S3 clients use streaming signatures; accepting them keeps the gateway
 // generally usable.
-func (a *Auth) wrapStreaming(r *http.Request, amzDate, region, seed string) error {
-	scope := amzDate[:8] + "/" + region + "/s3/aws4_request"
-	key := signingKey(a.SecretKey, amzDate[:8], region, "s3")
+func (a *Auth) wrapStreaming(r *http.Request, secret, amzDate, region, service, seed string) error {
+	scope := amzDate[:8] + "/" + region + "/" + service + "/aws4_request"
+	key := signingKey(secret, amzDate[:8], region, service)
 	r.Body = &chunkedBody{
 		r:     bufio.NewReader(r.Body),
 		key:   key,

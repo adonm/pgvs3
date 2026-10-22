@@ -78,15 +78,6 @@ type locationConstraint struct {
 	Value   string   `xml:",chardata"`
 }
 
-type listMultipartUploadsResult struct {
-	XMLName     xml.Name `xml:"ListMultipartUploadsResult"`
-	Xmlns       string   `xml:"xmlns,attr"`
-	Bucket      string   `xml:"Bucket"`
-	KeyMarker   string   `xml:"KeyMarker,omitempty"`
-	MaxUploads  int      `xml:"MaxUploads"`
-	IsTruncated bool     `xml:"IsTruncated"`
-}
-
 type deleteResult struct {
 	XMLName xml.Name       `xml:"DeleteResult"`
 	Xmlns   string         `xml:"xmlns,attr"`

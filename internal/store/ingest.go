@@ -40,6 +40,7 @@ type Checksum struct {
 
 // Published is the result of one successful object or part ingest.
 type Published struct {
+	FileID   int64
 	Size     int64
 	ETag     string
 	SHA256   []byte
@@ -140,7 +141,7 @@ func (f *rowFramer) digests() (int64, []byte, []byte) {
 }
 
 type writerTarget struct {
-	kind       int // 0 object, 1 part
+	kind       int // 0 object, 1 part, 2 append data
 	bucket     string
 	key        string
 	condition  Condition
@@ -163,10 +164,11 @@ const (
 // ChunkWriter streams one PUT or multipart part into its own COPY stream and
 // commits the chunks and the publication in the same transaction.
 type ChunkWriter struct {
-	store  *Store
-	pw     *io.PipeWriter
-	done   chan error
-	framer *rowFramer
+	store     *Store
+	algorithm string
+	pw        *io.PipeWriter
+	done      chan error
+	framer    *rowFramer
 
 	mu        sync.Mutex
 	checksums []Checksum
@@ -182,6 +184,13 @@ func (s *Store) StartObject(ctx context.Context, bucket, key string, cond Condit
 		kind: 0, bucket: bucket, key: key, condition: cond, ifMatch: ifMatch,
 		userMeta: userMeta, content: contentType,
 	})
+}
+
+// StartAppend streams the appended bytes into a fresh file. The file commits
+// on its own; FinishAppend attaches it to the object only if the caller's
+// expected size still matches.
+func (s *Store) StartAppend(ctx context.Context, bucket, key string) (*ChunkWriter, error) {
+	return s.startWriter(ctx, writerTarget{kind: 2, bucket: bucket, key: key})
 }
 
 // StartPart begins a multipart part write. A re-sent part replaces the earlier
@@ -205,7 +214,7 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 		conn.Release()
 		return nil, err
 	}
-	if t.kind == 0 {
+	if t.kind == 0 || t.kind == 2 {
 		var one int
 		err = tx.QueryRow(ctx, "SELECT 1 FROM s3p.buckets WHERE name = $1 FOR KEY SHARE", t.bucket).Scan(&one)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -232,11 +241,16 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 	}
 
 	pr, pw := io.Pipe()
+	alg := ""
+	if t.checksumAl != "" {
+		alg = t.checksumAl
+	}
 	w := &ChunkWriter{
-		store:  s,
-		pw:     pw,
-		done:   make(chan error, 1),
-		framer: newRowFramer(fileID),
+		store:     s,
+		algorithm: alg,
+		pw:        pw,
+		done:      make(chan error, 1),
+		framer:    newRowFramer(fileID),
 	}
 	go w.run(ctx, conn, tx, pr, t)
 	return w, nil
@@ -266,6 +280,9 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			w.done <- err
 			return
 		}
+	case 2:
+		// Append data: the chunks commit on their own; the object row is
+		// updated by FinishAppend only after the expected offset is verified.
 	case 1:
 		if t.checksumAl != "" {
 			name := "x-amz-checksum-" + lower(t.checksumAl)
@@ -293,7 +310,7 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 		w.done <- err
 		return
 	}
-	pub := Published{Size: size, ETag: etag, SHA256: sha, MD5: md5, Checksum: checksum}
+	pub := Published{FileID: fileIDOf(w), Size: size, ETag: etag, SHA256: sha, MD5: md5, Checksum: checksum}
 	if t.kind == 0 {
 		w.store.cache.Put(ctx, t.bucket, t.key, Meta{
 			Size: size, SHA256: sha, ETag: etag, UserMetadata: t.userMeta,
@@ -309,6 +326,9 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 // fileIDOf exists because the framer owns the ID; keeping it in one place
 // makes the publish code below read naturally.
 func fileIDOf(w *ChunkWriter) int64 { return w.framer.fileID }
+
+// ChecksumAlgorithm is the algorithm a multipart part must carry, if any.
+func (w *ChunkWriter) ChecksumAlgorithm() string { return w.algorithm }
 
 func (w *ChunkWriter) Write(p []byte) (int, error) {
 	out, err := w.framer.push(p)
@@ -425,8 +445,11 @@ func queueFiles(ctx context.Context, tx pgx.Tx, fileID int64, parts []int64) err
 	dead := make([]int64, 0, len(parts)+1)
 	dead = append(dead, parts...)
 	dead = append(dead, fileID)
-	_, err := tx.Exec(ctx,
-		"INSERT INTO s3p.garbage (file_id) SELECT DISTINCT unnest($1::int8[]) ON CONFLICT DO NOTHING", dead)
+	_, err := tx.Exec(ctx, `INSERT INTO s3p.garbage (file_id)
+		SELECT f.file_id FROM unnest($1::int8[]) AS f(file_id)
+		WHERE NOT EXISTS (SELECT 1 FROM s3p.objects o WHERE o.file_id = f.file_id OR f.file_id = ANY(o.parts))
+		  AND NOT EXISTS (SELECT 1 FROM s3p.upload_parts p WHERE p.file_id = f.file_id)
+		ON CONFLICT DO NOTHING`, dead)
 	return err
 }
 

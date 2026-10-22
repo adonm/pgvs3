@@ -1,26 +1,48 @@
-replicas: 2
+replicas: 3
 image: ghcr.io/adonm/pgvs3:latest
 # Secret with `url` (and `caCert`, possibly empty, for a private database CA).
 # The URL never enters Helm values or release history.
 urlSecretName: pgvs3-db
 s3SecretName: pgvs3-s3
+# Optional secret with a `sessionKey` key for CreateSession tokens. If unset,
+# each gateway derives the key from the SigV4 secret; use a shared value when
+# gateways run in more than one AZ.
+sessionKeySecretName: ""
+region: us-east-1
+accountId: "000000000000"
+vhostDomain: ""
 # Configure a TLS Secret for non-loopback deployments. Plaintext is an explicit
 # opt-in for isolated test clusters only.
 tlsSecretName: ""
 allowHttp: false
 allowPlaintextDb: false
-# A per-replica ceiling: 2 x 64 gateway connections. Size PostgreSQL
-# max_connections for the entire fleet, including rollout headroom.
+# A per-replica ceiling. Size PostgreSQL max_connections for the whole fleet,
+# including rollout headroom and other clients.
 poolMax: 64
 poolMin: 64
-# pgvs3 is stateless (metadata cache is per-process, keyed by bucket/key), so
-# replicas scale reads linearly; writes are serialized in PostgreSQL.
+# Cross-AZ metadata cache. Static membership: the peer list is generated from
+# `replicas` and the StatefulSet's ordinal DNS names. Do not combine with an
+# HPA that changes the replica count without updating the peer list.
+peerCache:
+  enabled: true
+  port: 8015
+  mainBytes: 67108864
+  hotBytes: 67108864
+  # Optional Secret with a `token` key, sent on peer HTTP requests.
+  secretName: ""
+# One gateway per zone. Increase replicas in multiples of the number of zones
+# if you need more.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  whenUnsatisfiable: DoNotSchedule
 resources:
   requests: { cpu: 250m, memory: 256Mi }
   limits: { memory: 4Gi }
-# Optional HPA; requires metrics-server.
+# HPA is off by default because the peer list is static. Enable only with
+# peerCache disabled or an external peer discovery controller.
 autoscaling:
   enabled: false
-  minReplicas: 2
-  maxReplicas: 8
+  minReplicas: 3
+  maxReplicas: 9
   targetCPUUtilizationPercentage: 70

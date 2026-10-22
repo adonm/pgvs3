@@ -55,7 +55,7 @@ for entry in "a:$port_a:$peer_a" "b:$port_b:$peer_b"; do
   label=${entry%%:*}; rest=${entry#*:}; port=${rest%%:*}; peer=${rest#*:}
   args=()
   if [ "$mode" = contract ]; then
-    args+=(--peers "127.0.0.1:$peer_a,127.0.0.1:$peer_b" --peer-advertise "127.0.0.1:$peer" --peer-addr "127.0.0.1:$peer")
+    args+=(--peers "127.0.0.1:$peer_a,127.0.0.1:$peer_b" --peer-advertise "127.0.0.1:$peer" --peer-addr "127.0.0.1:$peer" --reap-grace 1s --maintenance-interval 1s)
   fi
   .tmp/pgvs3/pgvs3 --url "$PGVS3_TEST_DB_URL" serve --addr "127.0.0.1:$port" "${args[@]}" \
     > ".tmp/pgvs3/$mode-$label.log" 2>&1 & pids+=("$!")

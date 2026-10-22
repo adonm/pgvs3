@@ -140,6 +140,21 @@ func (in *integrity) verify(h http.Header) ([]store.Checksum, error) {
 	return out, nil
 }
 
+func algorithmHasher(algorithm string) (hash.Hash, string, bool) {
+	switch algorithm {
+	case "CRC32":
+		return crc32.NewIEEE(), "x-amz-checksum-crc32", true
+	case "CRC32C":
+		return crc32.New(crc32.MakeTable(crc32.Castagnoli)), "x-amz-checksum-crc32c", true
+	case "SHA1":
+		return sha1.New(), "x-amz-checksum-sha1", true
+	case "SHA256":
+		return sha256.New(), "x-amz-checksum-sha256", true
+	default:
+		return nil, "", false
+	}
+}
+
 func contains(list []string, v string) bool {
 	for _, x := range list {
 		if x == v {

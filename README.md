@@ -1,216 +1,273 @@
 # pgvs3 — S3 on PostgreSQL
 
-pgvs3 is a small S3-compatible gateway that stores objects in PostgreSQL. It
-is built to be DuckLake's object store: DuckLake keeps its catalog in PostgreSQL,
-and with pgvs3 the data files live there too, so every DuckDB that attaches
-the catalog sees the same tables and the same data.
+pgvs3 is a small, fast S3-compatible gateway that stores objects as rows in
+PostgreSQL. It is built to be DuckLake's object store: DuckLake keeps its
+catalog in PostgreSQL, and with pgvs3 the data files live there too, so every
+DuckDB that attaches the catalog sees the same tables and the same data.
 
-**Status: early alpha, no releases.** Any storage layout change requires a
-fresh database; there are no migrations. Use disposable databases only.
+The gateway is Go, stateless over PostgreSQL, and runs as a distroless static
+container built with [ko](https://ko.build/). It keeps the v8 storage layout, so
+the earlier Rust gateway and this one can serve the same database.
+
+**Status: early alpha, no releases.** Any storage layout change requires a fresh
+database; there are no migrations. Use disposable databases only.
 
 > Postgres is all you need. ;P — for durable bytes and metadata here; DuckDB
 > does the analytics.
 
-## pgvs3 vs Amazon S3
-
-pgvs3 was measured locally with `just bench`: DuckDB 1.5.6 as the client, one
-16-core host, PostgreSQL 18 over loopback. The S3 column is published
-third-party figures for EC2 in the same region. Method, full tables and sources:
-[docs/benchmarks.md](docs/benchmarks.md).
-
-| | pgvs3 (local) | Amazon S3 (published) |
-| --- | ---: | ---: |
-| Small GET, per request p50 | <1 ms (4 KiB; 1.0 ms per HEAD+GET in DuckDB) | ~30 ms ([AnyBlob][anyblob]); AWS: 100–200 ms ([AWS][aws-perf]) |
-| 8 MiB GET, one stream | 14 ms · 548 MiB/s | ~190 ms · 55–60 MiB/s median ([AnyBlob][anyblob]) |
-| Aggregate GET bandwidth | 2.0 GiB/s at 16 in flight (0.45 GiB/s on the first read after a write) | ~9–11 GiB/s per 100 Gbit/s instance at 200–250 in flight ([AnyBlob][anyblob]) |
-| Small GETs per second | ~7,000 (64 in flight, one gateway) | ≥5,500 per prefix, more prefixes scale it ([AWS][aws-perf]) |
-| Small PUTs per second | ~4,400 (64 in flight) | ≥3,500 per prefix ([AWS][aws-perf]) |
-
-pgvs3 answers requests 1–2 orders of magnitude sooner, which keeps DuckDB's
-many small footer and row-group reads cheap. S3 wins on aggregate scale and
-durability. pgvs3 is bounded by one PostgreSQL, 32 TiB of object data, and in
-practice a single DuckLake writer.
-
-[anyblob]: https://www.vldb.org/pvldb/vol16/p2769-durner.pdf
-[aws-perf]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html
-
 ## Quick start
 
-Needs [mise](https://mise.jdx.dev/) and Docker (or PostgreSQL 18+ with
-`pg_cron` preloaded and installed in the target database: pass `--url`).
+Needs [mise](https://mise.jdx.dev/) and Docker (or PostgreSQL 18+ with a
+`--url`).
 
 ```sh
-just setup      # toolchain (rust, mbx, just, uv, helm) + cargo fetch
-just contract   # S3/DB contract: two gateways on a disposable PostgreSQL
-just ducklake   # DuckLake compatibility: writer on one gateway, reader on the other
-just bench      # DuckDB S3 benchmark + DuckLake row-group tuning
+just setup
+just dev-db                 # PostgreSQL 18 on 127.0.0.1:5432
+go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmode=disable' \
+  serve --addr 127.0.0.1:8014
 ```
 
-Run the gateway with explicit SigV4 credentials (the example key is for
-loopback development only):
+Create a bucket and write an object (the example key is for loopback
+development only):
 
 ```sh
-export PGVS3_ACCESS_KEY=cachebench PGVS3_SECRET_KEY=cachebench-local-only
-./target/release/pgvs3 --url 'postgres://user:pass@host/db?sslmode=require' serve --addr 127.0.0.1:8014
+export PGVS3_ACCESS_KEY=pgvs3 PGVS3_SECRET_KEY=pgvs3-local-only
 curl --aws-sigv4 aws:amz:us-east-1:s3 --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
-     -X PUT http://127.0.0.1:8014/lake  # create the bucket once
+     -X PUT http://127.0.0.1:8014/lake
+curl --aws-sigv4 aws:amz:us-east-1:s3 --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" \
+     -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
 ```
 
-DuckDB: `SET s3_endpoint='127.0.0.1:8014'; SET s3_use_ssl=false; SET s3_url_style='path';`
+DuckDB 2.0+:
 
-`pgvs3 stat` reports logical vs physical size, queued file count and the age
-of the oldest queued file.
+```sql
+INSTALL httpfs; LOAD httpfs;
+CREATE SECRET (
+    TYPE s3, KEY_ID 'pgvs3', SECRET 'pgvs3-local-only',
+    REGION 'us-east-1', ENDPOINT '127.0.0.1:8014',
+    URL_STYLE 'path', USE_SSL false
+);
+SELECT * FROM read_text('s3://lake/README.md') LIMIT 1;
+```
+
+DuckLake 1.1 on DuckDB 2.0 (catalog and data in the same PostgreSQL):
+
+```sql
+INSTALL ducklake; INSTALL postgres; LOAD ducklake; LOAD postgres;
+CREATE SECRET (TYPE POSTGRES, HOST '127.0.0.1', PORT 5432,
+               DATABASE 'ducklake_catalog', USER 'postgres', PASSWORD 'postgres');
+ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 's3://lake/ducklake/');
+CREATE TABLE lake.events (site_id INTEGER, day DATE, value DOUBLE);
+INSERT INTO lake.events VALUES (42, DATE '2026-09-01', 1.0);
+SELECT * FROM lake.events;
+```
+
+## Why it is fast
+
+The layout is deliberately narrow:
+
+- **One 8 KB page per chunk row.** A chunk is `file_id(8) + no(4) + varlena(4)
+  + 8120` bytes plus the 24-byte tuple header. With `toast_tuple_target = 8160`
+  and `STORAGE EXTERNAL`, one row fills one page at 99.6% occupancy with no
+  TOAST and no detoasting on read.
+- **Files are immutable.** A write streams rows under a new `file_id`; an
+  overwrite publishes a new `file_id`. `file_id` is the cache version tag, so a
+  warm DuckDB never revalidates bytes it already holds.
+- **Reads are primary-key range queries.** Up to 8 MiB is one query; longer
+  reads use one repeatable-read snapshot so an overwrite cannot remove later
+  rows mid-response. Rows stream straight into the HTTP response.
+- **Writes are one binary `COPY`.** The body is hashed and framed as it
+  arrives; chunks and the object row commit in the same transaction. A failed
+  or abandoned write publishes nothing.
+- **Autovacuum is tuned for whole-file deletes** (`scale_factor = 0.01`,
+  `threshold = 1000`), and the unordered chunks table uses bitmap heap scans
+  with PostgreSQL 18 read-ahead. Ordered listings temporarily enable index
+  scans.
+- **Maintenance is in-process.** A background reaper removes at most 65,536
+  chunk rows per run after a 10-minute grace, serialised across gateways with
+  an advisory try-lock. pg_cron is not required.
+- **The connection pool is most-recently-used first**, keeping TCP slow-start
+  out of the hot path.
+
+`docs/performance.md` maps each pgvfs technique to the implementation.
+
+## Cross-AZ metadata cache
+
+Gateways in different AZs can form a peer cache with
+[`groupcache-go/v3`](https://github.com/groupcache/groupcache-go) and
+[Otter](https://github.com/maypok86/otter) (W-TinyLFU). Each key has one owner;
+concurrent misses cluster-wide are coalesced into one PostgreSQL read. A peer
+that fetches a remotely-owned key mirrors it in a local hot cache, so repeated
+reads in that AZ stay in local RAM.
+
+```sh
+PGVS3_PEERS='10.0.1.10:8015,10.0.2.10:8015,10.0.3.10:8015' \
+PGVS3_PEER_ADVERTISE='10.0.1.10:8015' \
+PGVS3_PEER_ADDR='0.0.0.0:8015' \
+PGVS3_CACHE_MAIN_BYTES=$((64<<20)) \
+PGVS3_CACHE_HOT_BYTES=$((64<<20)) \
+pgvs3 serve --addr 0.0.0.0:8014
+```
+
+- The hot cache defaults to **100% of the main cache** (groupcache's default is
+  1/8, which causes constant cross-AZ fetches for the two-thirds of keys owned
+  by other nodes).
+- Only **metadata** is cached. Object bytes are already cached by DuckDB's
+  external file cache; a second gateway-level copy would double memory and add
+  cross-AZ traffic.
+- Writes enqueue a best-effort cluster-wide invalidation. A stale entry can
+  cause one retry, never stale bytes: the range query checks that the object
+  still points at the cached `file_id`.
+- `PGVS3_PEER_SECRET` adds a shared header to peer requests. Keep the peer port
+  on a private network either way.
 
 ## S3 surface
 
-- Operations: `GET` (with ranges), `HEAD`, `PUT`, `DELETE`, `DeleteObjects`,
-  `ListObjectsV2`, `ListBuckets`, `CreateBucket` (idempotent), `HeadBucket`,
-  `DeleteBucket` and multipart uploads. Anything else returns `NotImplemented`.
-- **ETags are standard S3**: the MD5 of the object, or for multipart the MD5 of
-  the part MD5s plus `-N`. SHA-256 is stored as the internal integrity digest;
-  both are computed in the single streaming write pass and reads do no hashing.
-- **Checksums**: `Content-MD5` and `x-amz-checksum-*` headers or trailers are
-  verified before publication; signed chunks are verified by s3s. Multipart
-  uploads accept a composite checksum algorithm (CRC32, CRC32C, CRC64NVME,
-  SHA1, SHA256) at Create: every part must carry it, UploadPart echoes the
-  verified value, and Complete must repeat it per part. Whole-object checksums
-  on Complete are not implemented.
-- **Metadata**: user metadata (up to 2 KiB) and Content-Type are stored with
-  the object and returned by HEAD/GET.
-- `If-None-Match: *` and strong `If-Match` PUTs are checked atomically.
-  Content-Encoding, server-side encryption and conditional or versioned
-  DELETEs are rejected rather than silently claimed.
+`GET` (ranges and conditional), `HEAD`, `PUT`, `DELETE`, `DeleteObjects`,
+`ListObjectsV2`, `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket`,
+multipart uploads, `CopyObject`, `UploadPartCopy`, `GetObjectAttributes`,
+`ListParts`, `ListMultipartUploads`, `RenameObject`, and appends via
+`x-amz-write-offset-bytes`.
 
-## How it works
+S3 Express One Zone additions:
 
-Six tables (`crates/pgvs3/schema.sql`): `s3p.buckets`; `s3p.objects` maps
-bucket/key to a file id, size, SHA-256, ETag, metadata and, for multipart
-objects, the ordered part files; `s3p.chunks` holds each file as numbered
-8120-byte rows; `s3p.uploads` and `s3p.upload_parts` track incomplete
-multipart work; `s3p.garbage` queues unreferenced files for reclamation.
+- **Directory buckets** named `base--zone-id--x-s3`, including virtual-hosted
+  zonal requests and `HeadBucket`'s `x-amz-bucket-location-type`,
+  `x-amz-bucket-arn` and `x-amz-bucket-region` headers.
+- **CreateSession** (`GET /{bucket}?session`) issues stateless, HMAC-signed,
+  five-minute credentials scoped to one bucket. Zonal requests authenticate with
+  `x-amz-s3session-token`; both `s3` and `s3express` SigV4 signing names work.
+  Read-only sessions reject mutating methods.
+- **RenameObject** (`PUT /{key}?renameObject`) moves metadata only.
+- **AppendObject** is `PUT` with `x-amz-write-offset-bytes`; the new bytes become
+  another part and existing bytes never move. The 10,000-part limit applies.
+- **CopyObject** shares immutable files between object rows; GC checks every
+  reference before reaping. **UploadPartCopy** currently copies the requested
+  source range through the streaming ingest path.
+- `GetObjectAttributes`, `ListParts` and `ListMultipartUploads` are implemented.
+  `ListDirectoryBuckets` is selected when the request is signed for
+  `s3express` (AWS SDKs use that signing name).
+- `x-amz-storage-class: EXPRESS_ONEZONE` and
+  `x-amz-server-side-encryption: AES256` are accepted/returned for directory
+  buckets. SSE-C and DSSE-KMS are rejected, as Express does.
 
-- **Writes** stream into one binary `COPY` per PUT or part. A PUT commits its
-  chunks and object row in one transaction, only after the whole body and any
-  supplied checksums verify, so interrupted writes never publish. Parts commit
-  with their upload record; Complete publishes the ordered part list without
-  moving data. Mutations of one key serialize; acknowledged writes use
-  synchronous commit.
-- **Reads** turn a byte range into a row range by arithmetic and fetch one
-  row-range query per 8 MiB, streaming rows as they arrive. Multi-query reads
-  share a repeatable-read snapshot, so an overwrite cannot remove rows
-  mid-response. Each query checks the cached metadata still points at the
-  current object, so an overwrite through another gateway is never served stale.
-- **Maintenance** is PostgreSQL's: DELETE and overwrite queue old files in the
-  same transaction; a `pg_cron` job reclaims at most 65,536 chunk rows (about
-  508 MiB) per minute and expires multipart uploads abandoned for 24 hours.
-  Autovacuum, tuned on the chunks table, reclaims dead rows. Before listening,
-  the gateway requires `pg_cron` in its database (`cron.database_name`
-  pointing at it), checks the chunk table settings and the job, and installs
-  the job only when it creates a fresh layout. Watch `pgvs3 stat` under
-  sustained deletes.
-- **Buckets** are explicit: create them before writing. Deleting a bucket with
-  objects or an incomplete upload returns `BucketNotEmpty`.
-- **Capacity** is one PostgreSQL relation: 2^32 − 2 pages × 8 KB = 32 TiB,
-  about 31.7 TiB of object data at one chunk row per page. A single object or
-  part is further capped by `int4` row numbers (2^31 × 8120 bytes).
-- **Layout version** (`s3p.layout`, currently 8): a gateway refuses any other
-  layout. Point a new layout at a fresh database.
+**Not yet implemented:** `x-amz-checksum-type: FULL_OBJECT` and `CRC64NVME`
+(CRC32, CRC32C, SHA1, SHA256 and MD5 are supported), `partNumber` on GET/HEAD,
+per-part checksums in `GetObjectAttributes`, and `x-amz-client-token`
+idempotency for `RenameObject`. Like Express, pgvs3 has no versioning, object
+tags, Object Lock, ACLs, lifecycle transitions, replication, Event
+Notifications, S3 Select, website hosting, access logs, Storage Lens or
+Transfer Acceleration. ETags are opaque; single PUTs use MD5 and appends use a
+random strong ETag.
 
-Why 8120-byte rows (PostgreSQL 18 `heaptoast.c`, `heaptoast.h`,
-`reloptions.c`): a value moves out of line only when the row exceeds
-`toast_tuple_target`, which can be raised to 8160 bytes. With no nullable
-columns, `file_id(8) + no(4) + length(4) + 8120` bytes plus the 24-byte header
-fits: one row per 8 KB page, 99.6% full, no TOAST and no detoasting on read.
+A known AWS SDK quirk: boto3's `create_bucket` for a directory bucket calls
+`CreateSession` first, and with a custom endpoint it can return `NoSuchBucket`
+before sending `CreateBucket`. Create the bucket once with the CLI or REST
+(`PUT /{bucket}` with a `CreateBucketConfiguration`); object operations then
+work normally, including session auth.
 
 ## Configuration
 
-A flag overrides the same-named variable.
+A flag overrides the same-named environment variable.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `--url` | `PGVS3_URL` | local dev DB | PostgreSQL URL. Remote hosts require `sslmode=require`, which verifies certificate and hostname against system CAs (plus `PGVS3_DB_CA_FILE` if set). Loopback/local `prefer` can fall back to plaintext. |
-| `--addr` | `PGVS3_ADDR` | `127.0.0.1:8014` | Listen address; use `0.0.0.0:8014` in a container. |
+| `--url` | `PGVS3_URL` | local dev DB | PostgreSQL URL. Remote hosts require `sslmode=require`; certificates and hostnames are verified against system CAs plus `PGVS3_DB_CA_FILE`. Loopback may use plaintext. |
+| `--addr` | `PGVS3_ADDR` | `127.0.0.1:8014` | S3 listen address. |
 | `--access-key` | `PGVS3_ACCESS_KEY` | required | SigV4 access key. |
 | `--secret-key` | `PGVS3_SECRET_KEY` | required | SigV4 secret key. |
-| `--tls-cert`, `--tls-key` | `PGVS3_TLS_CERT`, `PGVS3_TLS_KEY` | unset | PEM file paths for HTTPS on non-loopback addresses. Set both; mount the private key read-only. |
-| `--allow-http` | `PGVS3_ALLOW_HTTP` | false | Explicitly permit plaintext HTTP outside loopback for an isolated test cluster; do not expose that listener to untrusted clients. |
-| | `PGVS3_DB_CA_FILE` | unset | Path to an additional PostgreSQL CA PEM bundle, e.g. a managed service's CA. |
-| | `PGVS3_DB_ALLOW_PLAINTEXT` | false | Permit `prefer`/`disable` to remote PostgreSQL for an isolated test cluster. |
-| | `PGVS3_POOL_MIN` | 64 | Connections opened at start and kept warm. Clamped to the max. |
-| | `PGVS3_POOL_MAX` | 64 | Connections open at once, per gateway. Include all replicas, rollout headroom and other clients in the PostgreSQL connection budget. |
+| `--session-key` | `PGVS3_SESSION_KEY` | derived from secret | HMAC key for CreateSession tokens. Share it across gateways. |
+| `--vhost-domain` | `PGVS3_VHOST_DOMAIN` | unset | Extra virtual-host suffix, e.g. `s3.internal`. `--x-s3` hosts are always recognized. |
+| `--account-id` | `PGVS3_ACCOUNT_ID` | `000000000000` | Account ID in `x-amz-bucket-arn`. |
+| `--tls-cert`, `--tls-key` | `PGVS3_TLS_CERT`, `PGVS3_TLS_KEY` | unset | PEM files for HTTPS on non-loopback addresses. |
+| `--allow-http` | `PGVS3_ALLOW_HTTP` | false | Explicitly permit plaintext HTTP outside loopback. |
+| | `PGVS3_DB_CA_FILE` | unset | Extra PostgreSQL CA bundle. |
+| | `PGVS3_DB_ALLOW_PLAINTEXT` | false | Permit plaintext to a remote PostgreSQL for an isolated rig. |
+| `--pool-min` | `PGVS3_POOL_MIN` | 64 | Connections opened at start and kept warm. |
+| `--pool-max` | `PGVS3_POOL_MAX` | 64 | Connections per gateway. Size the fleet against PostgreSQL `max_connections`. |
+| `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long deleted files stay readable. |
+| `--maintenance-interval` | `PGVS3_MAINTENANCE_INTERVAL` | `1m` | Reaper and upload-expiry interval. |
+| `--cache-main-bytes` | `PGVS3_CACHE_MAIN_BYTES` | 64 MiB | Local cache for owned metadata keys. |
+| `--cache-hot-bytes` | `PGVS3_CACHE_HOT_BYTES` | 64 MiB | Local mirror of peer-owned metadata keys. |
+| `--peers` | `PGVS3_PEERS` | unset | Comma-separated `host:port` peer list. |
+| `--peer-addr` | `PGVS3_PEER_ADDR` | `0.0.0.0:8015` | Peer cache listen address. |
+| `--peer-advertise` | `PGVS3_PEER_ADVERTISE` | required with peers | This gateway's address as peers see it; must be in `PGVS3_PEERS`. |
+| `--peer-secret` | `PGVS3_PEER_SECRET` | unset | Shared secret header for peer requests. |
+| `--region` | `PGVS3_REGION` | `us-east-1` | SigV4 region and bucket ARN region. |
+| `--log-level` | `PGVS3_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 
-`GET /healthz` is an unauthenticated liveness probe.
+`GET /healthz` is an unauthenticated liveness probe. `pgvs3 stat` reports
+logical vs physical size, queued files and the age of the oldest queued file.
+
+## Storage cost and limits
+
+- **WAL on write is about 1× the bytes**, the same as the Rust gateway.
+- **One relation caps at 32 TiB** (`MaxBlockNumber × 8 KB`), about 31.7 TiB of
+  object data. A single object or part is capped by `int4` row numbers.
+- **Peak heap** is live data plus files deleted inside the reap grace plus
+  space held by long transactions. Freed pages are reused; plain `VACUUM` does
+  not return space to the operating system.
+- **One PostgreSQL** bounds capacity and write throughput. The design assumes a
+  single DuckLake writer; add read-only DuckDB workers for reads and read
+  replicas for PostgreSQL read scale.
+
+## Container
+
+`ko` builds a static, nonroot, distroless image directly from source — no
+Dockerfile, no shell, no libc:
+
+```sh
+just image            # local ko.local image
+just image push=true  # ghcr.io/adonm/pgvs3, amd64 + arm64
+```
+
+The image is about 17 MB. It exposes `8014` (S3) and `8015` (peer cache).
 
 ## Design decisions
 
-- **No row cache.** DuckDB caches the bytes it reads.
-- **Connections are reused most-recently-used first** (`src/pg.rs`): idle TCP
-  connections restart slow start.
-- **Reads up to 8 MiB are one query**; bitmap heap scans use PostgreSQL 18
-  read-ahead, and ordered listings enable index scans for their transaction.
-- **One unpartitioned chunks table**: DuckLake has a single writer, so there
-  is no insert contention to spread; the cost is the 32 TiB relation cap.
-- **Multipart parts are separate files**: parts upload in parallel with no
-  staging, and Complete moves no data.
-
-## Scaling
-
-pgvs3 gateways are stateless; scale them within the PostgreSQL connection
-budget (`replicas × PGVS3_POOL_MAX` plus other clients and rollout headroom).
-The design assumes one DuckLake catalog writer; add query-only DuckDB workers
-for reads.
+- **No row cache.** DuckDB caches immutable file bytes; the gateway caches only
+  metadata.
+- **Connections are reused most-recently-used first** to keep TCP slow-start out
+  of the hot path.
+- **Reads up to 8 MiB are one query.** Larger reads share a repeatable-read
+  snapshot; rows stream through a bounded channel so a slow client
+  backpressures PostgreSQL.
+- **Multipart parts are separate files.** Parts upload in parallel with no
+  staging; Complete publishes the ordered part list without moving data.
+- **One unpartitioned chunks table.** DuckLake has one writer; every read is a
+  `file_id = $1` primary-key range.
+- **Maintenance runs in the gateway.** Removing pg_cron keeps managed
+  PostgreSQL and small installations simple.
 
 ## Testing and benchmarks
 
-Every recipe starts a disposable PostgreSQL in Docker and two local gateways
-(`deploy/bench/stack.sh`) and removes them on exit. `just contract` runs the
-S3/DB contract through both gateways, and `just ducklake` runs the DuckLake
-lifecycle checks. `just churn` is opt-in sustained overwrite/delete/multipart
-churn with vacuum evidence. `just bench` runs the DuckDB S3 benchmark,
-DuckLake compatibility and Parquet row-group tuning, writing
-`.tmp/pgvs3/bench.json`; results are in [docs/benchmarks.md](docs/benchmarks.md).
-`hk.pkl` checks formatting, Clippy, shell/Python syntax, the chart and the
-justfile. Install the hooks with `mise exec -- hk install --mise`. CI runs
-`just ci`. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Running in a container
-
-Published to GHCR on every push to `main` (amd64 and arm64), built by
-`just image`: `rust:alpine` builds a static musl binary into a `scratch`
-image. `:latest` can change layouts; pin a digest. Supply a TLS certificate and
-key for any non-loopback listener, and keep credentials in Secrets:
-
-```yaml
-containers:
-  - name: pgvs3
-    image: ghcr.io/adonm/pgvs3:latest
-    env:
-      - name: PGVS3_URL
-        valueFrom: { secretKeyRef: { name: pgvs3, key: url } }
-      - name: PGVS3_SECRET_KEY
-        valueFrom: { secretKeyRef: { name: pgvs3, key: secret-key } }
-      - name: PGVS3_ACCESS_KEY
-        valueFrom: { secretKeyRef: { name: pgvs3, key: access-key } }
-      - { name: PGVS3_TLS_CERT, value: /tls/tls.crt }
-      - { name: PGVS3_TLS_KEY, value: /tls/tls.key }
-    volumeMounts:
-      - { name: tls, mountPath: /tls, readOnly: true }
-    ports: [{ containerPort: 8014 }]
-volumes:
-  - name: tls
-    secret: { secretName: pgvs3-tls }
+```sh
+just test       # Go unit tests
+just contract   # S3, DuckDB 2.0, DuckLake 1.1, duckdb-object-storage, Express APIs
+just ducklake   # DuckLake compatibility through the benchmark harness
+just bench      # DuckDB S3 benchmark, DuckLake checks and row-group tuning
 ```
+
+Every recipe starts a disposable PostgreSQL 18 in Docker and two local
+gateways, then removes them. `just contract` covers conditional writes,
+pagination, multipart, byte ranges, cross-gateway reads, peer invalidation,
+CreateSession, copy/rename/append, attributes, and both DuckDB 2.0 and
+`duckdb-object-storage` on 1.5.6. `docs/benchmarks.md` has the method and
+historical numbers.
 
 ## Repo layout
 
-- `crates/pgvs3/src/`: `main.rs` (CLI), `server.rs` (S3 API on
-  [s3s](https://crates.io/crates/s3s) and `/healthz`), `db.rs` (metadata,
-  reads, writes, multipart), `ingest.rs` (the `COPY` write path), `cache.rs`
-  (metadata cache), `pg.rs` (PostgreSQL pool and TLS).
-- `crates/pgvs3/schema.sql`: the storage layout.
-- `crates/pgvs3/tests/s3_contract.rs`: the two-gateway S3/DB contract.
-- `deploy/bench/`: `stack.sh` (disposable PostgreSQL + gateways for every
-  test and benchmark) and `duck_bench.py` (DuckDB S3 benchmark, DuckLake
-  checks and tuning). `deploy/postgres/`: PostgreSQL 18 + pg_cron image.
-  `deploy/charts/pgvs3/`: Helm chart for the gateway.
-- `justfile`: every task (`just` lists them); `mise.toml`: toolchain pins.
+- `cmd/pgvs3/`: CLI (`serve`, `stat`).
+- `internal/store/`: schema, PostgreSQL pool, streaming COPY/GET, multipart,
+  copy/rename/append, maintenance.
+- `internal/s3/`: S3 routing, SigV4, sessions, XML, ranges, checksums, Express
+  extensions.
+- `internal/peercache/`: groupcache + Otter cross-AZ metadata cache.
+- `test/e2e.sh`: the contract.
+- `deploy/bench/`: disposable stack and DuckDB benchmark.
+- `deploy/charts/pgvs3/`: Helm chart (3-AZ topology and peer cache).
+- `justfile`, `.ko.yaml`, `mise.toml`: toolchain and build.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
