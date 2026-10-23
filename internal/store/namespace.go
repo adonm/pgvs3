@@ -123,6 +123,11 @@ func (s *Store) EnsureNamespace(ctx context.Context, kind ns.Kind, name string, 
 		}
 		return err
 	}
+	if kind == ns.Queue {
+		if _, err := s.pool.Exec(ctx, "SELECT s3p.tune_queue_schema($1)", sc); err != nil {
+			return err
+		}
+	}
 	s.knownNS.Store(nsKey(kind, name), struct{}{})
 	return nil
 }

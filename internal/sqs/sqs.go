@@ -608,10 +608,27 @@ func (s *Server) opDeleteMessage(ctx context.Context, r *http.Request, op string
 }
 
 func (s *Server) opDeleteMessageBatch(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {
-	return s.runReceiptBatch(r, in, "DeleteMessageBatchRequestEntry", false, func(name string, e batchEntry) error {
-		_, err := s.store.DeleteMessage(ctx, name, e.ReceiptHandle)
-		return err
-	})
+	name, perr := queueFromURL(in.str("QueueUrl"), r.Host)
+	if perr != nil {
+		return nil, perr
+	}
+	entries, perr := decodeBatchEntries(in, "DeleteMessageBatchRequestEntry")
+	if perr != nil {
+		return nil, perr
+	}
+	receipts := make([]string, len(entries))
+	for i, e := range entries {
+		receipts[i] = e.ReceiptHandle
+	}
+	errs, err := s.store.DeleteMessages(ctx, name, receipts)
+	if err != nil {
+		return nil, errBad(err.Error())
+	}
+	ok, fail, perr := receiptBatchResult(entries, errs)
+	if perr != nil {
+		return nil, perr
+	}
+	return deleteBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: fail}, nil
 }
 
 func (s *Server) opChangeVisibility(ctx context.Context, r *http.Request, op string, in input) (any, *apiError) {
@@ -631,40 +648,50 @@ func (s *Server) opChangeVisibility(ctx context.Context, r *http.Request, op str
 }
 
 func (s *Server) opChangeVisibilityBatch(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {
-	return s.runReceiptBatch(r, in, "ChangeMessageVisibilityBatchRequestEntry", true, func(name string, e batchEntry) error {
-		_, err := s.store.ChangeVisibility(ctx, name, e.ReceiptHandle, e.VisibilityTimeout)
-		return err
-	})
-}
-
-func (s *Server) runReceiptBatch(r *http.Request, in input, prefix string, visibility bool, fn func(string, batchEntry) error) (any, *apiError) {
 	name, perr := queueFromURL(in.str("QueueUrl"), r.Host)
 	if perr != nil {
 		return nil, perr
 	}
-	entries, perr := decodeBatchEntries(in, prefix)
+	entries, perr := decodeBatchEntries(in, "ChangeMessageVisibilityBatchRequestEntry")
 	if perr != nil {
 		return nil, perr
 	}
-	ok := []xmlBatchOK{}
-	fail := []xmlBatchResultError{}
-	for _, e := range entries {
-		if err := fn(name, e); err != nil {
-			if errors.Is(err, store.ErrReceiptStale) || errors.Is(err, store.ErrReceiptInvalid) {
-				fail = append(fail, xmlBatchResultError{
-					Id: e.ID, Code: "ReceiptHandleIsInvalid",
-					Message: "The receipt handle is invalid.", SenderFault: true,
-				})
-				continue
-			}
-			return nil, errBad(err.Error())
+	receipts := make([]string, len(entries))
+	visibility := make([]int32, len(entries))
+	for i, e := range entries {
+		receipts[i] = e.ReceiptHandle
+		visibility[i] = int32(e.VisibilityTimeout)
+	}
+	errs, err := s.store.ChangeVisibilityBatch(ctx, name, receipts, visibility)
+	if err != nil {
+		return nil, errBad(err.Error())
+	}
+	ok, fail, perr := receiptBatchResult(entries, errs)
+	if perr != nil {
+		return nil, perr
+	}
+	return changeVisibilityBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: fail}, nil
+}
+
+func receiptBatchResult(entries []batchEntry, errs []error) ([]xmlBatchOK, []xmlBatchResultError, *apiError) {
+	ok := make([]xmlBatchOK, 0, len(entries))
+	fail := make([]xmlBatchResultError, 0)
+	for i, e := range entries {
+		err := errs[i]
+		if err == nil {
+			ok = append(ok, xmlBatchOK{Id: e.ID})
+			continue
 		}
-		ok = append(ok, xmlBatchOK{Id: e.ID})
+		if errors.Is(err, store.ErrReceiptStale) || errors.Is(err, store.ErrReceiptInvalid) {
+			fail = append(fail, xmlBatchResultError{
+				Id: e.ID, Code: "ReceiptHandleIsInvalid",
+				Message: "The receipt handle is invalid.", SenderFault: true,
+			})
+			continue
+		}
+		return nil, nil, errBad(err.Error())
 	}
-	if visibility {
-		return changeVisibilityBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: fail}, nil
-	}
-	return deleteBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: fail}, nil
+	return ok, fail, nil
 }
 
 func (s *Server) opGetQueueAttrs(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {

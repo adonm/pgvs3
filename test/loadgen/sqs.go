@@ -102,12 +102,24 @@ func runSQS(endpoint, queue, op string, size int64, workers, pipeline int, durat
 						firstErr.CompareAndSwap(nil, err.Error())
 						return
 					}
-					for _, m := range reply.Messages {
-						_ = sqsCall(c, endpoint, "DeleteMessage", map[string]any{
-							"QueueUrl": queueURL, "ReceiptHandle": m.ReceiptHandle,
-						}, nil)
-						atomic.AddInt64(&msgs, 1)
-						atomic.AddInt64(&bytesXfer, int64(len(m.Body)))
+					if len(reply.Messages) > 0 {
+						entries := make([]map[string]string, 0, len(reply.Messages))
+						for i, m := range reply.Messages {
+							entries = append(entries, map[string]string{
+								"Id": fmt.Sprintf("%d", i), "ReceiptHandle": m.ReceiptHandle,
+							})
+						}
+						if err := sqsCall(c, endpoint, "DeleteMessageBatch", map[string]any{
+							"QueueUrl": queueURL, "Entries": entries,
+						}, nil); err != nil {
+							atomic.AddInt64(&errs, 1)
+							firstErr.CompareAndSwap(nil, err.Error())
+							return
+						}
+						atomic.AddInt64(&msgs, int64(len(reply.Messages)))
+						for _, m := range reply.Messages {
+							atomic.AddInt64(&bytesXfer, int64(len(m.Body)))
+						}
 					}
 				}
 				local = append(local, time.Since(t0)/time.Duration(max(pipeline, 1)))

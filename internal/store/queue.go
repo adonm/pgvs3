@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -322,6 +323,140 @@ func (s *Store) ReceiveMessages(ctx context.Context, queue string, max, visibili
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// DeleteMessages removes a batch of leased messages in one statement. The
+// returned slice is aligned with receipts; a nil entry means the message was
+// deleted or had already disappeared. Invalid/stale receipts return an error
+// for that entry.
+func (s *Store) DeleteMessages(ctx context.Context, queue string, receipts []string) ([]error, error) {
+	errs := make([]error, len(receipts))
+	if len(receipts) == 0 {
+		return errs, nil
+	}
+	sc, err := nsSQLIdent(ns.Queue, queue)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0, len(receipts))
+	for i, receipt := range receipts {
+		id, perr := strconv.ParseInt(receiptMsgID(receipt), 10, 64)
+		if perr != nil {
+			errs[i] = ErrReceiptInvalid
+			continue
+		}
+		ids = append(ids, id)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	current := make(map[int64]string, len(ids))
+	if len(ids) > 0 {
+		rows, err := tx.Query(ctx, "SELECT id, receipt FROM "+sc+".messages WHERE id = ANY($1::int8[]) FOR UPDATE", ids)
+		if isMissingBucketSchema(err) {
+			for i := range errs {
+				if errs[i] == nil {
+					errs[i] = ErrReceiptInvalid
+				}
+			}
+			return errs, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			var receipt string
+			if err := rows.Scan(&id, &receipt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			current[id] = receipt
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM "+sc+".messages WHERE receipt = ANY($1::text[])", receipts); err != nil {
+		return nil, err
+	}
+	for i, receipt := range receipts {
+		if errs[i] != nil {
+			continue
+		}
+		id, _ := strconv.ParseInt(receiptMsgID(receipt), 10, 64)
+		if got, ok := current[id]; ok && got != receipt {
+			errs[i] = ErrReceiptStale
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return errs, nil
+}
+
+// ChangeVisibilityBatch updates a batch of leases in one statement. The
+// returned slice is aligned with receipts; errors identify stale/invalid
+// receipts.
+func (s *Store) ChangeVisibilityBatch(ctx context.Context, queue string, receipts []string, visibility []int32) ([]error, error) {
+	errs := make([]error, len(receipts))
+	if len(receipts) == 0 {
+		return errs, nil
+	}
+	if len(receipts) != len(visibility) {
+		return nil, fmt.Errorf("receipt/visibility length mismatch")
+	}
+	sc, err := nsSQLIdent(ns.Queue, queue)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `UPDATE `+sc+`.messages m
+		SET visible_at = now() + make_interval(secs => t.visibility)
+		FROM unnest($1::text[], $2::int4[]) AS t(receipt, visibility)
+		WHERE m.receipt = t.receipt
+		RETURNING m.receipt`, receipts, visibility)
+	if isMissingBucketSchema(err) {
+		for i := range errs {
+			errs[i] = ErrReceiptInvalid
+		}
+		return errs, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	updated := make(map[string]struct{}, len(receipts))
+	for rows.Next() {
+		var receipt string
+		if err := rows.Scan(&receipt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		updated[receipt] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for i, receipt := range receipts {
+		if _, ok := updated[receipt]; ok {
+			continue
+		}
+		gone, err := s.classifyMissingReceipt(ctx, sc, receipt)
+		switch {
+		case err != nil:
+			errs[i] = err
+		case gone:
+			errs[i] = ErrReceiptInvalid
+		default:
+			errs[i] = ErrReceiptStale
+		}
+	}
+	return errs, nil
 }
 
 // DeleteMessage removes one leased message. A stale receipt is an error.

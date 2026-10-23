@@ -109,6 +109,67 @@ func TestFIFOOrderingAndDedup(t *testing.T) {
 	}
 }
 
+func TestQueueBatchLeases(t *testing.T) {
+	ctx := testCtx
+	q := unique("batch")
+	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.SendMessages(ctx, q, []OutMessage{
+		{Body: []byte("one")}, {Body: []byte("two")}, {Body: []byte("three")},
+	}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := testStore.ReceiveMessages(ctx, q, 10, 30, true, false)
+	if err != nil || len(msgs) != 3 {
+		t.Fatalf("receive: %v %+v", err, msgs)
+	}
+	receipts := []string{msgs[0].Receipt, msgs[1].Receipt, msgs[2].Receipt, "bogus"}
+	errs, err := testStore.DeleteMessages(ctx, q, receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, err := range errs {
+		if i < 3 && err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	if !errors.Is(errs[3], ErrReceiptInvalid) {
+		t.Fatalf("bogus receipt = %v", errs[3])
+	}
+
+	if _, err := testStore.SendMessages(ctx, q, []OutMessage{{Body: []byte("four")}, {Body: []byte("five")}}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err = testStore.ReceiveMessages(ctx, q, 10, 30, true, false)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("receive second batch: %v %+v", err, msgs)
+	}
+	receipts = []string{msgs[0].Receipt, msgs[1].Receipt}
+	if errs, err = testStore.ChangeVisibilityBatch(ctx, q, receipts, []int32{60, 60}); err != nil {
+		t.Fatal(err)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("visibility %d: %v", i, err)
+		}
+	}
+	if got, err := testStore.ReceiveMessages(ctx, q, 10, 30, true, false); err != nil || len(got) != 0 {
+		t.Fatalf("inflight receive = %v %+v", err, got)
+	}
+	if errs, err = testStore.ChangeVisibilityBatch(ctx, q, receipts, []int32{0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("visibility reset %d: %v", i, err)
+		}
+	}
+	if got, err := testStore.ReceiveMessages(ctx, q, 10, 30, true, false); err != nil || len(got) != 2 {
+		t.Fatalf("visible receive = %v %+v", err, got)
+	}
+}
+
 func TestFIFORedrivePreservesGroup(t *testing.T) {
 	ctx := testCtx
 	src := unique("src")
@@ -302,8 +363,8 @@ func TestGooseMigrationsAndIdempotentInit(t *testing.T) {
 		"SELECT max(version_id) FROM s3p.goose_db_version").Scan(&gooseVersion); err != nil {
 		t.Fatal(err)
 	}
-	if gooseVersion != 5 {
-		t.Fatalf("goose version = %d, want 5", gooseVersion)
+	if gooseVersion != 6 {
+		t.Fatalf("goose version = %d, want 6", gooseVersion)
 	}
 	var layout int
 	if err := testStore.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&layout); err != nil {
@@ -334,7 +395,7 @@ func TestInitAdoptsExistingLayoutWithoutGooseHistory(t *testing.T) {
 		"SELECT max(version_id) FROM s3p.goose_db_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Fatalf("goose version after adoption = %d, want 5", version)
+	if version != 6 {
+		t.Fatalf("goose version after adoption = %d, want 6", version)
 	}
 }
