@@ -22,44 +22,63 @@ import (
 
 var version = "dev"
 
-func main() { os.Exit(run()) }
+func main() { os.Exit(run(os.Args[1:])) }
 
-func run() int {
-	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "version" {
-		fmt.Println(version)
-		return 0
-	}
-	for _, cmd := range []struct {
-		name string
-		fn   func([]string) int
-	}{
-		{"health", health}, {"reap", reap}, {"doctor", doctor}, {"stat", stat},
-		{"clone", cloneNS}, {"drop", dropNS}, {"adopt", adoptNS}, {"migrate", migrateNS}, {"version", nil},
-	} {
-		if i := indexArg(args, cmd.name); i >= 0 && cmd.fn != nil {
-			return cmd.fn(removeArg(args, i))
-		}
-	}
-	if i := indexArg(args, "serve"); i >= 0 {
-		args = removeArg(args, i)
+var subcommands = map[string]func([]string) int{
+	"serve":   serve,
+	"health":  health,
+	"reap":    reap,
+	"doctor":  doctor,
+	"stat":    stat,
+	"clone":   cloneNS,
+	"drop":    dropNS,
+	"adopt":   adoptNS,
+	"migrate": migrateNS,
+	"version": func([]string) int { fmt.Println(version); return 0 },
+}
+
+func run(args []string) int {
+	cmd, rest := extractSubcommand(args)
+	if fn, ok := subcommands[cmd]; ok {
+		return fn(rest)
 	}
 	return serve(args)
 }
 
-func indexArg(args []string, want string) int {
-	for i, a := range args {
-		if a == want {
-			return i
+// extractSubcommand locates the subcommand at the first non-flag position so
+// positional arguments after a subcommand (for example `pgvs3 drop stat`) are
+// never mistaken for another subcommand, while leading global flags like
+// `pgvs3 --url ... serve` continue to work.
+func extractSubcommand(args []string) (string, []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			return "", args
 		}
+		if strings.HasPrefix(a, "-") {
+			if !strings.Contains(a, "=") && flagTakesValue(strings.TrimLeft(a, "-")) && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if _, ok := subcommands[a]; ok {
+			out := make([]string, 0, len(args)-1)
+			out = append(out, args[:i]...)
+			out = append(out, args[i+1:]...)
+			return a, out
+		}
+		return "", args
 	}
-	return -1
+	return "", args
 }
 
-func removeArg(args []string, i int) []string {
-	out := make([]string, 0, len(args)-1)
-	out = append(out, args[:i]...)
-	return append(out, args[i+1:]...)
+func flagTakesValue(name string) bool {
+	switch name {
+	case "read-only", "force", "all", "json", "h", "help":
+		return false
+	default:
+		return true
+	}
 }
 
 func serve(args []string) int {
@@ -93,6 +112,7 @@ func serve(args []string) int {
 		return 1
 	}
 	defer st.Close()
+
 	if *readOnly {
 		if err := st.CheckLayout(ctx); err != nil {
 			log.Error("checking storage layout", "err", err)
@@ -100,30 +120,29 @@ func serve(args []string) int {
 		}
 	} else {
 		if err := st.Init(ctx); err != nil {
-			log.Error("initialising storage layout", "err", err)
+			log.Error("initializing schema", "err", err)
 			return 1
 		}
 		if err := st.EnsureMaintenance(ctx); err != nil {
-			log.Error("checking storage layout", "err", err)
+			log.Error("verifying maintenance schema", "err", err)
 			return 1
 		}
-		go maintain(ctx, st, *reapGrace, min(*reapGrace, time.Minute), log)
+		go maintain(ctx, st, *reapGrace, time.Minute, log)
 	}
 
 	var origin *objcache.Tier
 	if *originCfg != "" {
-		cfg, err := os.ReadFile(*originCfg)
+		raw, err := os.ReadFile(*originCfg)
 		if err != nil {
 			log.Error("reading origin config", "err", err)
 			return 1
 		}
-		origin, err = objcache.New(log, cfg, st, *cacheNS, *cacheTTL, *cacheKeep, *fillMax)
+		origin, err = objcache.New(log, raw, st, *cacheNS, *cacheTTL, *cacheKeep, *fillMax)
 		if err != nil {
-			log.Error("building origin cache", "err", err)
+			log.Error("opening origin", "err", err)
 			return 1
 		}
 		defer origin.Close()
-		log.Info("origin cache enabled", "namespace", *cacheNS, "ttl", *cacheTTL)
 	}
 
 	g := gateway.New(st, log, *readOnly, origin, gateway.Limits{SQS: *sqsMax, RESP: *respMax})
@@ -141,164 +160,152 @@ func serve(args []string) int {
 	return 0
 }
 
-func stat(args []string) int {
-	fs := flag.NewFlagSet("stat", flag.ContinueOnError)
+func withStore(name string, args []string, timeout time.Duration, checkLayout bool, setup func(*flag.FlagSet), fn func(context.Context, *store.Store, []string) int) int {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	kind := fs.String("kind", "", "bucket, cache or queue (default: all)")
-	name := fs.String("name", "", "namespace name")
-	asJSON := fs.Bool("json", false, "print JSON")
+	if setup != nil {
+		setup(fs)
+	}
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	st := mustStore(ctx, *url)
-	defer st.Close()
-	s, err := st.StatNamespace(ctx, ns.Kind(*kind), *name, "", 0)
+	st, err := store.Open(ctx, *url, 4, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	overhead := 0.0
-	if s.LogicalBytes > 0 {
-		overhead = (float64(s.PhysicalBytes)/float64(s.LogicalBytes) - 1) * 100
+	defer st.Close()
+	if checkLayout {
+		if err := st.CheckLayout(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 	}
-	oldest := "none"
-	if s.OldestGarbage != nil {
-		oldest = s.OldestGarbage.Round(time.Second).String()
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(s)
+	return fn(ctx, st, fs.Args())
+}
+
+func stat(args []string) int {
+	var kind, name *string
+	var asJSON *bool
+	return withStore("stat", args, 30*time.Second, false, func(fs *flag.FlagSet) {
+		kind = fs.String("kind", "", "bucket, cache or queue (default: all)")
+		name = fs.String("name", "", "namespace name")
+		asJSON = fs.Bool("json", false, "print JSON")
+	}, func(ctx context.Context, st *store.Store, _ []string) int {
+		s, err := st.StatNamespace(ctx, ns.Kind(*kind), *name, "", 0)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		overhead := 0.0
+		if s.LogicalBytes > 0 {
+			overhead = (float64(s.PhysicalBytes)/float64(s.LogicalBytes) - 1) * 100
+		}
+		oldest := "none"
+		if s.OldestGarbage != nil {
+			oldest = s.OldestGarbage.Round(time.Second).String()
+		}
+		if *asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(s)
+			return 0
+		}
+		fmt.Printf("namespaces=%d buckets=%d objects=%d chunks=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
+			s.Namespaces, s.Buckets, s.Objects, s.Chunks, s.LogicalBytes>>20,
+			s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
 		return 0
-	}
-	fmt.Printf("namespaces=%d buckets=%d objects=%d chunks=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
-		s.Namespaces, s.Buckets, s.Objects, s.Chunks, s.LogicalBytes>>20,
-		s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
-	return 0
+	})
 }
 
 func cloneNS(args []string) int {
-	fs := flag.NewFlagSet("clone", flag.ContinueOnError)
-	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	kind := fs.String("kind", "bucket", "bucket or cache")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	rest := fs.Args()
-	if len(rest) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: pgvs3 clone [--kind bucket|cache] <src> <dst>")
-		return 2
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-	st := mustStore(ctx, *url)
-	defer st.Close()
-	if err := st.CheckLayout(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if err := st.CloneNamespace(ctx, ns.Kind(*kind), rest[0], rest[1]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	fmt.Printf("cloned=%s->%s kind=%s\n", rest[0], rest[1], *kind)
-	return 0
+	var kind *string
+	return withStore("clone", args, 30*time.Minute, true, func(fs *flag.FlagSet) {
+		kind = fs.String("kind", "bucket", "bucket or cache")
+	}, func(ctx context.Context, st *store.Store, rest []string) int {
+		if len(rest) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: pgvs3 clone [--kind bucket|cache] <src> <dst>")
+			return 2
+		}
+		if err := st.CloneNamespace(ctx, ns.Kind(*kind), rest[0], rest[1]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Printf("cloned=%s->%s kind=%s\n", rest[0], rest[1], *kind)
+		return 0
+	})
 }
 
 func dropNS(args []string) int {
-	fs := flag.NewFlagSet("drop", flag.ContinueOnError)
-	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	kind := fs.String("kind", "bucket", "bucket, cache or queue")
-	force := fs.Bool("force", false, "drop non-empty namespaces and reclaim their schema immediately")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	rest := fs.Args()
-	if len(rest) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: pgvs3 drop [--kind bucket|cache|queue] [--force] <name>")
-		return 2
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	st := mustStore(ctx, *url)
-	defer st.Close()
-	if err := st.CheckLayout(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	res, err := st.DropNamespace(ctx, ns.Kind(*kind), rest[0], *force)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	switch res {
-	case store.BucketDeleted:
-		fmt.Printf("dropped=%s kind=%s\n", rest[0], *kind)
-		return 0
-	case store.BucketNotEmpty:
-		fmt.Fprintf(os.Stderr, "namespace %s is not empty (pass --force)\n", rest[0])
-		return 1
-	default:
-		fmt.Fprintf(os.Stderr, "namespace %s does not exist\n", rest[0])
-		return 1
-	}
+	var kind *string
+	var force *bool
+	return withStore("drop", args, 5*time.Minute, true, func(fs *flag.FlagSet) {
+		kind = fs.String("kind", "bucket", "bucket, cache or queue")
+		force = fs.Bool("force", false, "drop non-empty namespaces and reclaim their schema immediately")
+	}, func(ctx context.Context, st *store.Store, rest []string) int {
+		if len(rest) != 1 {
+			fmt.Fprintln(os.Stderr, "usage: pgvs3 drop [--kind bucket|cache|queue] [--force] <name>")
+			return 2
+		}
+		res, err := st.DropNamespace(ctx, ns.Kind(*kind), rest[0], *force)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		switch res {
+		case store.BucketDeleted:
+			fmt.Printf("dropped=%s kind=%s\n", rest[0], *kind)
+			return 0
+		case store.BucketNotEmpty:
+			fmt.Fprintf(os.Stderr, "namespace %s is not empty (pass --force)\n", rest[0])
+			return 1
+		default:
+			fmt.Fprintf(os.Stderr, "namespace %s does not exist\n", rest[0])
+			return 1
+		}
+	})
 }
 
 func migrateNS(args []string) int {
-	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
-	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
-	defer cancel()
-	st := mustStore(ctx, *url)
-	defer st.Close()
-	n, err := st.Migrate(ctx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	fmt.Printf("migrated_buckets=%d layout=%d\n", n, store.LayoutVersion)
-	return 0
+	return withStore("migrate", args, 6*time.Hour, false, nil, func(ctx context.Context, st *store.Store, _ []string) int {
+		n, err := st.Migrate(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Printf("migrated_buckets=%d layout=%d\n", n, store.LayoutVersion)
+		return 0
+	})
 }
 
 func adoptNS(args []string) int {
-	fs := flag.NewFlagSet("adopt", flag.ContinueOnError)
-	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	kind := fs.String("kind", "", "bucket, cache or queue (default: all)")
-	all := fs.Bool("all", false, "adopt every matching schema")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-	st := mustStore(ctx, *url)
-	defer st.Close()
-	if err := st.CheckLayout(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if *all || len(fs.Args()) == 0 {
-		n, err := st.AdoptAll(ctx, ns.Kind(*kind))
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
+	var kind *string
+	var all *bool
+	return withStore("adopt", args, 30*time.Minute, true, func(fs *flag.FlagSet) {
+		kind = fs.String("kind", "", "bucket, cache or queue (default: all)")
+		all = fs.Bool("all", false, "adopt every matching schema")
+	}, func(ctx context.Context, st *store.Store, rest []string) int {
+		if *all || len(rest) == 0 {
+			n, err := st.AdoptAll(ctx, ns.Kind(*kind))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			fmt.Printf("adopted=%d kind=%s\n", n, orAll(*kind))
+			return 0
 		}
-		fmt.Printf("adopted=%d kind=%s\n", n, orAll(*kind))
+		for _, name := range rest {
+			outcome, err := st.Adopt(ctx, ns.Kind(*kind), name)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			fmt.Printf("%s=%s kind=%s\n", name, outcome, orAll(*kind))
+		}
 		return 0
-	}
-	for _, name := range fs.Args() {
-		outcome, err := st.Adopt(ctx, ns.Kind(*kind), name)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		fmt.Printf("%s=%s kind=%s\n", name, outcome, orAll(*kind))
-	}
-	return 0
+	})
 }
 
 func orAll(kind string) string {
@@ -327,72 +334,48 @@ func health(args []string) int {
 }
 
 func reap(args []string) int {
-	fs := flag.NewFlagSet("reap", flag.ContinueOnError)
-	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	grace := fs.Duration("grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "only reap files deleted at least this long ago")
-	all := fs.Bool("all", false, "repeat the bounded pass until no garbage remains")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-	st := mustStore(ctx, *url)
-	defer st.Close()
-	if err := st.CheckLayout(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	for i := 0; ; i++ {
-		beforeRows, beforeFiles := st.ReapedRows(), st.ReapedFiles()
-		if err := st.Maintain(ctx, *grace); err != nil {
+	var grace *time.Duration
+	var all *bool
+	return withStore("reap", args, 30*time.Minute, true, func(fs *flag.FlagSet) {
+		grace = fs.Duration("grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "only reap files deleted at least this long ago")
+		all = fs.Bool("all", false, "repeat the bounded pass until no garbage remains")
+	}, func(ctx context.Context, st *store.Store, _ []string) int {
+		for i := 0; ; i++ {
+			beforeRows, beforeFiles := st.ReapedRows(), st.ReapedFiles()
+			if err := st.Maintain(ctx, *grace); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			if !*all || (st.ReapedRows() == beforeRows && st.ReapedFiles() == beforeFiles) || i >= 1000 {
+				break
+			}
+		}
+		after, err := st.Stat(ctx)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		if !*all || (st.ReapedRows() == beforeRows && st.ReapedFiles() == beforeFiles) || i >= 1000 {
-			break
-		}
-	}
-	after, err := st.Stat(ctx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	fmt.Printf("garbage_files=%d reaped_rows=%d reaped_files=%d expired_objects=%d db=%d MiB\n",
-		after.GarbageFiles, st.ReapedRows(), st.ReapedFiles(), st.ExpiredObjects(), after.DatabaseBytes>>20)
-	return 0
+		fmt.Printf("garbage_files=%d reaped_rows=%d reaped_files=%d expired_objects=%d db=%d MiB\n",
+			after.GarbageFiles, st.ReapedRows(), st.ReapedFiles(), st.ExpiredObjects(), after.DatabaseBytes>>20)
+		return 0
+	})
 }
 
 func doctor(args []string) int {
-	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	st := mustStore(ctx, *url)
-	defer st.Close()
-	d, err := st.Diagnose(ctx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	fmt.Printf("server_version_num=%d layout=%d namespaces=%d buckets=%d queues=%d caches=%d configured=%v objects=%d garbage=%d orphan_schemas=%d missing_schemas=%d db=%d MiB\n",
-		d.ServerVersion, d.Layout, d.Namespaces, d.Buckets, d.Queues, d.Caches,
-		d.ChunksConfigured, d.Objects, d.GarbageFiles, d.OrphanSchemas, d.MissingSchemas, d.DatabaseBytes>>20)
-	if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured {
-		return 1
-	}
-	return 0
-}
-
-func mustStore(ctx context.Context, url string) *store.Store {
-	st, err := store.Open(ctx, url, 4, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	return st
+	return withStore("doctor", args, 30*time.Second, false, nil, func(ctx context.Context, st *store.Store, _ []string) int {
+		d, err := st.Diagnose(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Printf("server_version_num=%d layout=%d namespaces=%d buckets=%d queues=%d caches=%d configured=%v objects=%d garbage=%d orphan_schemas=%d missing_schemas=%d db=%d MiB\n",
+			d.ServerVersion, d.Layout, d.Namespaces, d.Buckets, d.Queues, d.Caches,
+			d.ChunksConfigured, d.Objects, d.GarbageFiles, d.OrphanSchemas, d.MissingSchemas, d.DatabaseBytes>>20)
+		if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured {
+			return 1
+		}
+		return 0
+	})
 }
 
 func maintain(ctx context.Context, st *store.Store, grace, interval time.Duration, log *slog.Logger) {

@@ -651,11 +651,18 @@ c = boto3.client('s3', endpoint_url=os.environ['OCACHE_ENDPOINT'],
 b = 'edge'
 k = os.environ['OCACHE_RUN'] + '/obj.bin'
 body = b'origin-payload-' + b'x' * 4000
-c.put_object(Bucket=b, Key=k, Body=body, ContentType='application/octet-stream')
+put_res = c.put_object(Bucket=b, Key=k, Body=body, ContentType='application/octet-stream')
+assert put_res.get('ETag', '').strip('"'), put_res
 assert c.get_object(Bucket=b, Key=k)['Body'].read() == body
 head = c.head_object(Bucket=b, Key=k)
 assert head['ContentLength'] == len(body)
 assert c.get_object(Bucket=b, Key=k, Range='bytes=0-15')['Body'].read() == body[:16]
+# 0-byte object through the cache tier must report Content-Length: 0.
+empty_k = os.environ['OCACHE_RUN'] + '/empty.bin'
+c.put_object(Bucket=b, Key=empty_k, Body=b'')
+assert c.head_object(Bucket=b, Key=empty_k)['ContentLength'] == 0
+assert c.get_object(Bucket=b, Key=empty_k)['Body'].read() == b''
+c.delete_object(Bucket=b, Key=empty_k)
 p = os.path.join(os.environ['OCACHE_DIR'], b, k)
 open(p, 'wb').write(b'origin-updated')
 assert c.get_object(Bucket=b, Key=k)['Body'].read() == b'origin-updated'

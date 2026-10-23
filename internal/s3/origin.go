@@ -54,7 +54,20 @@ func (s *Server) serveOrigin(w http.ResponseWriter, r *http.Request, bucket, key
 
 func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	switch r.Method {
-	case http.MethodHead, http.MethodGet:
+	case http.MethodHead:
+		obj, err := s.origin.Head(r.Context(), bucket, key)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, r, errNoSuchKey(), s.log)
+				return
+			}
+			writeError(w, r, errInternal(err, s.log), s.log)
+			return
+		}
+		writeOriginHeaders(w, obj)
+		w.WriteHeader(http.StatusOK)
+
+	case http.MethodGet:
 		first, last, suffix, _, err := parseRange(r.Header.Get("Range"))
 		if err != nil {
 			writeError(w, r, errInvalidRange(), s.log)
@@ -74,24 +87,13 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			return
 		}
 		defer obj.Body.Close()
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("ETag", quoteETag(obj.ETag))
-		if obj.ContentType != "" {
-			w.Header().Set("Content-Type", obj.ContentType)
-		}
-		if !obj.LastModified.IsZero() {
-			w.Header().Set("Last-Modified", obj.LastModified.UTC().Format(http.TimeFormat))
-		}
-		w.Header().Set("Content-Length", strconv.FormatInt(obj.End-obj.Start+1, 10))
+		writeOriginHeaders(w, obj)
 		if obj.Ranged {
 			w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(obj.Start, 10)+"-"+
 				strconv.FormatInt(obj.End, 10)+"/"+strconv.FormatInt(obj.Size, 10))
 			w.WriteHeader(http.StatusPartialContent)
 		} else {
 			w.WriteHeader(http.StatusOK)
-		}
-		if r.Method == http.MethodHead {
-			return
 		}
 		buf := copyBuf()
 		defer putCopyBuf(buf)
@@ -107,12 +109,13 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		if ct == "" {
 			ct = "application/octet-stream"
 		}
-		if err := s.origin.Upload(r.Context(), bucket, key, r.Body, ct); err != nil {
-			writeError(w, r, errInternal(err, s.log), s.log)
+		etag, err := s.origin.Upload(r.Context(), bucket, key, r.Body, ct)
+		if err != nil {
+			writeError(w, r, s.ingestError(err), s.log)
 			return
 		}
-		if m, err := s.store.MetaHeader(r.Context(), bucket, key); err == nil {
-			w.Header().Set("ETag", quoteETag(m.ETag))
+		if etag != "" {
+			w.Header().Set("ETag", quoteETag(etag))
 		}
 		w.WriteHeader(http.StatusOK)
 
@@ -129,6 +132,18 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	default:
 		s.methodNotAllowed(w, r)
 	}
+}
+
+func writeOriginHeaders(w http.ResponseWriter, obj *objcache.Object) {
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("ETag", quoteETag(obj.ETag))
+	if obj.ContentType != "" {
+		w.Header().Set("Content-Type", obj.ContentType)
+	}
+	if !obj.LastModified.IsZero() {
+		w.Header().Set("Last-Modified", obj.LastModified.UTC().Format(http.TimeFormat))
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(obj.ContentLength(), 10))
 }
 
 func (s *Server) listOrigin(w http.ResponseWriter, r *http.Request, bucket string, q map[string][]string) {

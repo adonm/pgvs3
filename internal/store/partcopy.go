@@ -48,29 +48,14 @@ func (s *Store) CopyPart(ctx context.Context, uploadID, bucket, key string, part
 	if err != nil {
 		return nil, false, err
 	}
-	var checksum *string
+	var chk *Checksum
 	if algorithm.Valid {
 		if algorithm.String != "SHA256" {
 			return nil, false, nil
 		}
-		v := base64.StdEncoding.EncodeToString(src.SHA256)
-		checksum = &v
+		chk = &Checksum{Name: "SHA256", Value: base64.StdEncoding.EncodeToString(src.SHA256)}
 	}
-	var old pgtype.Int8
-	err = tx.QueryRow(ctx, `DELETE FROM `+sc+`.upload_parts WHERE upload_id = $1 AND part_no = $2
-		RETURNING file_id`, uploadID, partNo).Scan(&old)
-	if err != nil && err != pgx.ErrNoRows {
-		return nil, false, err
-	}
-	if old.Valid {
-		if err := queueFiles(ctx, tx, sc, old.Int64, nil); err != nil {
-			return nil, false, err
-		}
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+sc+`.upload_parts
-		(upload_id, part_no, file_id, size, sha256, md5, checksum)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		uploadID, partNo, src.FileID, src.Size, src.SHA256, md5sum, checksum); err != nil {
+	if err := commitPart(ctx, tx, sc, uploadID, partNo, src.FileID, src.Size, src.SHA256, md5sum, chk); err != nil {
 		return nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -78,13 +63,7 @@ func (s *Store) CopyPart(ctx context.Context, uploadID, bucket, key string, part
 	}
 	return &Published{
 		FileID: src.FileID, Size: src.Size, ETag: hex.EncodeToString(md5sum),
-		SHA256: src.SHA256, MD5: md5sum,
-		Checksum: func() *Checksum {
-			if checksum == nil {
-				return nil
-			}
-			return &Checksum{Name: "SHA256", Value: *checksum}
-		}(),
+		SHA256: src.SHA256, MD5: md5sum, Checksum: chk,
 	}, true, nil
 }
 

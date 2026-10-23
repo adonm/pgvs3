@@ -159,12 +159,20 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 	if err := swapObjectParts(ctx, tx, sc, requestBucket, key, nil, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
 		return nil, err
 	}
-	for _, c := range selectedChecks {
+	if len(selectedChecks) > 0 {
+		nos := make([]int32, len(selectedChecks))
+		fids := make([]int64, len(selectedChecks))
+		vals := make([]string, len(selectedChecks))
+		for i, c := range selectedChecks {
+			nos[i], fids[i], vals[i] = c.no, c.fileID, c.checksum
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO `+sc+`.object_part_checksums
-			(key, part_no, file_id, algorithm, value) VALUES ($1,$2,$3,$4,$5)
+			(key, part_no, file_id, algorithm, value)
+			SELECT $1, no, fid, $4, val
+			FROM unnest($2::int4[], $3::int8[], $5::text[]) AS t(no, fid, val)
 			ON CONFLICT (key, part_no) DO UPDATE SET file_id = EXCLUDED.file_id,
 			  algorithm = EXCLUDED.algorithm, value = EXCLUDED.value`,
-			key, c.no, c.fileID, algorithm.String, c.checksum); err != nil {
+			key, nos, fids, algorithm.String, vals); err != nil {
 			return nil, err
 		}
 	}

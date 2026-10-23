@@ -40,9 +40,14 @@ type Tier struct {
 }
 
 // memFillMax is the largest origin body buffered in memory before writing to
-// PostgreSQL. Larger fills spool to a temp file so the database connection is
+// PostgreSQL. Larger bodies spool to a temp file so a database connection is
 // never held while waiting on the origin network.
 const memFillMax = 8 << 20
+
+// fullCacheMax is the largest object downloaded whole to satisfy a range
+// request. Above it, ranges are passed through to the origin so a footer read
+// never pulls a multi-GB file.
+const fullCacheMax = 8 << 20
 
 // Config is the subset of the Thanos objstore config pgvs3 ships with.
 type Config struct {
@@ -94,76 +99,21 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 	if maxFills <= 0 {
 		maxFills = 8
 	}
-	return &Tier{origin: b, store: st, namespace: namespace, ttl: ttl,
-		retention: retention, fills: make(chan struct{}, maxFills), log: log}, nil
+	return &Tier{
+		origin:    b,
+		store:     st,
+		namespace: namespace,
+		ttl:       ttl,
+		retention: retention,
+		fills:     make(chan struct{}, maxFills),
+		log:       log,
+	}, nil
 }
 
 func (t *Tier) Name() string                  { return t.namespace }
 func (t *Tier) Origin() objstore.Bucket       { return t.origin }
 func (t *Tier) Close() error                  { return t.origin.Close() }
 func (t *Tier) key(bucket, key string) string { return bucket + "/" + key }
-
-// Ensure returns fresh metadata for bucket/key, downloading from the origin
-// when the cached copy is missing, stale or a different version.
-func (t *Tier) Ensure(ctx context.Context, bucket, key string) (*store.Meta, error) {
-	ck := t.key(bucket, key)
-	m, err := t.store.MetaKind(ctx, ns.Cache, t.namespace, ck)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-	if err == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl {
-		return m, nil
-	}
-
-	attrs, aerr := t.origin.Attributes(ctx, ck)
-	if aerr != nil {
-		if t.origin.IsObjNotFoundErr(aerr) {
-			return nil, store.ErrNotFound
-		}
-		return nil, aerr
-	}
-	version := fmt.Sprintf("%d-%d", attrs.Size, attrs.LastModified.UnixNano())
-	if err == nil && m.Size == attrs.Size && m.OriginETag == version {
-		t.touch(ctx, ck)
-		m.CreatedAt = time.Now()
-		return m, nil
-	}
-
-	// Bound concurrent fills and fetch the body before touching PostgreSQL:
-	// a slow origin must never pin a pool connection.
-	select {
-	case t.fills <- struct{}{}:
-		defer func() { <-t.fills }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	src, cleanup, err := t.fetch(ctx, ck, attrs.Size)
-	if err != nil {
-		return nil, err
-	}
-	defer cleanup()
-
-	exp := time.Now().Add(t.retention)
-	ct := contentTypeFor(key)
-	w, werr := t.store.StartObjectKind(ctx, ns.Cache, t.namespace, ck,
-		store.Unconditional, "", nil, ct, &exp, false, version)
-	if werr != nil {
-		return nil, werr
-	}
-	if _, err := io.Copy(w, src); err != nil {
-		w.Abort()
-		return nil, err
-	}
-	if _, err := w.Finish(nil); err != nil {
-		return nil, err
-	}
-	return t.store.MetaKind(ctx, ns.Cache, t.namespace, ck)
-}
-
-// fullCacheMax is the largest object downloaded whole to satisfy a range
-// request. Above it, ranges are passed through to the origin so a footer read
-// never pulls a multi-GB file.
-const fullCacheMax = 8 << 20
 
 // Object is one origin response, served from the cache or passed through.
 type Object struct {
@@ -177,83 +127,140 @@ type Object struct {
 	Hit          bool
 }
 
-// fetch downloads the origin body into memory (small) or a temp file (large).
-func (t *Tier) fetch(ctx context.Context, ck string, size int64) (io.Reader, func(), error) {
-	rc, err := t.origin.Get(ctx, ck)
-	if err != nil {
-		if t.origin.IsObjNotFoundErr(err) {
-			return nil, nil, store.ErrNotFound
-		}
-		return nil, nil, err
+// ContentLength returns the number of response payload bytes.
+func (o *Object) ContentLength() int64 {
+	if o.Size == 0 {
+		return 0
 	}
-	defer rc.Close()
+	return o.End - o.Start + 1
+}
 
-	if size <= memFillMax {
-		buf, err := io.ReadAll(io.LimitReader(rc, memFillMax+1))
-		if err != nil {
-			return nil, nil, err
+// Ensure returns fresh metadata for bucket/key, downloading from the origin
+// when the cached copy is missing, stale or a different version.
+func (t *Tier) Ensure(ctx context.Context, bucket, key string) (*store.Meta, error) {
+	ck := t.key(bucket, key)
+	m, err := t.store.MetaHeaderKind(ctx, ns.Cache, t.namespace, ck)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	if err == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl {
+		return m, nil
+	}
+	attrs, aerr := t.origin.Attributes(ctx, ck)
+	if aerr != nil {
+		if t.origin.IsObjNotFoundErr(aerr) {
+			return nil, store.ErrNotFound
 		}
-		return bytes.NewReader(buf), func() {}, nil
+		return nil, aerr
 	}
-	tmp, err := os.CreateTemp("", "pgvs3-fill-*")
-	if err != nil {
-		return nil, nil, err
+	version := versionFor(attrs)
+	if err == nil && m.Size == attrs.Size && m.OriginETag == version {
+		t.touch(ctx, ck)
+		m.CreatedAt = time.Now()
+		return m, nil
 	}
-	name := tmp.Name()
-	if _, err := io.Copy(tmp, rc); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return nil, nil, err
+	return t.fill(ctx, ck, key, attrs.Size, version)
+}
+
+// Head returns metadata for bucket/key without downloading the origin body on a
+// cache miss.
+func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
+	ck := t.key(bucket, key)
+	m, err := t.store.MetaHeaderKind(ctx, ns.Cache, t.namespace, ck)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
 	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return nil, nil, err
+	if err == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl {
+		return &Object{
+			Size: m.Size, ETag: m.ETag, ContentType: m.ContentType,
+			LastModified: m.CreatedAt, End: max(m.Size-1, 0), Hit: true,
+		}, nil
 	}
-	return tmp, func() { tmp.Close(); os.Remove(name) }, nil
+	attrs, aerr := t.origin.Attributes(ctx, ck)
+	if aerr != nil {
+		if t.origin.IsObjNotFoundErr(aerr) {
+			return nil, store.ErrNotFound
+		}
+		return nil, aerr
+	}
+	version := versionFor(attrs)
+	if err == nil && m.Size == attrs.Size && m.OriginETag == version {
+		t.touch(ctx, ck)
+		return &Object{
+			Size: m.Size, ETag: m.ETag, ContentType: m.ContentType,
+			LastModified: time.Now(), End: max(m.Size-1, 0), Hit: true,
+		}, nil
+	}
+	return &Object{
+		Size: attrs.Size, ETag: etagFor(version), ContentType: contentTypeFor(key),
+		LastModified: attrs.LastModified, End: max(attrs.Size-1, 0),
+	}, nil
 }
 
 // Open serves [first,last] (or the whole object) with a cache hit, a whole
-// object download, or a pass-through origin range.
+// object download, or a pass-through origin range. Warm cache hits within
+// --cache-ttl do not contact the origin.
 func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix int64) (*Object, error) {
 	ck := t.key(bucket, key)
-	attrs, err := t.origin.Attributes(ctx, ck)
-	if err != nil {
-		if t.origin.IsObjNotFoundErr(err) {
-			return nil, store.ErrNotFound
-		}
-		return nil, err
+	m, merr := t.store.MetaHeaderKind(ctx, ns.Cache, t.namespace, ck)
+	if merr != nil && !errors.Is(merr, store.ErrNotFound) {
+		return nil, merr
 	}
-	size := attrs.Size
+	valid := merr == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl
+
+	var (
+		size    int64
+		version string
+		lastMod time.Time
+	)
+	if valid {
+		size = m.Size
+		lastMod = m.CreatedAt
+	} else {
+		attrs, err := t.origin.Attributes(ctx, ck)
+		if err != nil {
+			if t.origin.IsObjNotFoundErr(err) {
+				return nil, store.ErrNotFound
+			}
+			return nil, err
+		}
+		size = attrs.Size
+		lastMod = attrs.LastModified
+		version = versionFor(attrs)
+		if merr == nil {
+			if m.Size == size && m.OriginETag == version {
+				t.touch(ctx, ck)
+				valid = true
+			} else {
+				// Origin moved on: never serve stale bytes.
+				_, _ = t.store.CacheDel(ctx, t.namespace, []string{ck})
+				m, merr = nil, store.ErrNotFound
+			}
+		}
+	}
+
 	start, end, ranged := resolveRange(size, first, last, suffix)
 	if size > 0 && (start > end || start >= size) {
 		return nil, store.ErrInvalidRange
 	}
 	if size == 0 {
-		if _, err := t.Ensure(ctx, bucket, key); err != nil {
-			return nil, err
-		}
-		sm, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, ck, 0, -1, -1, nil)
-		if err != nil {
-			return nil, err
-		}
-		return &Object{Size: 0, ETag: sm.ETag, ContentType: sm.ContentType,
-			LastModified: sm.CreatedAt, Body: body}, nil
-	}
-	length := end - start + 1
-	version := fmt.Sprintf("%d-%d", size, attrs.LastModified.UnixNano())
-
-	m, merr := t.store.MetaKind(ctx, ns.Cache, t.namespace, ck)
-	if merr == nil && m.OriginETag != "" && m.OriginETag != version {
-		// Origin moved on: never serve stale bytes.
-		_, _ = t.store.CacheDel(ctx, t.namespace, []string{ck})
-		m, merr = nil, store.ErrNotFound
-	}
-	fresh := merr == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl
-	if fresh || length == size || size <= fullCacheMax {
-		if !fresh {
-			m, err = t.Ensure(ctx, bucket, key)
+		if !valid {
+			var err error
+			m, err = t.fill(ctx, ck, key, 0, version)
 			if err != nil {
+				return nil, err
+			}
+		}
+		return &Object{
+			Size: 0, ETag: m.ETag, ContentType: m.ContentType,
+			LastModified: m.CreatedAt, Body: io.NopCloser(bytes.NewReader(nil)), Hit: valid,
+		}, nil
+	}
+
+	length := end - start + 1
+	if valid || length == size || size <= fullCacheMax {
+		if !valid {
+			if _, err := t.fill(ctx, ck, key, size, version); err != nil {
 				return nil, err
 			}
 		}
@@ -277,66 +284,127 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 	}
 	return &Object{
 		Size: size, ETag: etagFor(version), ContentType: contentTypeFor(key),
-		LastModified: attrs.LastModified, Body: rc, Start: start, End: end, Ranged: ranged,
+		LastModified: lastMod, Body: rc, Start: start, End: end, Ranged: ranged,
 	}, nil
 }
 
-// resolveRange maps S3 range headers onto [start,end].
-func resolveRange(size, first, last, suffix int64) (int64, int64, bool) {
-	if suffix >= 0 {
-		return max(size-suffix, 0), size - 1, true
+// fill downloads ck from the origin under the fill semaphore, stores it in the
+// cache namespace with version, and returns the stored metadata.
+func (t *Tier) fill(ctx context.Context, ck, key string, size int64, version string) (*store.Meta, error) {
+	select {
+	case t.fills <- struct{}{}:
+		defer func() { <-t.fills }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	start := max(first, 0)
-	end := size - 1
-	if last >= 0 {
-		end = min(last, size-1)
-	}
-	return start, end, first > 0 || last >= 0
-}
-
-func etagFor(version string) string {
-	sum := md5.Sum([]byte(version))
-	return hex.EncodeToString(sum[:])
-}
-
-// Upload writes through to the origin and refreshes the cached copy.
-func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, contentType string) error {
-	ck := t.key(bucket, key)
-	pr, pw := io.Pipe()
-	uploadErr := make(chan error, 1)
-	go func() { uploadErr <- t.origin.Upload(ctx, ck, pr) }()
-
-	exp := time.Now().Add(t.retention)
-	w, err := t.store.StartObjectKind(ctx, ns.Cache, t.namespace, ck,
-		store.Unconditional, "", nil, contentType, &exp, false, "")
+	rc, err := t.origin.Get(ctx, ck)
 	if err != nil {
-		_ = pw.CloseWithError(err)
-		<-uploadErr
-		return err
-	}
-	_, copyErr := io.Copy(io.MultiWriter(pw, w), body)
-	_ = pw.CloseWithError(copyErr)
-	upErr := <-uploadErr
-	if copyErr != nil {
-		w.Abort()
-		return copyErr
-	}
-	if upErr != nil {
-		w.Abort()
-		return upErr
-	}
-	if _, err := w.Finish(nil); err != nil {
-		return err
-	}
-	// Record the uploaded version so the next read revalidates cheaply.
-	if attrs, err := t.origin.Attributes(ctx, ck); err == nil {
-		version := fmt.Sprintf("%d-%d", attrs.Size, attrs.LastModified.UnixNano())
-		if sc, err := ns.Cache.Schema(t.namespace); err == nil {
-			_, _ = t.store.Pool().Exec(ctx,
-				`UPDATE "`+sc+`".objects SET origin_etag = $2 WHERE key = $1`, ck, version)
+		if t.origin.IsObjNotFoundErr(err) {
+			return nil, store.ErrNotFound
 		}
+		return nil, err
 	}
-	return nil
+	sp, cleanup, err := spoolStream(rc)
+	_ = rc.Close()
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	return t.storeSpooled(ctx, ck, contentTypeFor(key), version, sp)
+}
+
+type spooled struct {
+	r    io.ReadSeeker
+	data []byte
+	size int64
+}
+
+// spoolStream buffers r into memory (<= memFillMax) or a temporary file so no
+// PostgreSQL connection is held during network I/O.
+func spoolStream(r io.Reader) (spooled, func(), error) {
+	head, err := io.ReadAll(io.LimitReader(r, memFillMax+1))
+	if err != nil {
+		return spooled{}, nil, err
+	}
+	if len(head) <= memFillMax {
+		return spooled{
+			r:    bytes.NewReader(head),
+			data: head,
+			size: int64(len(head)),
+		}, func() {}, nil
+	}
+	tmp, err := os.CreateTemp("", "pgvs3-fill-*")
+	if err != nil {
+		return spooled{}, nil, err
+	}
+	name := tmp.Name()
+	clean := func() { _ = tmp.Close(); _ = os.Remove(name) }
+	if _, err := tmp.Write(head); err != nil {
+		clean()
+		return spooled{}, nil, err
+	}
+	n, err := io.Copy(tmp, r)
+	if err != nil {
+		clean()
+		return spooled{}, nil, err
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		clean()
+		return spooled{}, nil, err
+	}
+	return spooled{r: tmp, size: int64(len(head)) + n}, clean, nil
+}
+
+func (t *Tier) storeSpooled(ctx context.Context, ck, ct, version string, sp spooled) (*store.Meta, error) {
+	exp := time.Now().Add(t.retention)
+	if sp.data != nil && int64(len(sp.data)) <= int64(ns.Cache.InlineMax()) {
+		return t.store.PutInlineKind(ctx, ns.Cache, t.namespace, ck, sp.data,
+			store.Unconditional, "", nil, ct, &exp, false, version)
+	}
+	if _, err := sp.r.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	w, err := t.store.StartObjectKind(ctx, ns.Cache, t.namespace, ck,
+		store.Unconditional, "", nil, ct, &exp, false, version)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(w, sp.r); err != nil {
+		w.Abort()
+		return nil, err
+	}
+	pub, err := w.Finish(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &store.Meta{
+		FileID: pub.FileID, Size: pub.Size, SHA256: pub.SHA256, ETag: pub.ETag,
+		ContentType: ct, CreatedAt: time.Now(), ExpiresAt: &exp, OriginETag: version,
+	}, nil
+}
+
+// Upload spools the body, uploads it to the origin, and populates the cache
+// without holding a database connection during network I/O.
+func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, contentType string) (string, error) {
+	ck := t.key(bucket, key)
+	sp, cleanup, err := spoolStream(body)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+
+	if err := t.origin.Upload(ctx, ck, sp.r); err != nil {
+		return "", err
+	}
+	var version string
+	if attrs, err := t.origin.Attributes(ctx, ck); err == nil {
+		version = versionFor(attrs)
+	}
+	m, err := t.storeSpooled(ctx, ck, contentType, version, sp)
+	if err != nil {
+		return "", err
+	}
+	return m.ETag, nil
 }
 
 // Delete removes the object from the origin and the cache.
@@ -387,6 +455,28 @@ func (t *Tier) List(ctx context.Context, bucket, prefix, after string, limit int
 }
 
 var errStopIter = errors.New("stop iteration")
+
+// resolveRange maps S3 range headers onto [start,end].
+func resolveRange(size, first, last, suffix int64) (int64, int64, bool) {
+	if suffix >= 0 {
+		return max(size-suffix, 0), size - 1, true
+	}
+	start := max(first, 0)
+	end := size - 1
+	if last >= 0 {
+		end = min(last, size-1)
+	}
+	return start, end, first > 0 || last >= 0
+}
+
+func versionFor(attrs objstore.ObjectAttributes) string {
+	return fmt.Sprintf("%d-%d", attrs.Size, attrs.LastModified.UnixNano())
+}
+
+func etagFor(version string) string {
+	sum := md5.Sum([]byte(version))
+	return hex.EncodeToString(sum[:])
+}
 
 func (t *Tier) touch(ctx context.Context, ck string) {
 	sc, err := ns.Cache.Schema(t.namespace)
