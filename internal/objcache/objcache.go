@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"mime"
@@ -15,11 +16,11 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/go-kit/log"
-	"github.com/jackc/pgx/v5"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/objstore/providers/s3"
@@ -42,6 +43,11 @@ type Tier struct {
 	group     singleflight.Group
 	meta      *s3Meta
 	log       *slog.Logger
+	keyLocks  [64]sync.Mutex
+
+	cancel    context.CancelFunc
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // memFillMax is the largest origin body buffered in memory before writing to
@@ -57,6 +63,10 @@ const maxListingEntries = 1_000_000
 // request. Above it, ranges are passed through to the origin so a footer read
 // never pulls a multi-GB file.
 const fullCacheMax = 8 << 20
+
+// errPendingOrigin means a multipart completion is still waiting for its
+// origin upload. It must not be overwritten by a read-through fill.
+var errPendingOrigin = errors.New("cache object is pending origin upload")
 
 // Config is the subset of the Thanos objstore config pgvs3 ships with.
 type Config struct {
@@ -116,7 +126,8 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 			log.Warn("origin metadata unavailable; falling back to extension content types", "err", err)
 		}
 	}
-	return &Tier{
+	ctx, cancel := context.WithCancel(context.Background())
+	t := &Tier{
 		origin:    b,
 		store:     st,
 		namespace: namespace,
@@ -126,13 +137,33 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 		completes: make(chan struct{}, maxFills),
 		meta:      meta,
 		log:       log,
-	}, nil
+		cancel:    cancel,
+		done:      make(chan struct{}),
+	}
+	go t.runPending(ctx)
+	return t, nil
 }
 
-func (t *Tier) Name() string                  { return t.namespace }
-func (t *Tier) Origin() objstore.Bucket       { return t.origin }
-func (t *Tier) Close() error                  { return t.origin.Close() }
+func (t *Tier) Name() string            { return t.namespace }
+func (t *Tier) Origin() objstore.Bucket { return t.origin }
+func (t *Tier) Close() error {
+	t.closeOnce.Do(func() {
+		t.cancel()
+		<-t.done
+	})
+	return t.origin.Close()
+}
 func (t *Tier) key(bucket, key string) string { return bucket + "/" + key }
+
+// lockKey serializes writes and pending flushes for a key. A fixed stripe set
+// avoids an unbounded per-key lock map; collisions only reduce concurrency.
+func (t *Tier) lockKey(ck string) func() {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(ck))
+	mu := &t.keyLocks[h.Sum32()%uint32(len(t.keyLocks))]
+	mu.Lock()
+	return mu.Unlock
+}
 
 // Object is one origin response, served from the cache or passed through.
 type Object struct {
@@ -163,7 +194,8 @@ func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
-	if err == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl {
+	pending := err == nil && store.IsPendingOrigin(m.OriginETag)
+	if err == nil && !pending && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl {
 		return &Object{
 			Size: m.Size, ETag: originETag(m), ContentType: m.ContentType,
 			UserMetadata: m.UserMetadata, LastModified: m.CreatedAt,
@@ -178,7 +210,7 @@ func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 		return nil, aerr
 	}
 	version := versionFor(a)
-	if err == nil && m.Size == a.Size && m.OriginETag == version {
+	if err == nil && !pending && m.Size == a.Size && m.OriginETag == version {
 		t.touch(ctx, ck)
 		return &Object{
 			Size: m.Size, ETag: originETag(m), ContentType: m.ContentType,
@@ -205,7 +237,8 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 	if merr != nil && !errors.Is(merr, store.ErrNotFound) {
 		return nil, merr
 	}
-	valid := merr == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl
+	pending := merr == nil && store.IsPendingOrigin(m.OriginETag)
+	valid := merr == nil && !pending && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl
 
 	var (
 		size    int64
@@ -231,7 +264,7 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 		lastMod = a.LastModified
 		version = versionFor(a)
 		ct = a.ContentType
-		if merr == nil {
+		if merr == nil && !pending {
 			if m.Size == size && m.OriginETag == version {
 				t.touch(ctx, ck)
 				valid = true
@@ -252,9 +285,21 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 		return nil, store.ErrInvalidRange
 	}
 	if size == 0 {
+		if pending {
+			return &Object{
+				Size: 0, ETag: etagForAttrs(a), ContentType: ct,
+				LastModified: lastMod, Body: io.NopCloser(bytes.NewReader(nil)),
+			}, nil
+		}
 		if !valid {
 			var err error
 			m, err = t.fill(ctx, ck, key, 0, version, ct)
+			if errors.Is(err, errPendingOrigin) {
+				return &Object{
+					Size: 0, ETag: etagForAttrs(a), ContentType: ct,
+					LastModified: lastMod, Body: io.NopCloser(bytes.NewReader(nil)),
+				}, nil
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -267,15 +312,24 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 	}
 
 	length := end - start + 1
+	if pending {
+		return t.passThrough(ctx, ck, start, length, size, end, ranged, a, ct, lastMod)
+	}
 	if valid || length == size || size <= fullCacheMax {
 		if !valid {
-			if _, err := t.fill(ctx, ck, key, size, version, ct); err != nil {
+			if _, err := t.fill(ctx, ck, key, size, version, ct); errors.Is(err, errPendingOrigin) {
+				return t.passThrough(ctx, ck, start, length, size, end, ranged, a, ct, lastMod)
+			} else if err != nil {
 				return nil, err
 			}
 		}
 		sm, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, ck, start, end, -1, nil)
 		if err != nil {
 			return nil, err
+		}
+		if store.IsPendingOrigin(sm.OriginETag) {
+			_ = body.Close()
+			return t.openPending(ctx, ck, key, first, last, suffix)
 		}
 		return &Object{
 			Size: sm.Size, ETag: originETagSlice(sm), ContentType: sm.ContentType,
@@ -285,6 +339,39 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 		}, nil
 	}
 
+	return t.passThrough(ctx, ck, start, length, size, end, ranged, a, ct, lastMod)
+}
+
+// openPending serves an object from the origin after a concurrent multipart
+// completion replaced a committed cache object with a pending one. The caller
+// must not serve the pending cache bytes.
+func (t *Tier) openPending(ctx context.Context, ck, key string, first, last, suffix int64) (*Object, error) {
+	a, err := t.attrs(ctx, ck, key)
+	if err != nil {
+		if t.origin.IsObjNotFoundErr(err) {
+			return nil, store.ErrNotFound
+		}
+		return nil, err
+	}
+	ct := a.ContentType
+	if ct == "" {
+		ct = contentTypeFor(key)
+	}
+	size := a.Size
+	start, end, ranged := resolveRange(size, first, last, suffix)
+	if size > 0 && (start > end || start >= size) {
+		return nil, store.ErrInvalidRange
+	}
+	if size == 0 {
+		return &Object{
+			Size: 0, ETag: etagForAttrs(a), ContentType: ct,
+			LastModified: a.LastModified, Body: io.NopCloser(bytes.NewReader(nil)),
+		}, nil
+	}
+	return t.passThrough(ctx, ck, start, end-start+1, size, end, ranged, a, ct, a.LastModified)
+}
+
+func (t *Tier) passThrough(ctx context.Context, ck string, start, length, size, end int64, ranged bool, a originAttrs, ct string, lastMod time.Time) (*Object, error) {
 	rc, err := t.origin.GetRange(ctx, ck, start, length)
 	if err != nil {
 		if t.origin.IsObjNotFoundErr(err) {
@@ -304,6 +391,11 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 // cold key pulls from the origin only once.
 func (t *Tier) fill(ctx context.Context, ck, key string, _ int64, version, ct string) (*store.Meta, error) {
 	ch := t.group.DoChan(ck, func() (any, error) {
+		unlock := t.lockKey(ck)
+		defer unlock()
+		if cur, err := t.store.MetaHeaderKind(ctx, ns.Cache, t.namespace, ck); err == nil && store.IsPendingOrigin(cur.OriginETag) {
+			return nil, errPendingOrigin
+		}
 		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 		defer cancel()
 		select {
@@ -419,10 +511,15 @@ func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, u
 		return nil, err
 	}
 	defer cleanup()
+	unlock := t.lockKey(ck)
+	defer unlock()
 
 	if err := t.origin.Upload(ctx, ck, sp.r); err != nil {
 		return nil, err
 	}
+	// The origin now has this write; an older pending multipart completion for
+	// the same key must not be flushed over it.
+	_ = t.store.ClearPendingUpload(context.WithoutCancel(ctx), t.namespace, ck)
 	var version string
 	var attrs originAttrs
 	if a, err := t.attrs(ctx, ck, key); err == nil {
@@ -431,6 +528,9 @@ func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, u
 	}
 	m, err := t.storeSpooled(ctx, ck, userMeta, contentType, version, sp)
 	if err != nil {
+		// Drop a superseded pending cache object if the replacement cache write
+		// failed; the origin already has the new bytes.
+		_, _ = t.store.CacheDel(context.WithoutCancel(ctx), t.namespace, []string{ck})
 		return nil, err
 	}
 	if !attrs.LastModified.IsZero() {
@@ -469,8 +569,9 @@ func (t *Tier) StartPart(ctx context.Context, uploadID, bucket, key string, part
 	return t.store.StartPartKind(ctx, ns.Cache, uploadID, t.namespace, t.key(bucket, key), partNo)
 }
 
-// CompleteUpload publishes the multipart object in the PostgreSQL cache and
-// writes it through to the origin so both hold the completed object immediately.
+// CompleteUpload publishes the multipart object in the cache as pending,
+// records an outbox row, and flushes it to the origin. Readers treat the
+// pending object as a miss, so a failed or crashed upload cannot be served.
 func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string, listed []store.ListedPart) (*store.Completed, error) {
 	ck := t.key(bucket, key)
 	exp := time.Now().Add(t.retention)
@@ -480,41 +581,104 @@ func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string,
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	done, err := t.store.CompleteUploadKindUpload(ctx, ns.Cache, uploadID, t.namespace, ck, listed, &exp,
-		func(ctx context.Context, tx pgx.Tx, schema string, ids []int64) error {
-			pr, pw := io.Pipe()
-			errCh := make(chan error, 1)
-			go func() {
-				err := store.StreamChunks(ctx, tx, schema, ids, pw)
-				_ = pw.CloseWithError(err)
-				errCh <- err
-			}()
-			upErr := t.origin.Upload(ctx, ck, pr)
-			if upErr != nil {
-				_ = pr.CloseWithError(upErr)
-			} else {
-				_ = pr.Close()
-			}
-			streamErr := <-errCh
-			if upErr != nil {
-				return upErr
-			}
-			return streamErr
-		})
+	unlock := t.lockKey(ck)
+	defer unlock()
+	done, err := t.store.CompleteUploadKindPending(ctx, ns.Cache, uploadID, t.namespace, ck, listed, &exp)
 	if err != nil {
 		return nil, err
 	}
+	_ = t.store.DeleteOriginEntries(context.WithoutCancel(ctx), t.namespace, []string{ck})
+	if err := t.flushOneLocked(ctx, ck, store.PendingOriginToken(uploadID)); err != nil {
+		return nil, err
+	}
 	if a, err := t.attrs(ctx, ck, key); err == nil {
-		t.setOriginETag(ctx, ck, versionFor(a))
 		done.ETag = etagForAttrs(a)
-		_ = t.store.UpsertOriginEntry(ctx, t.namespace, store.OriginListEntry{
-			Key: ck, Size: done.Size, ETag: etagForAttrs(a),
-			ContentType: done.ContentType, LastModified: a.LastModified,
-		})
 	}
 	done.Bucket = bucket
 	done.Key = key
 	return done, nil
+}
+
+// flushOne coalesces concurrent attempts for the same key.
+func (t *Tier) flushOne(ctx context.Context, ck, token string) error {
+	unlock := t.lockKey(ck)
+	defer unlock()
+	_, err, _ := t.group.Do("pending:"+ck, func() (any, error) {
+		return nil, t.flushOneLocked(ctx, ck, token)
+	})
+	return err
+}
+
+// flushOneLocked spools the pending cache object, uploads it to the origin,
+// then marks the cache object committed. The PostgreSQL connection is released
+// before the origin upload starts.
+func (t *Tier) flushOneLocked(ctx context.Context, ck, token string) error {
+	sm, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, ck, 0, -1, -1, nil)
+	if errors.Is(err, store.ErrNotFound) {
+		_ = t.store.ClearPendingUpload(context.WithoutCancel(ctx), t.namespace, ck)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if sm.OriginETag != token {
+		_ = t.store.ClearPendingUploadToken(context.WithoutCancel(ctx), t.namespace, ck, token)
+		return nil
+	}
+	sp, cleanup, err := spoolStream(body)
+	_ = body.Close()
+	if err != nil {
+		_ = t.store.FailPendingUpload(context.WithoutCancel(ctx), t.namespace, ck, token, err)
+		return err
+	}
+	defer cleanup()
+	if err := t.origin.Upload(ctx, ck, sp.r); err != nil {
+		_ = t.store.FailPendingUpload(context.WithoutCancel(ctx), t.namespace, ck, token, err)
+		return err
+	}
+	version := sm.ETag
+	var attrs originAttrs
+	if a, err := t.attrs(ctx, ck, ck); err == nil {
+		attrs = a
+		version = versionFor(a)
+	}
+	if err := t.store.MarkOriginCommitted(ctx, t.namespace, ck, token, version); err != nil {
+		_ = t.store.FailPendingUpload(context.WithoutCancel(ctx), t.namespace, ck, token, err)
+		return err
+	}
+	if !attrs.LastModified.IsZero() {
+		_ = t.store.UpsertOriginEntry(ctx, t.namespace, store.OriginListEntry{
+			Key: ck, Size: sm.Size, ETag: etagForAttrs(attrs),
+			ContentType: sm.ContentType, LastModified: attrs.LastModified,
+		})
+	}
+	return nil
+}
+
+func (t *Tier) runPending(ctx context.Context) {
+	defer close(t.done)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		pending, err := t.store.PendingUploads(ctx, t.namespace, 8)
+		if err != nil {
+			t.log.Warn("list pending origin uploads", "err", err)
+			continue
+		}
+		for _, p := range pending {
+			flushCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			err := t.flushOne(flushCtx, p.Key, p.Token)
+			cancel()
+			if err != nil {
+				t.log.Warn("pending origin upload failed", "key", p.Key, "attempt", p.Attempts+1, "err", err)
+			}
+		}
+	}
 }
 
 // AbortUpload discards an in-progress multipart upload in the cache namespace.
@@ -527,24 +691,19 @@ func (t *Tier) ListParts(ctx context.Context, uploadID, bucket, key string, max 
 	return t.store.ListPartsKind(ctx, ns.Cache, uploadID, t.namespace, t.key(bucket, key), max, marker)
 }
 
-func (t *Tier) setOriginETag(ctx context.Context, ck, version string) {
-	sc, err := ns.Cache.Schema(t.namespace)
-	if err != nil {
-		return
-	}
-	_, _ = t.store.Pool().Exec(ctx,
-		`UPDATE "`+sc+`".objects SET origin_etag = $2, created_at = now() WHERE key = $1`, ck, version)
-}
-
 // Delete removes the object from the origin and the cache.
 func (t *Tier) Delete(ctx context.Context, bucket, key string) error {
 	ck := t.key(bucket, key)
+	unlock := t.lockKey(ck)
+	defer unlock()
 	err := t.origin.Delete(ctx, ck)
 	if err != nil && !t.origin.IsObjNotFoundErr(err) {
 		return err
 	}
-	_, _ = t.store.CacheDel(ctx, t.namespace, []string{ck})
-	_ = t.store.DeleteOriginEntries(ctx, t.namespace, []string{ck})
+	cleanupCtx := context.WithoutCancel(ctx)
+	_, _ = t.store.CacheDel(cleanupCtx, t.namespace, []string{ck})
+	_ = t.store.DeleteOriginEntries(cleanupCtx, t.namespace, []string{ck})
+	_ = t.store.ClearPendingUpload(cleanupCtx, t.namespace, ck)
 	return nil
 }
 
@@ -560,19 +719,21 @@ type DeleteResult struct {
 // S3-shaped per-key results.
 func (t *Tier) DeleteMany(ctx context.Context, bucket string, keys []string) []DeleteResult {
 	results := make([]DeleteResult, 0, len(keys))
-	evict := make([]string, 0, len(keys))
 	for _, k := range keys {
 		ck := t.key(bucket, k)
-		if err := t.origin.Delete(ctx, ck); err != nil && !t.origin.IsObjNotFoundErr(err) {
+		unlock := t.lockKey(ck)
+		err := t.origin.Delete(ctx, ck)
+		if err != nil && !t.origin.IsObjNotFoundErr(err) {
+			unlock()
 			results = append(results, DeleteResult{Key: k, Err: err})
 			continue
 		}
-		evict = append(evict, ck)
+		cleanupCtx := context.WithoutCancel(ctx)
+		_, _ = t.store.CacheDel(cleanupCtx, t.namespace, []string{ck})
+		_ = t.store.DeleteOriginEntries(cleanupCtx, t.namespace, []string{ck})
+		_ = t.store.ClearPendingUpload(cleanupCtx, t.namespace, ck)
+		unlock()
 		results = append(results, DeleteResult{Key: k})
-	}
-	if len(evict) > 0 {
-		_, _ = t.store.CacheDel(ctx, t.namespace, evict)
-		_ = t.store.DeleteOriginEntries(ctx, t.namespace, evict)
 	}
 	return results
 }
@@ -672,7 +833,7 @@ func (t *Tier) listDirect(ctx context.Context, bucket, prefix, after string, lim
 		rows, err := t.store.ListKind(ctx, ns.Cache, t.namespace, pfx, pfx+"\U0010FFFF", bucket+"/"+after, len(rels)*2)
 		if err == nil {
 			for _, r := range rows {
-				if time.Since(r.CreatedAt) < t.ttl {
+				if time.Since(r.CreatedAt) < t.ttl && !store.IsPendingOrigin(r.OriginETag) {
 					cached[strings.TrimPrefix(r.Key, bucket+"/")] = r
 				}
 			}

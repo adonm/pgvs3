@@ -171,6 +171,12 @@ and switching `PGVS3_URL`.
   because even `ReceiveMessage` writes a lease.
 - **Kubernetes / Helm:** `deploy/charts/pgvs3` deploys a stateless multi-AZ
   `Deployment` with optional HPA (`autoscaling.enabled=true`) and `PodDisruptionBudget`.
+  Hardened defaults include a nonroot read-only root filesystem with a writable
+  `/tmp` emptyDir, no service-account token automount, a 60s termination grace
+  period, and a default-deny NetworkPolicy that allows same-namespace clients.
+  Add `networkPolicy.ingress.from` peers for other namespaces. Setting
+  `networkPolicy.egress.allowAll=false` also requires explicit DNS and PostgreSQL
+  egress rules. An optional Prometheus Operator `ServiceMonitor` is available.
   Ensure PostgreSQL `max_connections` exceeds `replicas × PGVS3_POOL_MAX × 2`
   (main pool + chunk pool).
 - **Failure handling:**
@@ -265,14 +271,23 @@ larger than 8 MiB are passed straight through to the origin (`GetRange`,
 `X-Cache: MISS`) instead of downloading the whole object, while full reads and
 ranges on already-cached objects are served from PostgreSQL.
 
-Writes are **write-through**: single `PUT`, `CopyObject`, and multipart uploads
-(`CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`) write to
-both the origin and `s3c_<namespace>`, so other cache consumers immediately
-read `X-Cache: HIT` without re-pulling from the origin. `DELETE` and
-`DeleteObjects` remove from both. `--cache-retention` evicts idle entries.
-Fills and single-request uploads buffer the body (memory ≤8 MiB, otherwise a
-temp file) before opening a PostgreSQL writer so origin latency never holds
-pool connections. Supported origin types are `s3`, `filesystem` and `inmem`.
+Single `PUT`, `CopyObject`, and `DELETE`/`DeleteObjects` write through to both
+the origin and `s3c_<namespace>`. Multipart completion first publishes the
+assembled object to the cache with a `pending:` origin sentinel and an
+`s3p.pending_uploads` outbox row, then uploads it to the origin. Readers treat
+pending cache objects as misses (and serve an older origin object if one
+exists), so pending bytes are never visible. A successful
+`CompleteMultipartUpload` response means the first origin flush succeeded; if
+that flush fails, the request returns an error but the outbox row is retained
+and a background worker retries with bounded backoff. The completion consumes
+the multipart `uploadId`, so a failed completion cannot be replayed with the
+same id; poll `GET`/`HEAD` after the worker has had time to retry. `DELETE` and
+`DeleteObjects` remove cache entries and outbox rows as well. Inspect pending
+work with `SELECT namespace, key, attempts, next_attempt, last_error FROM
+s3p.pending_uploads;`. `--cache-retention` evicts idle entries. Fills and
+single-request uploads buffer the body (memory ≤8 MiB, otherwise a temp file)
+before opening a PostgreSQL writer so origin latency never holds pool
+connections. Supported origin types are `s3`, `filesystem` and `inmem`.
 
 ## Admission control
 

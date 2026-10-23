@@ -3,7 +3,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,8 +11,6 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/testutil"
@@ -191,7 +188,7 @@ func TestOriginListingIndex(t *testing.T) {
 	}
 }
 
-func TestCompleteUploadOriginFirst(t *testing.T) {
+func TestCompleteUploadPendingOutbox(t *testing.T) {
 	ctx := testCtx
 	cache := unique("origin")
 	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
@@ -216,53 +213,49 @@ func TestCompleteUploadOriginFirst(t *testing.T) {
 		}
 		parts = append(parts, ListedPart{PartNo: int32(i + 1), ETag: pub.ETag})
 	}
-	var uploaded []byte
-	done, err := testStore.CompleteUploadKindUpload(ctx, ns.Cache, uploadID, cache, "bkt/mp", parts, nil,
-		func(ctx context.Context, tx pgx.Tx, schema string, ids []int64) error {
-			var buf bytes.Buffer
-			if err := StreamChunks(ctx, tx, schema, ids, &buf); err != nil {
-				return err
-			}
-			uploaded = buf.Bytes()
-			return nil
-		})
+	done, err := testStore.CompleteUploadKindPending(ctx, ns.Cache, uploadID, cache, "bkt/mp", parts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(uploaded) != "hello world" || done.Size != 11 {
-		t.Fatalf("uploaded=%q size=%d", uploaded, done.Size)
+	if done.Size != 11 {
+		t.Fatalf("size = %d", done.Size)
 	}
 	m, err := testStore.MetaHeaderKind(ctx, ns.Cache, cache, "bkt/mp")
-	if err != nil || m.Size != 11 {
-		t.Fatalf("published object: m=%+v err=%v", m, err)
+	if err != nil || !IsPendingOrigin(m.OriginETag) {
+		t.Fatalf("pending object: m=%+v err=%v", m, err)
 	}
-
-	// A failed origin callback must leave the cache unpublished.
-	uploadID, err = testStore.CreateUploadKind(ctx, ns.Cache, cache, "bkt/mp-fail", nil, "text/plain", nil)
-	if err != nil {
+	var token string
+	if err := testStore.pool.QueryRow(ctx,
+		"SELECT token FROM s3p.pending_uploads WHERE namespace = $1 AND key = $2",
+		cache, "bkt/mp").Scan(&token); err != nil {
 		t.Fatal(err)
 	}
-	w, err := testStore.StartPartKind(ctx, ns.Cache, uploadID, cache, "bkt/mp-fail", 1)
-	if err != nil {
+	if token != PendingOriginToken(uploadID) {
+		t.Fatalf("token = %q, want %q", token, PendingOriginToken(uploadID))
+	}
+	// A stale flush must not publish over a newer pending token.
+	if err := testStore.MarkOriginCommitted(ctx, cache, "bkt/mp", "pending:stale", "stale-v1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Write([]byte("nope")); err != nil {
+	m, err = testStore.MetaHeaderKind(ctx, ns.Cache, cache, "bkt/mp")
+	if err != nil || !IsPendingOrigin(m.OriginETag) {
+		t.Fatalf("stale commit changed pending object: m=%+v err=%v", m, err)
+	}
+	if err := testStore.MarkOriginCommitted(ctx, cache, "bkt/mp", token, "origin-v1"); err != nil {
 		t.Fatal(err)
 	}
-	pub, err := w.Finish(nil)
-	if err != nil {
+	m, err = testStore.MetaHeaderKind(ctx, ns.Cache, cache, "bkt/mp")
+	if err != nil || m.OriginETag != "origin-v1" {
+		t.Fatalf("committed object: m=%+v err=%v", m, err)
+	}
+	var pending int
+	if err := testStore.pool.QueryRow(ctx,
+		"SELECT count(*) FROM s3p.pending_uploads WHERE namespace = $1 AND key = $2",
+		cache, "bkt/mp").Scan(&pending); err != nil {
 		t.Fatal(err)
 	}
-	_, err = testStore.CompleteUploadKindUpload(ctx, ns.Cache, uploadID, cache, "bkt/mp-fail",
-		[]ListedPart{{PartNo: 1, ETag: pub.ETag}}, nil,
-		func(context.Context, pgx.Tx, string, []int64) error {
-			return errors.New("origin unavailable")
-		})
-	if err == nil {
-		t.Fatal("expected origin failure")
-	}
-	if _, err := testStore.MetaHeaderKind(ctx, ns.Cache, cache, "bkt/mp-fail"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("failed completion published an object: %v", err)
+	if pending != 0 {
+		t.Fatalf("pending rows = %d, want 0", pending)
 	}
 }
 
@@ -309,8 +302,8 @@ func TestGooseMigrationsAndIdempotentInit(t *testing.T) {
 		"SELECT max(version_id) FROM s3p.goose_db_version").Scan(&gooseVersion); err != nil {
 		t.Fatal(err)
 	}
-	if gooseVersion != 3 {
-		t.Fatalf("goose version = %d, want 3", gooseVersion)
+	if gooseVersion != 4 {
+		t.Fatalf("goose version = %d, want 4", gooseVersion)
 	}
 	var layout int
 	if err := testStore.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&layout); err != nil {
@@ -341,7 +334,7 @@ func TestInitAdoptsExistingLayoutWithoutGooseHistory(t *testing.T) {
 		"SELECT max(version_id) FROM s3p.goose_db_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Fatalf("goose version after adoption = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("goose version after adoption = %d, want 4", version)
 	}
 }

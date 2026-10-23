@@ -6,7 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -56,18 +56,20 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 // CompleteUploadKind validates the listed parts and publishes the multipart
 // object in a bucket or cache namespace.
 func (s *Store) CompleteUploadKind(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time) (*Completed, error) {
-	return s.completeUploadKind(ctx, kind, uploadID, requestBucket, requestKey, listed, expiresAt, nil)
+	return s.completeUploadKind(ctx, kind, uploadID, requestBucket, requestKey, listed, expiresAt, "")
 }
 
-// CompleteUploadKindUpload publishes only after upload has consumed the
-// selected object bytes. The callback runs inside the completion transaction,
-// before the object pointer is swapped, so a failed origin upload leaves the
-// cache unchanged. The callback must not use the transaction itself.
-func (s *Store) CompleteUploadKindUpload(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time, upload func(context.Context, pgx.Tx, string, []int64) error) (*Completed, error) {
-	return s.completeUploadKind(ctx, kind, uploadID, requestBucket, requestKey, listed, expiresAt, upload)
+// CompleteUploadKindPending publishes the cache object in a pending state and
+// records an outbox row. A background worker uploads it to the origin and calls
+// MarkOriginCommitted; readers treat the object as a cache miss until then.
+func (s *Store) CompleteUploadKindPending(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time) (*Completed, error) {
+	if kind != ns.Cache {
+		return nil, fmt.Errorf("pending multipart completion requires a cache namespace")
+	}
+	return s.completeUploadKind(ctx, kind, uploadID, requestBucket, requestKey, listed, expiresAt, pendingVersion(uploadID))
 }
 
-func (s *Store) completeUploadKind(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time, beforePublish func(context.Context, pgx.Tx, string, []int64) error) (*Completed, error) {
+func (s *Store) completeUploadKind(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time, pendingToken string) (*Completed, error) {
 	sc, err := nsSQLIdent(kind, requestBucket)
 	if err != nil {
 		return nil, err
@@ -171,13 +173,21 @@ func (s *Store) completeUploadKind(ctx context.Context, kind ns.Kind, uploadID, 
 	if expiresAt != nil {
 		target = &writerTarget{expiresAt: expiresAt}
 	}
-	if beforePublish != nil {
-		if err := beforePublish(ctx, tx, sc, ids); err != nil {
-			return nil, err
-		}
-	}
 	if err := swapObjectParts(ctx, tx, sc, requestBucket, key, target, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
 		return nil, err
+	}
+	if pendingToken != "" {
+		if _, err := tx.Exec(ctx, `UPDATE `+sc+`.objects SET origin_etag = $2 WHERE key = $1`, key, pendingToken); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO s3p.pending_uploads
+			(namespace, key, token, attempts, next_attempt, last_error, created_at)
+			VALUES ($1, $2, $3, 0, now(), NULL, now())
+			ON CONFLICT (namespace, key) DO UPDATE
+			  SET token = EXCLUDED.token, attempts = 0, next_attempt = now(), last_error = NULL`,
+			requestBucket, key, pendingToken); err != nil {
+			return nil, err
+		}
 	}
 	if len(selectedChecks) > 0 {
 		nos := make([]int32, len(selectedChecks))
@@ -206,34 +216,6 @@ func (s *Store) completeUploadKind(ctx context.Context, kind ns.Kind, uploadID, 
 		return nil, err
 	}
 	return &Completed{Bucket: requestBucket, Key: key, ETag: etag, Size: size, ContentType: contentType}, nil
-}
-
-// StreamChunks writes the concatenated chunk payloads for ids to w. It is
-// used by the cache tier to upload an assembled multipart object to the origin
-// before the cache publish commits.
-func StreamChunks(ctx context.Context, tx pgx.Tx, schema string, ids []int64, w io.Writer) error {
-	for _, id := range ids {
-		rows, err := tx.Query(ctx, `SELECT data FROM `+schema+`.chunks WHERE file_id = $1 ORDER BY no`, id)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var data []byte
-			if err := rows.Scan(&data); err != nil {
-				rows.Close()
-				return err
-			}
-			if _, err := w.Write(data); err != nil {
-				rows.Close()
-				return err
-			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // AbortUpload discards an in-progress multipart upload.

@@ -89,8 +89,11 @@ clients ── S3 / SQS / HTTP / RESP2 ──┐
   leases because even `ReceiveMessage` writes visibility state.
 - **The cache tier is optional and asymmetric.** With `--origin-config`, S3
   reads become read-through cache fills and writes write through to a thanos
-  objstore origin. The origin remains the source of truth; the PostgreSQL cache
-  is an accelerator, not a second durable copy.
+  objstore origin. Multipart completion publishes a `pending:` cache object and
+  an `s3p.pending_uploads` outbox row, then uploads to the origin; readers treat
+  pending objects as misses, and a background worker retries failed or crashed
+  uploads with bounded backoff. The origin remains the source of truth; the
+  PostgreSQL cache is an accelerator, not a second durable copy.
 
 ## Scope boundaries
 

@@ -286,7 +286,7 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 		return err
 	}
 	defer conn.Release()
-	for _, rel := range []string{"s3p.layout", "s3p.namespaces", "s3p.file_ids", "s3p.origin_listing", "s3p.origin_listing_state", "s3p.goose_db_version"} {
+	for _, rel := range []string{"s3p.layout", "s3p.namespaces", "s3p.file_ids", "s3p.origin_listing", "s3p.origin_listing_state", "s3p.goose_db_version", "s3p.pending_uploads"} {
 		var exists bool
 		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", rel).Scan(&exists); err != nil {
 			return err

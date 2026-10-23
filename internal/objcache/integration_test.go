@@ -167,7 +167,7 @@ func TestTierETagConsistency(t *testing.T) {
 	}
 }
 
-func TestTierMultipartOriginFirst(t *testing.T) {
+func TestTierMultipartPendingOutbox(t *testing.T) {
 	ctx := testCtx
 	f := newFixture(t)
 	uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp", nil, "text/plain", nil)
@@ -203,8 +203,11 @@ func TestTierMultipartOriginFirst(t *testing.T) {
 	if err != nil || head.Size != 11 {
 		t.Fatalf("head = %+v err=%v", head, err)
 	}
+	if n := f.pending(t, "mp"); n != 0 {
+		t.Fatalf("pending rows after success = %d", n)
+	}
 
-	// A failed origin upload must leave the cache unpublished.
+	// A failed origin upload leaves a pending outbox row and is never served.
 	uploadID, err = f.tier.CreateUpload(ctx, "bkt", "mp-fail", nil, "text/plain", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -223,13 +226,111 @@ func TestTierMultipartOriginFirst(t *testing.T) {
 	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o555); err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = os.Chmod(filepath.Join(f.dir, "bkt"), 0o755) }()
 	_, err = f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-fail",
 		[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}})
-	_ = os.Chmod(filepath.Join(f.dir, "bkt"), 0o755)
 	if err == nil {
 		t.Fatal("expected origin failure")
 	}
 	if _, err := f.tier.Head(ctx, "bkt", "mp-fail"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("failed completion published an object: %v", err)
 	}
+	if n := f.pending(t, "mp-fail"); n != 1 {
+		t.Fatalf("pending rows after failure = %d, want 1", n)
+	}
+
+	// Once the origin recovers, the outbox worker must publish the pending
+	// object without another client request.
+	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for f.pending(t, "mp-fail") != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("outbox worker did not clear the pending row")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	head, err = f.tier.Head(ctx, "bkt", "mp-fail")
+	if err != nil || head.Size != 4 {
+		t.Fatalf("retried object head = %+v err=%v", head, err)
+	}
+	if got := f.readOrigin(t, "bkt/mp-fail"); got != "nope" {
+		t.Fatalf("origin after retry = %q", got)
+	}
+}
+
+func TestTierPendingDoesNotHideOldOrigin(t *testing.T) {
+	ctx := testCtx
+	f := newFixture(t)
+	if _, err := f.tier.Upload(ctx, "bkt", "mp-old", strings.NewReader("old"), nil, "text/plain"); err != nil {
+		t.Fatal(err)
+	}
+	uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp-old", nil, "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp-old", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new!")); err != nil {
+		t.Fatal(err)
+	}
+	pub, err := w.Finish(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(filepath.Join(f.dir, "bkt"), 0o755) }()
+	_, err = f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-old",
+		[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}})
+	if err == nil {
+		t.Fatal("expected origin failure")
+	}
+	obj, err := f.tier.Open(ctx, "bkt", "mp-old", 0, -1, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(obj.Body)
+	_ = obj.Body.Close()
+	if err != nil || string(body) != "old" {
+		t.Fatalf("pending read = %q err=%v, want old origin object", body, err)
+	}
+	if n := f.pending(t, "mp-old"); n != 1 {
+		t.Fatalf("pending rows after failed completion = %d, want 1", n)
+	}
+
+	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for f.pending(t, "mp-old") != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("outbox worker did not clear the pending row")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	obj, err = f.tier.Open(ctx, "bkt", "mp-old", 0, -1, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err = io.ReadAll(obj.Body)
+	_ = obj.Body.Close()
+	if err != nil || string(body) != "new!" {
+		t.Fatalf("retried read = %q err=%v", body, err)
+	}
+}
+
+func (f *fixture) pending(t *testing.T, key string) int {
+	t.Helper()
+	var n int
+	if err := testStore.Pool().QueryRow(testCtx,
+		"SELECT count(*) FROM s3p.pending_uploads WHERE namespace = $1 AND key = $2",
+		f.tier.namespace, f.tier.key("bkt", key)).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

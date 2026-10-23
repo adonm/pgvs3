@@ -846,10 +846,11 @@ func (s *Store) DeleteManyKind(ctx context.Context, kind ns.Kind, name string, k
 }
 
 type Listed struct {
-	Key       string
-	Size      int64
-	ETag      string
-	CreatedAt time.Time
+	Key        string
+	Size       int64
+	ETag       string
+	OriginETag string
+	CreatedAt  time.Time
 }
 
 // List returns key-ordered objects in [prefix, prefixEnd) with key > after.
@@ -863,7 +864,7 @@ func (s *Store) ListKind(ctx context.Context, kind ns.Kind, name, prefix, prefix
 	if err != nil {
 		return nil, err
 	}
-	query := `SELECT key, size, etag, EXTRACT(EPOCH FROM created_at)::float8
+	query := `SELECT key, size, etag, COALESCE(origin_etag, ''), EXTRACT(EPOCH FROM created_at)::float8
 		FROM ` + sc + `.objects
 		WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
 		  AND key COLLATE "C" > $3
@@ -879,7 +880,7 @@ func (s *Store) ListKind(ctx context.Context, kind ns.Kind, name, prefix, prefix
 	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Listed, error) {
 		var l Listed
 		var epoch float64
-		err := row.Scan(&l.Key, &l.Size, &l.ETag, &epoch)
+		err := row.Scan(&l.Key, &l.Size, &l.ETag, &l.OriginETag, &epoch)
 		l.CreatedAt = time.Unix(0, int64(epoch*1e9))
 		return l, err
 	})

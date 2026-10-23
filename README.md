@@ -104,11 +104,13 @@ SELECT * FROM lake.events;
   confined to cache namespaces.
 - **Accelerating cache tier (`--origin-config`).** With a Thanos objstore YAML
   file, every S3 `GET` becomes a read-through cache in `s3c_<namespace>` with
-  TTL revalidation and write-through `PUT`/`DELETE`. Ranges above 8 MiB are
-  passed through to the origin, and fills are bounded (`--fill-concurrency`)
-  and spooled to memory or a temp file before touching PostgreSQL, so a slow
-  origin never pins a database connection. Supported origins: `s3`,
-  `filesystem` and `inmem`.
+  TTL revalidation and write-through `PUT`/`DELETE`. Multipart completion
+  publishes a `pending:` cache object plus an outbox row, flushes it to the
+  origin, and lets a background worker retry failures; readers treat pending
+  objects as misses. Ranges above 8 MiB are passed through to the origin, and
+  fills are bounded (`--fill-concurrency`) and spooled to memory or a temp file
+  before touching PostgreSQL, so a slow origin never pins a database
+  connection. Supported origins: `s3`, `filesystem` and `inmem`.
 - **Immutable files, atomic publish.** Writes stream into `chunks` via
   binary `COPY` under a new `file_id` and publish in the same transaction.
   Interrupted writes leave nothing visible.
@@ -208,7 +210,9 @@ Full tables and DuckDB `httpfs` benchmarks are in
   is not implemented.
 - **S3 cache tier:** read-through and write-through `GET`/`HEAD`/`PUT`/`CopyObject`/multipart uploads/`DELETE`/`DeleteObjects`/`ListObjectsV2` in front of an
   objstore origin (`X-Cache: HIT|MISS`), with TTL revalidation (`--cache-ttl`) and idle eviction
-  (`--cache-retention`). `ListObjectsV2` is served from a PostgreSQL listing index that is
+  (`--cache-retention`). Multipart completion uses a pending cache object plus
+  `s3p.pending_uploads` outbox; readers miss pending entries and a worker retries
+  origin uploads. `ListObjectsV2` is served from a PostgreSQL listing index that is
   rebuilt from the origin on a cold or stale prefix; write-through updates keep it current.
 - **RESP (Redis/Valkey) cache protocol on `:8014`:** supports `GET`, `SET`
   (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `SETNX`, `SETEX`,

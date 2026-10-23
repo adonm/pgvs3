@@ -2,7 +2,7 @@
 
 Status: **decisions recorded 2026-10-23; implementation in progress**. The
 trust-model wording, presigned-URL rejection, decoder hardening, SSE/ACL
-policy, per-key deletes, origin-first write-through, origin ETags, FIFO queues,
+policy, per-key deletes, pending/outbox multipart write-through, origin ETags, FIFO queues,
 the listing index, read-only SQS metadata, and the database budget guard are
 implemented. Verification and remaining polish are tracked below.
 
@@ -12,7 +12,7 @@ implemented. Verification and remaining polish are tracked below.
 | --- | --- |
 | 1. aws-chunked | **A+D** — strict 8 MiB cap, 128-byte header, reject unknown streaming algorithms, enforce decoded length when present, rolling buffer with no declared-size allocation |
 | 2. cache listing | **B** — PostgreSQL listing index |
-| 3. write-through | **A** — origin-first everywhere |
+| 3. write-through | **C+outbox** — pending sentinel plus `s3p.pending_uploads` |
 | 4. DeleteObjects | **A** — HTTP 200 with per-key `Deleted`/`Error`, `Quiet` honored |
 | 5. origin ETag/Content-Type | **B** — origin ETag plus real Content-Type |
 | 6. SQS FIFO | **B** — full FIFO (dedup, per-group ordering, sequence numbers; high-throughput deferred) |
@@ -161,15 +161,25 @@ only helps after the first listing and adds cache-invalidation work.
 
 The two write paths order their effects differently:
 
-- `Tier.Upload` writes the origin first, then PostgreSQL (`objcache.go:418`).
-- `Tier.CompleteUpload` publishes to PostgreSQL first, then uploads the whole
-  object to the origin (`objcache.go:458-475`). A concurrent reader can see a
-  "completed" object the origin does not have; if the origin upload fails, the
-  cache entry is deleted only after it was visible.
+- `Tier.Upload` writes the origin first, then PostgreSQL.
+- Multipart completion must assemble part rows into one object. Publishing the
+  cache first exposes bytes the origin does not have; uploading first holds a
+  PostgreSQL transaction and connection open across the origin network call.
+
+The implemented design uses a pending sentinel (`origin_etag =
+'pending:<upload-id>'`) plus an `s3p.pending_uploads` outbox row, published in
+the same transaction. Readers treat the sentinel as a miss, so pending bytes are
+never served. `CompleteMultipartUpload` then spools the pending object, releases
+the PostgreSQL connection, uploads it to the origin, and atomically swaps the
+sentinel for the origin version while deleting the outbox row. If the first
+flush fails, the request returns an error but the outbox row remains for a
+background worker to retry with bounded exponential backoff. Token guards and
+per-key locks prevent an old flush from overwriting a newer PUT, DELETE, or
+multipart completion.
 
 `Tier.Copy` goes through `Upload`, so it inherits the origin-first order.
-`DeleteMany` stops at the first origin error and then evicts only the keys
-processed so far, while the S3 layer reports a single 500 for the whole batch.
+`DeleteMany` uses per-key results (section 4) and evicts each cache key and
+outbox row immediately after its origin delete succeeds.
 
 ### Options
 
@@ -177,18 +187,20 @@ processed so far, while the S3 layer reports a single 500 for the whole batch.
 | --- | --- | --- | --- |
 | **A** | Origin-first everywhere | PUT stays as-is; multipart completion streams the assembled object from PostgreSQL to the origin, then publishes the cache | Origin is authoritative; no phantom; one extra PostgreSQL read per completed multipart; client waits for the origin upload either way. |
 | **B** | Pending state column | Add `state` (`pending`/`committed`) to cache objects; readers treat `pending` as a miss; mark committed after the origin upload | No double read; crash leaves pending rows for GC; schema + read-path changes. |
-| **C** | Sentinel in `origin_etag` | Publish with `origin_etag = 'pending:<uuid>'`; readers miss on the sentinel; replace with the real version after the origin upload; delete on failure | No schema change; small read-path checks; crash leaves sentinel rows until TTL/GC. |
+| **C** | Sentinel + outbox | Publish with `origin_etag = 'pending:<uuid>'` plus an `s3p.pending_uploads` row; readers miss on the sentinel; replace with the real version after the origin upload; retry failures in the background | No per-object schema change; small read-path checks; one additive table; crash recovery and retries. |
 | **D** | Keep current + delete on failure | Smallest change; the phantom window and partial-batch behavior remain | Does not meet the "explicit rejection over silent approximation" principle. |
 
 ### Recommendation
 
-**A** for consistency and simplicity. **C** is the best fallback if multipart
-completion latency matters and a second read is unacceptable. Whichever is
-chosen, make cache population best-effort on PUT: if the origin succeeds and
-the cache write fails, return success and log; the next read is a miss.
+**C + outbox** (implemented). A successful `CompleteMultipartUpload` still
+waits for the first origin upload, but the PostgreSQL transaction and connection
+are released before the network call; crash recovery and retries are durable in
+`s3p.pending_uploads`. Make cache population best-effort on PUT: if the origin
+succeeds and the cache write fails, return success and log; the next read is a
+miss.
 
-For `DeleteMany`, switch to per-key results (section 4) and evict each cache
-key immediately after its origin delete succeeds.
+`DeleteMany` uses per-key results (section 4) and evicts each cache key and
+outbox row immediately after its origin delete succeeds.
 
 ### Open questions
 
@@ -477,7 +489,7 @@ For each section, record one of: `A`, `B`, `C`, `D`, `defer`, or `reject`.
 | --- | --- | --- |
 | 1. aws-chunked | A+D | strict 8 MiB cap, rolling buffer |
 | 2. cache listing | B | PostgreSQL listing index |
-| 3. write-through | A | origin-first everywhere |
+| 3. write-through | C+outbox | pending sentinel + retry outbox |
 | 4. DeleteObjects | A | per-key results |
 | 5. origin ETag/Content-Type | B | origin ETag + real Content-Type |
 | 6. SQS FIFO | B | full FIFO |
@@ -487,8 +499,9 @@ For each section, record one of: `A`, `B`, `C`, `D`, `defer`, or `reject`.
 | 10. verification | B+C+D | integration + fuzz + SDK matrix |
 
 Schema changes are additive and keep layout v11: `s3p.origin_listing`,
-`s3p.origin_listing_state`, and queue `group_id`/`dedup_id` columns plus the
-per-queue `dedup` table are created with idempotent DDL on startup. The disk
+`s3p.origin_listing_state`, `s3p.pending_uploads`, and queue
+`group_id`/`dedup_id` columns plus the per-queue `dedup` table are created with
+idempotent DDL or goose migrations on startup. The disk
 guard is implemented as `--max-db-bytes` because PostgreSQL exposes no portable
 free-space SQL function to a remote client.
 
