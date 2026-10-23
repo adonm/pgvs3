@@ -1,4 +1,4 @@
-name: s3-compat
+name: s3t
 
 on:
   schedule:
@@ -9,13 +9,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: s3-compat
+  group: s3t
   cancel-in-progress: false
 
 jobs:
-  s3-tests:
+  s3t:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18
@@ -45,11 +45,11 @@ jobs:
           done
           cat /tmp/pgvs3.log
           exit 1
-      - name: Run filtered Ceph s3-tests
-        run: bash test/s3-compat.sh
+      - name: Run s3t allow-list
+        run: bash test/s3t.sh
       - name: Upload gateway log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: pgvs3-s3-compat-log
+          name: pgvs3-s3t-log
           path: /tmp/pgvs3.log

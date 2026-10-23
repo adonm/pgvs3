@@ -25,7 +25,7 @@ from Go source with `ko` (no `Dockerfile`, `CGO_ENABLED=0`).
 just test       # unit tests
 just race       # unit tests with race detector
 just integration # store/queue/cache integration tests against PostgreSQL 18 (testcontainers)
-just s3-compat  # filtered Ceph s3-tests against a running gateway
+just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just vet        # go vet
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
 just interop    # rclone, restic, boto3, DuckLake, and SlateDB
@@ -36,6 +36,27 @@ disposable PostgreSQL 18 container and two local gateways, then verifies
 conditional writes, byte ranges, multipart uploads, zero-copy copies,
 cross-gateway read-after-write consistency, garbage collection, DuckDB 2.0,
 DuckLake, and `duckdb-object-storage`.
+
+## Test surface
+
+Keep one harness per layer. Do not add a second framework for the same job.
+
+| Layer | Harness |
+| --- | --- |
+| Pure logic | Go unit tests |
+| SQL, store, queues, cache | `just integration` (testcontainers) |
+| S3 conformance | `just s3t` (pinned Go port of `ceph/s3-tests`) |
+| Real clients and end-to-end flows | `just contract`, `just interop` |
+
+S3 compatibility is **`s3t` only**. The Python `ceph/s3-tests`/tox/pytest path
+was removed deliberately: it required a separate Python toolchain, duplicated
+the Go integration layer, and was slow and Ceph-specific. Do not reintroduce
+it or vendor a second conformance suite.
+
+Grow coverage by adding node IDs to `test/s3t-allow.txt` when the pinned `s3t`
+version already has the test, or by contributing the port upstream. The pinned
+commit lives in `test/s3t.sh`; bump it deliberately and re-run the allow-list.
+A new test harness must replace an existing layer, not add a parallel one.
 
 Format code before committing:
 

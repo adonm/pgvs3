@@ -297,7 +297,7 @@ CHART_VERSION=v0.3.1 just chart push=true  # OCI chart oci://ghcr.io/adonm/chart
 just test       # Go unit tests
 just race       # unit tests with race detector
 just integration # store/queue/cache integration tests against PostgreSQL 18 (testcontainers)
-just s3-compat  # filtered Ceph s3-tests against a running gateway
+just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
 just interop    # rclone, restic, boto3, DuckLake, and SlateDB
 just load       # direct S3 load generator benchmark

@@ -1,0 +1,56 @@
+[DEFAULT]
+host = @HOST@
+port = @PORT@
+is_secure = False
+ssl_verify = False
+
+[fixtures]
+bucket prefix = pgvs3-{random}-
+
+[s3 main]
+display_name = pgvs3
+user_id = pgvs3
+email = pgvs3@example.invalid
+api_name = default
+access_key = test
+secret_key = test
+
+[s3 alt]
+display_name = pgvs3-alt
+user_id = pgvs3-alt
+email = pgvs3-alt@example.invalid
+access_key = test2
+secret_key = test2
+
+[s3 tenant]
+display_name = pgvs3-tenant
+user_id = pgvs3-tenant
+access_key = test3
+secret_key = test3
+email = pgvs3-tenant@example.invalid
+tenant = pgvs3
+
+[iam]
+email = pgvs3@example.invalid
+user_id = pgvs3-iam
+access_key = test4
+secret_key = test4
+display_name = pgvs3-iam
+
+[iam root]
+access_key = AAAAAAAAAAAAAAAAAAaa
+secret_key = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+account_id = RGW11111111111111111
+user_id = RGW11111111111111111
+email = account1@example.invalid
+
+[iam alt root]
+access_key = BBBBBBBBBBBBBBBBBBbb
+secret_key = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+account_id = RGW22222222222222222
+user_id = RGW22222222222222222
+email = account2@example.invalid
+
+[webidentity]
+token = ignored
+role_arn = arn:aws:iam::000000000000:role/ignored
