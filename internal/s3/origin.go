@@ -30,6 +30,10 @@ func (s *Server) serveOriginBucket(w http.ResponseWriter, r *http.Request, bucke
 			s.getBucketLocation(w, r, bucket)
 			return
 		}
+		if q.Has("versions") {
+			s.listOriginObjectVersions(w, r, bucket, q)
+			return
+		}
 		s.listObjectsV2(w, r, bucket, q)
 	case http.MethodDelete:
 		writeError(w, r, errNotImplemented(), s.log)

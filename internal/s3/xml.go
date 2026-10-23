@@ -38,6 +38,32 @@ type listBucketResult struct {
 	EncodingType          string            `xml:"EncodingType,omitempty"`
 }
 
+type listVersionsResult struct {
+	XMLName             xml.Name     `xml:"ListVersionsResult"`
+	Xmlns               string       `xml:"xmlns,attr"`
+	Name                string       `xml:"Name"`
+	Prefix              string       `xml:"Prefix"`
+	KeyMarker           string       `xml:"KeyMarker"`
+	VersionIdMarker     string       `xml:"VersionIdMarker"`
+	NextKeyMarker       string       `xml:"NextKeyMarker,omitempty"`
+	NextVersionIdMarker string       `xml:"NextVersionIdMarker,omitempty"`
+	MaxKeys             int          `xml:"MaxKeys"`
+	IsTruncated         bool         `xml:"IsTruncated"`
+	Versions            []versionXML `xml:"Version"`
+	EncodingType        string       `xml:"EncodingType,omitempty"`
+}
+
+type versionXML struct {
+	Key          string   `xml:"Key"`
+	VersionId    string   `xml:"VersionId"`
+	IsLatest     bool     `xml:"IsLatest"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
+	Size         int64    `xml:"Size"`
+	StorageClass string   `xml:"StorageClass"`
+	Owner        ownerXML `xml:"Owner"`
+}
+
 type bucketXML struct {
 	Name         string `xml:"Name"`
 	CreationDate string `xml:"CreationDate"`

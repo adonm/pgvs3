@@ -188,6 +188,10 @@ Full tables and DuckDB `httpfs` benchmarks are in
   and immediately returns OS disk space.
 - **Checksums:** verifies MD5, CRC32, CRC32C, CRC64NVME, SHA-1, and SHA-256 on
   upload; stores per-part checksums on multipart uploads.
+- **Versioning:** not supported. `ListObjectVersions` is a read-only
+  compatibility shim that reports each current object as the `null` version so
+  cleanup tools can empty a bucket; it does not create versions or delete
+  markers.
 - **Plain HTTP & static sites:** `GET /{bucket}/{key}` works with any HTTP
   client or browser. Trailing slashes resolve to `index.html`, plain
   `GET /{bucket}` serves `/{bucket}/index.html` when present, and `Content-Type`

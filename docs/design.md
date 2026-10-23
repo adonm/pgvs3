@@ -105,6 +105,11 @@ are explicitly out of scope and return errors or are ignored by design:
 | RESP | RESP3, `MULTI`/`EXEC`/`WATCH` |
 | Layout | migrations older than the previous layout; arbitrary schema changes without a version bump |
 
+The one versioning affordance is a read-only `ListObjectVersions` shim: it
+reports each current object as the `null` version so test harnesses and
+cleanup tools can empty a bucket. It does not create versions or delete
+markers, and `versionId` on GET/DELETE remains unsupported.
+
 When a feature is not implemented, the preferred behavior is to reject it
 explicitly rather than accept and silently ignore it. Presigned URLs follow
 that rule. The remaining compatibility gaps and their options are tracked in

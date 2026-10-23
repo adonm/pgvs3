@@ -147,6 +147,8 @@ func (s *Server) bucketRequest(w http.ResponseWriter, r *http.Request, bucket st
 		switch {
 		case q.Has("location"):
 			s.getBucketLocation(w, r, bucket)
+		case q.Has("versions"):
+			s.listObjectVersions(w, r, bucket, q)
 		case q.Has("uploads"):
 			s.listMultipartUploads(w, r, bucket, q)
 		case r.URL.RawQuery == "" && r.Header.Get("Authorization") == "" && r.Header.Get("x-amz-date") == "":
