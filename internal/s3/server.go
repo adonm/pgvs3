@@ -588,7 +588,12 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket st
 		}
 		keys = append(keys, o.Key)
 	}
-	if err := s.store.DeleteMany(r.Context(), bucket, keys); err != nil {
+	if s.origin != nil {
+		err = s.origin.DeleteMany(r.Context(), bucket, keys)
+	} else {
+		err = s.store.DeleteMany(r.Context(), bucket, keys)
+	}
+	if err != nil {
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return
 	}
@@ -633,13 +638,18 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, b
 	if algorithm != "" {
 		alg = &algorithm
 	}
-	id, err := s.store.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
+	var id string
+	if s.origin != nil {
+		id, err = s.origin.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
+	} else {
+		id, err = s.store.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNoBucket) {
 			writeError(w, r, errNoSuchBucket(), s.log)
 			return
 		}
-		writeError(w, r, errInternal(err, s.log), s.log)
+		writeError(w, r, s.ingestError(err), s.log)
 		return
 	}
 	writeXML(w, http.StatusOK, initiateMultipartUploadResult{
@@ -658,7 +668,12 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 		writeError(w, r, err, s.log)
 		return
 	}
-	writer, err := s.store.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
+	var writer *store.ChunkWriter
+	if s.origin != nil {
+		writer, err = s.origin.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
+	} else {
+		writer, err = s.store.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNoUpload) {
 			writeError(w, r, errNoSuchUpload(), s.log)
@@ -732,7 +747,12 @@ func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 		}
 		listed = append(listed, store.ListedPart{PartNo: int32(p.PartNumber), ETag: stripETag(p.ETag), Checksum: cs})
 	}
-	done, err := s.store.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
+	var done *store.Completed
+	if s.origin != nil {
+		done, err = s.origin.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
+	} else {
+		done, err = s.store.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrNoUpload):
@@ -740,7 +760,7 @@ func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 		case errors.Is(err, store.ErrInvalidPart):
 			writeError(w, r, errInvalidPart(), s.log)
 		default:
-			writeError(w, r, errInternal(err, s.log), s.log)
+			writeError(w, r, s.ingestError(err), s.log)
 		}
 		return
 	}
@@ -755,7 +775,15 @@ func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
-	ok, err := s.store.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
+	var (
+		ok  bool
+		err error
+	)
+	if s.origin != nil {
+		ok, err = s.origin.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
+	} else {
+		ok, err = s.store.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
+	}
 	if err != nil {
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return

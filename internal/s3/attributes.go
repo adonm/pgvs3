@@ -107,7 +107,17 @@ func (s *Server) listParts(w http.ResponseWriter, r *http.Request, bucket, key s
 		}
 		marker = int32(n)
 	}
-	parts, truncated, next, err := s.store.ListParts(r.Context(), uploadID, bucket, key, max, marker)
+	var (
+		parts     []store.UploadPartInfo
+		truncated bool
+		next      int32
+		err       error
+	)
+	if s.origin != nil {
+		parts, truncated, next, err = s.origin.ListParts(r.Context(), uploadID, bucket, key, max, marker)
+	} else {
+		parts, truncated, next, err = s.store.ListParts(r.Context(), uploadID, bucket, key, max, marker)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNoUpload) {
 			writeError(w, r, errNoSuchUpload(), s.log)

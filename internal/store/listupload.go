@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/adonm/pgvs3/internal/ns"
 )
 
 type PartInfo struct {
@@ -81,7 +83,13 @@ type UploadPartInfo struct {
 
 // ListParts returns one page of an in-progress multipart upload's parts.
 func (s *Store) ListParts(ctx context.Context, uploadID, bucket, key string, max int, marker int32) ([]UploadPartInfo, bool, int32, error) {
-	sc, err := bucketSQLIdent(bucket)
+	return s.ListPartsKind(ctx, ns.Bucket, uploadID, bucket, key, max, marker)
+}
+
+// ListPartsKind returns one page of an in-progress multipart upload's parts in
+// a bucket or cache namespace.
+func (s *Store) ListPartsKind(ctx context.Context, kind ns.Kind, uploadID, name, key string, max int, marker int32) ([]UploadPartInfo, bool, int32, error) {
+	sc, err := nsSQLIdent(kind, name)
 	if err != nil {
 		return nil, false, 0, err
 	}

@@ -2,8 +2,13 @@ package objcache
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/thanos-io/objstore"
 )
 
 func TestObjectContentLengthAndResolveRange(t *testing.T) {
@@ -49,5 +54,20 @@ func TestSpoolStreamMemoryAndTempFile(t *testing.T) {
 	got, err := io.ReadAll(sp2.r)
 	if err != nil || !bytes.Equal(got, large) {
 		t.Fatalf("large spool read len=%d err=%v", len(got), err)
+	}
+}
+
+func TestListSortsBeforeLimit(t *testing.T) {
+	b := objstore.NewInMemBucket()
+	ctx := context.Background()
+	for _, k := range []string{"edge/c", "edge/a", "edge/b"} {
+		if err := b.Upload(ctx, k, strings.NewReader(k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tier := &Tier{origin: b, namespace: "origin", ttl: time.Minute, retention: time.Hour, fills: make(chan struct{}, 2)}
+	rows, err := tier.List(ctx, "edge", "", "", 2)
+	if err != nil || len(rows) != 2 || rows[0].Key != "a" || rows[1].Key != "b" {
+		t.Fatalf("rows=%+v err=%v", rows, err)
 	}
 }

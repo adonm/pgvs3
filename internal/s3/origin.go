@@ -1,14 +1,9 @@
 package s3
 
 import (
-	"crypto/md5"
-	"encoding/base64"
-	"encoding/xml"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -52,7 +47,7 @@ func (s *Server) serveOrigin(w http.ResponseWriter, r *http.Request, bucket, key
 			w.WriteHeader(http.StatusOK)
 		case http.MethodPost:
 			if q.Has("delete") {
-				s.deleteOriginObjects(w, r, bucket)
+				s.deleteObjects(w, r, bucket)
 				return
 			}
 			s.methodNotAllowed(w, r)
@@ -85,6 +80,10 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		w.WriteHeader(http.StatusOK)
 
 	case http.MethodGet:
+		if q.Has("uploadId") {
+			s.listParts(w, r, bucket, key, q)
+			return
+		}
 		first, last, suffix, _, err := parseRange(r.Header.Get("Range"))
 		if err != nil {
 			writeError(w, r, errInvalidRange(), s.log)
@@ -118,7 +117,7 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 
 	case http.MethodPut:
 		if q.Has("partNumber") && q.Has("uploadId") {
-			s.uploadOriginPart(w, r, bucket, key, q)
+			s.uploadPart(w, r, bucket, key, q)
 			return
 		}
 		if r.Header.Get("x-amz-copy-source") != "" {
@@ -164,27 +163,18 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 
 	case http.MethodPost:
 		if q.Has("uploads") {
-			s.createOriginMultipartUpload(w, r, bucket, key)
+			s.createMultipartUpload(w, r, bucket, key)
 			return
 		}
 		if q.Has("uploadId") {
-			s.completeOriginMultipartUpload(w, r, bucket, key, q)
+			s.completeMultipartUpload(w, r, bucket, key, q)
 			return
 		}
 		s.methodNotAllowed(w, r)
 
 	case http.MethodDelete:
 		if q.Has("uploadId") {
-			ok, err := s.origin.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
-			if err != nil {
-				writeError(w, r, errInternal(err, s.log), s.log)
-				return
-			}
-			if !ok {
-				writeError(w, r, errNoSuchUpload(), s.log)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
+			s.abortMultipartUpload(w, r, bucket, key, q)
 			return
 		}
 		if err := s.origin.Delete(r.Context(), bucket, key); err != nil {
@@ -231,182 +221,6 @@ func (s *Server) copyOriginObject(w http.ResponseWriter, r *http.Request, bucket
 	writeXML(w, http.StatusOK, copyObjectResult{
 		Xmlns: s3Namespace, ETag: quoteETag(out.ETag), LastModified: isoTime(out.CreatedAt),
 	})
-}
-
-func (s *Server) createOriginMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	algorithm := r.Header.Get("x-amz-checksum-algorithm")
-	if algorithm != "" && !checksumAlgorithms[algorithm] {
-		writeError(w, r, errNotImplemented(), s.log)
-		return
-	}
-	meta, err := parseMetadata(r.Header)
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	ct, err := contentType(r.Header.Get("Content-Type"))
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	var alg *string
-	if algorithm != "" {
-		alg = &algorithm
-	}
-	id, err := s.origin.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
-	if err != nil {
-		writeError(w, r, s.ingestError(err), s.log)
-		return
-	}
-	writeXML(w, http.StatusOK, initiateMultipartUploadResult{
-		Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: id,
-	})
-}
-
-func (s *Server) uploadOriginPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
-	partNo, err := strconv.ParseInt(q.Get("partNumber"), 10, 32)
-	if err != nil || partNo < 1 || partNo > 10000 {
-		writeError(w, r, errInvalidPart(), s.log)
-		return
-	}
-	in, err := newIntegrity(r.Header)
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	writer, err := s.origin.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
-	if err != nil {
-		if errors.Is(err, store.ErrNoUpload) {
-			writeError(w, r, errNoSuchUpload(), s.log)
-			return
-		}
-		writeError(w, r, s.ingestError(err), s.log)
-		return
-	}
-	body := io.ReadCloser(r.Body)
-	if len(in.h) > 0 {
-		body = &integrityReader{r: body, in: in}
-	}
-	buf := copyBuf()
-	defer putCopyBuf(buf)
-	if _, err := io.CopyBuffer(writer, body, buf); err != nil {
-		writer.Abort()
-		writeError(w, r, bodyError(err), s.log)
-		return
-	}
-	checks, err := in.verify(r.Trailer)
-	if err != nil {
-		writer.Abort()
-		writeError(w, r, err, s.log)
-		return
-	}
-	pub, err := writer.Finish(checks)
-	if err != nil {
-		writeError(w, r, s.ingestError(err), s.log)
-		return
-	}
-	w.Header().Set("ETag", quoteETag(pub.ETag))
-	if pub.Checksum != nil {
-		w.Header().Set(pub.Checksum.Name, pub.Checksum.Value)
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (s *Server) completeOriginMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
-	if err != nil {
-		writeError(w, r, bodyError(err), s.log)
-		return
-	}
-	var req completeMultipartUploadRequest
-	if err := xml.Unmarshal(body, &req); err != nil {
-		writeError(w, r, errInvalidRequest("malformed CompleteMultipartUpload XML"), s.log)
-		return
-	}
-	listed := make([]store.ListedPart, 0, len(req.Parts))
-	for _, p := range req.Parts {
-		if p.PartNumber < 1 || p.PartNumber > 10000 || p.ETag == "" {
-			writeError(w, r, errInvalidPart(), s.log)
-			return
-		}
-		var checks []store.Checksum
-		for name, value := range map[string]string{
-			"CRC32": p.ChecksumCRC32, "CRC32C": p.ChecksumCRC32C, "CRC64NVME": p.ChecksumCRC64NVME,
-			"SHA1": p.ChecksumSHA1, "SHA256": p.ChecksumSHA256,
-		} {
-			if value != "" {
-				checks = append(checks, store.Checksum{Name: name, Value: value})
-			}
-		}
-		if len(checks) > 1 {
-			writeError(w, r, errInvalidRequest("a part may carry only one checksum"), s.log)
-			return
-		}
-		var cs *store.Checksum
-		if len(checks) == 1 {
-			cs = &checks[0]
-		}
-		listed = append(listed, store.ListedPart{PartNo: int32(p.PartNumber), ETag: stripETag(p.ETag), Checksum: cs})
-	}
-	done, err := s.origin.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrNoUpload):
-			writeError(w, r, errNoSuchUpload(), s.log)
-		case errors.Is(err, store.ErrInvalidPart):
-			writeError(w, r, errInvalidPart(), s.log)
-		default:
-			writeError(w, r, s.ingestError(err), s.log)
-		}
-		return
-	}
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	writeXML(w, http.StatusOK, completeMultipartUploadResult{
-		Xmlns: s3Namespace, Location: fmt.Sprintf("%s://%s/%s/%s", scheme, r.Host, done.Bucket, done.Key),
-		Bucket: done.Bucket, Key: done.Key, ETag: quoteETag(done.ETag),
-	})
-}
-
-func (s *Server) deleteOriginObjects(w http.ResponseWriter, r *http.Request, bucket string) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
-	if err != nil {
-		writeError(w, r, bodyError(err), s.log)
-		return
-	}
-	if want := r.Header.Get("Content-MD5"); want != "" {
-		sum := md5.Sum(body)
-		if base64.StdEncoding.EncodeToString(sum[:]) != want {
-			writeError(w, r, apiErr("BadDigest", "The Content-MD5 you specified did not match the request body.", http.StatusBadRequest), s.log)
-			return
-		}
-	}
-	var req deleteRequest
-	if err := xml.Unmarshal(body, &req); err != nil {
-		writeError(w, r, errInvalidRequest("malformed Delete XML"), s.log)
-		return
-	}
-	if len(req.Objects) == 0 || len(req.Objects) > 1000 {
-		writeError(w, r, errInvalidRequest("Delete must contain between 1 and 1000 objects"), s.log)
-		return
-	}
-	out := deleteResult{Xmlns: s3Namespace}
-	for _, o := range req.Objects {
-		if o.Key == "" || len(o.Key) > 1024 {
-			writeError(w, r, errInvalidRequest("invalid object key"), s.log)
-			return
-		}
-		if err := s.origin.Delete(r.Context(), bucket, o.Key); err != nil {
-			writeError(w, r, errInternal(err, s.log), s.log)
-			return
-		}
-		if !req.Quiet {
-			out.Deleted = append(out.Deleted, deletedXML{Key: o.Key})
-		}
-	}
-	writeXML(w, http.StatusOK, out)
 }
 
 func writeOriginHeaders(w http.ResponseWriter, obj *objcache.Object) {

@@ -22,6 +22,7 @@ import (
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/objstore/providers/s3"
+	"golang.org/x/sync/singleflight"
 	"gopkg.in/yaml.v2"
 
 	"github.com/adonm/pgvs3/internal/ns"
@@ -36,6 +37,7 @@ type Tier struct {
 	ttl       time.Duration
 	retention time.Duration
 	fills     chan struct{}
+	group     singleflight.Group
 	log       *slog.Logger
 }
 
@@ -294,28 +296,43 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 }
 
 // fill downloads ck from the origin under the fill semaphore, stores it in the
-// cache namespace with version, and returns the stored metadata.
-func (t *Tier) fill(ctx context.Context, ck, key string, size int64, version string) (*store.Meta, error) {
+// cache namespace with version, and returns the stored metadata. Concurrent
+// fills for the same ck coalesce via singleflight so a thundering herd on a
+// cold key pulls from the origin only once.
+func (t *Tier) fill(ctx context.Context, ck, key string, _ int64, version string) (*store.Meta, error) {
+	ch := t.group.DoChan(ck, func() (any, error) {
+		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+		defer cancel()
+		select {
+		case t.fills <- struct{}{}:
+			defer func() { <-t.fills }()
+		case <-fillCtx.Done():
+			return nil, fillCtx.Err()
+		}
+		rc, err := t.origin.Get(fillCtx, ck)
+		if err != nil {
+			if t.origin.IsObjNotFoundErr(err) {
+				return nil, store.ErrNotFound
+			}
+			return nil, err
+		}
+		sp, cleanup, err := spoolStream(rc)
+		_ = rc.Close()
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		return t.storeSpooled(fillCtx, ck, nil, contentTypeFor(key), version, sp)
+	})
 	select {
-	case t.fills <- struct{}{}:
-		defer func() { <-t.fills }()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.(*store.Meta), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	rc, err := t.origin.Get(ctx, ck)
-	if err != nil {
-		if t.origin.IsObjNotFoundErr(err) {
-			return nil, store.ErrNotFound
-		}
-		return nil, err
-	}
-	sp, cleanup, err := spoolStream(rc)
-	_ = rc.Close()
-	if err != nil {
-		return nil, err
-	}
-	defer cleanup()
-	return t.storeSpooled(ctx, ck, nil, contentTypeFor(key), version, sp)
 }
 
 type spooled struct {
@@ -468,6 +485,11 @@ func (t *Tier) AbortUpload(ctx context.Context, uploadID, bucket, key string) (b
 	return t.store.AbortUploadKind(ctx, ns.Cache, uploadID, t.namespace, t.key(bucket, key))
 }
 
+// ListParts returns one page of an in-progress multipart upload's parts in the cache namespace.
+func (t *Tier) ListParts(ctx context.Context, uploadID, bucket, key string, max int, marker int32) ([]store.UploadPartInfo, bool, int32, error) {
+	return t.store.ListPartsKind(ctx, ns.Cache, uploadID, t.namespace, t.key(bucket, key), max, marker)
+}
+
 func (t *Tier) setOriginETag(ctx context.Context, ck, version string) {
 	sc, err := ns.Cache.Schema(t.namespace)
 	if err != nil {
@@ -488,43 +510,79 @@ func (t *Tier) Delete(ctx context.Context, bucket, key string) error {
 	return nil
 }
 
+// DeleteMany removes each key from the origin and evicts them from the cache in
+// a single batch.
+func (t *Tier) DeleteMany(ctx context.Context, bucket string, keys []string) error {
+	cks := make([]string, 0, len(keys))
+	for _, k := range keys {
+		ck := t.key(bucket, k)
+		if err := t.origin.Delete(ctx, ck); err != nil && !t.origin.IsObjNotFoundErr(err) {
+			return err
+		}
+		cks = append(cks, ck)
+	}
+	_, _ = t.store.CacheDel(ctx, t.namespace, cks)
+	return nil
+}
+
 // Exists reports whether the object exists at the origin.
 func (t *Tier) Exists(ctx context.Context, bucket, key string) (bool, error) {
 	return t.origin.Exists(ctx, t.key(bucket, key))
 }
 
-// List returns up to limit origin keys under prefix in lexical order.
+// List returns up to limit origin keys under prefix in lexical order, using
+// cached metadata when fresh so warm keys avoid per-key origin HEAD calls.
 func (t *Tier) List(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error) {
-	var out []store.Listed
-	err := t.origin.Iter(ctx, bucket+"/"+prefix, func(name string) error {
+	if limit <= 0 {
+		return nil, nil
+	}
+	pfx := bucket + "/" + prefix
+	var rels []string
+	err := t.origin.Iter(ctx, pfx, func(name string) error {
 		if strings.HasSuffix(name, "/") {
 			return nil
 		}
 		rel := strings.TrimPrefix(name, bucket+"/")
-		if rel <= after {
-			return nil
-		}
-		attrs, err := t.origin.Attributes(ctx, name)
-		if err != nil {
-			return nil
-		}
-		out = append(out, store.Listed{Key: rel, Size: attrs.Size, CreatedAt: attrs.LastModified})
-		if len(out) >= limit {
-			return errStopIter
+		if rel > after {
+			rels = append(rels, rel)
 		}
 		return nil
 	})
-	if err != nil && !errors.Is(err, errStopIter) {
+	if err != nil {
 		return nil, err
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	if len(out) > limit {
-		out = out[:limit]
+	sort.Strings(rels)
+	if len(rels) > limit {
+		rels = rels[:limit]
+	}
+	cached := map[string]store.Listed{}
+	if t.store != nil && t.ttl > 0 && len(rels) > 0 {
+		rows, err := t.store.ListKind(ctx, ns.Cache, t.namespace, pfx, pfx+"\U0010FFFF", bucket+"/"+after, len(rels)*2)
+		if err == nil {
+			for _, r := range rows {
+				if time.Since(r.CreatedAt) < t.ttl {
+					cached[strings.TrimPrefix(r.Key, bucket+"/")] = r
+				}
+			}
+		}
+	}
+	out := make([]store.Listed, 0, len(rels))
+	for _, rel := range rels {
+		if c, ok := cached[rel]; ok {
+			c.Key = rel
+			out = append(out, c)
+			continue
+		}
+		attrs, err := t.origin.Attributes(ctx, bucket+"/"+rel)
+		if err != nil {
+			continue
+		}
+		out = append(out, store.Listed{
+			Key: rel, Size: attrs.Size, ETag: etagFor(versionFor(attrs)), CreatedAt: attrs.LastModified,
+		})
 	}
 	return out, nil
 }
-
-var errStopIter = errors.New("stop iteration")
 
 // resolveRange maps S3 range headers onto [start,end].
 func resolveRange(size, first, last, suffix int64) (int64, int64, bool) {
