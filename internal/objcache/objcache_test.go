@@ -60,14 +60,18 @@ func TestSpoolStreamMemoryAndTempFile(t *testing.T) {
 func TestListSortsBeforeLimit(t *testing.T) {
 	b := objstore.NewInMemBucket()
 	ctx := context.Background()
-	for _, k := range []string{"edge/c", "edge/a", "edge/b"} {
+	for _, k := range []string{"edge/dir/c", "edge/a", "edge/dir/b"} {
 		if err := b.Upload(ctx, k, strings.NewReader(k)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	tier := &Tier{origin: b, namespace: "origin", ttl: time.Minute, retention: time.Hour, fills: make(chan struct{}, 2)}
 	rows, err := tier.List(ctx, "edge", "", "", 2)
-	if err != nil || len(rows) != 2 || rows[0].Key != "a" || rows[1].Key != "b" {
+	if err != nil || len(rows) != 2 || rows[0].Key != "a" || rows[1].Key != "dir/b" {
 		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+	sub, err := tier.List(ctx, "edge", "dir/b", "", 10)
+	if err != nil || len(sub) != 1 || sub[0].Key != "dir/b" {
+		t.Fatalf("sub=%+v err=%v", sub, err)
 	}
 }

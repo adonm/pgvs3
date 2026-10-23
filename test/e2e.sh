@@ -661,7 +661,14 @@ assert {mk.lower(): mv for mk, mv in get_res.get('Metadata', {}).items()} == {'t
 head = c.head_object(Bucket=b, Key=k)
 assert head['ContentLength'] == len(body)
 assert head['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', head['ResponseMetadata']['HTTPHeaders']
+try:
+    c.get_object(Bucket=b, Key=k, IfNoneMatch=head['ETag'])
+    raise AssertionError('expected 304 Not Modified')
+except c.exceptions.ClientError as exc:
+    assert exc.response['Error']['Code'] == '304', exc.response
 assert c.get_object(Bucket=b, Key=k, Range='bytes=0-15')['Body'].read() == body[:16]
+delim = c.list_objects_v2(Bucket=b, Prefix='', Delimiter='/')
+assert any(cp['Prefix'] == os.environ['OCACHE_RUN'] + '/' for cp in delim.get('CommonPrefixes', [])), delim
 # CopyObject through the cache tier writes through to the origin and caches the destination immediately.
 copy_k = os.environ['OCACHE_RUN'] + '/copied.bin'
 c.copy_object(Bucket=b, Key=copy_k, CopySource={'Bucket': b, 'Key': k})
@@ -728,6 +735,8 @@ rows=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
   "SELECT count(*) FROM \"s3c_ocache-$RUN\".objects WHERE key = 'edge/$RUN/big.bin'")
 [ "$rows" = 1 ] || fail "full GET was not cached ($rows rows)"
 curl -fsSI -H 'Range: bytes=1048576-1049599' "$OCACHE/edge/$RUN/big.bin" | grep -qi 'x-cache: HIT' || fail "cached 16 MiB range did not hit cache"
+stat_out=$(.tmp/pgvs3/pgvs3 stat --url "$PGVS3_TEST_DB_URL" --kind cache --name "ocache-$RUN")
+echo "$stat_out" | grep -Eq 'chunks=[1-9]' || fail "pgvs3 stat chunks: $stat_out"
 kill "$ocache_pid" 2>/dev/null || true
 
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------

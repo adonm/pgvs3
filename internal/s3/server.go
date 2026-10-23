@@ -832,7 +832,15 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 	if maxKeys > 0 {
 	outer:
 		for {
-			rows, err := s.store.List(r.Context(), bucket, prefix, bound, after, 1024)
+			var (
+				rows []store.Listed
+				err  error
+			)
+			if s.origin != nil {
+				rows, err = s.origin.List(r.Context(), bucket, prefix, after, 1024)
+			} else {
+				rows, err = s.store.List(r.Context(), bucket, prefix, bound, after, 1024)
+			}
 			if err != nil {
 				writeError(w, r, errInternal(err, s.log), s.log)
 				return

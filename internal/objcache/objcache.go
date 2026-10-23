@@ -537,9 +537,13 @@ func (t *Tier) List(ctx context.Context, bucket, prefix, after string, limit int
 		return nil, nil
 	}
 	pfx := bucket + "/" + prefix
+	dir := bucket + "/"
+	if i := strings.LastIndexByte(pfx, '/'); i >= 0 {
+		dir = pfx[:i+1]
+	}
 	var rels []string
-	err := t.origin.Iter(ctx, pfx, func(name string) error {
-		if strings.HasSuffix(name, "/") {
+	err := t.origin.Iter(ctx, dir, func(name string) error {
+		if strings.HasSuffix(name, "/") || !strings.HasPrefix(name, pfx) {
 			return nil
 		}
 		rel := strings.TrimPrefix(name, bucket+"/")
@@ -547,7 +551,7 @@ func (t *Tier) List(ctx context.Context, bucket, prefix, after string, limit int
 			rels = append(rels, rel)
 		}
 		return nil
-	})
+	}, objstore.WithRecursiveIter())
 	if err != nil {
 		return nil, err
 	}

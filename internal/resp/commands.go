@@ -126,7 +126,7 @@ func cmdSelect(_ *Server, _ context.Context, conn redcon.Conn, sess *respSession
 }
 
 func cmdInfo(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, _ [][]byte) error {
-	st, _ := s.store.StatNamespace(ctx, ns.Cache, sess.bucket, "", 0)
+	st, _ := s.store.StatNamespace(ctx, ns.Cache, sess.bucket)
 	info := fmt.Sprintf("# Server\r\nredis_version:6.2.0\r\npgvs3_version:%s\r\nredis_mode:standalone\r\n# Keyspace\r\ndb0:keys=%d,logical_bytes=%d,physical_bytes=%d\r\n",
 		s.version, st.Objects, st.LogicalBytes, st.PhysicalBytes)
 	conn.WriteBulkString(info)

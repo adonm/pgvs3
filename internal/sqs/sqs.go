@@ -365,28 +365,25 @@ func defaultAttrs() map[string]any {
 }
 
 func (s *Server) queueAttrs(ctx context.Context, name string) (map[string]string, error) {
+	raw, ok, err := s.store.NamespaceAttrs(ctx, ns.Queue, name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errNoQueue()
+	}
 	out := map[string]string{}
 	for k, v := range defaultAttrs() {
 		out[k] = v.(string)
 	}
-	infos, err := s.store.Namespaces(ctx, ns.Queue)
-	if err != nil {
-		return nil, err
-	}
-	for _, n := range infos {
-		if n.Name != name {
-			continue
+	for k, v := range raw {
+		if sv, ok := v.(string); ok {
+			out[k] = sv
+		} else if fv, ok := v.(float64); ok {
+			out[k] = strconv.FormatInt(int64(fv), 10)
 		}
-		for k, v := range n.Attrs {
-			if sv, ok := v.(string); ok {
-				out[k] = sv
-			} else if fv, ok := v.(float64); ok {
-				out[k] = strconv.FormatInt(int64(fv), 10)
-			}
-		}
-		return out, nil
 	}
-	return nil, errNoQueue()
+	return out, nil
 }
 
 func (s *Server) attrInt(ctx context.Context, name, key string, def int) int {
@@ -674,11 +671,20 @@ func (s *Server) opSendMessage(ctx context.Context, r *http.Request, _ string, i
 	if len(body) > 262144 {
 		return nil, errBad("message body exceeds 256 KiB")
 	}
+	delayDefault, retSecs := 0, 345600
+	if attrs, err := s.queueAttrs(ctx, name); err == nil {
+		if n, err := strconv.Atoi(attrs["DelaySeconds"]); err == nil {
+			delayDefault = n
+		}
+		if n, err := strconv.Atoi(attrs["MessageRetentionPeriod"]); err == nil {
+			retSecs = n
+		}
+	}
 	sent, err := s.store.SendMessages(ctx, name, []store.OutMessage{{
 		Body:  body,
 		Attrs: in.raw("MessageAttributes"),
-		Delay: in.int("DelaySeconds", s.attrInt(ctx, name, "DelaySeconds", 0)),
-	}}, s.retention(ctx, name))
+		Delay: in.int("DelaySeconds", delayDefault),
+	}}, time.Duration(retSecs)*time.Second)
 	if err != nil {
 		return nil, errBad(err.Error())
 	}

@@ -36,7 +36,7 @@ func (s *Server) serveOrigin(w http.ResponseWriter, r *http.Request, bucket, key
 				s.getBucketLocation(w, r, bucket)
 				return
 			}
-			s.listOrigin(w, r, bucket, q)
+			s.listObjectsV2(w, r, bucket, q)
 		case http.MethodDelete:
 			writeError(w, r, errNotImplemented(), s.log)
 		case http.MethodPut:
@@ -76,6 +76,15 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			writeError(w, r, errInternal(err, s.log), s.log)
 			return
 		}
+		if err := readCondition(r, obj.ETag); err != nil {
+			if errors.Is(err, errNotModifiedSentinel) {
+				w.Header().Set("ETag", quoteETag(obj.ETag))
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			writeError(w, r, err, s.log)
+			return
+		}
 		writeOriginHeaders(w, obj)
 		w.WriteHeader(http.StatusOK)
 
@@ -103,6 +112,15 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			return
 		}
 		defer obj.Body.Close()
+		if err := readCondition(r, obj.ETag); err != nil {
+			if errors.Is(err, errNotModifiedSentinel) {
+				w.Header().Set("ETag", quoteETag(obj.ETag))
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			writeError(w, r, err, s.log)
+			return
+		}
 		writeOriginHeaders(w, obj)
 		if obj.Ranged {
 			w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(obj.Start, 10)+"-"+
@@ -241,49 +259,4 @@ func writeOriginHeaders(w http.ResponseWriter, obj *objcache.Object) {
 		w.Header().Set("Last-Modified", obj.LastModified.UTC().Format(http.TimeFormat))
 	}
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.ContentLength(), 10))
-}
-
-func (s *Server) listOrigin(w http.ResponseWriter, r *http.Request, bucket string, q map[string][]string) {
-	prefix := first(q["prefix"])
-	maxKeys := 1000
-	if v := first(q["max-keys"]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			maxKeys = min(n, 1000)
-		}
-	}
-	after := first(q["continuation-token"])
-	if after == "" {
-		after = first(q["start-after"])
-	}
-	rows, err := s.origin.List(r.Context(), bucket, prefix, after, maxKeys+1)
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	truncated := len(rows) > maxKeys
-	if truncated {
-		rows = rows[:maxKeys]
-	}
-	out := listBucketResult{
-		Xmlns: s3Namespace, Name: bucket, Prefix: prefix, MaxKeys: maxKeys,
-		IsTruncated: truncated,
-	}
-	for _, row := range rows {
-		out.Contents = append(out.Contents, objectXML{
-			Key: row.Key, LastModified: isoTime(row.CreatedAt),
-			ETag: quoteETag(row.ETag), Size: row.Size, StorageClass: "STANDARD",
-		})
-	}
-	out.KeyCount = len(out.Contents)
-	if truncated && len(rows) > 0 {
-		out.NextContinuationToken = rows[len(rows)-1].Key
-	}
-	writeXML(w, http.StatusOK, out)
-}
-
-func first(v []string) string {
-	if len(v) == 0 {
-		return ""
-	}
-	return v[0]
 }

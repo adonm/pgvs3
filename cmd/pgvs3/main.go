@@ -194,7 +194,7 @@ func stat(args []string) int {
 		name = fs.String("name", "", "namespace name")
 		asJSON = fs.Bool("json", false, "print JSON")
 	}, func(ctx context.Context, st *store.Store, _ []string) int {
-		s, err := st.StatNamespace(ctx, ns.Kind(*kind), *name, "", 0)
+		s, err := st.StatNamespace(ctx, ns.Kind(*kind), *name)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1

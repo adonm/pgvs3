@@ -339,6 +339,29 @@ func (s *Store) AdoptAll(ctx context.Context, kind ns.Kind) (int, error) {
 	return n, nil
 }
 
+// NamespaceAttrs returns the attributes of a single namespace, or ok=false if
+// the namespace is not registered.
+func (s *Store) NamespaceAttrs(ctx context.Context, kind ns.Kind, name string) (map[string]any, bool, error) {
+	if _, _, err := NewNamespaceRef(kind, name); err != nil {
+		return nil, false, err
+	}
+	var raw []byte
+	err := s.pool.QueryRow(ctx,
+		"SELECT attrs FROM s3p.namespaces WHERE kind = $1 AND name = $2",
+		string(kind), name).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	out := map[string]any{}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return out, true, nil
+}
+
 // SetNamespaceAttrs merges attrs into a namespace.
 func (s *Store) SetNamespaceAttrs(ctx context.Context, kind ns.Kind, name string, attrs map[string]any) error {
 	b, err := json.Marshal(attrs)
@@ -491,29 +514,44 @@ type Stats struct {
 }
 
 // Stat aggregates every namespace.
-func (s *Store) Stat(ctx context.Context) (Stats, error) { return s.StatNamespace(ctx, "", "", "", 0) }
+func (s *Store) Stat(ctx context.Context) (Stats, error) { return s.StatNamespace(ctx, "", "") }
 
 // StatBucket aggregates one bucket, or all namespaces when bucket is empty.
 func (s *Store) StatBucket(ctx context.Context, bucket string) (Stats, error) {
 	if bucket == "" {
-		return s.StatNamespace(ctx, "", "", "", 0)
+		return s.StatNamespace(ctx, "", "")
 	}
-	return s.StatNamespace(ctx, ns.Bucket, bucket, "", 0)
+	return s.StatNamespace(ctx, ns.Bucket, bucket)
 }
 
 // StatNamespace reports usage for one namespace, one kind, or everything.
-func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name, prefix string, limit int) (Stats, error) {
+func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (Stats, error) {
 	var st Stats
-	infos, err := s.Namespaces(ctx, kind)
+	rows, err := s.pool.Query(ctx, `SELECT kind, name, schema_name
+		FROM s3p.namespaces
+		WHERE ($1 = '' OR kind = $1) AND ($2 = '' OR name = $2)
+		ORDER BY kind, name`, string(kind), name)
 	if err != nil {
+		return st, err
+	}
+	var infos []NamespaceInfo
+	for rows.Next() {
+		var n NamespaceInfo
+		var k string
+		if err := rows.Scan(&k, &n.Name, &n.Schema); err != nil {
+			rows.Close()
+			return st, err
+		}
+		n.Kind = ns.Kind(k)
+		infos = append(infos, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
 		return st, err
 	}
 	var maxOldest float64
 	var hasOldest bool
 	for _, n := range infos {
-		if name != "" && n.Name != name {
-			continue
-		}
 		st.Namespaces++
 		q := quoteIdent(n.Schema)
 		var logical, physical, objs, chunks, garb int64
@@ -530,7 +568,15 @@ func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name, prefix st
 				(SELECT COALESCE(sum(size),0)::int8 FROM `+q+`.objects),
 				pg_total_relation_size('`+q+`.objects') + pg_total_relation_size('`+q+`.chunks'),
 				(SELECT count(*) FROM `+q+`.objects),
-				(SELECT count(*) FROM `+q+`.chunks),
+				(SELECT COALESCE(sum(
+					CASE
+						WHEN part_ends IS NOT NULL THEN (
+							SELECT sum((part_ends[i] - CASE WHEN i = 1 THEN 0 ELSE part_ends[i-1] END + 8119) / 8120)
+							FROM generate_subscripts(part_ends, 1) AS i
+						)
+						ELSE (size + 8119) / 8120
+					END
+				),0)::int8 FROM `+q+`.objects WHERE file_id IS NOT NULL),
 				(SELECT count(*) FROM `+q+`.garbage),
 				(SELECT EXTRACT(EPOCH FROM now() - min(queued_at))::float8 FROM `+q+`.garbage)`).
 				Scan(&logical, &physical, &objs, &chunks, &garb, &oldest)
