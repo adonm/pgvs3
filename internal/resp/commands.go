@@ -465,32 +465,11 @@ func cmdExpire(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessi
 	if err != nil {
 		return err
 	}
-	curTTL, hasTTL, exists, err := s.store.CacheTTL(ctx, b, k)
-	if err != nil || !exists {
-		return writeBoolInt(conn, false, err)
+	opts := make([]string, len(args)-2)
+	for i, opt := range args[2:] {
+		opts[i] = string(opt)
 	}
-	want := time.Until(exp)
-	for _, opt := range args[2:] {
-		switch strings.ToUpper(string(opt)) {
-		case "NX":
-			if hasTTL {
-				return writeBoolInt(conn, false, nil)
-			}
-		case "XX":
-			if !hasTTL {
-				return writeBoolInt(conn, false, nil)
-			}
-		case "GT":
-			if !hasTTL || want <= curTTL {
-				return writeBoolInt(conn, false, nil)
-			}
-		case "LT":
-			if hasTTL && want >= curTTL {
-				return writeBoolInt(conn, false, nil)
-			}
-		}
-	}
-	ok, err := s.store.CacheExpire(ctx, b, k, &exp)
+	ok, err := s.store.CacheExpire(ctx, b, k, &exp, opts...)
 	return writeBoolInt(conn, ok, err)
 }
 

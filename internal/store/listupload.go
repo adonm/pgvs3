@@ -109,23 +109,21 @@ func (s *Store) ListPartsKind(ctx context.Context, kind ns.Kind, uploadID, name,
 	if err != nil {
 		return nil, false, 0, err
 	}
-	defer rows.Close()
-	out := make([]UploadPartInfo, 0, max+1)
-	for rows.Next() {
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (UploadPartInfo, error) {
 		var no int32
 		var size int64
 		var md5sum []byte
 		var checksum pgtype.Text
-		if err := rows.Scan(&no, &size, &md5sum, &checksum); err != nil {
-			return nil, false, 0, err
+		if err := row.Scan(&no, &size, &md5sum, &checksum); err != nil {
+			return UploadPartInfo{}, err
 		}
 		p := UploadPartInfo{Number: no, Size: size, ETag: hex.EncodeToString(md5sum), LastModified: time.Unix(0, int64(epoch*1e9))}
 		if algorithm.Valid && checksum.Valid {
 			p.Checksum = &Checksum{Name: algorithm.String, Value: checksum.String}
 		}
-		out = append(out, p)
-	}
-	if err := rows.Err(); err != nil {
+		return p, nil
+	})
+	if err != nil {
 		return nil, false, 0, err
 	}
 	truncated := len(out) > max
@@ -162,18 +160,14 @@ func (s *Store) ListUploads(ctx context.Context, bucket, prefix, bound, keyMarke
 	if err != nil {
 		return nil, false, err
 	}
-	defer rows.Close()
-	out := make([]UploadInfo, 0, max+1)
-	for rows.Next() {
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (UploadInfo, error) {
 		var u UploadInfo
 		var epoch float64
-		if err := rows.Scan(&u.Key, &u.UploadID, &epoch); err != nil {
-			return nil, false, err
-		}
+		err := row.Scan(&u.Key, &u.UploadID, &epoch)
 		u.Initiated = time.Unix(0, int64(epoch*1e9))
-		out = append(out, u)
-	}
-	if err := rows.Err(); err != nil {
+		return u, err
+	})
+	if err != nil {
 		return nil, false, err
 	}
 	truncated := len(out) > max

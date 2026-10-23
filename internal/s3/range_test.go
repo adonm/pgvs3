@@ -3,6 +3,8 @@ package s3
 import (
 	"net/http/httptest"
 	"testing"
+
+	"github.com/adonm/pgvs3/internal/store"
 )
 
 func TestParseRange(t *testing.T) {
@@ -74,7 +76,7 @@ func TestETagMatching(t *testing.T) {
 		{"*", "abc", true},
 		{`"other"`, "abc", false},
 	} {
-		if got := etagListMatches(tc.header, tc.etag); got != tc.want {
+		if got := store.ETagMatches(tc.header, tc.etag); got != tc.want {
 			t.Fatalf("%q vs %q = %v", tc.header, tc.etag, got)
 		}
 	}

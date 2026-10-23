@@ -106,3 +106,16 @@ func (k Kind) InlineMax() int {
 
 // Logged reports whether the kind's tables are WAL-logged.
 func (k Kind) Logged() bool { return k != Cache }
+
+// Ref addresses a namespace by kind and name.
+type Ref struct {
+	Kind Kind
+	Name string
+}
+
+func BucketRef(name string) Ref { return Ref{Kind: Bucket, Name: name} }
+func CacheRef(name string) Ref  { return Ref{Kind: Cache, Name: name} }
+func QueueRef(name string) Ref  { return Ref{Kind: Queue, Name: name} }
+
+func (r Ref) Schema() (string, error) { return r.Kind.Schema(r.Name) }
+func (r Ref) Key() string             { return string(r.Kind) + "\x00" + r.Name }

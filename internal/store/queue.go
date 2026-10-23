@@ -367,31 +367,6 @@ func (s *Store) QueueCounts(ctx context.Context, queue string) (visible, infligh
 	return visible, inflight, delayed, err
 }
 
-// QueueAttr returns one catalog attribute for a queue.
-func (s *Store) QueueAttr(ctx context.Context, queue, name string) (string, bool, error) {
-	infos, err := s.Namespaces(ctx, ns.Queue)
-	if err != nil {
-		return "", false, err
-	}
-	for _, n := range infos {
-		if n.Name != queue {
-			continue
-		}
-		if n.Attrs == nil {
-			return "", false, nil
-		}
-		v, ok := n.Attrs[name]
-		if !ok {
-			return "", false, nil
-		}
-		if s, ok := v.(string); ok {
-			return s, true, nil
-		}
-		return "", false, nil
-	}
-	return "", false, nil
-}
-
 // ExpireQueueMessages drops messages past their retention window.
 func (s *Store) ExpireQueueMessages(ctx context.Context, queue string, max int) (int64, error) {
 	sc, err := nsSQLIdent(ns.Queue, queue)

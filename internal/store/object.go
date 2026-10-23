@@ -58,21 +58,41 @@ func (s *Store) Meta(ctx context.Context, bucket, key string) (*Meta, error) {
 
 // MetaKind reads metadata from any namespace kind.
 func (s *Store) MetaKind(ctx context.Context, kind ns.Kind, name, key string) (*Meta, error) {
+	return s.metaKind(ctx, kind, name, key, true)
+}
+
+// MetaHeader reads object metadata without transferring inline_data.
+func (s *Store) MetaHeader(ctx context.Context, bucket, key string) (*Meta, error) {
+	return s.MetaHeaderKind(ctx, ns.Bucket, bucket, key)
+}
+
+// MetaHeaderKind reads metadata from any namespace kind without inline bytes.
+func (s *Store) MetaHeaderKind(ctx context.Context, kind ns.Kind, name, key string) (*Meta, error) {
+	return s.metaKind(ctx, kind, name, key, false)
+}
+
+func (s *Store) metaKind(ctx context.Context, kind ns.Kind, name, key string, withInline bool) (*Meta, error) {
 	sc, err := nsSQLIdent(kind, name)
 	if err != nil {
 		return nil, err
 	}
-	var m Meta
-	var epoch float64
-	var parts, ends []int64
-	var fileID pgtype.Int8
-	var inline []byte
-	var hasInline bool
-	var expires pgtype.Timestamptz
-	var origin pgtype.Text
+	var (
+		m         Meta
+		epoch     float64
+		parts     []int64
+		ends      []int64
+		fileID    pgtype.Int8
+		inline    []byte
+		hasInline bool
+		expires   pgtype.Timestamptz
+		origin    pgtype.Text
+	)
+	inlineExpr := "NULL::bytea, false"
+	if withInline {
+		inlineExpr = "inline_data, inline_data IS NOT NULL"
+	}
 	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
-		parts, part_ends, etag, user_metadata, content_type, inline_data, inline_data IS NOT NULL,
-		expires_at, origin_etag
+		parts, part_ends, etag, user_metadata, content_type, `+inlineExpr+`, expires_at, origin_etag
 		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`, key).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
 			&m.ContentType, &inline, &hasInline, &expires, &origin)
@@ -104,49 +124,6 @@ func (s *Store) MetaKind(ctx context.Context, kind ns.Kind, name, key string) (*
 	return &m, nil
 }
 
-// MetaHeader reads object metadata without transferring inline_data.
-func (s *Store) MetaHeader(ctx context.Context, bucket, key string) (*Meta, error) {
-	return s.MetaHeaderKind(ctx, ns.Bucket, bucket, key)
-}
-
-// MetaHeaderKind reads metadata from any namespace kind without inline bytes.
-func (s *Store) MetaHeaderKind(ctx context.Context, kind ns.Kind, name, key string) (*Meta, error) {
-	sc, err := nsSQLIdent(kind, name)
-	if err != nil {
-		return nil, err
-	}
-	var m Meta
-	var epoch float64
-	var parts, ends []int64
-	var fileID pgtype.Int8
-	var expires pgtype.Timestamptz
-	var origin pgtype.Text
-	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
-		parts, part_ends, etag, user_metadata, content_type, expires_at, origin_etag
-		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`, key).
-		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
-			&m.ContentType, &expires, &origin)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	m.CreatedAt = time.Unix(0, int64(epoch*1e9))
-	m.Parts, m.PartEnds = parts, ends
-	if fileID.Valid {
-		m.FileID = fileID.Int64
-	}
-	if expires.Valid {
-		t := expires.Time
-		m.ExpiresAt = &t
-	}
-	if origin.Valid {
-		m.OriginETag = origin.String
-	}
-	return &m, nil
-}
-
 func (s *Store) metaForRead(ctx context.Context, kind ns.Kind, name, key string, cond *ReadCondition) (*Meta, error) {
 	m, err := s.MetaKind(ctx, kind, name, key)
 	if err != nil {
@@ -155,26 +132,26 @@ func (s *Store) metaForRead(ctx context.Context, kind ns.Kind, name, key string,
 	if cond == nil {
 		return m, nil
 	}
-	if cond.IfMatch != "" && !etagMatches(cond.IfMatch, m.ETag) {
+	if cond.IfMatch != "" && !ETagMatches(cond.IfMatch, m.ETag) {
 		return nil, ErrPrecondition
 	}
-	if cond.IfNoneMatch != "" && etagMatches(cond.IfNoneMatch, m.ETag) {
+	if cond.IfNoneMatch != "" && ETagMatches(cond.IfNoneMatch, m.ETag) {
 		return nil, ErrNotModified
 	}
 	return m, nil
 }
 
-// etagMatches accepts quoted and unquoted strong ETags; a comma-separated list
+// ETagMatches accepts quoted and unquoted strong ETags; a comma-separated list
 // and "*" are also valid per RFC 9110.
-func etagMatches(header, etag string) bool {
-	for _, want := range strings.Split(header, ",") {
-		want = strings.TrimSpace(want)
-		if want == "*" {
+func ETagMatches(header, etag string) bool {
+	want := strings.Trim(strings.TrimPrefix(strings.TrimSpace(etag), "W/"), `"`)
+	for _, token := range strings.Split(header, ",") {
+		t := strings.TrimSpace(token)
+		if t == "*" {
 			return true
 		}
-		want = strings.TrimPrefix(want, "W/")
-		want = strings.Trim(want, `"`)
-		if want == etag {
+		t = strings.Trim(strings.TrimPrefix(t, "W/"), `"`)
+		if t != "" && t == want {
 			return true
 		}
 	}
@@ -560,10 +537,22 @@ func (s *Store) streamSpan(ctx context.Context, ch chan<- result, schema, key st
 		return
 	}
 	if len(pieces) > 1 {
-		if err := s.streamSnapshot(ctx, ch, schema, key, rootID, pieces, start, end, send); err != nil {
+		tx, err := s.chunkPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
 			select {
 			case ch <- result{err: err}:
 			case <-ctx.Done():
+			}
+			return
+		}
+		defer tx.Rollback(context.WithoutCancel(ctx))
+		for _, p := range pieces {
+			if err := streamRows(ctx, tx, schema, p, start, end, send); err != nil {
+				select {
+				case ch <- result{err: err}:
+				case <-ctx.Done():
+				}
+				return
 			}
 		}
 		return
@@ -676,20 +665,6 @@ func (s *Store) streamParallel(ctx context.Context, out chan<- result, schema, _
 	}
 	wg.Wait()
 	return nil
-}
-
-func (s *Store) streamSnapshot(ctx context.Context, _ chan<- result, schema, _ string, _ int64, pieces []piece, start, end int64, send func([]byte) bool) error {
-	tx, err := s.chunkPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	for _, p := range pieces {
-		if err := streamRows(ctx, tx, schema, p, start, end, send); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
 }
 
 func (s *Store) streamPiece(ctx context.Context, _ chan<- result, schema string, _ string, _ int64, p piece, start, end int64, send func([]byte) bool) error {
@@ -809,57 +784,10 @@ type Slice struct {
 	Bytes     []byte
 }
 
-// Put overwrites or creates an object through the same streaming path as PUT.
-func (s *Store) Put(ctx context.Context, bucket, key string, data []byte) error {
-	w, err := s.StartObject(ctx, bucket, key, Unconditional, "", nil, "application/octet-stream")
-	if err != nil {
-		return err
-	}
-	defer w.Abort()
-	for len(data) > 0 {
-		n := min(len(data), 4<<20)
-		if _, err := w.Write(data[:n]); err != nil {
-			return err
-		}
-		data = data[n:]
-	}
-	_, err = w.Finish(nil)
-	return err
-}
-
 // Delete removes one object and queues its storage for reaping.
 func (s *Store) Delete(ctx context.Context, bucket, key string) (bool, error) {
-	sc, err := bucketSQLIdent(bucket)
-	if err != nil {
-		return false, err
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	if err := lockObjectKey(ctx, tx, bucket, key); err != nil {
-		return false, err
-	}
-	var fileID pgtype.Int8
-	var parts []int64
-	err = tx.QueryRow(ctx, "DELETE FROM "+sc+".objects WHERE key = $1 RETURNING file_id, parts", key).Scan(&fileID, &parts)
-	if isMissingBucketSchema(err) {
-		return false, nil
-	}
-	found := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return false, err
-	}
-	if found && fileID.Valid {
-		if err := queueFiles(ctx, tx, sc, fileID.Int64, parts); err != nil {
-			return false, err
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, err
-	}
-	return found, nil
+	n, err := s.DeleteManyKind(ctx, ns.Bucket, bucket, []string{key})
+	return n > 0, err
 }
 
 // DeleteMany removes up to 1000 keys in one transaction, queueing every file
@@ -882,47 +810,38 @@ func (s *Store) DeleteManyKind(ctx context.Context, kind ns.Kind, name string, k
 	}
 	sorted := append([]string(nil), keys...)
 	sort.Strings(sorted)
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0) # hashtextextended(k,1))
-		FROM unnest($2::text[]) AS k`, name, sorted); err != nil {
-		return 0, err
-	}
-	var deleted int64
-	err = tx.QueryRow(ctx, `WITH doomed AS (
-		DELETE FROM `+sc+`.objects WHERE key = ANY($1::text[])
-		RETURNING key, file_id, parts, (expires_at IS NULL OR expires_at > now()) AS live
-	), dead AS (
-		SELECT file_id FROM doomed WHERE file_id IS NOT NULL
-		UNION ALL
-		SELECT unnest(parts) FROM doomed WHERE parts IS NOT NULL
-	), queued AS (
-		INSERT INTO `+sc+`.garbage (file_id)
-		SELECT DISTINCT d.file_id FROM dead d
-		WHERE d.file_id IS NOT NULL
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
-		    WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id
-		      AND NOT (o.key = ANY($1::text[])))
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
-		    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
-		      AND NOT (o.key = ANY($1::text[])))
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
-		ON CONFLICT DO NOTHING
-	)
-	SELECT count(*) FILTER (WHERE live) FROM doomed`, keys).Scan(&deleted)
-	if isMissingBucketSchema(err) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return deleted, nil
+	return withTx(ctx, s, func(tx pgx.Tx) (int64, error) {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0) # hashtextextended(k,1))
+			FROM unnest($2::text[]) AS k`, name, sorted); err != nil {
+			return 0, err
+		}
+		var deleted int64
+		err := tx.QueryRow(ctx, `WITH doomed AS (
+			DELETE FROM `+sc+`.objects WHERE key = ANY($1::text[])
+			RETURNING key, file_id, parts, (expires_at IS NULL OR expires_at > now()) AS live
+		), dead AS (
+			SELECT file_id FROM doomed WHERE file_id IS NOT NULL
+			UNION ALL
+			SELECT unnest(parts) FROM doomed WHERE parts IS NOT NULL
+		), queued AS (
+			INSERT INTO `+sc+`.garbage (file_id)
+			SELECT DISTINCT d.file_id FROM dead d
+			WHERE d.file_id IS NOT NULL
+			  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
+			    WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id
+			      AND NOT (o.key = ANY($1::text[])))
+			  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
+			    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
+			      AND NOT (o.key = ANY($1::text[])))
+			  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
+			ON CONFLICT DO NOTHING
+		)
+		SELECT count(*) FILTER (WHERE live) FROM doomed`, keys).Scan(&deleted)
+		if isMissingBucketSchema(err) {
+			return 0, nil
+		}
+		return deleted, err
+	})
 }
 
 type Listed struct {
@@ -956,21 +875,17 @@ func (s *Store) ListKind(ctx context.Context, kind ns.Kind, name, prefix, prefix
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []Listed
-	for rows.Next() {
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Listed, error) {
 		var l Listed
 		var epoch float64
-		if err := rows.Scan(&l.Key, &l.Size, &l.ETag, &epoch); err != nil {
-			return nil, err
-		}
+		err := row.Scan(&l.Key, &l.Size, &l.ETag, &epoch)
 		l.CreatedAt = time.Unix(0, int64(epoch*1e9))
-		out = append(out, l)
+		return l, err
+	})
+	if isMissingBucketSchema(err) {
+		return nil, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return out, err
 }
 
 // Buckets lists S3 bucket namespaces in key order.

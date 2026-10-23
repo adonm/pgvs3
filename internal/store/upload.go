@@ -21,27 +21,13 @@ func (s *Store) CreateUpload(ctx context.Context, bucket, key string, userMeta [
 
 // CreateUploadKind starts a multipart upload in a bucket or cache namespace.
 func (s *Store) CreateUploadKind(ctx context.Context, kind ns.Kind, name, key string, userMeta []string, contentType string, checksumAlgorithm *string) (string, error) {
-	sc, err := nsSQLIdent(kind, name)
-	if err != nil {
-		return "", err
-	}
-	if !s.known(kind, name) {
-		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
-			return "", err
-		}
-	}
-	query := `INSERT INTO ` + sc + `.uploads (upload_id, key, checksum_algorithm, user_metadata, content_type)
-		VALUES (gen_random_uuid()::text, $1, $2, $3, $4)
-		RETURNING upload_id`
-	var id string
-	err = s.pool.QueryRow(ctx, query, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
-	if isMissingBucketSchema(err) {
-		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
-			return "", err
-		}
-		err = s.pool.QueryRow(ctx, query, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
-	}
-	return id, err
+	return withAutoCreate(ctx, s, kind, name, func(sc string) (string, error) {
+		var id string
+		err := s.pool.QueryRow(ctx, `INSERT INTO `+sc+`.uploads (upload_id, key, checksum_algorithm, user_metadata, content_type)
+			VALUES (gen_random_uuid()::text, $1, $2, $3, $4)
+			RETURNING upload_id`, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
+		return id, err
+	})
 }
 
 // ListedPart is one part named in CompleteMultipartUpload.
@@ -215,40 +201,28 @@ func (s *Store) AbortUploadKind(ctx context.Context, kind ns.Kind, uploadID, nam
 	if err != nil {
 		return false, err
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	var one int
-	err = tx.QueryRow(ctx, "SELECT 1 FROM "+sc+".uploads WHERE upload_id = $1 AND key = $2 FOR UPDATE", uploadID, key).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	var ids []int64
-	rows, err := tx.Query(ctx, "SELECT file_id FROM "+sc+".upload_parts WHERE upload_id = $1", uploadID)
-	if err != nil {
-		return false, err
-	}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
+	return withTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+		var one int
+		err := tx.QueryRow(ctx, "SELECT 1 FROM "+sc+".uploads WHERE upload_id = $1 AND key = $2 FOR UPDATE", uploadID, key).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+			return false, nil
+		}
+		if err != nil {
 			return false, err
 		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if _, err := tx.Exec(ctx, "DELETE FROM "+sc+".uploads WHERE upload_id = $1", uploadID); err != nil {
-		return false, err
-	}
-	if err := queueFileIDs(ctx, tx, sc, ids); err != nil {
-		return false, err
-	}
-	return true, tx.Commit(ctx)
+		rows, err := tx.Query(ctx, "SELECT file_id FROM "+sc+".upload_parts WHERE upload_id = $1", uploadID)
+		if err != nil {
+			return false, err
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM "+sc+".uploads WHERE upload_id = $1", uploadID); err != nil {
+			return false, err
+		}
+		return true, queueFileIDs(ctx, tx, sc, ids)
+	})
 }
 
 func s3ETag(md5sum []byte, parts int) string {

@@ -16,12 +16,7 @@ const MaxInlineBytes = 65536
 
 // PutInline publishes a bucket object up to 64 KiB in one SQL round trip.
 func (s *Store) PutInline(ctx context.Context, bucket, key string, data []byte, cond Condition, ifMatch string, userMeta []string, contentType string) (*Meta, error) {
-	return s.PutInlineOpts(ctx, bucket, key, data, cond, ifMatch, userMeta, contentType, nil, false)
-}
-
-// PutInlineOpts is PutInline with TTL control.
-func (s *Store) PutInlineOpts(ctx context.Context, bucket, key string, data []byte, cond Condition, ifMatch string, userMeta []string, contentType string, expiresAt *time.Time, keepTTL bool) (*Meta, error) {
-	return s.PutInlineKind(ctx, ns.Bucket, bucket, key, data, cond, ifMatch, userMeta, contentType, expiresAt, keepTTL, "")
+	return s.PutInlineKind(ctx, ns.Bucket, bucket, key, data, cond, ifMatch, userMeta, contentType, nil, false, "")
 }
 
 // PutInlineKind publishes an object up to the kind's inline ceiling in one SQL
@@ -33,10 +28,6 @@ func (s *Store) PutInlineKind(ctx context.Context, kind ns.Kind, name, key strin
 	}
 	if s.checkQuota(ctx, kind, name, int64(len(data))) {
 		return nil, ErrQuotaExceeded
-	}
-	sc, err := nsSQLIdent(kind, name)
-	if err != nil {
-		return nil, err
 	}
 	sumMD5 := md5.Sum(data)
 	sumSHA := sha256.Sum256(data)
@@ -58,24 +49,13 @@ func (s *Store) PutInlineKind(ctx context.Context, kind ns.Kind, name, key strin
 	if userMeta == nil {
 		userMeta = []string{}
 	}
-	if !s.known(kind, name) {
-		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
-			return nil, err
-		}
-	}
-	query := "SELECT " + sc + ".put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
-	var result string
-	err = s.pool.QueryRow(ctx, query,
-		key, stored, int64(len(data)), sumSHA[:], etag, userMeta, contentType,
-		condText, match, "on", expiresAt, keepTTL, originETag).Scan(&result)
-	if isMissingBucketSchema(err) {
-		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
-			return nil, err
-		}
-		err = s.pool.QueryRow(ctx, query,
+	result, err := withAutoCreate(ctx, s, kind, name, func(sc string) (string, error) {
+		var res string
+		err := s.pool.QueryRow(ctx, "SELECT "+sc+".put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
 			key, stored, int64(len(data)), sumSHA[:], etag, userMeta, contentType,
-			condText, match, "on", expiresAt, keepTTL, originETag).Scan(&result)
-	}
+			condText, match, "on", expiresAt, keepTTL, originETag).Scan(&res)
+		return res, err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -83,12 +63,9 @@ func (s *Store) PutInlineKind(ctx context.Context, kind ns.Kind, name, key strin
 	case "ok":
 	case "nobucket":
 		return nil, ErrNoBucket
-	case "precondition":
-		return nil, ErrPrecondition
 	default:
 		return nil, ErrPrecondition
 	}
-	s.markKnown(kind, name)
 	m := Meta{
 		Size: int64(len(data)), SHA256: sumSHA[:], ETag: etag,
 		UserMetadata: userMeta, ContentType: contentType, CreatedAt: time.Now(),

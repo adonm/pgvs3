@@ -108,10 +108,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, errAccessDenied("gateway is read-only"), s.log)
 		return
 	}
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		s.serveOrigin(w, r, origin, bucket, key)
-		return
-	}
 	q := r.URL.Query()
 	switch {
 	case bucket == "":
@@ -121,6 +117,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		s.methodNotAllowed(w, r)
 	case key == "":
+		if s.originFor(r.Context(), bucket) != nil {
+			s.serveOriginBucket(w, r, bucket, q)
+			return
+		}
 		s.bucketRequest(w, r, bucket, q)
 	default:
 		s.objectRequest(w, r, bucket, key, q)
@@ -323,6 +323,10 @@ func (s *Server) getBucketLocation(w http.ResponseWriter, _ *http.Request, _ str
 }
 
 func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		s.headOriginObject(w, r, origin, bucket, key)
+		return
+	}
 	m, err := s.store.MetaHeader(r.Context(), bucket, key)
 	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
 		key += "index.html"
@@ -366,6 +370,10 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 }
 
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		s.getOriginObject(w, r, origin, bucket, key)
+		return
+	}
 	part, hasPart, err := parsePartNumber(r.URL.Query())
 	if err != nil {
 		writeError(w, r, err, s.log)
@@ -450,6 +458,10 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 }
 
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		s.putOriginObject(w, r, origin, bucket, key)
+		return
+	}
 	if r.Header.Get("Content-Encoding") != "" {
 		writeError(w, r, errNotImplemented(), s.log)
 		return
@@ -552,7 +564,13 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		writeError(w, r, errNotImplemented(), s.log)
 		return
 	}
-	if _, err := s.store.Delete(r.Context(), bucket, key); err != nil {
+	var err error
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		err = origin.Delete(r.Context(), bucket, key)
+	} else {
+		_, err = s.store.Delete(r.Context(), bucket, key)
+	}
+	if err != nil {
 		writeError(w, r, errInternal(err, s.log), s.log)
 		return
 	}
@@ -966,30 +984,16 @@ func putCondition(r *http.Request) (store.Condition, string, error) {
 }
 
 func readCondition(r *http.Request, etag string) error {
-	if v := r.Header.Get("If-Match"); v != "" && !etagListMatches(v, etag) {
+	if v := r.Header.Get("If-Match"); v != "" && !store.ETagMatches(v, etag) {
 		return errPreconditionFailed()
 	}
-	if v := r.Header.Get("If-None-Match"); v != "" && etagListMatches(v, etag) {
+	if v := r.Header.Get("If-None-Match"); v != "" && store.ETagMatches(v, etag) {
 		return errNotModifiedSentinel
 	}
 	return nil
 }
 
 var errNotModifiedSentinel = errors.New("not modified")
-
-func etagListMatches(header, etag string) bool {
-	for _, want := range strings.Split(header, ",") {
-		want = strings.TrimSpace(want)
-		if want == "*" {
-			return true
-		}
-		want = strings.Trim(strings.TrimPrefix(want, "W/"), `"`)
-		if want == etag {
-			return true
-		}
-	}
-	return false
-}
 
 func setObjectHeaders(w http.ResponseWriter, m *store.Meta, key string) {
 	ct := m.ContentType

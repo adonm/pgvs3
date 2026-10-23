@@ -38,6 +38,12 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	var expiredUploads int
 	for _, n := range infos {
 		q := quoteIdent(n.Schema)
+		if n.Kind == ns.Queue {
+			if removed, err := s.ExpireQueueMessages(ctx, n.Name, ExpireBatch); err == nil {
+				s.expiredObjects.Add(removed)
+			}
+			continue
+		}
 		if n.Kind == ns.Bucket {
 			var v int
 			if err := conn.QueryRow(ctx, "SELECT "+q+".expire_uploads(interval '24 hours', 64)").Scan(&v); err != nil {

@@ -30,12 +30,6 @@ func NewNamespaceRef(kind ns.Kind, name string) (ns.Kind, string, error) {
 	return kind, name, nil
 }
 
-// BucketSchema returns the PostgreSQL schema for an S3 bucket name.
-func BucketSchema(bucket string) (string, error) { return ns.Bucket.Schema(bucket) }
-
-// NamespaceSchema returns the schema for any namespace kind.
-func NamespaceSchema(kind ns.Kind, name string) (string, error) { return kind.Schema(name) }
-
 func quoteIdent(ident string) string {
 	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
 }
@@ -64,6 +58,47 @@ func (s *Store) markKnown(kind ns.Kind, name string) {
 func (s *Store) forget(kind ns.Kind, name string) {
 	s.knownNS.Delete(nsKey(kind, name))
 	s.quota.Delete(nsKey(kind, name))
+}
+
+func withTx[T any](ctx context.Context, s *Store, fn func(pgx.Tx) (T, error)) (T, error) {
+	var zero T
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	v, err := fn(tx)
+	if err != nil {
+		return zero, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return zero, err
+	}
+	return v, nil
+}
+
+func withAutoCreate[T any](ctx context.Context, s *Store, kind ns.Kind, name string, fn func(schema string) (T, error)) (T, error) {
+	var zero T
+	sc, err := nsSQLIdent(kind, name)
+	if err != nil {
+		return zero, err
+	}
+	if !s.known(kind, name) {
+		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
+			return zero, err
+		}
+	}
+	v, err := fn(sc)
+	if isMissingBucketSchema(err) {
+		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
+			return zero, err
+		}
+		v, err = fn(sc)
+	}
+	if err == nil {
+		s.markKnown(kind, name)
+	}
+	return v, err
 }
 
 // EnsureNamespace creates (idempotently) a namespace and its schema.
@@ -99,11 +134,6 @@ func isInvalidNameErr(err error) bool {
 // CreateBucket ensures an S3 bucket namespace.
 func (s *Store) CreateBucket(ctx context.Context, name string) error {
 	return s.EnsureNamespace(ctx, ns.Bucket, name, nil, nil)
-}
-
-// EnsureCache ensures a volatile cache namespace.
-func (s *Store) EnsureCache(ctx context.Context, name string) error {
-	return s.EnsureNamespace(ctx, ns.Cache, name, nil, nil)
 }
 
 // EnsureQueue ensures a queue namespace with the given attributes.
@@ -166,10 +196,6 @@ func (s *Store) DropNamespace(ctx context.Context, kind ns.Kind, name string, fo
 	}
 }
 
-func (s *Store) DeleteBucket(ctx context.Context, name string) (BucketDeletion, error) {
-	return s.DropNamespace(ctx, ns.Bucket, name, false)
-}
-
 func (s *Store) DropBucket(ctx context.Context, name string, force bool) (BucketDeletion, error) {
 	return s.DropNamespace(ctx, ns.Bucket, name, force)
 }
@@ -225,15 +251,13 @@ func (s *Store) Namespaces(ctx context.Context, kind ns.Kind) ([]NamespaceInfo, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []NamespaceInfo
-	for rows.Next() {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (NamespaceInfo, error) {
 		var kindS, name, schema string
 		var quota pgtype.Int8
 		var attrs []byte
 		var epoch float64
-		if err := rows.Scan(&kindS, &name, &schema, &quota, &attrs, &epoch); err != nil {
-			return nil, err
+		if err := row.Scan(&kindS, &name, &schema, &quota, &attrs, &epoch); err != nil {
+			return NamespaceInfo{}, err
 		}
 		n := NamespaceInfo{Kind: ns.Kind(kindS), Name: name, Schema: schema, CreatedAt: time.Unix(0, int64(epoch*1e9))}
 		if quota.Valid {
@@ -243,22 +267,8 @@ func (s *Store) Namespaces(ctx context.Context, kind ns.Kind) ([]NamespaceInfo, 
 		if len(attrs) > 0 {
 			_ = json.Unmarshal(attrs, &n.Attrs)
 		}
-		out = append(out, n)
-	}
-	return out, rows.Err()
-}
-
-// namespaceSchemas returns the schemas of one kind (or all kinds).
-func (s *Store) namespaceSchemas(ctx context.Context, kind ns.Kind) ([]string, error) {
-	infos, err := s.Namespaces(ctx, kind)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, 0, len(infos))
-	for _, n := range infos {
-		out = append(out, n.Schema)
-	}
-	return out, nil
+		return n, nil
+	})
 }
 
 // Migrate upgrades a layout v10 database in place. It returns the number of
@@ -532,14 +542,6 @@ type Stats struct {
 // Stat aggregates every namespace.
 func (s *Store) Stat(ctx context.Context) (Stats, error) { return s.StatNamespace(ctx, "", "") }
 
-// StatBucket aggregates one bucket, or all namespaces when bucket is empty.
-func (s *Store) StatBucket(ctx context.Context, bucket string) (Stats, error) {
-	if bucket == "" {
-		return s.StatNamespace(ctx, "", "")
-	}
-	return s.StatNamespace(ctx, ns.Bucket, bucket)
-}
-
 // StatNamespace reports usage for one namespace, one kind, or everything.
 func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (Stats, error) {
 	var st Stats
@@ -550,19 +552,14 @@ func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (S
 	if err != nil {
 		return st, err
 	}
-	var infos []NamespaceInfo
-	for rows.Next() {
+	infos, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (NamespaceInfo, error) {
 		var n NamespaceInfo
 		var k string
-		if err := rows.Scan(&k, &n.Name, &n.Schema); err != nil {
-			rows.Close()
-			return st, err
-		}
+		err := row.Scan(&k, &n.Name, &n.Schema)
 		n.Kind = ns.Kind(k)
-		infos = append(infos, n)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return n, err
+	})
+	if err != nil {
 		return st, err
 	}
 	var maxOldest float64

@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -243,29 +242,14 @@ func lockTwo(ctx context.Context, tx pgx.Tx, b1, k1, b2, k2 string) error {
 // is intentionally opaque; only equality and "*" matter.
 func condOK(ifMatch, ifNone string, exists bool, etag string) bool {
 	if ifMatch != "" {
-		if !exists || !etagListMatch(ifMatch, etag) {
+		if !exists || !ETagMatches(ifMatch, etag) {
 			return false
 		}
 	}
 	if ifNone != "" {
-		if exists && etagListMatch(ifNone, etag) {
+		if exists && ETagMatches(ifNone, etag) {
 			return false
 		}
 	}
 	return true
-}
-
-func etagListMatch(header, etag string) bool {
-	want := strings.Trim(strings.TrimPrefix(strings.TrimSpace(etag), "W/"), `"`)
-	for _, token := range strings.Split(header, ",") {
-		t := strings.TrimSpace(token)
-		if t == "*" {
-			return true
-		}
-		t = strings.Trim(strings.TrimPrefix(t, "W/"), `"`)
-		if t != "" && t == want {
-			return true
-		}
-	}
-	return false
 }

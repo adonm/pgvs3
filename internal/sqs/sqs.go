@@ -467,11 +467,7 @@ func (s *Server) opCreateQueue(ctx context.Context, r *http.Request, _ string, i
 	if err := s.store.EnsureQueue(ctx, name, attrs); err != nil {
 		return nil, errBad(err.Error())
 	}
-	u := queueURL(r, name)
-	if in.json != nil {
-		return map[string]string{"QueueUrl": u}, nil
-	}
-	return createQueueResponse{Xmlns: sqsNS, QueueUrl: u}, nil
+	return createQueueResponse{Xmlns: sqsNS, QueueUrl: queueURL(r, name)}, nil
 }
 
 func (s *Server) opGetQueueURL(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {
@@ -483,11 +479,7 @@ func (s *Server) opGetQueueURL(ctx context.Context, r *http.Request, _ string, i
 	if !ok {
 		return nil, errNoQueue()
 	}
-	u := queueURL(r, name)
-	if in.json != nil {
-		return map[string]string{"QueueUrl": u}, nil
-	}
-	return getQueueURLResponse{Xmlns: sqsNS, QueueUrl: u}, nil
+	return getQueueURLResponse{Xmlns: sqsNS, QueueUrl: queueURL(r, name)}, nil
 }
 
 func (s *Server) opListQueues(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {
@@ -501,9 +493,6 @@ func (s *Server) opListQueues(ctx context.Context, r *http.Request, _ string, in
 		if prefix == "" || strings.HasPrefix(q.Name, prefix) {
 			urls = append(urls, queueURL(r, q.Name))
 		}
-	}
-	if in.json != nil {
-		return map[string]any{"QueueUrls": urls}, nil
 	}
 	return listQueuesResponse{Xmlns: sqsNS, QueueUrls: urls}, nil
 }
@@ -583,20 +572,12 @@ func (s *Server) runReceiptBatch(r *http.Request, in input, prefix string, visib
 	if perr != nil {
 		return nil, perr
 	}
-	var (
-		jsonOK   = []map[string]string{}
-		jsonFail = []map[string]any{}
-		xmlOK    []xmlBatchOK
-		xmlFail  []xmlBatchResultError
-	)
+	ok := []xmlBatchOK{}
+	fail := []xmlBatchResultError{}
 	for _, e := range entries {
 		if err := fn(name, e); err != nil {
 			if errors.Is(err, store.ErrReceiptStale) || errors.Is(err, store.ErrReceiptInvalid) {
-				jsonFail = append(jsonFail, map[string]any{
-					"Id": e.ID, "Code": "ReceiptHandleIsInvalid",
-					"Message": "The receipt handle is invalid.", "SenderFault": true,
-				})
-				xmlFail = append(xmlFail, xmlBatchResultError{
+				fail = append(fail, xmlBatchResultError{
 					Id: e.ID, Code: "ReceiptHandleIsInvalid",
 					Message: "The receipt handle is invalid.", SenderFault: true,
 				})
@@ -604,16 +585,12 @@ func (s *Server) runReceiptBatch(r *http.Request, in input, prefix string, visib
 			}
 			return nil, errBad(err.Error())
 		}
-		jsonOK = append(jsonOK, map[string]string{"Id": e.ID})
-		xmlOK = append(xmlOK, xmlBatchOK{Id: e.ID})
-	}
-	if in.json != nil {
-		return map[string]any{"Successful": jsonOK, "Failed": jsonFail}, nil
+		ok = append(ok, xmlBatchOK{Id: e.ID})
 	}
 	if visibility {
-		return changeVisibilityBatchResponse{Xmlns: sqsNS, Successful: xmlOK, Failed: xmlFail}, nil
+		return changeVisibilityBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: fail}, nil
 	}
-	return deleteBatchResponse{Xmlns: sqsNS, Successful: xmlOK, Failed: xmlFail}, nil
+	return deleteBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: fail}, nil
 }
 
 func (s *Server) opGetQueueAttrs(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {
@@ -689,11 +666,6 @@ func (s *Server) opSendMessage(ctx context.Context, r *http.Request, _ string, i
 		return nil, errBad(err.Error())
 	}
 	s.notify(name)
-	if in.json != nil {
-		return map[string]string{
-			"MessageId": sent[0].ID, "MD5OfMessageBody": sent[0].MD5OfBody,
-		}, nil
-	}
 	return sendMessageResponse{Xmlns: sqsNS, MessageId: sent[0].ID, MD5OfMessageBody: sent[0].MD5OfBody}, nil
 }
 
@@ -752,18 +724,11 @@ func (s *Server) opSendMessageBatch(ctx context.Context, r *http.Request, _ stri
 		return nil, errBad(err.Error())
 	}
 	s.notify(name)
-	if in.json != nil {
-		ok := make([]map[string]string, len(entries))
-		for i, e := range entries {
-			ok[i] = map[string]string{"Id": e.ID, "MessageId": sent[i].ID, "MD5OfMessageBody": sent[i].MD5OfBody}
-		}
-		return map[string]any{"Successful": ok, "Failed": []any{}}, nil
-	}
-	xmlOK := make([]xmlSendBatchResult, len(entries))
+	ok := make([]xmlSendBatchResult, len(entries))
 	for i, e := range entries {
-		xmlOK[i] = xmlSendBatchResult{Id: e.ID, MessageId: sent[i].ID, MD5OfMessageBody: sent[i].MD5OfBody}
+		ok[i] = xmlSendBatchResult{Id: e.ID, MessageId: sent[i].ID, MD5OfMessageBody: sent[i].MD5OfBody}
 	}
-	return sendBatchResponse{Xmlns: sqsNS, Successful: xmlOK}, nil
+	return sendBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: []xmlBatchResultError{}}, nil
 }
 
 func (s *Server) opReceiveMessage(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {

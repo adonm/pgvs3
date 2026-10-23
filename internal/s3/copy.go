@@ -47,13 +47,18 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 			return
 		}
 	}
-	out, err := s.store.Copy(r.Context(), srcBucket, srcKey, bucket, key, store.CopyOptions{
-		ReplaceMetadata: replace, UserMetadata: meta, ContentType: ct,
-		SourceIfMatch: r.Header.Get("x-amz-copy-source-if-match"),
-		SourceIfNone:  r.Header.Get("x-amz-copy-source-if-none-match"),
-		DestIfMatch:   r.Header.Get("If-Match"),
-		DestIfNone:    r.Header.Get("If-None-Match"),
-	})
+	var out *store.Meta
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		out, err = origin.Copy(r.Context(), srcBucket, srcKey, bucket, key, meta, ct, replace)
+	} else {
+		out, err = s.store.Copy(r.Context(), srcBucket, srcKey, bucket, key, store.CopyOptions{
+			ReplaceMetadata: replace, UserMetadata: meta, ContentType: ct,
+			SourceIfMatch: r.Header.Get("x-amz-copy-source-if-match"),
+			SourceIfNone:  r.Header.Get("x-amz-copy-source-if-none-match"),
+			DestIfMatch:   r.Header.Get("If-Match"),
+			DestIfNone:    r.Header.Get("If-None-Match"),
+		})
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
