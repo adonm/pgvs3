@@ -232,7 +232,12 @@ func (s *Store) StartObjectKind(ctx context.Context, kind ns.Kind, name, key str
 // StartPart begins a multipart part write. A re-sent part replaces the earlier
 // attempt atomically, rows included.
 func (s *Store) StartPart(ctx context.Context, uploadID, bucket, key string, partNo int32) (*ChunkWriter, error) {
-	return s.startWriter(ctx, writerTarget{kind: 1, bucket: bucket, key: key, uploadID: uploadID, partNo: partNo})
+	return s.StartPartKind(ctx, ns.Bucket, uploadID, bucket, key, partNo)
+}
+
+// StartPartKind begins a multipart part write in a bucket or cache namespace.
+func (s *Store) StartPartKind(ctx context.Context, kind ns.Kind, uploadID, name, key string, partNo int32) (*ChunkWriter, error) {
+	return s.startWriter(ctx, writerTarget{kind: 1, nsKind: kind, bucket: name, key: key, uploadID: uploadID, partNo: partNo})
 }
 
 func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, error) {
@@ -485,15 +490,19 @@ func swapObjectParts(ctx context.Context, tx pgx.Tx, schema, bucket, key string,
 	if _, err := tx.Exec(ctx, "DELETE FROM "+schema+".object_part_checksums WHERE key = $1", key); err != nil {
 		return err
 	}
+	var exp any
+	if t != nil && t.expiresAt != nil {
+		exp = *t.expiresAt
+	}
 	_, err = tx.Exec(ctx,
-		`INSERT INTO `+schema+`.objects (key, file_id, size, sha256, etag, user_metadata, content_type, parts, part_ends, inline_data)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
+		`INSERT INTO `+schema+`.objects (key, file_id, size, sha256, etag, user_metadata, content_type, expires_at, parts, part_ends, inline_data)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL)
 		 ON CONFLICT (key) DO UPDATE SET file_id = EXCLUDED.file_id, size = EXCLUDED.size,
 		   sha256 = EXCLUDED.sha256, etag = EXCLUDED.etag,
 		   user_metadata = EXCLUDED.user_metadata, content_type = EXCLUDED.content_type,
-		   parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends, inline_data = NULL,
-		   created_at = now()`,
-		key, fileID, size, sha, etag, userMeta, content, parts, ends)
+		   expires_at = EXCLUDED.expires_at, parts = EXCLUDED.parts, part_ends = EXCLUDED.part_ends,
+		   inline_data = NULL, created_at = now()`,
+		key, fileID, size, sha, etag, userMeta, content, exp, parts, ends)
 	if err != nil {
 		return err
 	}

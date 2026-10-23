@@ -215,16 +215,21 @@ YAML
 pgvs3 serve --origin-config origin.yaml --cache-namespace origin --cache-ttl 5m
 ```
 
-Every S3 `GET` is served from `s3c_<namespace>` when the cached size and origin
-mtime still match, and downloaded otherwise. **Ranges of objects larger than
-8 MiB are passed straight through to the origin** (`GetRange`) instead of
-downloading the whole object, which is what DuckDB footer and row-group reads
-need; a full GET still populates the cache. `PUT` writes through to the origin
-and refreshes the cache; `DELETE` removes both. `--cache-retention` evicts idle
-entries. Fills are bounded by `--fill-concurrency` and the origin body is
-buffered (memory ≤8 MiB, otherwise a temp file) before the PostgreSQL writer
-opens, so origin latency never consumes pool connections. Supported origin
-types are `s3`, `filesystem` and `inmem`.
+Every S3 `GET` and `HEAD` is served from `s3c_<namespace>` (`X-Cache: HIT`)
+without contacting the origin while within `--cache-ttl`, or when the cached
+size and origin mtime still match on revalidation. Cold ranges of objects
+larger than 8 MiB are passed straight through to the origin (`GetRange`,
+`X-Cache: MISS`) instead of downloading the whole object, while full reads and
+ranges on already-cached objects are served from PostgreSQL.
+
+Writes are **write-through**: single `PUT`, `CopyObject`, and multipart uploads
+(`CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`) write to
+both the origin and `s3c_<namespace>`, so other cache consumers immediately
+read `X-Cache: HIT` without re-pulling from the origin. `DELETE` and
+`DeleteObjects` remove from both. `--cache-retention` evicts idle entries.
+Fills and single-request uploads buffer the body (memory ≤8 MiB, otherwise a
+temp file) before opening a PostgreSQL writer so origin latency never holds
+pool connections. Supported origin types are `s3`, `filesystem` and `inmem`.
 
 ## Admission control
 

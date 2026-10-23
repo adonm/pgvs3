@@ -16,12 +16,17 @@ import (
 
 // CreateUpload starts a multipart upload and returns its id.
 func (s *Store) CreateUpload(ctx context.Context, bucket, key string, userMeta []string, contentType string, checksumAlgorithm *string) (string, error) {
-	sc, err := bucketSQLIdent(bucket)
+	return s.CreateUploadKind(ctx, ns.Bucket, bucket, key, userMeta, contentType, checksumAlgorithm)
+}
+
+// CreateUploadKind starts a multipart upload in a bucket or cache namespace.
+func (s *Store) CreateUploadKind(ctx context.Context, kind ns.Kind, name, key string, userMeta []string, contentType string, checksumAlgorithm *string) (string, error) {
+	sc, err := nsSQLIdent(kind, name)
 	if err != nil {
 		return "", err
 	}
-	if !s.known(ns.Bucket, bucket) {
-		if err := s.CreateBucket(ctx, bucket); err != nil {
+	if !s.known(kind, name) {
+		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
 			return "", err
 		}
 	}
@@ -31,7 +36,7 @@ func (s *Store) CreateUpload(ctx context.Context, bucket, key string, userMeta [
 	var id string
 	err = s.pool.QueryRow(ctx, query, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
 	if isMissingBucketSchema(err) {
-		if err := s.CreateBucket(ctx, bucket); err != nil {
+		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
 			return "", err
 		}
 		err = s.pool.QueryRow(ctx, query, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
@@ -57,7 +62,13 @@ type Completed struct {
 // CompleteUpload validates the listed parts and publishes the ordered part
 // list without moving any data.
 func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, requestKey string, listed []ListedPart) (*Completed, error) {
-	sc, err := bucketSQLIdent(requestBucket)
+	return s.CompleteUploadKind(ctx, ns.Bucket, uploadID, requestBucket, requestKey, listed, nil)
+}
+
+// CompleteUploadKind validates the listed parts and publishes the multipart
+// object in a bucket or cache namespace.
+func (s *Store) CompleteUploadKind(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time) (*Completed, error) {
+	sc, err := nsSQLIdent(kind, requestBucket)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +167,11 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 		return nil, ErrInvalidPart
 	}
 	etag := s3ETag(md5All.Sum(nil), len(ids))
-	if err := swapObjectParts(ctx, tx, sc, requestBucket, key, nil, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
+	var target *writerTarget
+	if expiresAt != nil {
+		target = &writerTarget{expiresAt: expiresAt}
+	}
+	if err := swapObjectParts(ctx, tx, sc, requestBucket, key, target, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
 		return nil, err
 	}
 	if len(selectedChecks) > 0 {
@@ -190,7 +205,13 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 
 // AbortUpload discards an in-progress multipart upload.
 func (s *Store) AbortUpload(ctx context.Context, uploadID, bucket, key string) (bool, error) {
-	sc, err := bucketSQLIdent(bucket)
+	return s.AbortUploadKind(ctx, ns.Bucket, uploadID, bucket, key)
+}
+
+// AbortUploadKind discards an in-progress multipart upload in a bucket or
+// cache namespace.
+func (s *Store) AbortUploadKind(ctx context.Context, kind ns.Kind, uploadID, name, key string) (bool, error) {
+	sc, err := nsSQLIdent(kind, name)
 	if err != nil {
 		return false, err
 	}

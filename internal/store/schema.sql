@@ -141,7 +141,7 @@ BEGIN
     );
     CREATE INDEX IF NOT EXISTS garbage_by_age ON %1$I.garbage (queued_at, file_id);
 
-    CREATE TABLE IF NOT EXISTS %1$I.uploads (
+    CREATE %2$s TABLE IF NOT EXISTS %1$I.uploads (
       upload_id          text PRIMARY KEY,
       key                text COLLATE "C" NOT NULL,
       checksum_algorithm text CHECK (checksum_algorithm IN ('CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256')),
@@ -155,7 +155,7 @@ BEGIN
     CREATE INDEX IF NOT EXISTS uploads_by_key ON %1$I.uploads (key, upload_id);
     CREATE INDEX IF NOT EXISTS uploads_by_age ON %1$I.uploads (created_at, upload_id);
 
-    CREATE TABLE IF NOT EXISTS %1$I.upload_parts (
+    CREATE %2$s TABLE IF NOT EXISTS %1$I.upload_parts (
       upload_id text NOT NULL REFERENCES %1$I.uploads ON DELETE CASCADE,
       part_no   int4 NOT NULL,
       file_id   int8 NOT NULL,
@@ -329,46 +329,42 @@ BEGIN
       END IF;
       RETURN COALESCE(removed, 0);
     END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.commit_part(
+      p_upload text, p_no int4, p_file_id int8, p_size int8, p_sha bytea,
+      p_md5 bytea, p_checksum text DEFAULT NULL
+    ) RETURNS void LANGUAGE plpgsql AS $body$
+    DECLARE old bigint;
+    BEGIN
+      DELETE FROM %1$I.upload_parts WHERE upload_id = p_upload AND part_no = p_no
+        RETURNING file_id INTO old;
+      IF old IS NOT NULL THEN
+        PERFORM %1$I.queue_garbage(ARRAY[old]);
+      END IF;
+      INSERT INTO %1$I.upload_parts (upload_id, part_no, file_id, size, sha256, md5, checksum)
+      VALUES (p_upload, p_no, p_file_id, p_size, p_sha, p_md5, p_checksum);
+    END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.expire_uploads(
+      p_grace interval DEFAULT interval '24 hours',
+      p_max_uploads int DEFAULT 64
+    ) RETURNS int LANGUAGE plpgsql AS $body$
+    DECLARE victim_upload text; removed int := 0;
+    BEGIN
+      FOR attempt IN 1..p_max_uploads LOOP
+        SELECT upload_id INTO victim_upload FROM %1$I.uploads
+          WHERE created_at < now() - p_grace
+          ORDER BY created_at, upload_id LIMIT 1 FOR UPDATE SKIP LOCKED;
+        EXIT WHEN victim_upload IS NULL;
+        INSERT INTO %1$I.garbage (file_id)
+          SELECT file_id FROM %1$I.upload_parts WHERE upload_id = victim_upload
+          ON CONFLICT DO NOTHING;
+        DELETE FROM %1$I.uploads WHERE upload_id = victim_upload;
+        removed := removed + 1;
+      END LOOP;
+      RETURN removed;
+    END $body$;
   $fn$, p_schema, hashtextextended(p_schema, 0), v_inline);
-
-  IF p_kind = 'bucket' THEN
-    EXECUTE format($fn$
-      CREATE OR REPLACE FUNCTION %1$I.commit_part(
-        p_upload text, p_no int4, p_file_id int8, p_size int8, p_sha bytea,
-        p_md5 bytea, p_checksum text DEFAULT NULL
-      ) RETURNS void LANGUAGE plpgsql AS $body$
-      DECLARE old bigint;
-      BEGIN
-        DELETE FROM %1$I.upload_parts WHERE upload_id = p_upload AND part_no = p_no
-          RETURNING file_id INTO old;
-        IF old IS NOT NULL THEN
-          PERFORM %1$I.queue_garbage(ARRAY[old]);
-        END IF;
-        INSERT INTO %1$I.upload_parts (upload_id, part_no, file_id, size, sha256, md5, checksum)
-        VALUES (p_upload, p_no, p_file_id, p_size, p_sha, p_md5, p_checksum);
-      END $body$;
-
-      CREATE OR REPLACE FUNCTION %1$I.expire_uploads(
-        p_grace interval DEFAULT interval '24 hours',
-        p_max_uploads int DEFAULT 64
-      ) RETURNS int LANGUAGE plpgsql AS $body$
-      DECLARE victim_upload text; removed int := 0;
-      BEGIN
-        FOR attempt IN 1..p_max_uploads LOOP
-          SELECT upload_id INTO victim_upload FROM %1$I.uploads
-            WHERE created_at < now() - p_grace
-            ORDER BY created_at, upload_id LIMIT 1 FOR UPDATE SKIP LOCKED;
-          EXIT WHEN victim_upload IS NULL;
-          INSERT INTO %1$I.garbage (file_id)
-            SELECT file_id FROM %1$I.upload_parts WHERE upload_id = victim_upload
-            ON CONFLICT DO NOTHING;
-          DELETE FROM %1$I.uploads WHERE upload_id = victim_upload;
-          removed := removed + 1;
-        END LOOP;
-        RETURN removed;
-      END $body$;
-    $fn$, p_schema);
-  END IF;
 END $$;
 
 -- Idempotently creates a namespace's schema, tables, indexes and SQL helpers.

@@ -195,8 +195,8 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `ChangeMessageVisibilityBatch`, `GetQueueAttributes`, `SetQueueAttributes`
   over both the JSON (`AmazonSQS.*`) and Query (`Action=`) protocols, with
   visibility timeouts, delays, retention and long polling.
-- **S3 cache tier:** `GET`/`HEAD`/`PUT`/`DELETE`/`ListObjectsV2` in front of an
-  objstore origin, with TTL revalidation (`--cache-ttl`) and idle eviction
+- **S3 cache tier:** read-through and write-through `GET`/`HEAD`/`PUT`/`CopyObject`/multipart uploads/`DELETE`/`DeleteObjects`/`ListObjectsV2` in front of an
+  objstore origin (`X-Cache: HIT|MISS`), with TTL revalidation (`--cache-ttl`) and idle eviction
   (`--cache-retention`).
 - **RESP (Redis/Valkey) cache protocol on `:8014`:** supports `GET`, `SET`
   (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `SETNX`, `SETEX`,

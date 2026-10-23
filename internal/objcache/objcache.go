@@ -120,6 +120,7 @@ type Object struct {
 	Size         int64
 	ETag         string
 	ContentType  string
+	UserMetadata []string
 	LastModified time.Time
 	Body         io.ReadCloser
 	Start, End   int64
@@ -173,7 +174,8 @@ func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 	if err == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl {
 		return &Object{
 			Size: m.Size, ETag: m.ETag, ContentType: m.ContentType,
-			LastModified: m.CreatedAt, End: max(m.Size-1, 0), Hit: true,
+			UserMetadata: m.UserMetadata, LastModified: m.CreatedAt,
+			End: max(m.Size-1, 0), Hit: true,
 		}, nil
 	}
 	attrs, aerr := t.origin.Attributes(ctx, ck)
@@ -188,7 +190,8 @@ func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 		t.touch(ctx, ck)
 		return &Object{
 			Size: m.Size, ETag: m.ETag, ContentType: m.ContentType,
-			LastModified: time.Now(), End: max(m.Size-1, 0), Hit: true,
+			UserMetadata: m.UserMetadata, LastModified: time.Now(),
+			End: max(m.Size-1, 0), Hit: true,
 		}, nil
 	}
 	return &Object{
@@ -253,7 +256,8 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 		}
 		return &Object{
 			Size: 0, ETag: m.ETag, ContentType: m.ContentType,
-			LastModified: m.CreatedAt, Body: io.NopCloser(bytes.NewReader(nil)), Hit: valid,
+			UserMetadata: m.UserMetadata, LastModified: m.CreatedAt,
+			Body: io.NopCloser(bytes.NewReader(nil)), Hit: valid,
 		}, nil
 	}
 
@@ -270,8 +274,9 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 		}
 		return &Object{
 			Size: sm.Size, ETag: sm.ETag, ContentType: sm.ContentType,
-			LastModified: sm.CreatedAt, Body: body, Start: sm.Start, End: sm.End,
-			Ranged: ranged, Hit: true,
+			UserMetadata: sm.UserMetadata, LastModified: sm.CreatedAt,
+			Body: body, Start: sm.Start, End: sm.End,
+			Ranged: ranged, Hit: valid,
 		}, nil
 	}
 
@@ -310,7 +315,7 @@ func (t *Tier) fill(ctx context.Context, ck, key string, size int64, version str
 		return nil, err
 	}
 	defer cleanup()
-	return t.storeSpooled(ctx, ck, contentTypeFor(key), version, sp)
+	return t.storeSpooled(ctx, ck, nil, contentTypeFor(key), version, sp)
 }
 
 type spooled struct {
@@ -355,17 +360,17 @@ func spoolStream(r io.Reader) (spooled, func(), error) {
 	return spooled{r: tmp, size: int64(len(head)) + n}, clean, nil
 }
 
-func (t *Tier) storeSpooled(ctx context.Context, ck, ct, version string, sp spooled) (*store.Meta, error) {
+func (t *Tier) storeSpooled(ctx context.Context, ck string, userMeta []string, ct, version string, sp spooled) (*store.Meta, error) {
 	exp := time.Now().Add(t.retention)
 	if sp.data != nil && int64(len(sp.data)) <= int64(ns.Cache.InlineMax()) {
 		return t.store.PutInlineKind(ctx, ns.Cache, t.namespace, ck, sp.data,
-			store.Unconditional, "", nil, ct, &exp, false, version)
+			store.Unconditional, "", userMeta, ct, &exp, false, version)
 	}
 	if _, err := sp.r.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	w, err := t.store.StartObjectKind(ctx, ns.Cache, t.namespace, ck,
-		store.Unconditional, "", nil, ct, &exp, false, version)
+		store.Unconditional, "", userMeta, ct, &exp, false, version)
 	if err != nil {
 		return nil, err
 	}
@@ -379,32 +384,97 @@ func (t *Tier) storeSpooled(ctx context.Context, ck, ct, version string, sp spoo
 	}
 	return &store.Meta{
 		FileID: pub.FileID, Size: pub.Size, SHA256: pub.SHA256, ETag: pub.ETag,
-		ContentType: ct, CreatedAt: time.Now(), ExpiresAt: &exp, OriginETag: version,
+		UserMetadata: userMeta, ContentType: ct, CreatedAt: time.Now(),
+		ExpiresAt: &exp, OriginETag: version,
 	}, nil
 }
 
-// Upload spools the body, uploads it to the origin, and populates the cache
-// without holding a database connection during network I/O.
-func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, contentType string) (string, error) {
+// Upload spools the body, writes it through to the origin, and populates the
+// PostgreSQL cache so other cache consumers immediately read a cache hit
+// without re-pulling from the origin.
+func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, userMeta []string, contentType string) (*store.Meta, error) {
 	ck := t.key(bucket, key)
 	sp, cleanup, err := spoolStream(body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer cleanup()
 
 	if err := t.origin.Upload(ctx, ck, sp.r); err != nil {
-		return "", err
+		return nil, err
 	}
 	var version string
 	if attrs, err := t.origin.Attributes(ctx, ck); err == nil {
 		version = versionFor(attrs)
 	}
-	m, err := t.storeSpooled(ctx, ck, contentType, version, sp)
+	return t.storeSpooled(ctx, ck, userMeta, contentType, version, sp)
+}
+
+// Copy copies srcBucket/srcKey to dstBucket/dstKey with write-through caching:
+// the source is read from the cache (or origin if cold) and the destination is
+// written to both the origin and the PostgreSQL cache.
+func (t *Tier) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, userMeta []string, contentType string, replaceMeta bool) (*store.Meta, error) {
+	srcObj, err := t.Open(ctx, srcBucket, srcKey, 0, -1, -1)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return m.ETag, nil
+	defer srcObj.Body.Close()
+	meta, ct := srcObj.UserMetadata, srcObj.ContentType
+	if replaceMeta {
+		meta, ct = userMeta, contentType
+	}
+	return t.Upload(ctx, dstBucket, dstKey, srcObj.Body, meta, ct)
+}
+
+// CreateUpload starts a write-through multipart upload staged in the cache namespace.
+func (t *Tier) CreateUpload(ctx context.Context, bucket, key string, userMeta []string, contentType string, checksumAlg *string) (string, error) {
+	return t.store.CreateUploadKind(ctx, ns.Cache, t.namespace, t.key(bucket, key), userMeta, contentType, checksumAlg)
+}
+
+// StartPart opens a multipart part writer in the cache namespace.
+func (t *Tier) StartPart(ctx context.Context, uploadID, bucket, key string, partNo int32) (*store.ChunkWriter, error) {
+	return t.store.StartPartKind(ctx, ns.Cache, uploadID, t.namespace, t.key(bucket, key), partNo)
+}
+
+// CompleteUpload publishes the multipart object in the PostgreSQL cache and
+// writes it through to the origin so both hold the completed object immediately.
+func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string, listed []store.ListedPart) (*store.Completed, error) {
+	ck := t.key(bucket, key)
+	exp := time.Now().Add(t.retention)
+	done, err := t.store.CompleteUploadKind(ctx, ns.Cache, uploadID, t.namespace, ck, listed, &exp)
+	if err != nil {
+		return nil, err
+	}
+	_, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, ck, 0, -1, -1, nil)
+	if err != nil {
+		return nil, err
+	}
+	upErr := t.origin.Upload(ctx, ck, body)
+	_ = body.Close()
+	if upErr != nil {
+		_, _ = t.store.CacheDel(ctx, t.namespace, []string{ck})
+		return nil, upErr
+	}
+	if attrs, err := t.origin.Attributes(ctx, ck); err == nil {
+		t.setOriginETag(ctx, ck, versionFor(attrs))
+	}
+	done.Bucket = bucket
+	done.Key = key
+	return done, nil
+}
+
+// AbortUpload discards an in-progress multipart upload in the cache namespace.
+func (t *Tier) AbortUpload(ctx context.Context, uploadID, bucket, key string) (bool, error) {
+	return t.store.AbortUploadKind(ctx, ns.Cache, uploadID, t.namespace, t.key(bucket, key))
+}
+
+func (t *Tier) setOriginETag(ctx context.Context, ck, version string) {
+	sc, err := ns.Cache.Schema(t.namespace)
+	if err != nil {
+		return
+	}
+	_, _ = t.store.Pool().Exec(ctx,
+		`UPDATE "`+sc+`".objects SET origin_etag = $2, created_at = now() WHERE key = $1`, ck, version)
 }
 
 // Delete removes the object from the origin and the cache.

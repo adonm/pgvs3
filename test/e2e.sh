@@ -651,18 +651,42 @@ c = boto3.client('s3', endpoint_url=os.environ['OCACHE_ENDPOINT'],
 b = 'edge'
 k = os.environ['OCACHE_RUN'] + '/obj.bin'
 body = b'origin-payload-' + b'x' * 4000
-put_res = c.put_object(Bucket=b, Key=k, Body=body, ContentType='application/octet-stream')
+put_res = c.put_object(Bucket=b, Key=k, Body=body, ContentType='application/octet-stream', Metadata={'tier': 'write-through'})
 assert put_res.get('ETag', '').strip('"'), put_res
-assert c.get_object(Bucket=b, Key=k)['Body'].read() == body
+# Write-through: the very first GET/HEAD after PUT must be a cache HIT without re-pulling from the origin.
+get_res = c.get_object(Bucket=b, Key=k)
+assert get_res['Body'].read() == body
+assert get_res['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', get_res['ResponseMetadata']['HTTPHeaders']
+assert {mk.lower(): mv for mk, mv in get_res.get('Metadata', {}).items()} == {'tier': 'write-through'}, get_res.get('Metadata')
 head = c.head_object(Bucket=b, Key=k)
 assert head['ContentLength'] == len(body)
+assert head['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', head['ResponseMetadata']['HTTPHeaders']
 assert c.get_object(Bucket=b, Key=k, Range='bytes=0-15')['Body'].read() == body[:16]
+# CopyObject through the cache tier writes through to the origin and caches the destination immediately.
+copy_k = os.environ['OCACHE_RUN'] + '/copied.bin'
+c.copy_object(Bucket=b, Key=copy_k, CopySource={'Bucket': b, 'Key': k})
+copy_get = c.get_object(Bucket=b, Key=copy_k)
+assert copy_get['Body'].read() == body
+assert copy_get['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', copy_get['ResponseMetadata']['HTTPHeaders']
+assert os.path.exists(os.path.join(os.environ['OCACHE_DIR'], b, copy_k))
+# Multipart upload through the cache tier writes through to the origin and is immediately a cache HIT.
+mp_k = os.environ['OCACHE_RUN'] + '/mp.bin'
+mp_body = b'part-payload-' * 1000
+up = c.create_multipart_upload(Bucket=b, Key=mp_k)
+part = c.upload_part(Bucket=b, Key=mp_k, UploadId=up['UploadId'], PartNumber=1, Body=mp_body)
+c.complete_multipart_upload(Bucket=b, Key=mp_k, UploadId=up['UploadId'],
+    MultipartUpload={'Parts': [{'PartNumber': 1, 'ETag': part['ETag']}]})
+mp_get = c.get_object(Bucket=b, Key=mp_k)
+assert mp_get['Body'].read() == mp_body
+assert mp_get['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', mp_get['ResponseMetadata']['HTTPHeaders']
+assert os.path.exists(os.path.join(os.environ['OCACHE_DIR'], b, mp_k))
 # 0-byte object through the cache tier must report Content-Length: 0.
 empty_k = os.environ['OCACHE_RUN'] + '/empty.bin'
 c.put_object(Bucket=b, Key=empty_k, Body=b'')
 assert c.head_object(Bucket=b, Key=empty_k)['ContentLength'] == 0
 assert c.get_object(Bucket=b, Key=empty_k)['Body'].read() == b''
-c.delete_object(Bucket=b, Key=empty_k)
+c.delete_objects(Bucket=b, Delete={'Objects': [{'Key': empty_k}, {'Key': copy_k}, {'Key': mp_k}]})
+assert not os.path.exists(os.path.join(os.environ['OCACHE_DIR'], b, mp_k))
 p = os.path.join(os.environ['OCACHE_DIR'], b, k)
 open(p, 'wb').write(b'origin-updated')
 assert c.get_object(Bucket=b, Key=k)['Body'].read() == b'origin-updated'
@@ -703,6 +727,7 @@ curl -fsS "$OCACHE/edge/$RUN/big.bin" -o /dev/null
 rows=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
   "SELECT count(*) FROM \"s3c_ocache-$RUN\".objects WHERE key = 'edge/$RUN/big.bin'")
 [ "$rows" = 1 ] || fail "full GET was not cached ($rows rows)"
+curl -fsSI -H 'Range: bytes=1048576-1049599' "$OCACHE/edge/$RUN/big.bin" | grep -qi 'x-cache: HIT' || fail "cached 16 MiB range did not hit cache"
 kill "$ocache_pid" 2>/dev/null || true
 
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
