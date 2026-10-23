@@ -310,7 +310,7 @@ just integration # store/queue/cache integration tests against PostgreSQL 18 (te
 just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just helm-kind  # install the chart on a throwaway kind cluster under restricted Pod Security
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
-just interop    # rclone, restic, boto3, DuckLake, and SlateDB
+just interop    # rclone, restic, boto3, and DuckLake
 just load       # direct S3 load generator benchmark
 just bench      # DuckDB httpfs + DuckLake benchmark suite
 ```
