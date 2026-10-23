@@ -302,8 +302,8 @@ func TestGooseMigrationsAndIdempotentInit(t *testing.T) {
 		"SELECT max(version_id) FROM s3p.goose_db_version").Scan(&gooseVersion); err != nil {
 		t.Fatal(err)
 	}
-	if gooseVersion != 4 {
-		t.Fatalf("goose version = %d, want 4", gooseVersion)
+	if gooseVersion != 5 {
+		t.Fatalf("goose version = %d, want 5", gooseVersion)
 	}
 	var layout int
 	if err := testStore.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&layout); err != nil {
@@ -334,7 +334,7 @@ func TestInitAdoptsExistingLayoutWithoutGooseHistory(t *testing.T) {
 		"SELECT max(version_id) FROM s3p.goose_db_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Fatalf("goose version after adoption = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("goose version after adoption = %d, want 5", version)
 	}
 }
