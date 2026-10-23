@@ -113,9 +113,11 @@ print('ducklake ok')
 PY
 
 if mise exec rust -- cargo --version >/dev/null 2>&1; then
+  # SlateDB is Rust; keep its large dependency build outside the checkout.
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/pgvs3/slatedb-target}"
   S3_ENDPOINT="$A" S3_BUCKET="$BUCKET" S3_ACCESS_KEY="$PGVS3_ACCESS_KEY" \
   S3_SECRET_KEY="$PGVS3_SECRET_KEY" SLATEDB_PATH="$RUN/slatedb" \
-  mise exec rust -- cargo run --quiet --manifest-path test/slatedb/Cargo.toml
+  mise exec rust -- cargo run --quiet --locked --manifest-path test/slatedb/Cargo.toml
   echo "slatedb ok"
 else
   echo "SKIP slatedb: cargo not installed" >&2
