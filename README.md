@@ -134,7 +134,9 @@ on a 16-core host (6-vCPU VM numbers in [docs/benchmarks.md](docs/benchmarks.md)
   **`0.86 ms`** for an SQS `SendMessage`.
 - **RESP cache throughput (4 KiB, 64 workers):** **97.0k `GET`/s** unpipelined
   and **460.4k `GET`/s (1.76 GiB/s)** at pipeline 16; **48.2k durable `SET`/s**
-  unpipelined and **213.6k durable `SET`/s (834 MiB/s)** at pipeline 16.
+  unpipelined. The older **213.6k durable `SET`/s** pipeline-16 figure predates
+  the redcon move: redcon returns one command per 4 KiB read, so large
+  pipelined `SET`s may be processed individually rather than coalesced.
 - **S3 throughput (4 KiB):** **35.8k `GET`/s**, **26.1k `HEAD`/s**, and
   **20.9k durable `PUT`/s**.
 - **SQS throughput (4 KiB):** **12.7k `SendMessage`/s** and **2.1k
@@ -204,9 +206,10 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `SETRANGE`, `SCAN`, `TYPE`, `SELECT`,
   `FLUSHDB`, `DBSIZE`, `KEYS`, `INFO`, and `HELLO 2`. RESP3 is not supported:
   `HELLO 3` returns `NOPROTO`, and clients that default to RESP3 (for example
-  recent `redis-py` releases) must be configured with `protocol=2`. Pipelined `GET` and
-  `SET` bursts automatically coalesce into single-query `CacheMGet` /
-  `CacheMSet` database round trips. `EXPIRE` honours `NX`/`XX`/`GT`/`LT`.
+  recent `redis-py` releases) must be configured with `protocol=2`. Pipelined
+  `GET` bursts coalesce into one `CacheMGet`; consecutive `SET`s coalesce into
+  `CacheMSet` when redcon delivers them in the same read batch. `EXPIRE`
+  honours `NX`/`XX`/`GT`/`LT`.
   `MULTI`/`EXEC`/`WATCH` are rejected explicitly (use a pipeline; in
   `redis-py` pass `transaction=False`) because pgvs3 has no cross-command
   snapshot, and pretending otherwise would lose updates.
