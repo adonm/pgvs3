@@ -93,6 +93,10 @@ func (s *Server) getOriginObject(w http.ResponseWriter, r *http.Request, origin 
 		return
 	}
 	defer obj.Body.Close()
+	if obj.Size == 0 && obj.Ranged {
+		writeError(w, r, errInvalidRange(), s.log)
+		return
+	}
 	if err := readCondition(r, obj.ETag); err != nil {
 		if errors.Is(err, errNotModifiedSentinel) {
 			w.Header().Set("ETag", quoteETag(obj.ETag))

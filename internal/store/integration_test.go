@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/adonm/pgvs3/internal/ns"
+	"github.com/adonm/pgvs3/internal/testutil"
 )
 
 var (
@@ -25,26 +25,16 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	ctr, err := tcpostgres.Run(testCtx, "postgres:18",
-		tcpostgres.WithDatabase("pgvs3_test"),
-		tcpostgres.WithUsername("postgres"),
-		tcpostgres.WithPassword("postgres"),
-		tcpostgres.BasicWaitStrategies(),
-	)
+	url, cleanup, err := testutil.Postgres(testCtx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "start postgres:", err)
 		os.Exit(1)
 	}
 	code := 1
 	defer func() {
-		_ = ctr.Terminate(testCtx)
+		cleanup()
 		os.Exit(code)
 	}()
-	url, err := ctr.ConnectionString(testCtx, "sslmode=disable")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "postgres connection string:", err)
-		return
-	}
 	st, err := Open(testCtx, url, 8, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open store:", err)

@@ -361,7 +361,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	if hasPart {
 		start, end, ok := partBounds(m, part)
 		if !ok {
-			writeError(w, r, errInvalidRange(), s.log)
+			writeError(w, r, errInvalidPart(), s.log)
 			return
 		}
 		length = end - start + 1
@@ -413,7 +413,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		}
 		start, end, ok := partBounds(m, part)
 		if !ok {
-			writeError(w, r, errInvalidRange(), s.log)
+			writeError(w, r, errInvalidPart(), s.log)
 			return
 		}
 		first, last, suffix, ranged = start, end, -1, true
@@ -443,7 +443,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		return
 	}
 	defer body.Close()
-	if ranged && sm.Len() == 0 && sm.Size > 0 {
+	if ranged && sm.Len() == 0 {
 		w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(sm.Size, 10))
 		writeError(w, r, errInvalidRange(), s.log)
 		return

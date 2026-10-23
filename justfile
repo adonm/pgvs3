@@ -52,6 +52,10 @@ integration:
     mise exec go -- go test -tags=integration -timeout=15m ./internal/...
 
 [group('test')]
+s3-compat:
+    bash test/s3-compat.sh
+
+[group('test')]
 interop:
     bash deploy/bench/stack.sh interop
 

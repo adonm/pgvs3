@@ -38,13 +38,13 @@ const (
 // an internal error.
 func prepareBody(r *http.Request) error {
 	payload := r.Header.Get("x-amz-content-sha256")
-	enc := r.Header.Get("Content-Encoding")
-	encLower := strings.ToLower(enc)
-	chunked := strings.HasPrefix(payload, "STREAMING-") || strings.Contains(encLower, "aws-chunked")
-	if !chunked {
+	if !strings.HasPrefix(payload, "STREAMING-") {
+		// aws-chunked can appear as a content-encoding on an ordinary body;
+		// S3 stores the remaining encodings and drops aws-chunked itself.
+		stripAwsChunked(r)
 		return nil
 	}
-	if strings.HasPrefix(payload, "STREAMING-") && !streamingPayloads[payload] {
+	if !streamingPayloads[payload] {
 		return errInvalidRequest("unsupported streaming payload type")
 	}
 	decoded := int64(-1)
@@ -63,21 +63,27 @@ func prepareBody(r *http.Request) error {
 		trailer:    r.Trailer,
 		decodedLen: decoded,
 	}
-	if strings.Contains(encLower, "aws-chunked") {
-		var kept []string
-		for _, part := range strings.Split(enc, ",") {
-			part = strings.TrimSpace(part)
-			if part != "" && !strings.EqualFold(part, "aws-chunked") {
-				kept = append(kept, part)
-			}
-		}
-		if len(kept) == 0 {
-			r.Header.Del("Content-Encoding")
-		} else {
-			r.Header.Set("Content-Encoding", strings.Join(kept, ","))
+	stripAwsChunked(r)
+	return nil
+}
+
+func stripAwsChunked(r *http.Request) {
+	enc := r.Header.Get("Content-Encoding")
+	if !strings.Contains(strings.ToLower(enc), "aws-chunked") {
+		return
+	}
+	var kept []string
+	for _, part := range strings.Split(enc, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" && !strings.EqualFold(part, "aws-chunked") {
+			kept = append(kept, part)
 		}
 	}
-	return nil
+	if len(kept) == 0 {
+		r.Header.Del("Content-Encoding")
+	} else {
+		r.Header.Set("Content-Encoding", strings.Join(kept, ","))
+	}
 }
 
 // chunkedBody streams an aws-chunked body without allocating the declared

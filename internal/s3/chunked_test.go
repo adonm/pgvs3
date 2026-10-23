@@ -16,6 +16,7 @@ func signedChunk(size, data, sig string) string {
 func chunkedRequest(body string) *http.Request {
 	req := httptest.NewRequest("PUT", "/bucket/key", strings.NewReader(body))
 	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
 	return req
 }
 
@@ -140,5 +141,20 @@ func TestPrepareBodyStripsAwsChunkedEncoding(t *testing.T) {
 	}
 	if got := req.Header.Get("Content-Encoding"); got != "gzip" {
 		t.Fatalf("Content-Encoding = %q", got)
+	}
+}
+
+func TestAwsChunkedContentEncodingWithoutStreaming(t *testing.T) {
+	req := httptest.NewRequest("PUT", "/bucket/key", strings.NewReader("plain-body"))
+	req.Header.Set("Content-Encoding", "gzip, aws-chunked")
+	if err := prepareBody(req); err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q", got)
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil || string(body) != "plain-body" {
+		t.Fatalf("body = %q err=%v", body, err)
 	}
 }
