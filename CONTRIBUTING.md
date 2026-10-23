@@ -85,6 +85,6 @@ Apache-2.0. See [LICENSE](LICENSE).
 | `internal/store` | PostgreSQL layout, objects, blocks, cache, queues, GC |
 | `internal/s3` | S3 + plain HTTP handlers, cache-tier proxy |
 | `internal/sqs` | SQS JSON and Query protocols |
-| `internal/resp` | RESP2/RESP3 server |
+| `internal/resp` | RESP2 server |
 | `internal/objcache` | thanos-objstore read-through tier |
 | `internal/gateway` | protocol mux and HTTP server |

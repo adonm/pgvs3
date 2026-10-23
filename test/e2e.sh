@@ -300,18 +300,52 @@ PY
 E2E_RUN="$RUN" E2E_ENDPOINT_A="$A" E2E_ENDPOINT_B="$B" E2E_BUCKET="$BUCKET" \
 E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with redis --with boto3 python - <<'PY'
-import os, time, urllib.request, redis, boto3
+import os, socket, time, urllib.request, redis, boto3
 from botocore.config import Config
 
 ep_a = os.environ['E2E_ENDPOINT_A']
 ep_b = os.environ['E2E_ENDPOINT_B']
 host_a, port_a = ep_a.split('://')[1].split(':')
 host_b, port_b = ep_b.split('://')[1].split(':')
-ra = redis.Redis(host=host_a, port=int(port_a), decode_responses=False)
-rb = redis.Redis(host=host_b, port=int(port_b), decode_responses=False)
+ra = redis.Redis(host=host_a, port=int(port_a), decode_responses=False, protocol=2)
+rb = redis.Redis(host=host_b, port=int(port_b), decode_responses=False, protocol=2)
 
 assert ra.ping() is True
 assert ra.echo(b'hello') == b'hello'
+
+# RESP3 is not available: HELLO 3 must fail without closing the connection,
+# and HELLO 2 must still return the server banner in RESP2 form.
+def resp_value(f):
+    kind = f.read(1)
+    if kind == b'$':
+        n = int(f.readline())
+        if n < 0:
+            return None
+        data = f.read(n)
+        f.read(2)
+        return data
+    if kind == b':':
+        return int(f.readline())
+    if kind == b'+':
+        return f.readline().rstrip(b'\r\n')
+    if kind == b'-':
+        return Exception(f.readline().rstrip(b'\r\n'))
+    if kind == b'*':
+        n = int(f.readline())
+        return [resp_value(f) for _ in range(n)]
+    raise AssertionError(f'unexpected RESP type {kind!r}')
+
+raw = socket.create_connection((host_a, int(port_a)))
+rawf = raw.makefile('rb')
+raw.sendall(b'*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n')
+hello3 = resp_value(rawf)
+assert isinstance(hello3, Exception) and b'NOPROTO' in hello3.args[0], hello3
+raw.sendall(b'*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n')
+hello2 = resp_value(rawf)
+assert isinstance(hello2, list) and len(hello2) == 14, hello2
+banner = dict(zip(hello2[0::2], hello2[1::2]))
+assert banner[b'server'] == b'pgvs3' and banner[b'proto'] == 2, banner
+raw.close()
 
 # Basic SET/GET across gateways A and B, plus HTTP read of the same key in `s3b_cache`.
 assert ra.set('greeting', b'hello-from-resp') is True

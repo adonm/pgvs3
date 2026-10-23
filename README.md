@@ -40,7 +40,7 @@ from the connection, so there is nothing to configure:
 curl -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
 curl http://127.0.0.1:8014/lake/README.md
 
-# Redis / Valkey (RESP2 & RESP3)
+# Redis / Valkey (RESP2)
 redis-cli -p 8014 SET greeting "hello from resp" EX 60
 curl http://127.0.0.1:8014/_cache/cache/greeting
 redis-cli -p 8014 GET s3://lake/README.md     # explicit cross-namespace read
@@ -94,8 +94,8 @@ SELECT * FROM lake.events;
   (`len(stored) == wantLen`, e.g. Zstd Parquet). Logical chunk offsets remain
   `no × 8,120`, preserving `O(1)` byte-range seeking and the exact 8,160-byte
   PostgreSQL page budget (`99.6%` fill, no TOAST).
-- **Four protocols, one port.** S3/SQS/HTTP share the HTTP listener; RESP2/3
-  is detected from the first byte. RESP defaults to the `cache` namespace and
+- **Four protocols, one port.** S3/SQS/HTTP share the HTTP listener; RESP2 is
+  detected from the first byte. RESP defaults to the `cache` namespace and
   can read any durable bucket with `GET s3://<bucket>/<key>`; writes are
   confined to cache namespaces.
 - **Accelerating cache tier (`--origin-config`).** With a Thanos objstore YAML
@@ -202,7 +202,9 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`,
   `INCR`, `DECR`, `INCRBY`, `DECRBY`, `STRLEN`, `GETRANGE`, `APPEND`,
   `SETRANGE`, `SCAN`, `TYPE`, `SELECT`,
-  `FLUSHDB`, `DBSIZE`, `KEYS`, `INFO`, and `HELLO 2`/`3`. Pipelined `GET` and
+  `FLUSHDB`, `DBSIZE`, `KEYS`, `INFO`, and `HELLO 2`. RESP3 is not supported:
+  `HELLO 3` returns `NOPROTO`, and clients that default to RESP3 (for example
+  recent `redis-py` releases) must be configured with `protocol=2`. Pipelined `GET` and
   `SET` bursts automatically coalesce into single-query `CacheMGet` /
   `CacheMSet` database round trips. `EXPIRE` honours `NX`/`XX`/`GT`/`LT`.
   `MULTI`/`EXEC`/`WATCH` are rejected explicitly (use a pipeline; in

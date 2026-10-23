@@ -156,6 +156,14 @@ and switching `PGVS3_URL`.
 `just fault` tests gateway loss, mid-upload PostgreSQL restarts, and high
 overwrite churn.
 
+## RESP
+
+RESP shares the `:8014` listener and speaks **RESP2 only**. `HELLO 2` is
+accepted; `HELLO 3` returns `NOPROTO`. Clients that negotiate RESP3 by default
+must opt out, for example `redis.Redis(..., protocol=2)` in recent `redis-py`
+releases. RESP batches are bounded by `--resp-concurrency`, and pipelined `GET`
+and `SET` bursts are coalesced into `CacheMGet`/`CacheMSet`.
+
 ## SQS
 
 SQS shares the `:8014` listener. Point any SDK at it:

@@ -127,6 +127,7 @@ func serve(args []string) int {
 	}
 
 	g := gateway.New(st, log, *readOnly, origin, gateway.Limits{SQS: *sqsMax, RESP: *respMax})
+	g.SetVersion(version)
 	go func() {
 		<-ctx.Done()
 		g.SetDraining(true)

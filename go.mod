@@ -6,6 +6,7 @@ require (
 	github.com/go-kit/log v0.2.1
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/thanos-io/objstore v0.0.0-20261009124658-72d3b9ff63af
+	github.com/tidwall/redcon v1.6.4
 	gopkg.in/yaml.v2 v2.4.0
 )
 
@@ -54,6 +55,8 @@ require (
 	github.com/prometheus/procfs v0.11.1 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/stretchr/testify v1.12.1 // indirect
+	github.com/tidwall/btree v1.1.0 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tinylib/msgp v1.3.0 // indirect
 	golang.org/x/crypto v0.39.0 // indirect
 	golang.org/x/net v0.41.0 // indirect

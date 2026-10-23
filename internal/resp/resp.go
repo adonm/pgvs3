@@ -1,17 +1,16 @@
 package resp
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"net"
 	"path"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tidwall/redcon"
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
@@ -20,28 +19,33 @@ import (
 // DefaultCache is the cache namespace used when a client has not run SELECT.
 const DefaultCache = "cache"
 
-// Server terminates RESP2/RESP3 on a connection.
+// Server terminates RESP2 on a connection.
 type Server struct {
 	store    *store.Store
-	log      *slog.Logger
 	readOnly bool
 	metrics  *metrics
 	sem      chan struct{}
+	ctx      context.Context
+	version  string
 }
 
 // New returns a RESP server over the shared store.
-func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int) *Server {
+func New(st *store.Store, readOnly bool, maxConc int) *Server {
 	if maxConc <= 0 {
 		maxConc = 32
 	}
-	return &Server{store: st, log: log, readOnly: readOnly, metrics: newMetrics(),
-		sem: make(chan struct{}, maxConc)}
+	return &Server{store: st, readOnly: readOnly, metrics: newMetrics(),
+		sem: make(chan struct{}, maxConc), ctx: context.Background(), version: "dev"}
 }
 
 // Metrics writes this server's Prometheus counters.
 func (s *Server) Metrics(w io.Writer) { s.metrics.write(w) }
 
-func (s *Server) ServeConn(ctx context.Context, conn net.Conn) { s.serveRESP(ctx, conn) }
+// SetContext supplies the cancellation context for store work.
+func (s *Server) SetContext(ctx context.Context) { s.ctx = ctx }
+
+// SetVersion sets the version reported by HELLO and INFO.
+func (s *Server) SetVersion(v string) { s.version = v }
 
 type respCmd struct {
 	name string
@@ -50,47 +54,43 @@ type respCmd struct {
 
 type respSession struct {
 	bucket string
-	proto  int
 }
 
-func (s *Server) serveRESP(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
-	br := bufio.NewReaderSize(conn, 64<<10)
-	bw := bufio.NewWriterSize(conn, 64<<10)
-	sess := &respSession{bucket: DefaultCache, proto: 2}
+func fromRedcon(cmd redcon.Command) respCmd {
+	return respCmd{name: strings.ToUpper(string(cmd.Args[0])), args: cmd.Args[1:]}
+}
 
-	for {
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
-		first, err := readRESPCommand(br)
-		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-				writeRESPError(bw, "ERR "+err.Error())
-				_ = bw.Flush()
-			}
-			return
-		}
-		batch := []respCmd{first}
-		for br.Buffered() > 0 && len(batch) < 128 {
-			next, err := readRESPCommand(br)
-			if err != nil {
-				break
-			}
-			batch = append(batch, next)
-		}
-
-		quit := s.execRESPBatch(ctx, bw, sess, batch)
-		if err := bw.Flush(); err != nil || quit {
-			return
-		}
+// ServeRESP implements redcon's command handler. Any remaining commands in the
+// current pipeline are consumed here so consecutive GETs and SETs can still be
+// coalesced into CacheMGet/CacheMSet.
+func (s *Server) ServeRESP(conn redcon.Conn, first redcon.Command) {
+	sess, _ := conn.Context().(*respSession)
+	if sess == nil {
+		sess = &respSession{bucket: DefaultCache}
+		conn.SetContext(sess)
+	}
+	batch := make([]respCmd, 0, 1+len(conn.PeekPipeline()))
+	batch = append(batch, fromRedcon(first))
+	for _, cmd := range conn.ReadPipeline() {
+		batch = append(batch, fromRedcon(cmd))
+	}
+	quit := false
+	for len(batch) > 0 && !quit {
+		n := min(len(batch), 128)
+		quit = s.execRESPBatch(s.ctx, conn, sess, batch[:n])
+		batch = batch[n:]
+	}
+	if quit {
+		_ = conn.Close()
 	}
 }
 
-func (s *Server) execRESPBatch(ctx context.Context, bw *bufio.Writer, sess *respSession, batch []respCmd) bool {
+func (s *Server) execRESPBatch(ctx context.Context, conn redcon.Conn, sess *respSession, batch []respCmd) bool {
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	case <-ctx.Done():
-		writeRESPError(bw, "ERR server shutting down")
+		conn.WriteError("ERR server shutting down")
 		return true
 	}
 	for i := 0; i < len(batch); i++ {
@@ -115,11 +115,11 @@ func (s *Server) execRESPBatch(ctx context.Context, bw *bufio.Writer, sess *resp
 				vals, err := s.store.CacheMGet(ctx, b0, keys)
 				if err != nil {
 					for range keys {
-						writeRESPError(bw, "ERR "+err.Error())
+						conn.WriteError("ERR " + err.Error())
 					}
 				} else {
 					for _, v := range vals {
-						writeRESPBulk(bw, sess.proto, v)
+						writeBulk(conn, v)
 					}
 				}
 				i = j - 1
@@ -148,18 +148,18 @@ func (s *Server) execRESPBatch(ctx context.Context, bw *bufio.Writer, sess *resp
 				}
 				if err := s.store.CacheMSet(ctx, b0, keys, vals); err != nil {
 					for range keys {
-						writeRESPError(bw, "ERR "+err.Error())
+						conn.WriteError("ERR " + err.Error())
 					}
 				} else {
 					for range keys {
-						writeRESPSimple(bw, "OK")
+						conn.WriteString("OK")
 					}
 				}
 				i = j - 1
 				continue
 			}
 		}
-		if s.execRESPCommand(ctx, bw, sess, batch[i]) {
+		if s.execRESPCommand(ctx, conn, sess, batch[i]) {
 			return true
 		}
 	}
@@ -176,7 +176,7 @@ func resolveRESPTarget(currentBucket, rawKey string) (string, string) {
 	return currentBucket, rawKey
 }
 
-func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *respSession, cmd respCmd) bool {
+func (s *Server) execRESPCommand(ctx context.Context, conn redcon.Conn, sess *respSession, cmd respCmd) bool {
 	start := time.Now()
 	status := 200
 	defer func() {
@@ -186,7 +186,7 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 	rejectRO := func() bool {
 		if s.readOnly {
 			status = 403
-			writeRESPError(bw, "READONLY You can't write against a read only replica.")
+			conn.WriteError("READONLY You can't write against a read only replica.")
 			return true
 		}
 		return false
@@ -197,68 +197,68 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 	case "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH":
 		// Atomic transaction blocks are deliberately unsupported: pretending
 		// otherwise would silently lose updates. Pipelines (MULTI-free) work.
-		writeRESPError(bw, "ERR MULTI/EXEC/WATCH are not supported; use a pipeline (redis-py: transaction=False)")
+		conn.WriteError("ERR MULTI/EXEC/WATCH are not supported; use a pipeline (redis-py: transaction=False)")
 	case "TYPE":
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'type' command")
+			conn.WriteError("ERR wrong number of arguments for 'type' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		_, err := s.store.MetaHeaderKind(ctx, ns.Cache, b, k)
 		if errors.Is(err, store.ErrNotFound) {
-			writeRESPSimple(bw, "none")
+			conn.WriteString("none")
 		} else if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 		} else {
-			writeRESPSimple(bw, "string")
+			conn.WriteString("string")
 		}
 	case "SCAN":
-		s.respScan(ctx, bw, sess, args)
+		s.respScan(ctx, conn, sess, args)
 	case "APPEND":
 		if rejectRO() {
 			return false
 		}
 		if len(args) != 2 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'append' command")
+			conn.WriteError("ERR wrong number of arguments for 'append' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		if b != sess.bucket {
-			writeRESPError(bw, "ERR cross-namespace write denied")
+			conn.WriteError("ERR cross-namespace write denied")
 			return false
 		}
 		cur, _, err := s.store.CacheGet(ctx, b, k)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		next := append(append([]byte(nil), cur...), args[1]...)
 		if _, _, _, err := s.store.CacheSet(ctx, b, k, next, store.CacheSetOptions{KeepTTL: true}); err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPInt(bw, int64(len(next)))
+		conn.WriteInt64(int64(len(next)))
 	case "SETRANGE":
 		if rejectRO() {
 			return false
 		}
 		if len(args) != 3 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'setrange' command")
+			conn.WriteError("ERR wrong number of arguments for 'setrange' command")
 			return false
 		}
 		off, err := strconv.ParseInt(string(args[1]), 10, 64)
 		if err != nil || off < 0 {
-			writeRESPError(bw, "ERR offset is out of range")
+			conn.WriteError("ERR offset is out of range")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		if b != sess.bucket {
-			writeRESPError(bw, "ERR cross-namespace write denied")
+			conn.WriteError("ERR cross-namespace write denied")
 			return false
 		}
 		cur, _, err := s.store.CacheGet(ctx, b, k)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if int64(len(cur)) < off {
@@ -270,95 +270,89 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		copy(cur[off:], args[2])
 		if _, _, _, err := s.store.CacheSet(ctx, b, k, cur, store.CacheSetOptions{KeepTTL: true}); err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPInt(bw, int64(len(cur)))
+		conn.WriteInt64(int64(len(cur)))
 	case "PING":
 		if len(args) == 0 {
-			writeRESPSimple(bw, "PONG")
+			conn.WriteString("PONG")
 		} else {
-			writeRESPBulk(bw, sess.proto, args[0])
+			writeBulk(conn, args[0])
 		}
 	case "ECHO":
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'echo' command")
+			conn.WriteError("ERR wrong number of arguments for 'echo' command")
 			return false
 		}
-		writeRESPBulk(bw, sess.proto, args[0])
+		writeBulk(conn, args[0])
 	case "AUTH":
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 	case "QUIT":
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 		return true
 	case "RESET":
 		sess.bucket = DefaultCache
-		sess.proto = 2
-		writeRESPSimple(bw, "RESET")
+		conn.WriteString("RESET")
 	case "HELLO":
 		if len(args) >= 1 {
 			ver, err := strconv.Atoi(string(args[0]))
 			if err != nil {
-				writeRESPError(bw, "ERR Protocol version is not an integer or out of range")
+				conn.WriteError("ERR Protocol version is not an integer or out of range")
 				return false
 			}
-			if ver < 2 || ver > 3 {
-				writeRESPError(bw, "NOPROTO sorry this protocol version is not supported")
+			if ver != 2 {
+				conn.WriteError("NOPROTO sorry this protocol version is not supported")
 				return false
 			}
-			sess.proto = ver
 		}
-		if sess.proto == 3 {
-			_, _ = bw.WriteString("%7\r\n")
-		} else {
-			writeRESPArrayHeader(bw, 14)
-		}
-		writeRESPBulkString(bw, "server")
-		writeRESPBulkString(bw, "pgvs3")
-		writeRESPBulkString(bw, "version")
-		writeRESPBulkString(bw, "0.2.0")
-		writeRESPBulkString(bw, "proto")
-		writeRESPInt(bw, int64(sess.proto))
-		writeRESPBulkString(bw, "id")
-		writeRESPInt(bw, 1)
-		writeRESPBulkString(bw, "mode")
-		writeRESPBulkString(bw, "standalone")
-		writeRESPBulkString(bw, "role")
-		writeRESPBulkString(bw, "master")
-		writeRESPBulkString(bw, "modules")
-		writeRESPArrayHeader(bw, 0)
+		conn.WriteArray(14)
+		conn.WriteBulkString("server")
+		conn.WriteBulkString("pgvs3")
+		conn.WriteBulkString("version")
+		conn.WriteBulkString(s.version)
+		conn.WriteBulkString("proto")
+		conn.WriteInt64(2)
+		conn.WriteBulkString("id")
+		conn.WriteInt64(1)
+		conn.WriteBulkString("mode")
+		conn.WriteBulkString("standalone")
+		conn.WriteBulkString("role")
+		conn.WriteBulkString("master")
+		conn.WriteBulkString("modules")
+		conn.WriteArray(0)
 	case "COMMAND":
-		writeRESPArrayHeader(bw, 0)
+		conn.WriteArray(0)
 	case "CLIENT":
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 	case "CONFIG":
 		if len(args) >= 2 && strings.EqualFold(string(args[0]), "GET") {
 			param := strings.ToLower(string(args[1]))
 			switch param {
 			case "save":
-				writeRESPArrayHeader(bw, 2)
-				writeRESPBulkString(bw, "save")
-				writeRESPBulkString(bw, "")
+				conn.WriteArray(2)
+				conn.WriteBulkString("save")
+				conn.WriteBulkString("")
 			case "appendonly":
-				writeRESPArrayHeader(bw, 2)
-				writeRESPBulkString(bw, "appendonly")
-				writeRESPBulkString(bw, "no")
+				conn.WriteArray(2)
+				conn.WriteBulkString("appendonly")
+				conn.WriteBulkString("no")
 			default:
-				writeRESPArrayHeader(bw, 0)
+				conn.WriteArray(0)
 			}
 			return false
 		}
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 	case "SELECT":
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'select' command")
+			conn.WriteError("ERR wrong number of arguments for 'select' command")
 			return false
 		}
 		sel := string(args[0])
 		target := sel
 		if n, err := strconv.Atoi(sel); err == nil {
 			if n < 0 || n > 15 {
-				writeRESPError(bw, "ERR DB index is out of range")
+				conn.WriteError("ERR DB index is out of range")
 				return false
 			}
 			if n == 0 {
@@ -368,14 +362,14 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			}
 		}
 		if !ns.ValidName(target) {
-			writeRESPError(bw, "ERR invalid namespace name")
+			conn.WriteError("ERR invalid namespace name")
 			return false
 		}
 		sess.bucket = target
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 	case "GET":
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'get' command")
+			conn.WriteError("ERR wrong number of arguments for 'get' command")
 			return false
 		}
 		raw := string(args[0])
@@ -395,18 +389,18 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			status = 500
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if !ok {
 			status = 404
-			writeRESPNull(bw, sess.proto)
+			conn.WriteNull()
 			return false
 		}
-		writeRESPBulk(bw, sess.proto, val)
+		writeBulk(conn, val)
 	case "MGET":
 		if len(args) < 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'mget' command")
+			conn.WriteError("ERR wrong number of arguments for 'mget' command")
 			return false
 		}
 		keys := make([]string, len(args))
@@ -416,86 +410,86 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		vals, err := s.store.CacheMGet(ctx, sess.bucket, keys)
 		if err != nil {
 			status = 500
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPArrayHeader(bw, len(vals))
+		conn.WriteArray(len(vals))
 		for _, v := range vals {
-			writeRESPBulk(bw, sess.proto, v)
+			writeBulk(conn, v)
 		}
 	case "SET":
 		if rejectRO() {
 			return false
 		}
 		if len(args) < 2 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'set' command")
+			conn.WriteError("ERR wrong number of arguments for 'set' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		if b != sess.bucket {
-			writeRESPError(bw, "ERR cross-namespace write denied")
+			conn.WriteError("ERR cross-namespace write denied")
 			return false
 		}
 		val := args[1]
 		opts, err := parseRESPSetOptions(args[2:])
 		if err != nil {
 			status = 400
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		oldVal, hadOld, wrote, err := s.store.CacheSet(ctx, b, k, val, opts)
 		if err != nil {
 			status = 500
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if opts.ReturnOld {
 			if !hadOld {
-				writeRESPNull(bw, sess.proto)
+				conn.WriteNull()
 			} else {
-				writeRESPBulk(bw, sess.proto, oldVal)
+				writeBulk(conn, oldVal)
 			}
 			return false
 		}
 		if !wrote {
-			writeRESPNull(bw, sess.proto)
+			conn.WriteNull()
 			return false
 		}
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 	case "SETNX":
 		if rejectRO() {
 			return false
 		}
 		if len(args) != 2 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'setnx' command")
+			conn.WriteError("ERR wrong number of arguments for 'setnx' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		if b != sess.bucket {
-			writeRESPError(bw, "ERR cross-namespace write denied")
+			conn.WriteError("ERR cross-namespace write denied")
 			return false
 		}
 		_, _, wrote, err := s.store.CacheSet(ctx, b, k, args[1], store.CacheSetOptions{Condition: store.IfAbsent})
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if wrote {
-			writeRESPInt(bw, 1)
+			conn.WriteInt64(1)
 		} else {
-			writeRESPInt(bw, 0)
+			conn.WriteInt64(0)
 		}
 	case "SETEX", "PSETEX":
 		if rejectRO() {
 			return false
 		}
 		if len(args) != 3 {
-			writeRESPError(bw, "ERR wrong number of arguments for '"+strings.ToLower(cmd.name)+"' command")
+			conn.WriteError("ERR wrong number of arguments for '" + strings.ToLower(cmd.name) + "' command")
 			return false
 		}
 		n, err := strconv.ParseInt(string(args[1]), 10, 64)
 		if err != nil || n <= 0 {
-			writeRESPError(bw, "ERR invalid expire time in '"+strings.ToLower(cmd.name)+"' command")
+			conn.WriteError("ERR invalid expire time in '" + strings.ToLower(cmd.name) + "' command")
 			return false
 		}
 		unit := time.Second
@@ -505,63 +499,63 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		exp := time.Now().Add(time.Duration(n) * unit)
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		if b != sess.bucket {
-			writeRESPError(bw, "ERR cross-namespace write denied")
+			conn.WriteError("ERR cross-namespace write denied")
 			return false
 		}
 		if _, _, _, err := s.store.CacheSet(ctx, b, k, args[2], store.CacheSetOptions{ExpiresAt: &exp}); err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 	case "GETSET":
 		if rejectRO() {
 			return false
 		}
 		if len(args) != 2 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'getset' command")
+			conn.WriteError("ERR wrong number of arguments for 'getset' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		if b != sess.bucket {
-			writeRESPError(bw, "ERR cross-namespace write denied")
+			conn.WriteError("ERR cross-namespace write denied")
 			return false
 		}
 		oldVal, hadOld, _, err := s.store.CacheSet(ctx, b, k, args[1], store.CacheSetOptions{ReturnOld: true})
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if !hadOld {
-			writeRESPNull(bw, sess.proto)
+			conn.WriteNull()
 		} else {
-			writeRESPBulk(bw, sess.proto, oldVal)
+			writeBulk(conn, oldVal)
 		}
 	case "GETDEL":
 		if rejectRO() {
 			return false
 		}
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'getdel' command")
+			conn.WriteError("ERR wrong number of arguments for 'getdel' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		val, ok, err := s.store.CacheGet(ctx, b, k)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if !ok {
-			writeRESPNull(bw, sess.proto)
+			conn.WriteNull()
 			return false
 		}
 		_, _ = s.store.CacheDel(ctx, b, []string{k})
-		writeRESPBulk(bw, sess.proto, val)
+		writeBulk(conn, val)
 	case "MSET":
 		if rejectRO() {
 			return false
 		}
 		if len(args) == 0 || len(args)%2 != 0 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'mset' command")
+			conn.WriteError("ERR wrong number of arguments for 'mset' command")
 			return false
 		}
 		n := len(args) / 2
@@ -572,7 +566,7 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		for i := 0; i < n; i++ {
 			b, k := resolveRESPTarget(sess.bucket, string(args[2*i]))
 			if b != sess.bucket {
-				writeRESPError(bw, "ERR cross-namespace write denied")
+				conn.WriteError("ERR cross-namespace write denied")
 				return false
 			}
 			if i == 0 {
@@ -584,45 +578,45 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		if sameBucket {
 			if err := s.store.CacheMSet(ctx, b0, keys, vals); err != nil {
-				writeRESPError(bw, "ERR "+err.Error())
+				conn.WriteError("ERR " + err.Error())
 				return false
 			}
 		} else {
 			for i := 0; i < n; i++ {
 				b, k := resolveRESPTarget(sess.bucket, string(args[2*i]))
 				if _, _, _, err := s.store.CacheSet(ctx, b, k, vals[i], store.CacheSetOptions{}); err != nil {
-					writeRESPError(bw, "ERR "+err.Error())
+					conn.WriteError("ERR " + err.Error())
 					return false
 				}
 			}
 		}
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 	case "DEL", "UNLINK":
 		if rejectRO() {
 			return false
 		}
 		if len(args) < 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'del' command")
+			conn.WriteError("ERR wrong number of arguments for 'del' command")
 			return false
 		}
 		keys := make([]string, len(args))
 		for i, a := range args {
 			kb, kk := resolveRESPTarget(sess.bucket, string(a))
 			if kb != sess.bucket {
-				writeRESPError(bw, "ERR cross-namespace write denied")
+				conn.WriteError("ERR cross-namespace write denied")
 				return false
 			}
 			keys[i] = kk
 		}
 		n, err := s.store.CacheDel(ctx, sess.bucket, keys)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPInt(bw, n)
+		conn.WriteInt64(n)
 	case "EXISTS":
 		if len(args) < 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'exists' command")
+			conn.WriteError("ERR wrong number of arguments for 'exists' command")
 			return false
 		}
 		keys := make([]string, len(args))
@@ -631,21 +625,21 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		n, err := s.store.CacheExists(ctx, sess.bucket, keys)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPInt(bw, n)
+		conn.WriteInt64(n)
 	case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT":
 		if rejectRO() {
 			return false
 		}
 		if len(args) < 2 {
-			writeRESPError(bw, "ERR wrong number of arguments for '"+strings.ToLower(cmd.name)+"' command")
+			conn.WriteError("ERR wrong number of arguments for '" + strings.ToLower(cmd.name) + "' command")
 			return false
 		}
 		n, err := strconv.ParseInt(string(args[1]), 10, 64)
 		if err != nil {
-			writeRESPError(bw, "ERR value is not an integer or out of range")
+			conn.WriteError("ERR value is not an integer or out of range")
 			return false
 		}
 		var exp time.Time
@@ -661,16 +655,16 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		if b != sess.bucket {
-			writeRESPError(bw, "ERR cross-namespace write denied")
+			conn.WriteError("ERR cross-namespace write denied")
 			return false
 		}
 		curTTL, hasTTL, exists, err := s.store.CacheTTL(ctx, b, k)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if !exists {
-			writeRESPInt(bw, 0)
+			conn.WriteInt64(0)
 			return false
 		}
 		want := time.Until(exp)
@@ -678,78 +672,78 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			switch strings.ToUpper(string(opt)) {
 			case "NX":
 				if hasTTL {
-					writeRESPInt(bw, 0)
+					conn.WriteInt64(0)
 					return false
 				}
 			case "XX":
 				if !hasTTL {
-					writeRESPInt(bw, 0)
+					conn.WriteInt64(0)
 					return false
 				}
 			case "GT":
 				if !hasTTL || want <= curTTL {
-					writeRESPInt(bw, 0)
+					conn.WriteInt64(0)
 					return false
 				}
 			case "LT":
 				if hasTTL && want >= curTTL {
-					writeRESPInt(bw, 0)
+					conn.WriteInt64(0)
 					return false
 				}
 			}
 		}
 		ok, err := s.store.CacheExpire(ctx, b, k, &exp)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if ok {
-			writeRESPInt(bw, 1)
+			conn.WriteInt64(1)
 		} else {
-			writeRESPInt(bw, 0)
+			conn.WriteInt64(0)
 		}
 	case "PERSIST":
 		if rejectRO() {
 			return false
 		}
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'persist' command")
+			conn.WriteError("ERR wrong number of arguments for 'persist' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		ok, err := s.store.CacheExpire(ctx, b, k, nil)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if ok {
-			writeRESPInt(bw, 1)
+			conn.WriteInt64(1)
 		} else {
-			writeRESPInt(bw, 0)
+			conn.WriteInt64(0)
 		}
 	case "TTL", "PTTL":
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for '"+strings.ToLower(cmd.name)+"' command")
+			conn.WriteError("ERR wrong number of arguments for '" + strings.ToLower(cmd.name) + "' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		d, hasTTL, exists, err := s.store.CacheTTL(ctx, b, k)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if !exists {
-			writeRESPInt(bw, -2)
+			conn.WriteInt64(-2)
 			return false
 		}
 		if !hasTTL {
-			writeRESPInt(bw, -1)
+			conn.WriteInt64(-1)
 			return false
 		}
 		if cmd.name == "PTTL" {
-			writeRESPInt(bw, max(d.Milliseconds(), 1))
+			conn.WriteInt64(max(d.Milliseconds(), 1))
 		} else {
-			writeRESPInt(bw, max(int64(d.Seconds()+0.5), 1))
+			conn.WriteInt64(max(int64(d.Seconds()+0.5), 1))
 		}
 	case "INCR", "DECR", "INCRBY", "DECRBY":
 		if rejectRO() {
@@ -761,12 +755,12 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		if cmd.name == "INCRBY" || cmd.name == "DECRBY" {
 			if len(args) != 2 {
-				writeRESPError(bw, "ERR wrong number of arguments for '"+strings.ToLower(cmd.name)+"' command")
+				conn.WriteError("ERR wrong number of arguments for '" + strings.ToLower(cmd.name) + "' command")
 				return false
 			}
 			v, err := strconv.ParseInt(string(args[1]), 10, 64)
 			if err != nil {
-				writeRESPError(bw, "ERR value is not an integer or out of range")
+				conn.WriteError("ERR value is not an integer or out of range")
 				return false
 			}
 			if cmd.name == "DECRBY" {
@@ -775,27 +769,27 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 				delta = v
 			}
 		} else if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for '"+strings.ToLower(cmd.name)+"' command")
+			conn.WriteError("ERR wrong number of arguments for '" + strings.ToLower(cmd.name) + "' command")
 			return false
 		}
 		b, k := resolveRESPTarget(sess.bucket, string(args[0]))
 		if b != sess.bucket {
-			writeRESPError(bw, "ERR cross-namespace write denied")
+			conn.WriteError("ERR cross-namespace write denied")
 			return false
 		}
 		next, err := s.store.CacheIncrBy(ctx, b, k, delta)
 		if errors.Is(err, store.ErrNotInteger) {
-			writeRESPError(bw, "ERR value is not an integer or out of range")
+			conn.WriteError("ERR value is not an integer or out of range")
 			return false
 		}
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPInt(bw, next)
+		conn.WriteInt64(next)
 	case "STRLEN":
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'strlen' command")
+			conn.WriteError("ERR wrong number of arguments for 'strlen' command")
 			return false
 		}
 		raw := string(args[0])
@@ -806,23 +800,23 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		m, err := s.store.MetaHeaderKind(ctx, kind, b, k)
 		if errors.Is(err, store.ErrNotFound) {
-			writeRESPInt(bw, 0)
+			conn.WriteInt64(0)
 			return false
 		}
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPInt(bw, m.Size)
+		conn.WriteInt64(m.Size)
 	case "GETRANGE", "SUBSTR":
 		if len(args) != 3 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'getrange' command")
+			conn.WriteError("ERR wrong number of arguments for 'getrange' command")
 			return false
 		}
 		startIdx, err1 := strconv.ParseInt(string(args[1]), 10, 64)
 		endIdx, err2 := strconv.ParseInt(string(args[2]), 10, 64)
 		if err1 != nil || err2 != nil {
-			writeRESPError(bw, "ERR value is not an integer or out of range")
+			conn.WriteError("ERR value is not an integer or out of range")
 			return false
 		}
 		raw := string(args[0])
@@ -833,11 +827,11 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		}
 		m, err := s.store.MetaHeaderKind(ctx, kind, b, k)
 		if errors.Is(err, store.ErrNotFound) || (err == nil && m.Size == 0) {
-			writeRESPBulk(bw, sess.proto, []byte{})
+			writeBulk(conn, []byte{})
 			return false
 		}
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
 		if startIdx < 0 {
@@ -847,35 +841,35 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 			endIdx = m.Size + endIdx
 		}
 		if startIdx > endIdx || startIdx >= m.Size || endIdx < 0 {
-			writeRESPBulk(bw, sess.proto, []byte{})
+			writeBulk(conn, []byte{})
 			return false
 		}
 		endIdx = min(endIdx, m.Size-1)
 		sl, err := s.store.GetKind(ctx, kind, b, k, startIdx, endIdx, -1)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPBulk(bw, sess.proto, sl.Bytes)
+		writeBulk(conn, sl.Bytes)
 	case "DBSIZE":
 		n, err := s.store.CacheDBSize(ctx, sess.bucket)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPInt(bw, n)
+		conn.WriteInt64(n)
 	case "FLUSHDB", "FLUSHALL":
 		if rejectRO() {
 			return false
 		}
 		if err := s.store.CacheFlush(ctx, sess.bucket); err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return false
 		}
-		writeRESPSimple(bw, "OK")
+		conn.WriteString("OK")
 	case "KEYS":
 		if len(args) != 1 {
-			writeRESPError(bw, "ERR wrong number of arguments for 'keys' command")
+			conn.WriteError("ERR wrong number of arguments for 'keys' command")
 			return false
 		}
 		pat := string(args[0])
@@ -885,7 +879,7 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 		for {
 			rows, err := s.store.List(ctx, sess.bucket, prefix, prefixUpper(prefix), after, 1024)
 			if err != nil {
-				writeRESPError(bw, "ERR "+err.Error())
+				conn.WriteError("ERR " + err.Error())
 				return false
 			}
 			for _, r := range rows {
@@ -900,18 +894,18 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 				break
 			}
 		}
-		writeRESPArrayHeader(bw, len(matched))
+		conn.WriteArray(len(matched))
 		for _, k := range matched {
-			writeRESPBulkString(bw, k)
+			conn.WriteBulkString(k)
 		}
 	case "INFO":
 		st, _ := s.store.StatBucket(ctx, sess.bucket)
-		info := fmt.Sprintf("# Server\r\nredis_version:6.2.0\r\npgvs3_version:0.3.0\r\nredis_mode:standalone\r\n# Keyspace\r\ndb0:keys=%d,logical_bytes=%d,physical_bytes=%d\r\n",
-			st.Objects, st.LogicalBytes, st.PhysicalBytes)
-		writeRESPBulkString(bw, info)
+		info := fmt.Sprintf("# Server\r\nredis_version:6.2.0\r\npgvs3_version:%s\r\nredis_mode:standalone\r\n# Keyspace\r\ndb0:keys=%d,logical_bytes=%d,physical_bytes=%d\r\n",
+			s.version, st.Objects, st.LogicalBytes, st.PhysicalBytes)
+		conn.WriteBulkString(info)
 	default:
 		status = 400
-		writeRESPError(bw, "ERR unknown command '"+strings.ToLower(cmd.name)+"'")
+		conn.WriteError("ERR unknown command '" + strings.ToLower(cmd.name) + "'")
 	}
 	return false
 }
@@ -963,100 +957,13 @@ func parseRESPSetOptions(args [][]byte) (store.CacheSetOptions, error) {
 	return opts, nil
 }
 
-func readRESPCommand(br *bufio.Reader) (respCmd, error) {
-	b, err := br.Peek(1)
-	if err != nil {
-		return respCmd{}, err
-	}
-	if b[0] != '*' {
-		line, err := readRESPLine(br)
-		if err != nil {
-			return respCmd{}, err
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			return respCmd{name: "PING"}, nil
-		}
-		args := make([][]byte, len(fields)-1)
-		for i := 1; i < len(fields); i++ {
-			args[i-1] = []byte(fields[i])
-		}
-		return respCmd{name: strings.ToUpper(fields[0]), args: args}, nil
-	}
-	header, err := readRESPLine(br)
-	if err != nil {
-		return respCmd{}, err
-	}
-	argc, err := strconv.Atoi(header[1:])
-	if err != nil || argc < 1 || argc > 100000 {
-		return respCmd{}, fmt.Errorf("Protocol error: invalid multibulk length")
-	}
-	args := make([][]byte, argc)
-	for i := 0; i < argc; i++ {
-		line, err := readRESPLine(br)
-		if err != nil {
-			return respCmd{}, err
-		}
-		if len(line) == 0 || line[0] != '$' {
-			return respCmd{}, fmt.Errorf("Protocol error: expected '$'")
-		}
-		n, err := strconv.Atoi(line[1:])
-		if err != nil || n < 0 || n > 512<<20 {
-			return respCmd{}, fmt.Errorf("Protocol error: invalid bulk length")
-		}
-		buf := make([]byte, n+2)
-		if _, err := io.ReadFull(br, buf); err != nil {
-			return respCmd{}, err
-		}
-		args[i] = buf[:n]
-	}
-	return respCmd{name: strings.ToUpper(string(args[0])), args: args[1:]}, nil
-}
-
-func readRESPLine(br *bufio.Reader) (string, error) {
-	s, err := br.ReadString('\n')
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimRight(s, "\r\n"), nil
-}
-
-func writeRESPSimple(bw *bufio.Writer, s string) {
-	_, _ = bw.WriteString("+" + s + "\r\n")
-}
-
-func writeRESPError(bw *bufio.Writer, msg string) {
-	_, _ = bw.WriteString("-" + msg + "\r\n")
-}
-
-func writeRESPInt(bw *bufio.Writer, n int64) {
-	_, _ = bw.WriteString(":" + strconv.FormatInt(n, 10) + "\r\n")
-}
-
-func writeRESPNull(bw *bufio.Writer, proto int) {
-	if proto >= 3 {
-		_, _ = bw.WriteString("_\r\n")
-		return
-	}
-	_, _ = bw.WriteString("$-1\r\n")
-}
-
-func writeRESPBulk(bw *bufio.Writer, proto int, b []byte) {
+// writeBulk distinguishes a nil value (RESP null) from an empty value.
+func writeBulk(conn redcon.Conn, b []byte) {
 	if b == nil {
-		writeRESPNull(bw, proto)
+		conn.WriteNull()
 		return
 	}
-	_, _ = bw.WriteString("$" + strconv.Itoa(len(b)) + "\r\n")
-	_, _ = bw.Write(b)
-	_, _ = bw.WriteString("\r\n")
-}
-
-func writeRESPBulkString(bw *bufio.Writer, s string) {
-	writeRESPBulk(bw, 2, []byte(s))
-}
-
-func writeRESPArrayHeader(bw *bufio.Writer, n int) {
-	_, _ = bw.WriteString("*" + strconv.Itoa(n) + "\r\n")
+	conn.WriteBulk(b)
 }
 
 // literalPrefix returns the leading literal bytes of a Redis glob pattern.
@@ -1074,9 +981,9 @@ func literalPrefix(pat string) string {
 func prefixUpper(prefix string) string { return prefix + "\U0010FFFF" }
 
 // respScan implements SCAN cursor/count/match/type over the cache namespace.
-func (s *Server) respScan(ctx context.Context, bw *bufio.Writer, sess *respSession, args [][]byte) {
+func (s *Server) respScan(ctx context.Context, conn redcon.Conn, sess *respSession, args [][]byte) {
 	if len(args) < 1 {
-		writeRESPError(bw, "ERR wrong number of arguments for 'scan' command")
+		conn.WriteError("ERR wrong number of arguments for 'scan' command")
 		return
 	}
 	cursor := string(args[0])
@@ -1093,9 +1000,9 @@ func (s *Server) respScan(ctx context.Context, bw *bufio.Writer, sess *respSessi
 		case "TYPE":
 			// Only strings exist; a non-string TYPE yields no keys.
 			if !strings.EqualFold(string(args[i+1]), "string") {
-				writeRESPArrayHeader(bw, 2)
-				writeRESPBulkString(bw, "0")
-				writeRESPArrayHeader(bw, 0)
+				conn.WriteArray(2)
+				conn.WriteBulkString("0")
+				conn.WriteArray(0)
 				return
 			}
 		}
@@ -1111,7 +1018,7 @@ func (s *Server) respScan(ctx context.Context, bw *bufio.Writer, sess *respSessi
 	for len(keys) < count {
 		rows, err := s.store.List(ctx, sess.bucket, prefix, prefixUpper(prefix), after, limit)
 		if err != nil {
-			writeRESPError(bw, "ERR "+err.Error())
+			conn.WriteError("ERR " + err.Error())
 			return
 		}
 		if len(rows) == 0 {
@@ -1138,10 +1045,10 @@ func (s *Server) respScan(ctx context.Context, bw *bufio.Writer, sess *respSessi
 			break
 		}
 	}
-	writeRESPArrayHeader(bw, 2)
-	writeRESPBulkString(bw, next)
-	writeRESPArrayHeader(bw, len(keys))
+	conn.WriteArray(2)
+	conn.WriteBulkString(next)
+	conn.WriteArray(len(keys))
 	for _, k := range keys {
-		writeRESPBulkString(bw, k)
+		conn.WriteBulkString(k)
 	}
 }

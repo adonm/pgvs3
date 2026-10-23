@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tidwall/redcon"
+
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/resp"
 	"github.com/adonm/pgvs3/internal/s3"
@@ -37,7 +39,7 @@ func New(st *store.Store, log *slog.Logger, readOnly bool, origin *objcache.Tier
 	g := &Gateway{
 		s3:   s3.New(st, log, readOnly),
 		sqs:  sqs.New(st, log, readOnly, lim.SQS),
-		resp: resp.New(st, log, readOnly, lim.RESP),
+		resp: resp.New(st, readOnly, lim.RESP),
 	}
 	if origin != nil {
 		g.s3.SetOrigin(origin)
@@ -55,6 +57,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) SetDraining(v bool) { g.s3.SetDraining(v) }
+
+// SetVersion sets the version reported by the RESP server.
+func (g *Gateway) SetVersion(v string) { g.resp.SetVersion(v) }
 
 // NewHTTPServer returns the shared HTTP server.
 func NewHTTPServer(addr string, h http.Handler, log *slog.Logger) *http.Server {
@@ -74,19 +79,30 @@ func Run(ctx context.Context, srv *http.Server, g *Gateway, drain time.Duration,
 	if err != nil {
 		return err
 	}
-	ln := newMuxListener(ctx, raw, g.resp, maxConns, log)
+	ln := newMuxListener(raw, maxConns)
+	g.resp.SetContext(ctx)
+	rs := redcon.NewServer("", g.resp.ServeRESP, nil, nil)
+	rs.SetIdleClose(2 * time.Minute)
+	respLn := &respListener{m: ln}
+	go func() {
+		if err := rs.Serve(respLn); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Warn("resp serve", "err", err)
+		}
+	}()
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
-	log.Info("serving", "addr", raw.Addr().String(), "protocols", "http,s3,sqs,resp")
+	log.Info("serving", "addr", raw.Addr().String(), "protocols", "http,s3,sqs,resp2")
 	select {
 	case <-ctx.Done():
 		if drain > 0 {
 			time.Sleep(drain)
 		}
+		_ = rs.Close()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdown)
 	case err := <-errCh:
+		_ = rs.Close()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -96,27 +112,26 @@ func Run(ctx context.Context, srv *http.Server, g *Gateway, drain time.Duration,
 
 type muxListener struct {
 	net.Listener
-	httpCh chan net.Conn
-	ctx    context.Context
-	resp   *resp.Server
-	sem    chan struct{}
-	log    *slog.Logger
-	closed chan struct{}
-	once   sync.Once
+	httpCh     chan net.Conn
+	respCh     chan net.Conn
+	sem        chan struct{}
+	closed     chan struct{}
+	respClosed chan struct{}
+	once       sync.Once
+	respOnce   sync.Once
 }
 
-func newMuxListener(ctx context.Context, base net.Listener, r *resp.Server, maxConns int, log *slog.Logger) *muxListener {
+func newMuxListener(base net.Listener, maxConns int) *muxListener {
 	if maxConns <= 0 {
 		maxConns = 4096
 	}
 	m := &muxListener{
-		Listener: base,
-		httpCh:   make(chan net.Conn, 256),
-		ctx:      ctx,
-		resp:     r,
-		sem:      make(chan struct{}, maxConns),
-		log:      log,
-		closed:   make(chan struct{}),
+		Listener:   base,
+		httpCh:     make(chan net.Conn, 256),
+		respCh:     make(chan net.Conn, 256),
+		sem:        make(chan struct{}, maxConns),
+		closed:     make(chan struct{}),
+		respClosed: make(chan struct{}),
 	}
 	go m.acceptLoop()
 	return m
@@ -144,7 +159,11 @@ func (m *muxListener) acceptLoop() {
 			_ = conn.SetReadDeadline(time.Time{})
 			pc := &peekConn{Conn: conn, r: br}
 			if err == nil && isRESP(head) {
-				m.resp.ServeConn(m.ctx, pc)
+				select {
+				case m.respCh <- pc:
+				case <-m.respClosed:
+					_ = pc.Close()
+				}
 				return
 			}
 			select {
@@ -165,7 +184,7 @@ func isRESP(b []byte) bool {
 		return false
 	}
 	switch b[0] {
-	case '*', '+', '-', '$', ':', '_':
+	case '*', '+', '-', '$', ':':
 		return true
 	case 0x16: // TLS handshake
 		return false
@@ -193,14 +212,47 @@ func (m *muxListener) Accept() (net.Conn, error) {
 	}
 }
 
+func (m *muxListener) AcceptRESP() (net.Conn, error) {
+	select {
+	case c := <-m.respCh:
+		return c, nil
+	case <-m.respClosed:
+		return nil, net.ErrClosed
+	case <-m.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (m *muxListener) closeRESP() {
+	m.respOnce.Do(func() {
+		close(m.respClosed)
+		for {
+			select {
+			case c := <-m.respCh:
+				_ = c.Close()
+			default:
+				return
+			}
+		}
+	})
+}
+
 func (m *muxListener) Close() error {
 	var err error
 	m.once.Do(func() {
 		close(m.closed)
+		m.closeRESP()
 		err = m.Listener.Close()
 	})
 	return err
 }
+
+// respListener exposes only the RESP half of the shared mux listener.
+type respListener struct{ m *muxListener }
+
+func (l *respListener) Accept() (net.Conn, error) { return l.m.AcceptRESP() }
+func (l *respListener) Close() error              { l.m.closeRESP(); return nil }
+func (l *respListener) Addr() net.Addr            { return l.m.Listener.Addr() }
 
 // peekConn serves the buffered prefix before the raw connection.
 type peekConn struct {
