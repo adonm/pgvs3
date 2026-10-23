@@ -24,6 +24,7 @@ from Go source with `ko` (no `Dockerfile`, `CGO_ENABLED=0`).
 ```sh
 just test       # unit tests
 just race       # unit tests with race detector
+just integration # store/queue/cache integration tests against PostgreSQL 18 (testcontainers)
 just vet        # go vet
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
 just interop    # rclone, restic, boto3, DuckLake, and SlateDB

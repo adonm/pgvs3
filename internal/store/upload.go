@@ -25,7 +25,7 @@ func (s *Store) CreateUploadKind(ctx context.Context, kind ns.Kind, name, key st
 	return withAutoCreate(ctx, s, kind, name, func(sc string) (string, error) {
 		var id string
 		err := s.pool.QueryRow(ctx, `INSERT INTO `+sc+`.uploads (upload_id, key, checksum_algorithm, user_metadata, content_type)
-			VALUES (gen_random_uuid()::text, $1, $2, $3, $4)
+			VALUES (gen_random_uuid()::text, $1, $2, coalesce($3, '{}'::text[]), $4)
 			RETURNING upload_id`, key, checksumAlgorithm, userMeta, contentType).Scan(&id)
 		return id, err
 	})
