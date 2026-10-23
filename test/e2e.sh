@@ -271,7 +271,7 @@ cmp "$TMP/partcopy" "$TMP/partcopy.out" || fail "upload part copy bytes"
 # The standard S3 surface through an SDK.
 E2E_RUN="$RUN" E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
-import os, time, urllib.request, boto3
+import os, time, urllib.error, urllib.request, boto3
 from botocore.config import Config
 pc=boto3.client('s3', endpoint_url=os.environ['E2E_ENDPOINT'],
     aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
@@ -282,10 +282,21 @@ assert pc.get_object(Bucket=gen, Key=f'{run}/sdk')['Body'].read()==b'sdk'
 pc.copy_object(Bucket=gen, Key=f'{run}/sdk-copy', CopySource={'Bucket':gen,'Key':f'{run}/sdk'})
 assert pc.get_object(Bucket=gen, Key=f'{run}/sdk-copy')['Body'].read()==b'sdk'
 pc.put_object(Bucket=gen, Key=f'{run}/presigned', Body=b'presigned')
+# Presigned URLs are deliberately rejected: access control is the network's job.
 u=pc.generate_presigned_url('get_object', Params={'Bucket':gen,'Key':f'{run}/presigned'}, ExpiresIn=60)
-assert urllib.request.urlopen(u).read()==b'presigned'
+try:
+    urllib.request.urlopen(u)
+except urllib.error.HTTPError as e:
+    assert e.code == 400, e.code
+else:
+    raise AssertionError("presigned GET must be rejected")
 u=pc.generate_presigned_url('put_object', Params={'Bucket':gen,'Key':f'{run}/presigned-put'}, ExpiresIn=60)
-assert urllib.request.urlopen(urllib.request.Request(u,data=b'put',method='PUT')).status==200
+try:
+    urllib.request.urlopen(urllib.request.Request(u,data=b'put',method='PUT'))
+except urllib.error.HTTPError as e:
+    assert e.code == 400, e.code
+else:
+    raise AssertionError("presigned PUT must be rejected")
 pc.put_object(Bucket=gen, Key=f'{run}/over-inline', Body=b'old')
 up=pc.create_multipart_upload(Bucket=gen, Key=f'{run}/over-inline')
 part=pc.upload_part(Bucket=gen, Key=f'{run}/over-inline', UploadId=up['UploadId'], PartNumber=1, Body=b'n'*1048576)

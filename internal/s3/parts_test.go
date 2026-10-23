@@ -22,3 +22,10 @@ func TestPartBounds(t *testing.T) {
 		t.Fatal("out of range part accepted")
 	}
 }
+
+func TestInvalidPartNumberError(t *testing.T) {
+	e := errInvalidPartNumber()
+	if e.Code != "InvalidPartNumber" || e.Status != 416 {
+		t.Fatalf("invalid part number = %+v", e)
+	}
+}

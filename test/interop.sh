@@ -14,6 +14,9 @@ RUN="interop-$(date +%s)-$$"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# rclone/restic do not tolerate a missing bucket; create it once up front.
+curl -fsS -X PUT "$A/$BUCKET" >/dev/null
+
 RCLONE_BIN=$(mise which rclone 2>/dev/null || command -v rclone || true)
 RESTIC_BIN=$(mise which restic 2>/dev/null || command -v restic || true)
 

@@ -54,6 +54,10 @@ func errInvalidPart() *APIError {
 	return apiErr("InvalidPart", "One or more of the specified parts could not be found or did not match the supplied ETag.", http.StatusBadRequest)
 }
 
+func errInvalidPartNumber() *APIError {
+	return apiErr("InvalidPartNumber", "The requested part number is not satisfiable.", http.StatusRequestedRangeNotSatisfiable)
+}
+
 func errInvalidRequest(msg string) *APIError {
 	return apiErr("InvalidRequest", msg, http.StatusBadRequest)
 }

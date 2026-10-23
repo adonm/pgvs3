@@ -252,7 +252,7 @@ func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket strin
 }
 
 func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	if r.Header.Get("x-amz-bucket-object-lock-enabled") != "" {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("x-amz-bucket-object-lock-enabled")), "true") {
 		writeError(w, r, errNotImplemented(), s.log)
 		return
 	}
@@ -363,7 +363,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	if hasPart {
 		start, end, ok := partBounds(m, part)
 		if !ok {
-			writeError(w, r, errInvalidPart(), s.log)
+			writeError(w, r, errInvalidPartNumber(), s.log)
 			return
 		}
 		length = end - start + 1
@@ -415,7 +415,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		}
 		start, end, ok := partBounds(m, part)
 		if !ok {
-			writeError(w, r, errInvalidPart(), s.log)
+			writeError(w, r, errInvalidPartNumber(), s.log)
 			return
 		}
 		first, last, suffix, ranged = start, end, -1, true
