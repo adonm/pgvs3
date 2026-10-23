@@ -21,6 +21,7 @@ type Spec struct {
 	TTL        string `json:"ttl,omitempty"`
 	Retention  string `json:"retention,omitempty"`
 	MaxFills   int    `json:"max_fills,omitempty"`
+	RangeChunk int64  `json:"range_chunk,omitempty"`
 	ConfigYAML string `json:"config_yaml"`
 }
 
@@ -42,7 +43,12 @@ func NewFromSpec(log *slog.Logger, st *store.Store, spec Spec) (*Tier, error) {
 		}
 		ret = d
 	}
-	return New(log, []byte(spec.ConfigYAML), st, spec.Namespace, ttl, ret, spec.MaxFills)
+	t, err := New(log, []byte(spec.ConfigYAML), st, spec.Namespace, ttl, ret, spec.MaxFills)
+	if err != nil {
+		return nil, err
+	}
+	t.EnableRangeCache(spec.RangeChunk)
+	return t, nil
 }
 
 // SaveSpec validates and persists an origin configuration in PostgreSQL so any

@@ -273,8 +273,27 @@ Every S3 `GET` and `HEAD` is served from `s3c_<namespace>` (`X-Cache: HIT`)
 without contacting the origin while within `--cache-ttl`, or when the cached
 size and origin mtime still match on revalidation. Cold ranges of objects
 larger than 8 MiB are passed straight through to the origin (`GetRange`,
-`X-Cache: MISS`) instead of downloading the whole object, while full reads and
-ranges on already-cached objects are served from PostgreSQL.
+`X-Cache: MISS`) unless `--range-cache-chunk` is set, in which case aligned
+chunks are cached in `s3c_<namespace>` and served from PostgreSQL on repeat
+requests.
+
+HTTP origins are read-only by default and map the cache bucket path onto a
+base URL:
+
+```yaml
+type: http
+config:
+  base_url: https://data.source.coop
+  strip_bucket: true
+  read_only: true
+  headers:
+    User-Agent: pgvs3
+```
+
+Use `pgvs3 origin --range-cache-chunk 1048576 set origin.yaml` to persist range
+caching for a stored origin, or pass `--range-cache-chunk 1048576` to
+`pgvs3 serve` for a process-local `--origin-config`. The HTTP origin returns an
+explicit error for `ListObjectsV2`; use an S3 origin when listing is required.
 
 Single `PUT`, `CopyObject`, and `DELETE`/`DeleteObjects` write through to both
 the origin and `s3c_<namespace>`. Multipart completion first publishes the

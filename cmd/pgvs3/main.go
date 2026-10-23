@@ -101,6 +101,7 @@ func serve(args []string) int {
 		cacheKeep = fs.Duration("cache-retention", envDuration("PGVS3_CACHE_RETENTION", 24*time.Hour), "evict cached objects after this idle period")
 		cacheNS   = fs.String("cache-namespace", env("PGVS3_CACHE_NAMESPACE", "origin"), "cache namespace for origin objects")
 		fillMax   = fs.Int("fill-concurrency", envInt("PGVS3_FILL_CONCURRENCY", 8), "concurrent origin cache fills")
+		rangeSize = fs.Int64("range-cache-chunk", envInt64("PGVS3_RANGE_CACHE_CHUNK", 0), "cache aligned ranges of large objects at this byte size (0 disables)")
 		sqsMax    = fs.Int("queue-concurrency", envInt("PGVS3_QUEUE_CONCURRENCY", 16), "concurrent SQS requests")
 		respMax   = fs.Int("resp-concurrency", envInt("PGVS3_RESP_CONCURRENCY", 32), "concurrent RESP batches")
 	)
@@ -148,6 +149,7 @@ func serve(args []string) int {
 			log.Error("opening origin", "err", err)
 			return 1
 		}
+		origin.EnableRangeCache(*rangeSize)
 		defer origin.Close()
 	}
 
@@ -336,6 +338,7 @@ func originCmd(args []string) int {
 		ttl       *time.Duration
 		retention *time.Duration
 		fills     *int
+		rangeSize *int64
 	)
 	return withStore("origin", args, 30*time.Second, true, func(fs *flag.FlagSet) {
 		bucket = fs.String("bucket", "", "restrict origin passthrough to one bucket (default: global)")
@@ -343,6 +346,7 @@ func originCmd(args []string) int {
 		ttl = fs.Duration("cache-ttl", time.Minute, "origin revalidation interval")
 		retention = fs.Duration("cache-retention", 24*time.Hour, "idle eviction interval")
 		fills = fs.Int("fill-concurrency", 8, "concurrent origin cache fills")
+		rangeSize = fs.Int64("range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
 	}, func(ctx context.Context, st *store.Store, rest []string) int {
 		action := "list"
 		if len(rest) > 0 {
@@ -352,7 +356,7 @@ func originCmd(args []string) int {
 		switch action {
 		case "set":
 			if len(rest) != 1 {
-				fmt.Fprintln(os.Stderr, "usage: pgvs3 origin set [--bucket B] [--cache-namespace NS] <origin.yaml>")
+				fmt.Fprintln(os.Stderr, "usage: pgvs3 origin set [--bucket B] [--cache-namespace NS] [--range-cache-chunk N] <origin.yaml>")
 				return 2
 			}
 			raw, err := os.ReadFile(rest[0])
@@ -365,6 +369,7 @@ func originCmd(args []string) int {
 				TTL:        ttl.String(),
 				Retention:  retention.String(),
 				MaxFills:   *fills,
+				RangeChunk: *rangeSize,
 				ConfigYAML: string(raw),
 			}
 			if err := objcache.SaveSpec(ctx, st, *bucket, sp); err != nil {
@@ -399,7 +404,7 @@ func originCmd(args []string) int {
 				if scope == "" {
 					scope = "global"
 				}
-				fmt.Printf("origin=%s cache=%s ttl=%s retention=%s\n", scope, sp.Namespace, sp.TTL, sp.Retention)
+				fmt.Printf("origin=%s cache=%s ttl=%s retention=%s range_chunk=%d\n", scope, sp.Namespace, sp.TTL, sp.Retention, sp.RangeChunk)
 			}
 			return 0
 		default:

@@ -36,6 +36,7 @@ type Tier struct {
 	group     singleflight.Group
 	log       *slog.Logger
 	keyLocks  [64]sync.Mutex
+	rangeSize int64
 
 	cancel    context.CancelFunc
 	done      chan struct{}
@@ -55,6 +56,10 @@ const maxListingEntries = 1_000_000
 // request. Above it, ranges are passed through to the origin so a footer read
 // never pulls a multi-GB file.
 const fullCacheMax = 8 << 20
+
+// maxRangeCacheSpan bounds one range-cache request. Larger spans pass through
+// rather than occupying memory with many aligned chunks.
+const maxRangeCacheSpan = 8 << 20
 
 // errPendingOrigin means a multipart completion is still waiting for its
 // origin upload. It must not be overwritten by a read-through fill.
@@ -105,6 +110,22 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 }
 
 func (t *Tier) Name() string { return t.namespace }
+
+// EnableRangeCache caches aligned ranges of large objects instead of passing
+// them through to the origin. chunk is the alignment; 0 disables range caching.
+func (t *Tier) EnableRangeCache(chunk int64) {
+	if chunk < 0 {
+		chunk = 0
+	}
+	if chunk > 0 && chunk < 64<<10 {
+		chunk = 64 << 10
+	}
+	if chunk > 8<<20 {
+		chunk = 8 << 20
+	}
+	t.rangeSize = chunk
+}
+
 func (t *Tier) Close() error {
 	t.closeOnce.Do(func() {
 		t.cancel()
@@ -210,6 +231,7 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 		size = m.Size
 		lastMod = m.CreatedAt
 		ct = m.ContentType
+		version = originETag(m)
 	} else {
 		var err error
 		a, err = t.attrs(ctx, ck, key)
@@ -273,6 +295,9 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 	length := end - start + 1
 	if pending {
 		return t.passThrough(ctx, ck, start, length, size, end, ranged, a, ct, lastMod)
+	}
+	if t.rangeSize > 0 && !valid && size > fullCacheMax && length < size && length <= maxRangeCacheSpan {
+		return t.openRange(ctx, ck, key, start, end, size, version, ct, lastMod, ranged)
 	}
 	if valid || length == size || size <= fullCacheMax {
 		if !valid {
@@ -348,6 +373,119 @@ func (t *Tier) passThrough(ctx context.Context, ck string, start, length, size, 
 // cache namespace with version, and returns the stored metadata. Concurrent
 // fills for the same ck coalesce via singleflight so a thundering herd on a
 // cold key pulls from the origin only once.
+func rangeChunkKey(ck string, offset int64) string {
+	return fmt.Sprintf("%s.__range__.%016x", ck, offset)
+}
+
+// openRange serves a bounded range from aligned cached chunks. It is used for
+// large objects where downloading the whole object would be wasteful but the
+// caller still reads small, repeatable ranges (Parquet footers, row groups,
+// PMTiles).
+func (t *Tier) openRange(ctx context.Context, ck, key string, start, end, size int64, version, ct string, lastMod time.Time, ranged bool) (*Object, error) {
+	length := end - start + 1
+	body := make([]byte, 0, length)
+	first := start - start%t.rangeSize
+	for off := first; off <= end; off += t.rangeSize {
+		want := t.rangeSize
+		if off+want > size {
+			want = size - off
+		}
+		chunk, err := t.rangeChunk(ctx, ck, key, off, want, version, ct)
+		if err != nil {
+			return nil, err
+		}
+		from := int64(0)
+		if off == first && start > off {
+			from = start - off
+		}
+		to := int64(len(chunk))
+		if off == first+((end-first)/t.rangeSize)*t.rangeSize && end < off+to-1 {
+			to = end - off + 1
+		}
+		if from < to {
+			body = append(body, chunk[from:to]...)
+		}
+	}
+	if int64(len(body)) != length {
+		return nil, fmt.Errorf("range cache assembled %d bytes, wanted %d", len(body), length)
+	}
+	return &Object{
+		Size: size, ETag: version, ContentType: ct, LastModified: lastMod,
+		Body: io.NopCloser(bytes.NewReader(body)), Start: start, End: end,
+		Ranged: ranged,
+	}, nil
+}
+
+func (t *Tier) rangeChunk(ctx context.Context, ck, key string, off, length int64, version, ct string) ([]byte, error) {
+	chunkKey := rangeChunkKey(ck, off)
+	if m, err := t.store.MetaHeaderKind(ctx, ns.Cache, t.namespace, chunkKey); err == nil && m.OriginETag == version && m.Size == length {
+		t.touch(ctx, chunkKey)
+		_, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, chunkKey, 0, -1, -1, nil)
+		if err == nil {
+			b, rerr := io.ReadAll(body)
+			_ = body.Close()
+			if rerr == nil && int64(len(b)) == length {
+				return b, nil
+			}
+		}
+	}
+
+	ch := t.group.DoChan(chunkKey+"\x00"+version, func() (any, error) {
+		unlock := t.lockKey(chunkKey)
+		defer unlock()
+		if m, err := t.store.MetaHeaderKind(ctx, ns.Cache, t.namespace, chunkKey); err == nil && m.OriginETag == version && m.Size == length {
+			return nil, nil
+		}
+		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		select {
+		case t.fills <- struct{}{}:
+			defer func() { <-t.fills }()
+		case <-fillCtx.Done():
+			return nil, fillCtx.Err()
+		}
+		rc, err := t.origin.GetRange(fillCtx, ck, off, length)
+		if err != nil {
+			if t.origin.IsObjNotFoundErr(err) {
+				return nil, store.ErrNotFound
+			}
+			return nil, err
+		}
+		sp, cleanup, err := spoolStream(io.LimitReader(rc, length))
+		_ = rc.Close()
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		if sp.size != length {
+			return nil, fmt.Errorf("origin range %s at %d returned %d bytes, wanted %d", key, off, sp.size, length)
+		}
+		_, err = t.storeSpooled(fillCtx, chunkKey, nil, ct, version, sp)
+		return nil, err
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	_, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, chunkKey, 0, -1, -1, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	b, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) != length {
+		return nil, fmt.Errorf("cached range chunk %s has %d bytes, wanted %d", chunkKey, len(b), length)
+	}
+	return b, nil
+}
+
 func (t *Tier) fill(ctx context.Context, ck, key string, _ int64, version, ct string) (*store.Meta, error) {
 	ch := t.group.DoChan(ck, func() (any, error) {
 		unlock := t.lockKey(ck)

@@ -3,13 +3,17 @@ package objcache
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,12 +63,14 @@ func newOrigin(c Config) (originBucket, error) {
 	switch strings.ToLower(c.Type) {
 	case "s3":
 		return newS3Bucket(c)
+	case "http", "https":
+		return newHTTPBucket(c)
 	case "filesystem":
 		return newFSBucket(c)
 	case "inmem":
 		return newMemBucket(), nil
 	default:
-		return nil, fmt.Errorf("unsupported origin type %q (s3, filesystem or inmem)", c.Type)
+		return nil, fmt.Errorf("unsupported origin type %q (s3, http, filesystem or inmem)", c.Type)
 	}
 }
 
@@ -192,6 +198,278 @@ func (b *s3Bucket) IsObjNotFoundErr(err error) bool {
 }
 
 func (b *s3Bucket) Close() error { return nil }
+
+type httpConfig struct {
+	BaseURL     string            `yaml:"base_url"`
+	Headers     map[string]string `yaml:"headers"`
+	StripBucket bool              `yaml:"strip_bucket"`
+	ReadOnly    *bool             `yaml:"read_only"`
+	Insecure    bool              `yaml:"insecure"`
+}
+
+type httpStatusError struct {
+	status int
+	msg    string
+}
+
+func (e *httpStatusError) Error() string { return e.msg }
+
+type httpBucket struct {
+	base        *url.URL
+	headers     map[string]string
+	stripBucket bool
+	readOnly    bool
+	client      *http.Client
+}
+
+func newHTTPBucket(c Config) (*httpBucket, error) {
+	raw, err := yaml.Marshal(c.Config)
+	if err != nil {
+		return nil, err
+	}
+	var hc httpConfig
+	if err := yaml.Unmarshal(raw, &hc); err != nil {
+		return nil, err
+	}
+	if hc.BaseURL == "" {
+		return nil, fmt.Errorf("http origin requires base_url")
+	}
+	u, err := url.Parse(hc.BaseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("http origin base_url must be an absolute http(s) URL")
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if hc.Insecure {
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{}
+		}
+		tr.TLSClientConfig.InsecureSkipVerify = true
+	}
+	readOnly := true
+	if hc.ReadOnly != nil {
+		readOnly = *hc.ReadOnly
+	}
+	return &httpBucket{
+		base: u, headers: hc.Headers, stripBucket: hc.StripBucket,
+		readOnly: readOnly, client: &http.Client{Transport: tr, Timeout: 5 * time.Minute},
+	}, nil
+}
+
+func (b *httpBucket) urlFor(key string) (*url.URL, error) {
+	key = strings.TrimPrefix(key, "/")
+	if b.stripBucket {
+		if i := strings.IndexByte(key, '/'); i >= 0 {
+			key = key[i+1:]
+		} else {
+			key = ""
+		}
+	}
+	u := *b.base
+	parts := strings.Split(key, "/")
+	clean := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		clean = append(clean, p)
+	}
+	if len(clean) == 0 {
+		return &u, nil
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.Join(clean, "/")
+	return &u, nil
+}
+
+func (b *httpBucket) do(ctx context.Context, method, key string, rangeHeader string) (*http.Response, error) {
+	u, err := b.urlFor(key)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range b.headers {
+		req.Header.Set(k, v)
+	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
+		defer resp.Body.Close()
+		return nil, &httpStatusError{status: resp.StatusCode, msg: fmt.Sprintf("origin %s %s: %s", method, u, resp.Status)}
+	}
+	return resp, nil
+}
+
+func (b *httpBucket) Attributes(ctx context.Context, key string) (originAttrs, error) {
+	attrs, err := b.head(ctx, key)
+	if err == nil {
+		return attrs, nil
+	}
+	if he, ok := err.(*httpStatusError); ok && he.status == http.StatusNotFound {
+		return originAttrs{}, err
+	}
+	// HEAD is commonly rejected by object stores and static CDNs. A one-byte
+	// GET still returns the total size via Content-Range.
+	resp, gerr := b.do(ctx, http.MethodGet, key, "bytes=0-0")
+	if gerr != nil {
+		return originAttrs{}, gerr
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return originAttrs{}, fmt.Errorf("origin GET %s: %s", key, resp.Status)
+	}
+	a := originAttrs{ETag: strings.Trim(resp.Header.Get("ETag"), `"`), ContentType: resp.Header.Get("Content-Type")}
+	if total := contentRangeTotal(resp.Header.Get("Content-Range")); total > 0 {
+		a.Size = total
+	} else if resp.ContentLength > 0 {
+		a.Size = resp.ContentLength
+	}
+	if t, err := http.ParseTime(resp.Header.Get("Last-Modified")); err == nil {
+		a.LastModified = t
+	}
+	return a, nil
+}
+
+func (b *httpBucket) head(ctx context.Context, key string) (originAttrs, error) {
+	resp, err := b.do(ctx, http.MethodHead, key, "")
+	if err != nil {
+		return originAttrs{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return originAttrs{}, &httpStatusError{status: resp.StatusCode, msg: fmt.Sprintf("origin HEAD: %s", resp.Status)}
+	}
+	if resp.ContentLength < 0 {
+		return originAttrs{}, fmt.Errorf("origin HEAD returned no Content-Length")
+	}
+	a := originAttrs{Size: resp.ContentLength, ETag: strings.Trim(resp.Header.Get("ETag"), `"`), ContentType: resp.Header.Get("Content-Type")}
+	if t, err := http.ParseTime(resp.Header.Get("Last-Modified")); err == nil {
+		a.LastModified = t
+	}
+	return a, nil
+}
+
+func (b *httpBucket) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	resp, err := b.do(ctx, http.MethodGet, key, "")
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, &httpStatusError{status: resp.StatusCode, msg: fmt.Sprintf("origin GET: %s", resp.Status)}
+	}
+	return resp.Body, nil
+}
+
+func (b *httpBucket) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+	if length <= 0 {
+		return b.Get(ctx, key)
+	}
+	resp, err := b.do(ctx, http.MethodGet, key, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		return resp.Body, nil
+	}
+	if resp.StatusCode == http.StatusOK {
+		// Some servers ignore Range. Only accept it when the whole object fits
+		// in the requested span; otherwise a cache chunk would silently become
+		// a multi-gigabyte fill or the wrong bytes for a non-zero offset.
+		if offset > 0 || (resp.ContentLength >= 0 && resp.ContentLength > length) {
+			resp.Body.Close()
+			return nil, fmt.Errorf("origin ignored Range for %s (offset %d, size %d, wanted %d)", key, offset, resp.ContentLength, length)
+		}
+		return resp.Body, nil
+	}
+	resp.Body.Close()
+	return nil, &httpStatusError{status: resp.StatusCode, msg: fmt.Sprintf("origin range GET: %s", resp.Status)}
+}
+
+func (b *httpBucket) Upload(ctx context.Context, key string, r io.Reader, size int64) error {
+	if b.readOnly {
+		return fmt.Errorf("http origin is read-only")
+	}
+	u, err := b.urlFor(key)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), r)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = size
+	for k, v := range b.headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &httpStatusError{status: resp.StatusCode, msg: fmt.Sprintf("origin PUT: %s", resp.Status)}
+	}
+	return nil
+}
+
+func (b *httpBucket) Delete(ctx context.Context, key string) error {
+	if b.readOnly {
+		return fmt.Errorf("http origin is read-only")
+	}
+	u, err := b.urlFor(key)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range b.headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return &httpStatusError{status: resp.StatusCode, msg: fmt.Sprintf("origin DELETE: %s", resp.Status)}
+	}
+	return nil
+}
+
+func (b *httpBucket) Iter(_ context.Context, _ string, _ func(string) error, _ bool) error {
+	return fmt.Errorf("http origin does not support listing; use an S3 origin for ListObjectsV2")
+}
+
+func (b *httpBucket) IsObjNotFoundErr(err error) bool {
+	var he *httpStatusError
+	return errors.As(err, &he) && he.status == http.StatusNotFound
+}
+
+func (b *httpBucket) Close() error { return nil }
+
+func contentRangeTotal(v string) int64 {
+	if v == "" {
+		return 0
+	}
+	i := strings.LastIndexByte(v, '/')
+	if i < 0 || i+1 >= len(v) {
+		return 0
+	}
+	n, err := strconv.ParseInt(v[i+1:], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
 
 type fsConfig struct {
 	Directory string `yaml:"directory"`

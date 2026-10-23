@@ -2,7 +2,8 @@
 
 pgvs3 is a small, fast storage server that speaks **S3**, **SQS**,
 **HTTP** and **RESP (Redis/Valkey)** over one PostgreSQL database, and can also
-run as an **accelerating cache tier in front of an S3-compatible object store**.
+run as an **accelerating cache tier in front of an S3-compatible or read-only
+HTTP(S) object store**.
 
 It is built for [DuckLake](https://ducklake.select/) and co-located services:
 DuckLake keeps its catalog in PostgreSQL, and with pgvs3 lake files, queues and
@@ -101,16 +102,18 @@ SELECT * FROM lake.events;
   detected from the first byte. RESP defaults to the `cache` namespace and
   can read any durable bucket with `GET s3://<bucket>/<key>`; writes are
   confined to cache namespaces.
-- **Accelerating cache tier (`--origin-config`).** With an S3/filesystem origin
-  YAML file, every S3 `GET` becomes a read-through cache in `s3c_<namespace>` with
-  TTL revalidation and write-through `PUT`/`DELETE`. Multipart completion
-  publishes a `pending:` cache object plus an outbox row, flushes it to the
-  origin, and lets a background worker retry failures; readers treat pending
-  objects as misses. Ranges above 8 MiB are passed through to the origin, and
-  fills are bounded (`--fill-concurrency`) and spooled to memory or a temp file
+- **Accelerating cache tier (`--origin-config`).** With an S3, HTTP(S) or
+  filesystem origin, every S3 `GET` becomes a read-through cache in
+  `s3c_<namespace>` with TTL revalidation and write-through `PUT`/`DELETE`.
+  Multipart completion publishes a `pending:` cache object plus an outbox row,
+  flushes it to the origin, and lets a background worker retry failures;
+  readers treat pending objects as misses. With `--range-cache-chunk`, ranges
+  of large objects are cached as aligned chunks instead of being passed
+  through, which makes Parquet row-group and PMTiles range reads repeatable.
+  Fills are bounded (`--fill-concurrency`) and spooled to memory or a temp file
   before touching PostgreSQL, so a slow origin never pins a database
-  connection. The production origin is S3-compatible (`s3`); `filesystem` and
-  `inmem` remain small local/test providers.
+  connection. The production origins are S3-compatible (`s3`) and read-only
+  HTTP(S); `filesystem` and `inmem` remain small local/test providers.
 - **Immutable files, atomic publish.** Writes stream into `chunks` via
   binary `COPY` under a new `file_id` and publish in the same transaction.
   Interrupted writes leave nothing visible.
@@ -251,11 +254,12 @@ Every flag maps to an environment variable.
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | Log verbosity (`debug`, `info`, `warn`, `error`). |
 | `--pprof-addr` | `PGVS3_PPROF_ADDR` | unset | Optional loopback address for Go `net/http/pprof`, e.g. `127.0.0.1:6060`. |
 | `--max-conns` | `PGVS3_MAX_CONNS` | `4096` | Concurrent client connections before shedding load. |
-| `--origin-config` | `PGVS3_ORIGIN_CONFIG` | unset | S3/filesystem origin YAML; enables the cache tier. |
+| `--origin-config` | `PGVS3_ORIGIN_CONFIG` | unset | S3/HTTP/filesystem origin YAML; enables the cache tier. |
 | `--cache-ttl` | `PGVS3_CACHE_TTL` | `1m` | Origin revalidation interval (`0` = always revalidate). |
 | `--cache-retention` | `PGVS3_CACHE_RETENTION` | `24h` | Evict idle cached objects after this period. |
 | `--cache-namespace` | `PGVS3_CACHE_NAMESPACE` | `origin` | Cache namespace holding origin objects. |
 | `--fill-concurrency` | `PGVS3_FILL_CONCURRENCY` | `8` | Concurrent origin cache fills; bounds pool use while downloading. |
+| `--range-cache-chunk` | `PGVS3_RANGE_CACHE_CHUNK` | `0` | Cache aligned ranges of large objects at this byte size; 0 disables. |
 | `--queue-concurrency` | `PGVS3_QUEUE_CONCURRENCY` | `16` | Concurrent in-flight SQS requests. |
 | `--resp-concurrency` | `PGVS3_RESP_CONCURRENCY` | `32` | Concurrent in-flight RESP batches. |
 
@@ -268,7 +272,7 @@ Subcommands:
 - `pgvs3 drop [--kind bucket|cache|queue] [--force] <name>` — drop a namespace
   schema (`DROP SCHEMA CASCADE`).
 - `pgvs3 origin [--bucket B] [--cache-namespace NS] set|clear|list [origin.yaml]`
-  — persist or remove global or per-bucket S3 origin cache configs inside
+  — persist or remove global or per-bucket origin cache configs inside
   PostgreSQL (gateways discover them automatically with no external files).
 - `pgvs3 migrate` — apply pending schema migrations (including v10 → v11).
 - `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v11, and table settings.
@@ -286,6 +290,26 @@ just image            # local ko.local image
 just image push=true  # multi-arch ghcr.io/adonm/pgvs3 (amd64 + arm64)
 CHART_VERSION=v0.3.1 just chart push=true  # OCI chart oci://ghcr.io/adonm/charts/pgvs3
 ```
+
+## HTTP origins
+
+Read-only HTTP(S) origins are useful for static CDNs and Source Cooperative-
+style data hosts. Configure a base URL and strip the cache bucket prefix:
+
+```yaml
+type: http
+config:
+  base_url: https://data.source.coop
+  strip_bucket: true
+  read_only: true
+  headers:
+    User-Agent: pgvs3
+```
+
+Add `--range-cache-chunk 1048576` to `pgvs3 serve` (or the matching
+`pgvs3 origin ... set` flag) to cache aligned chunks of large Parquet/PMTiles
+files. HTTP origins do not support `ListObjectsV2`; use an S3 origin when
+listing is required.
 
 ## Limits to keep in mind
 
