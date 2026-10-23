@@ -880,7 +880,7 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 		return
 	}
 	bound := prefixEnd(prefix)
-	var contents []objectXML
+	var contents []listObjectXML
 	var common []commonPrefixXML
 	seen := map[string]bool{}
 	if delimiter != "" {
@@ -939,10 +939,8 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 				if encode {
 					display = awsEncode(row.Key, true)
 				}
-				storageClass := "STANDARD"
-				contents = append(contents, objectXML{
-					Key: display, LastModified: isoTime(row.CreatedAt),
-					ETag: quoteETag(row.ETag), Size: row.Size, StorageClass: storageClass,
+				contents = append(contents, listObjectXML{
+					Key: display, LastModified: row.CreatedAt, ETag: row.ETag, Size: row.Size,
 				})
 				after = row.Key
 			}
@@ -969,7 +967,7 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 	if truncated {
 		out.NextContinuationToken = after
 	}
-	writeXML(w, http.StatusOK, out)
+	writeListObjectsV2XML(w, http.StatusOK, out)
 }
 
 func (s *Server) metaError(w http.ResponseWriter, r *http.Request, _ string, err error) {
