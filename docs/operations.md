@@ -178,7 +178,10 @@ and switching `PGVS3_URL`.
   evaluate kubelet probes against the policy; add the node CIDR to
   `ingress.from` if probes fail. Setting `networkPolicy.egress.allowAll=false`
   also requires explicit DNS and PostgreSQL egress rules. An optional
-  Prometheus Operator `ServiceMonitor` is available.
+  Prometheus Operator `ServiceMonitor` is available. `just helm-kind` installs
+  the chart into a disposable kind cluster with the restricted Pod Security
+  Standard and checks the pod spec, NetworkPolicy, probes and a same-namespace
+  S3 round trip.
   Ensure PostgreSQL `max_connections` exceeds `replicas × PGVS3_POOL_MAX × 2`
   (main pool + chunk pool).
 - **Failure handling:**

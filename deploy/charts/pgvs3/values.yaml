@@ -4,7 +4,7 @@ imagePullPolicy: IfNotPresent
 # Secret with a `url` key (standard libpq/pgx URL; sslmode controls DB TLS).
 urlSecretName: pgvs3-db
 # Keep below the container memory limit; Go uses it as a soft heap ceiling.
-gomemlimit: "3Gi"
+gomemlimit: "3GiB"
 # A per-replica ceiling. Size PostgreSQL max_connections for the whole fleet,
 # including rollout headroom and other clients.
 poolMax: 64

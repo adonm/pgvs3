@@ -55,6 +55,11 @@ integration:
 s3t:
     bash test/s3t.sh
 
+# Install the chart into a throwaway kind cluster under restricted Pod Security.
+[group('test')]
+helm-kind:
+    bash test/helm-kind.sh
+
 [group('test')]
 interop:
     bash deploy/bench/stack.sh interop
@@ -146,4 +151,5 @@ ci:
     mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=5s ./internal/store
     mise exec go -- go test -fuzz=FuzzBlockCodec -fuzztime=5s ./internal/store
     mise exec helm -- helm lint deploy/charts/pgvs3
+    just helm-kind
     just contract
