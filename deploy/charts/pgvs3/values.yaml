@@ -36,9 +36,9 @@ containerSecurityContext:
   capabilities:
     drop: ["ALL"]
 # Cache fills and origin uploads spool to /tmp; it must be writable even with
-# a read-only root filesystem.
+# a read-only root filesystem. Raise sizeLimit if origin objects exceed it.
 tmpDir:
-  sizeLimit: 1Gi
+  sizeLimit: 10Gi
 # Ingress is default-deny. The default allows clients in the release namespace;
 # add namespaceSelector/podSelector entries for other namespaces.
 networkPolicy:
