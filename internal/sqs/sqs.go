@@ -963,8 +963,7 @@ func (s *Server) opReceiveMessage(ctx context.Context, r *http.Request, _ string
 	attrs, aerr = s.queueAttrs(ctx, name)
 	rel()
 	if aerr != nil {
-		var apiErr *apiError
-		if errors.As(aerr, &apiErr) {
+		if apiErr, ok := errors.AsType[*apiError](aerr); ok {
 			return nil, apiErr
 		}
 		return nil, errBad(aerr.Error())

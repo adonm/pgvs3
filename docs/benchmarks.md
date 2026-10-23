@@ -73,7 +73,7 @@ Key takeaways:
 - **Sub-millisecond S3 small reads & 20.9k/s durable S3 writes:** S3 4 KiB
   `GET` reaches **35.8k req/s** (`0.17 ms` p50 at 1 worker) and durable 4 KiB
   `PUT` reaches **20.9k req/s**.
-- **Cache tier:** a warm 4 KiB `GET` through the objstore proxy costs one
+- **Cache tier:** a warm 4 KiB `GET` through the cache proxy costs one
   PostgreSQL read and reaches **12.2k req/s**; 64 MiB reads reach **4.0 GiB/s**
   and write-through PUTs **488 MiB/s** (origin is a local filesystem).
 - **Cache ranges are passed through:** a cold 1 MiB range of a 256 MiB origin

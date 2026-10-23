@@ -49,7 +49,7 @@ race:
 
 [group('test')]
 integration:
-    mise exec go -- go test -tags=integration -timeout=15m ./internal/...
+    bash test/integration.sh
 
 [group('test')]
 s3t:
@@ -146,7 +146,7 @@ ci:
     test -z "$(mise exec go -- gofmt -l cmd internal test)" || { mise exec go -- gofmt -l cmd internal test; exit 1; }
     mise exec go -- go vet ./...
     mise exec go -- go test -race ./...
-    mise exec go -- go test -tags=integration -timeout=15m ./internal/...
+    just integration
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=5s ./internal/s3
     mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=5s ./internal/store
     mise exec go -- go test -fuzz=FuzzBlockCodec -fuzztime=5s ./internal/store

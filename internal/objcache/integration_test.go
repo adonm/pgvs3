@@ -284,7 +284,13 @@ func TestTierPendingDoesNotHideOldOrigin(t *testing.T) {
 	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o555); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = os.Chmod(filepath.Join(f.dir, "bkt"), 0o755) }()
+	if err := os.Chmod(filepath.Join(f.dir, "bkt", "mp-old"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.Chmod(filepath.Join(f.dir, "bkt", "mp-old"), 0o644)
+		_ = os.Chmod(filepath.Join(f.dir, "bkt"), 0o755)
+	}()
 	_, err = f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-old",
 		[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}})
 	if err == nil {
@@ -303,6 +309,9 @@ func TestTierPendingDoesNotHideOldOrigin(t *testing.T) {
 		t.Fatalf("pending rows after failed completion = %d, want 1", n)
 	}
 
+	if err := os.Chmod(filepath.Join(f.dir, "bkt", "mp-old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o755); err != nil {
 		t.Fatal(err)
 	}

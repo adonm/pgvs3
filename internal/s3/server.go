@@ -366,10 +366,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 			writeError(w, r, errInvalidPartNumber(), s.log)
 			return
 		}
-		length = end - start + 1
-		if length < 0 {
-			length = 0
-		}
+		length = max(end-start+1, 0)
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, m.Size))
 	}
 	setPartsCount(w, m)
@@ -884,7 +881,7 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 	var common []commonPrefixXML
 	seen := map[string]bool{}
 	if delimiter != "" {
-		if rest := strings.TrimPrefix(after, prefix); rest != after {
+		if rest, ok := strings.CutPrefix(after, prefix); ok {
 			if idx := strings.Index(rest, delimiter); idx >= 0 {
 				seen[prefix+rest[:idx+len(delimiter)]] = true
 			}
@@ -984,8 +981,7 @@ func (s *Server) metaError(w http.ResponseWriter, r *http.Request, _ string, err
 }
 
 func (s *Server) ingestError(err error) error {
-	var ae *APIError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[*APIError](err); ok {
 		return ae
 	}
 	var pgErr *pgconn.PgError
@@ -1011,8 +1007,7 @@ func (s *Server) ingestError(err error) error {
 }
 
 func bodyError(err error) error {
-	var ae *APIError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[*APIError](err); ok {
 		return ae
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {

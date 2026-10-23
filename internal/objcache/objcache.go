@@ -1,11 +1,10 @@
 // Package objcache turns pgvs3 into a read-through object cache in front of
-// any bucket supported by thanos-io/objstore.
+// an S3-compatible origin (filesystem/in-memory are local/test providers).
 package objcache
 
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -18,14 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
-	"github.com/go-kit/log"
-	"github.com/thanos-io/objstore"
-	"github.com/thanos-io/objstore/providers/filesystem"
-	"github.com/thanos-io/objstore/providers/s3"
 	"golang.org/x/sync/singleflight"
-	"gopkg.in/yaml.v2"
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
@@ -33,7 +26,7 @@ import (
 
 // Tier is a caching layer over an origin bucket.
 type Tier struct {
-	origin    objstore.Bucket
+	origin    originBucket
 	store     *store.Store
 	namespace string
 	ttl       time.Duration
@@ -41,7 +34,6 @@ type Tier struct {
 	fills     chan struct{}
 	completes chan struct{}
 	group     singleflight.Group
-	meta      *s3Meta
 	log       *slog.Logger
 	keyLocks  [64]sync.Mutex
 
@@ -68,45 +60,22 @@ const fullCacheMax = 8 << 20
 // origin upload. It must not be overwritten by a read-through fill.
 var errPendingOrigin = errors.New("cache object is pending origin upload")
 
-// Config is the subset of the Thanos objstore config pgvs3 ships with.
-type Config struct {
-	Type   string      `yaml:"type"`
-	Config interface{} `yaml:"config"`
-	Prefix string      `yaml:"prefix"`
-}
-
-// New builds a Tier. config accepts `type: s3|filesystem|inmem` plus the
-// provider's `config:` block, matching Thanos objstore YAML.
+// New builds a Tier. The s3 provider is the production path; filesystem and
+// inmem are available for local development and tests.
 func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl, retention time.Duration, maxFills int) (*Tier, error) {
-	var c Config
-	if err := yaml.UnmarshalStrict(config, &c); err != nil {
+	c, err := parseConfig(config)
+	if err != nil {
 		return nil, fmt.Errorf("parse origin config: %w", err)
 	}
-	confYAML, err := yaml.Marshal(c.Config)
+	b, err := newOrigin(c)
 	if err != nil {
 		return nil, err
-	}
-	var b objstore.Bucket
-	switch strings.ToLower(c.Type) {
-	case "s3":
-		b, err = s3.NewBucket(logAdapter{log}, confYAML, "pgvs3", nil)
-	case "filesystem":
-		b, err = filesystem.NewBucketFromConfig(confYAML)
-	case "inmem":
-		b = objstore.NewInMemBucket()
-	default:
-		return nil, fmt.Errorf("unsupported origin type %q (s3, filesystem or inmem)", c.Type)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if c.Prefix != "" {
-		b = objstore.NewPrefixedBucket(b, c.Prefix)
 	}
 	if namespace == "" {
 		namespace = "origin"
 	}
 	if !ns.ValidName(namespace) {
+		_ = b.Close()
 		return nil, fmt.Errorf("invalid cache namespace %q", namespace)
 	}
 	if ttl < 0 {
@@ -118,14 +87,6 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 	if maxFills <= 0 {
 		maxFills = 8
 	}
-	var meta *s3Meta
-	if strings.EqualFold(c.Type, "s3") {
-		if m, err := newS3Meta(c); err == nil {
-			meta = m
-		} else {
-			log.Warn("origin metadata unavailable; falling back to extension content types", "err", err)
-		}
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Tier{
 		origin:    b,
@@ -135,7 +96,6 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 		retention: retention,
 		fills:     make(chan struct{}, maxFills),
 		completes: make(chan struct{}, maxFills),
-		meta:      meta,
 		log:       log,
 		cancel:    cancel,
 		done:      make(chan struct{}),
@@ -144,8 +104,7 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 	return t, nil
 }
 
-func (t *Tier) Name() string            { return t.namespace }
-func (t *Tier) Origin() objstore.Bucket { return t.origin }
+func (t *Tier) Name() string { return t.namespace }
 func (t *Tier) Close() error {
 	t.closeOnce.Do(func() {
 		t.cancel()
@@ -514,7 +473,7 @@ func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, u
 	unlock := t.lockKey(ck)
 	defer unlock()
 
-	if err := t.origin.Upload(ctx, ck, sp.r); err != nil {
+	if err := t.origin.Upload(ctx, ck, sp.r, sp.size); err != nil {
 		return nil, err
 	}
 	// The origin now has this write; an older pending multipart completion for
@@ -632,7 +591,7 @@ func (t *Tier) flushOneLocked(ctx context.Context, ck, token string) error {
 		return err
 	}
 	defer cleanup()
-	if err := t.origin.Upload(ctx, ck, sp.r); err != nil {
+	if err := t.origin.Upload(ctx, ck, sp.r, sp.size); err != nil {
 		_ = t.store.FailPendingUpload(context.WithoutCancel(ctx), t.namespace, ck, token, err)
 		return err
 	}
@@ -794,7 +753,7 @@ func (t *Tier) refreshListing(ctx context.Context, bucket, prefix string) error 
 				ContentType: a.ContentType, LastModified: a.LastModified,
 			})
 			return nil
-		}, objstore.WithRecursiveIter())
+		}, true)
 		if err != nil {
 			return nil, err
 		}
@@ -820,7 +779,7 @@ func (t *Tier) listDirect(ctx context.Context, bucket, prefix, after string, lim
 			rels = append(rels, rel)
 		}
 		return nil
-	}, objstore.WithRecursiveIter())
+	}, true)
 	if err != nil {
 		return nil, err
 	}
@@ -895,27 +854,6 @@ func etagForAttrs(a originAttrs) string {
 	return versionFor(a)
 }
 
-func etagForObjstore(attrs objstore.ObjectAttributes) string {
-	if attrs.Version != nil {
-		if v := textVersion(attrs.Version.Value); v != "" {
-			return v
-		}
-	}
-	return fmt.Sprintf("%d-%d", attrs.Size, attrs.LastModified.UnixNano())
-}
-
-// textVersion keeps S3-style ASCII ETags and hex-encodes provider versions
-// that are raw bytes (the filesystem provider stores binary xattrs).
-func textVersion(v string) string {
-	if v == "" {
-		return ""
-	}
-	if utf8.ValidString(v) {
-		return v
-	}
-	return hex.EncodeToString([]byte(v))
-}
-
 func originETag(m *store.Meta) string {
 	if m.OriginETag != "" {
 		return m.OriginETag
@@ -930,24 +868,9 @@ func originETagSlice(m *store.SliceMeta) string {
 	return m.ETag
 }
 
-// attrs returns origin metadata. The optional S3 statter supplies the exact
-// ETag and Content-Type; objstore remains the fallback for local providers and
-// for S3 configurations without static credentials.
+// attrs returns exact origin metadata from the S3-compatible provider.
 func (t *Tier) attrs(ctx context.Context, ck, key string) (originAttrs, error) {
-	if t.meta != nil {
-		if a, err := t.meta.attrs(ctx, ck); err == nil {
-			return a, nil
-		}
-	}
-	a, err := t.origin.Attributes(ctx, ck)
-	if err != nil {
-		return originAttrs{}, err
-	}
-	out := originAttrs{Size: a.Size, LastModified: a.LastModified}
-	if a.Version != nil {
-		out.ETag = textVersion(a.Version.Value)
-	}
-	return out, nil
+	return t.origin.Attributes(ctx, ck)
 }
 
 func (t *Tier) touch(ctx context.Context, ck string) {
@@ -965,13 +888,3 @@ func contentTypeFor(key string) string {
 	}
 	return "application/octet-stream"
 }
-
-// logAdapter bridges *slog.Logger to go-kit's log.Logger (what objstore wants).
-type logAdapter struct{ l *slog.Logger }
-
-func (a logAdapter) Log(keyvals ...interface{}) error {
-	a.l.Debug("objstore", keyvals...)
-	return nil
-}
-
-var _ log.Logger = logAdapter{}

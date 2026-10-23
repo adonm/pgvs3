@@ -288,7 +288,7 @@ func cmdMSet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession
 	n := len(args) / 2
 	keys := make([]string, n)
 	vals := make([][]byte, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		_, k, err := writeTarget(sess.bucket, args[2*i])
 		if err != nil {
 			return err

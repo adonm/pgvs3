@@ -73,7 +73,7 @@ func stripAwsChunked(r *http.Request) {
 		return
 	}
 	var kept []string
-	for _, part := range strings.Split(enc, ",") {
+	for part := range strings.SplitSeq(enc, ",") {
 		part = strings.TrimSpace(part)
 		if part != "" && !strings.EqualFold(part, "aws-chunked") {
 			kept = append(kept, part)
@@ -172,8 +172,7 @@ func (c *chunkedBody) Read(p []byte) (int, error) {
 func (c *chunkedBody) Close() error { return nil }
 
 func (c *chunkedBody) fail(err error) error {
-	var ae *APIError
-	if !errors.As(err, &ae) {
+	if _, ok := errors.AsType[*APIError](err); !ok {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			err = apiErr("IncompleteBody", "The request body terminated unexpectedly.", http.StatusBadRequest)
 		} else {

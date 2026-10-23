@@ -56,7 +56,7 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 		}
 		// Expiry is chained until a pass comes back short, so a burst of TTL'd
 		// keys drains in one tick instead of 4 keys/s.
-		for pass := 0; pass < 128; pass++ {
+		for range 128 {
 			var v int
 			if err := conn.QueryRow(ctx, "SELECT "+q+".expire_objects($1)", ExpireBatch).Scan(&v); err != nil {
 				if isMissingBucketSchema(err) {

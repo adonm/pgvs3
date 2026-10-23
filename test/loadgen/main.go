@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -224,7 +225,7 @@ func main() {
 	}
 	wg.Wait()
 	elapsed := time.Since(start).Seconds()
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.Sort(latencies)
 	pick := func(q float64) float64 {
 		if len(latencies) == 0 {
 			return 0
@@ -250,7 +251,7 @@ func main() {
 func prefill(c *http.Client, s *signer, base, bucket, prefix string, count int, payload []byte, workers int) {
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
-	for i := 0; i < count; i++ {
+	for i := range count {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int) {
@@ -357,7 +358,7 @@ func canonicalQuery(raw string) string {
 	}
 	type pair struct{ k, v string }
 	var pairs []pair
-	for _, part := range strings.Split(raw, "&") {
+	for part := range strings.SplitSeq(raw, "&") {
 		if part == "" {
 			continue
 		}
@@ -476,7 +477,7 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 		latMu                 sync.Mutex
 		latencies             []time.Duration
 	)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -497,7 +498,7 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 			var seq int64
 			for time.Now().Before(deadline) {
 				t0 := time.Now()
-				for p := 0; p < pipeline; p++ {
+				for range pipeline {
 					seq++
 					if op == "resp-set" {
 						k := fmt.Sprintf("%s/w%d-%d", prefix, id, seq)
@@ -514,7 +515,7 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 				}
 				var batchBytes int64
 				failed := false
-				for p := 0; p < pipeline; p++ {
+				for range pipeline {
 					n, err := readReply(br)
 					if err != nil {
 						atomic.AddInt64(&errs, 1)
@@ -543,7 +544,7 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 	}
 	wg.Wait()
 	elapsed := time.Since(start).Seconds()
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.Sort(latencies)
 	pick := func(q float64) float64 {
 		if len(latencies) == 0 {
 			return 0

@@ -146,7 +146,7 @@ func (s *Store) metaForRead(ctx context.Context, kind ns.Kind, name, key string,
 // and "*" are also valid per RFC 9110.
 func ETagMatches(header, etag string) bool {
 	want := strings.Trim(strings.TrimPrefix(strings.TrimSpace(etag), "W/"), `"`)
-	for _, token := range strings.Split(header, ",") {
+	for token := range strings.SplitSeq(header, ",") {
 		t := strings.TrimSpace(token)
 		if t == "*" {
 			return true
@@ -484,7 +484,7 @@ func (s *Store) GetBody(ctx context.Context, bucket, key string, first, last, su
 
 // GetBodyKind serves a range from any namespace kind.
 func (s *Store) GetBodyKind(ctx context.Context, kind ns.Kind, name, key string, first, last, suffix int64, cond *ReadCondition) (*SliceMeta, *Body, error) {
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := range 2 {
 		m, err := s.metaForRead(ctx, kind, name, key, cond)
 		if err != nil {
 			return nil, nil, err

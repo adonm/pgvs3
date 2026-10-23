@@ -2,15 +2,14 @@
 
 pgvs3 is a small, fast storage server that speaks **S3**, **SQS**,
 **HTTP** and **RESP (Redis/Valkey)** over one PostgreSQL database, and can also
-run as an **accelerating cache tier in front of any object store** that
-[thanos-io/objstore](https://github.com/thanos-io/objstore) supports.
+run as an **accelerating cache tier in front of an S3-compatible object store**.
 
 It is built for [DuckLake](https://ducklake.select/) and co-located services:
 DuckLake keeps its catalog in PostgreSQL, and with pgvs3 lake files, queues and
 cached blobs live there too — one database to run, back up, and replicate.
 
 The gateway is written in Go, holds zero in-process state, and ships as a
-~14 MB distroless static container built with [ko](https://ko.build/).
+~15 MB distroless static container built with [ko](https://ko.build/).
 
 > **Trusted networks only — permanently.** pgvs3 does not authenticate,
 > authorize, or encrypt connections, and does not validate S3 signatures or
@@ -102,15 +101,16 @@ SELECT * FROM lake.events;
   detected from the first byte. RESP defaults to the `cache` namespace and
   can read any durable bucket with `GET s3://<bucket>/<key>`; writes are
   confined to cache namespaces.
-- **Accelerating cache tier (`--origin-config`).** With a Thanos objstore YAML
-  file, every S3 `GET` becomes a read-through cache in `s3c_<namespace>` with
+- **Accelerating cache tier (`--origin-config`).** With an S3/filesystem origin
+  YAML file, every S3 `GET` becomes a read-through cache in `s3c_<namespace>` with
   TTL revalidation and write-through `PUT`/`DELETE`. Multipart completion
   publishes a `pending:` cache object plus an outbox row, flushes it to the
   origin, and lets a background worker retry failures; readers treat pending
   objects as misses. Ranges above 8 MiB are passed through to the origin, and
   fills are bounded (`--fill-concurrency`) and spooled to memory or a temp file
   before touching PostgreSQL, so a slow origin never pins a database
-  connection. Supported origins: `s3`, `filesystem` and `inmem`.
+  connection. The production origin is S3-compatible (`s3`); `filesystem` and
+  `inmem` remain small local/test providers.
 - **Immutable files, atomic publish.** Writes stream into `chunks` via
   binary `COPY` under a new `file_id` and publish in the same transaction.
   Interrupted writes leave nothing visible.
@@ -209,7 +209,7 @@ Full tables and DuckDB `httpfs` benchmarks are in
   (explicit or content-based), and `SequenceNumber`; high-throughput FIFO mode
   is not implemented.
 - **S3 cache tier:** read-through and write-through `GET`/`HEAD`/`PUT`/`CopyObject`/multipart uploads/`DELETE`/`DeleteObjects`/`ListObjectsV2` in front of an
-  objstore origin (`X-Cache: HIT|MISS`), with TTL revalidation (`--cache-ttl`) and idle eviction
+  compact internal origin (`X-Cache: HIT|MISS`), with TTL revalidation (`--cache-ttl`) and idle eviction
   (`--cache-retention`). Multipart completion uses a pending cache object plus
   `s3p.pending_uploads` outbox; readers miss pending entries and a worker retries
   origin uploads. `ListObjectsV2` is served from a PostgreSQL listing index that is
@@ -251,7 +251,7 @@ Every flag maps to an environment variable.
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | Log verbosity (`debug`, `info`, `warn`, `error`). |
 | `--pprof-addr` | `PGVS3_PPROF_ADDR` | unset | Optional loopback address for Go `net/http/pprof`, e.g. `127.0.0.1:6060`. |
 | `--max-conns` | `PGVS3_MAX_CONNS` | `4096` | Concurrent client connections before shedding load. |
-| `--origin-config` | `PGVS3_ORIGIN_CONFIG` | unset | objstore YAML file; enables the S3 cache tier. |
+| `--origin-config` | `PGVS3_ORIGIN_CONFIG` | unset | S3/filesystem origin YAML; enables the cache tier. |
 | `--cache-ttl` | `PGVS3_CACHE_TTL` | `1m` | Origin revalidation interval (`0` = always revalidate). |
 | `--cache-retention` | `PGVS3_CACHE_RETENTION` | `24h` | Evict idle cached objects after this period. |
 | `--cache-namespace` | `PGVS3_CACHE_NAMESPACE` | `origin` | Cache namespace holding origin objects. |
@@ -306,7 +306,7 @@ CHART_VERSION=v0.3.1 just chart push=true  # OCI chart oci://ghcr.io/adonm/chart
 ```sh
 just test       # Go unit tests
 just race       # unit tests with race detector
-just integration # store/queue/cache integration tests against PostgreSQL 18 (testcontainers)
+just integration # store/queue/cache integration tests against PostgreSQL 18 (disposable container or PGVS3_TEST_DATABASE_URL)
 just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just helm-kind  # install the chart on a throwaway kind cluster under restricted Pod Security
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage

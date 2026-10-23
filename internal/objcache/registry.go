@@ -8,8 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/yaml.v2"
-
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
 )
@@ -52,8 +50,7 @@ func NewFromSpec(log *slog.Logger, st *store.Store, spec Spec) (*Tier, error) {
 // external config files. When bucket is empty, the origin applies globally
 // across all buckets; otherwise it applies only to the named bucket.
 func SaveSpec(ctx context.Context, st *store.Store, bucket string, spec Spec) error {
-	var c Config
-	if err := yaml.UnmarshalStrict([]byte(spec.ConfigYAML), &c); err != nil {
+	if _, err := parseConfig([]byte(spec.ConfigYAML)); err != nil {
 		return fmt.Errorf("parse origin config: %w", err)
 	}
 	if spec.Namespace == "" {

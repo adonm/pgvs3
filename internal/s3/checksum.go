@@ -11,6 +11,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/adonm/pgvs3/internal/store"
@@ -59,7 +60,7 @@ func newIntegrity(h http.Header) (*integrity, error) {
 		}
 	}
 	if declared := h.Get("x-amz-trailer"); declared != "" {
-		for _, name := range strings.Split(declared, ",") {
+		for name := range strings.SplitSeq(declared, ",") {
 			name = strings.ToLower(strings.TrimSpace(name))
 			if !supportedChecksums[name] || name == "content-md5" {
 				return nil, errNotImplemented()
@@ -167,10 +168,5 @@ func algorithmHasher(algorithm string) (hash.Hash, string, bool) {
 }
 
 func contains(list []string, v string) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, v)
 }

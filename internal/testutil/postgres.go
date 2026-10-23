@@ -1,32 +1,21 @@
 //go:build integration
 
-// Package testutil provides the PostgreSQL container used by integration
-// tests. It is compiled only with the integration build tag.
+// Package testutil provides the external PostgreSQL connection used by
+// integration tests. It is compiled only with the integration build tag.
 package testutil
 
 import (
 	"context"
-
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"fmt"
+	"os"
 )
 
-// Postgres starts PostgreSQL 18 and returns its connection string plus a
-// cleanup function. The caller owns the returned Store.
+// Postgres returns the configured integration database. Tests never manage a
+// container from Go; local runs use `just integration`, CI uses a service.
 func Postgres(ctx context.Context) (string, func(), error) {
-	ctr, err := tcpostgres.Run(ctx, "postgres:18",
-		tcpostgres.WithDatabase("pgvs3_test"),
-		tcpostgres.WithUsername("postgres"),
-		tcpostgres.WithPassword("postgres"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	if err != nil {
-		return "", nil, err
+	url := os.Getenv("PGVS3_TEST_DATABASE_URL")
+	if url == "" {
+		return "", nil, fmt.Errorf("PGVS3_TEST_DATABASE_URL is not set (run `just integration` or provide a test PostgreSQL URL)")
 	}
-	cleanup := func() { _ = ctr.Terminate(context.Background()) }
-	url, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	return url, cleanup, nil
+	return url, func() {}, nil
 }

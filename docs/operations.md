@@ -292,7 +292,8 @@ work with `SELECT namespace, key, attempts, next_attempt, last_error FROM
 s3p.pending_uploads;`. `--cache-retention` evicts idle entries. Fills and
 single-request uploads buffer the body (memory ≤8 MiB, otherwise a temp file)
 before opening a PostgreSQL writer so origin latency never holds pool
-connections. Supported origin types are `s3`, `filesystem` and `inmem`.
+connections. The production origin type is `s3` (implemented with `minio-go`);
+`filesystem` and `inmem` are local/test providers.
 
 ## Profiling
 

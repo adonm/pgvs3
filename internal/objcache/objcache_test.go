@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/thanos-io/objstore"
 )
 
 func TestObjectContentLengthAndResolveRange(t *testing.T) {
@@ -58,10 +56,10 @@ func TestSpoolStreamMemoryAndTempFile(t *testing.T) {
 }
 
 func TestListSortsBeforeLimit(t *testing.T) {
-	b := objstore.NewInMemBucket()
+	b := newMemBucket()
 	ctx := context.Background()
 	for _, k := range []string{"edge/dir/c", "edge/a", "edge/dir/b"} {
-		if err := b.Upload(ctx, k, strings.NewReader(k)); err != nil {
+		if err := b.Upload(ctx, k, strings.NewReader(k), int64(len(k))); err != nil {
 			t.Fatal(err)
 		}
 	}

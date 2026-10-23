@@ -1,5 +1,9 @@
 # Hardening and compatibility options
 
+> Implementation note (2026-10-24): `thanos-io/objstore` has been replaced by a
+> small internal S3/filesystem origin adapter. References to objstore below are
+> historical research notes, not the current implementation.
+
 Status: **decisions recorded 2026-10-23; implementation in progress**. The
 trust-model wording, presigned-URL rejection, decoder hardening, SSE/ACL
 policy, per-key deletes, pending/outbox multipart write-through, origin ETags, FIFO queues,

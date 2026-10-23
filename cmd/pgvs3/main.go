@@ -96,7 +96,7 @@ func serve(args []string) int {
 		readOnly  = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating requests")
 		logLevel  = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
 		pprofAddr = fs.String("pprof-addr", env("PGVS3_PPROF_ADDR", ""), "optional loopback address for net/http/pprof, e.g. 127.0.0.1:6060")
-		originCfg = fs.String("origin-config", env("PGVS3_ORIGIN_CONFIG", ""), "objstore YAML file: serve S3 as a read-through cache")
+		originCfg = fs.String("origin-config", env("PGVS3_ORIGIN_CONFIG", ""), "S3/filesystem origin YAML: serve S3 as a read-through cache")
 		cacheTTL  = fs.Duration("cache-ttl", envDuration("PGVS3_CACHE_TTL", time.Minute), "origin revalidation interval")
 		cacheKeep = fs.Duration("cache-retention", envDuration("PGVS3_CACHE_RETENTION", 24*time.Hour), "evict cached objects after this idle period")
 		cacheNS   = fs.String("cache-namespace", env("PGVS3_CACHE_NAMESPACE", "origin"), "cache namespace for origin objects")

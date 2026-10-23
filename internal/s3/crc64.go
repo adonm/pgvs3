@@ -9,7 +9,7 @@ var crc64NVMETable = func() [256]uint64 {
 	var t [256]uint64
 	for i := range t {
 		crc := uint64(i)
-		for j := 0; j < 8; j++ {
+		for range 8 {
 			if crc&1 != 0 {
 				crc = (crc >> 1) ^ poly
 			} else {

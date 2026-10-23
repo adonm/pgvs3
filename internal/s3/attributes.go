@@ -13,7 +13,7 @@ import (
 
 func (s *Server) getObjectAttributes(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	requested := map[string]bool{}
-	for _, a := range strings.Split(r.Header.Get("x-amz-object-attributes"), ",") {
+	for a := range strings.SplitSeq(r.Header.Get("x-amz-object-attributes"), ",") {
 		a = strings.TrimSpace(a)
 		if a != "" {
 			requested[a] = true
@@ -193,7 +193,7 @@ func (s *Server) listMultipartUploads(w http.ResponseWriter, r *http.Request, bu
 	}
 	seen := map[string]bool{}
 	if delimiter != "" {
-		if rest := strings.TrimPrefix(keyMarker, prefix); rest != keyMarker {
+		if rest, ok := strings.CutPrefix(keyMarker, prefix); ok {
 			if idx := strings.Index(rest, delimiter); idx >= 0 {
 				seen[prefix+rest[:idx+len(delimiter)]] = true
 			}

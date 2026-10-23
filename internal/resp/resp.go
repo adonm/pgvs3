@@ -202,8 +202,8 @@ func (s *Server) tryCoalesceSet(ctx context.Context, conn redcon.Conn, currentCa
 // resolveTarget parses an optional "s3://<bucket>/<key>" prefix. Without that
 // prefix, the key addresses the session's active cache namespace.
 func resolveTarget(currentCache, rawKey string) (ns.Kind, string, string) {
-	if strings.HasPrefix(rawKey, "s3://") {
-		rest := strings.TrimPrefix(rawKey, "s3://")
+	if after, ok := strings.CutPrefix(rawKey, "s3://"); ok {
+		rest := after
 		if b, k, ok := strings.Cut(rest, "/"); ok && b != "" && k != "" {
 			return ns.Bucket, b, k
 		}

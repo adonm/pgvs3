@@ -289,27 +289,27 @@ func (s *Store) CacheExpire(ctx context.Context, name, key string, expiresAt *ti
 		}
 		return tag.RowsAffected() > 0, err
 	}
-	condSQL := ""
+	var condSQL strings.Builder
 	for _, opt := range opts {
 		switch strings.ToUpper(opt) {
 		case "NX":
-			condSQL += " AND expires_at IS NULL"
+			condSQL.WriteString(" AND expires_at IS NULL")
 		case "XX":
-			condSQL += " AND expires_at IS NOT NULL"
+			condSQL.WriteString(" AND expires_at IS NOT NULL")
 		case "GT":
-			condSQL += " AND expires_at IS NOT NULL AND $2 > expires_at"
+			condSQL.WriteString(" AND expires_at IS NOT NULL AND $2 > expires_at")
 		case "LT":
-			condSQL += " AND (expires_at IS NULL OR $2 < expires_at)"
+			condSQL.WriteString(" AND (expires_at IS NULL OR $2 < expires_at)")
 		}
 	}
 	if !expiresAt.After(time.Now()) {
-		if condSQL == "" {
+		if condSQL.String() == "" {
 			n, err := s.CacheDel(ctx, name, []string{key})
 			return n > 0, err
 		}
 		var exists bool
 		err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM `+sc+`.objects
-			WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`+condSQL+`)`, key, *expiresAt).Scan(&exists)
+			WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`+condSQL.String()+`)`, key, *expiresAt).Scan(&exists)
 		if isMissingBucketSchema(err) || !exists {
 			return false, err
 		}
@@ -317,7 +317,7 @@ func (s *Store) CacheExpire(ctx context.Context, name, key string, expiresAt *ti
 		return n > 0, err
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE `+sc+`.objects SET expires_at = $2
-		WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`+condSQL, key, *expiresAt)
+		WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`+condSQL.String(), key, *expiresAt)
 	if isMissingBucketSchema(err) {
 		return false, nil
 	}

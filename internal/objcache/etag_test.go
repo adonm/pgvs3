@@ -7,18 +7,6 @@ import (
 	"github.com/adonm/pgvs3/internal/store"
 )
 
-func TestTextVersion(t *testing.T) {
-	if got := textVersion("abc123"); got != "abc123" {
-		t.Fatalf("ascii version = %q", got)
-	}
-	if got := textVersion("\x94\x01"); got != "9401" {
-		t.Fatalf("binary version = %q, want 9401", got)
-	}
-	if got := textVersion(""); got != "" {
-		t.Fatalf("empty version = %q", got)
-	}
-}
-
 func TestEtagForAttrs(t *testing.T) {
 	when := time.Unix(0, 42)
 	if got := etagForAttrs(originAttrs{ETag: "etag", Size: 5, LastModified: when}); got != "etag" {

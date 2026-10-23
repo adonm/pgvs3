@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,15 +74,13 @@ func runSQS(endpoint, queue, op string, size int64, workers, pipeline int, durat
 		latMu                 sync.Mutex
 		latencies             []time.Duration
 	)
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range workers {
+		wg.Go(func() {
 			local := make([]time.Duration, 0, 4096)
 			for time.Now().Before(deadline) {
 				t0 := time.Now()
 				if op == "sqs-send" {
-					for p := 0; p < pipeline; p++ {
+					for range pipeline {
 						if err := sqsCall(c, endpoint, "SendMessage", map[string]any{
 							"QueueUrl": queueURL, "MessageBody": string(payload),
 						}, nil); err != nil {
@@ -127,11 +125,11 @@ func runSQS(endpoint, queue, op string, size int64, workers, pipeline int, durat
 			latMu.Lock()
 			latencies = append(latencies, local...)
 			latMu.Unlock()
-		}()
+		})
 	}
 	wg.Wait()
 	elapsed := time.Since(start).Seconds()
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.Sort(latencies)
 	pick := func(q float64) float64 {
 		if len(latencies) == 0 {
 			return 0

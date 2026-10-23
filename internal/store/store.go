@@ -132,17 +132,15 @@ SET synchronous_commit = on;`
 	// Open the warm set up front so a burst does not pay TCP, TLS and SCRAM.
 	var wg sync.WaitGroup
 	errs := make(chan error, minConns)
-	for i := int32(0); i < minConns; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range minConns {
+		wg.Go(func() {
 			c, err := pool.Acquire(ctx)
 			if err != nil {
 				errs <- err
 				return
 			}
 			c.Release()
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
