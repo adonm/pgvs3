@@ -129,6 +129,12 @@ func main() {
 	}
 	time.Sleep(300 * time.Millisecond)
 
+	var putBody []byte
+	if *op == "put" {
+		putBody = make([]byte, *size)
+		_, _ = rand.Read(putBody)
+	}
+
 	var (
 		reqs, errs, bytesRead int64
 		firstErr              atomic.Value
@@ -159,8 +165,7 @@ func main() {
 				case "put":
 					method = http.MethodPut
 					urlStr = fmt.Sprintf("%s/%s/%s/w%d-%d", base, *bucket, *prefix, id, seq)
-					body = make([]byte, *size)
-					_, _ = rand.Read(body)
+					body = putBody
 					want = http.StatusOK
 				case "range":
 					header = http.Header{"Range": []string{fmt.Sprintf("bytes=0-%d", *rangeSize-1)}}
