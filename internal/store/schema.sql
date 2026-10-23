@@ -71,6 +71,14 @@ BEGIN
     CREATE INDEX IF NOT EXISTS messages_expiry ON %1$I.messages (expires_at);
     CREATE INDEX IF NOT EXISTS messages_receipt ON %1$I.messages (receipt)
       WHERE receipt IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS %1$I.meta (
+      singleton   bool PRIMARY KEY DEFAULT true CHECK (singleton),
+      kind        text NOT NULL,
+      name        text NOT NULL,
+      quota_bytes int8,
+      attrs       jsonb NOT NULL DEFAULT '{}'::jsonb,
+      created_at  timestamptz NOT NULL DEFAULT now()
+    );
   $ddl$, p_schema);
 END $$;
 
@@ -179,6 +187,15 @@ BEGIN
       PRIMARY KEY (key, part_no),
       FOREIGN KEY (key) REFERENCES %1$I.objects (key)
         ON UPDATE CASCADE ON DELETE CASCADE
+    );
+
+    CREATE %2$s TABLE IF NOT EXISTS %1$I.meta (
+      singleton   bool PRIMARY KEY DEFAULT true CHECK (singleton),
+      kind        text NOT NULL,
+      name        text NOT NULL,
+      quota_bytes int8,
+      attrs       jsonb NOT NULL DEFAULT '{}'::jsonb,
+      created_at  timestamptz NOT NULL DEFAULT now()
     );
   $ddl$, p_schema, v_persist, v_inline);
 
@@ -403,6 +420,16 @@ BEGIN
   ELSE
     PERFORM s3p.ensure_object_schema(v_schema, p_kind);
   END IF;
+
+  EXECUTE format($sql$
+    INSERT INTO %1$I.meta (singleton, kind, name, quota_bytes, attrs, created_at)
+    SELECT true, kind, name, quota_bytes, attrs, created_at
+    FROM s3p.namespaces WHERE kind = $1 AND name = $2
+    ON CONFLICT (singleton) DO UPDATE
+      SET quota_bytes = EXCLUDED.quota_bytes,
+          attrs = EXCLUDED.attrs
+  $sql$, v_schema) USING p_kind, p_name;
+
   RETURN v_schema;
 END $$;
 
@@ -467,15 +494,18 @@ BEGIN
   RETURN 'ok';
 END $$;
 
--- Registers one on-disk namespace schema in the catalog. Explicit only:
--- a restore or an operator-created schema never becomes a live bucket by
--- accident. Returns 'adopted', 'exists' or 'missing'.
+-- Registers one on-disk namespace schema in the catalog, restoring any
+-- per-schema metadata (`meta` table) and advancing `s3p.file_ids`. Returns
+-- 'adopted', 'exists' or 'missing'.
 CREATE OR REPLACE FUNCTION s3p.adopt_namespace(p_kind text, p_name text)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
-  v_schema text := s3p.namespace_schema(p_kind, p_name);
-  v_table text := CASE WHEN p_kind = 'queue' THEN 'messages' ELSE 'objects' END;
-  v_max bigint;
+  v_schema  text := s3p.namespace_schema(p_kind, p_name);
+  v_table   text := CASE WHEN p_kind = 'queue' THEN 'messages' ELSE 'objects' END;
+  v_quota   int8;
+  v_attrs   jsonb := '{}'::jsonb;
+  v_created timestamptz := now();
+  v_max     bigint;
 BEGIN
   IF to_regclass(format('%I.%I', v_schema, v_table)) IS NULL THEN
     RETURN 'missing';
@@ -484,19 +514,36 @@ BEGIN
   IF EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = p_kind AND name = p_name) THEN
     RETURN 'exists';
   END IF;
-  INSERT INTO s3p.namespaces (kind, name, schema_name) VALUES (p_kind, p_name, v_schema);
-  IF p_kind <> 'queue' THEN
+  IF to_regclass(format('%I.meta', v_schema)) IS NOT NULL THEN
+    EXECUTE format('SELECT quota_bytes, coalesce(attrs, ''{}''::jsonb), coalesce(created_at, now()) FROM %I.meta LIMIT 1', v_schema)
+      INTO v_quota, v_attrs, v_created;
+  END IF;
+  INSERT INTO s3p.namespaces (kind, name, schema_name, quota_bytes, attrs, created_at)
+  VALUES (p_kind, p_name, v_schema, v_quota, coalesce(v_attrs, '{}'::jsonb), coalesce(v_created, now()));
+  IF p_kind = 'queue' THEN
+    PERFORM s3p.ensure_queue_schema(v_schema);
+  ELSE
+    PERFORM s3p.ensure_object_schema(v_schema, p_kind);
     EXECUTE format('SELECT COALESCE(max(file_id), 0) FROM %I.chunks', v_schema) INTO v_max;
     IF v_max > 0 THEN
       PERFORM setval('s3p.file_ids',
         GREATEST((SELECT last_value FROM s3p.file_ids), v_max), true);
     END IF;
   END IF;
+  EXECUTE format($sql$
+    INSERT INTO %1$I.meta (singleton, kind, name, quota_bytes, attrs, created_at)
+    SELECT true, kind, name, quota_bytes, attrs, created_at
+    FROM s3p.namespaces WHERE kind = $1 AND name = $2
+    ON CONFLICT (singleton) DO UPDATE
+      SET quota_bytes = EXCLUDED.quota_bytes,
+          attrs = EXCLUDED.attrs
+  $sql$, v_schema) USING p_kind, p_name;
   RETURN 'adopted';
 END $$;
 
--- Adopts every matching schema (optionally one kind) and prunes catalog rows
--- whose schema has disappeared. Returns the number newly adopted.
+-- Reconciles on-disk `s3[bcq]_*` schemas with `s3p.namespaces`. Only schemas
+-- not yet in `s3p.namespaces` are inspected, so steady-state ticks do O(1)
+-- catalog work and never scan chunk tables.
 CREATE OR REPLACE FUNCTION s3p.adopt_namespaces(p_kind text DEFAULT NULL)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
@@ -512,10 +559,11 @@ BEGIN
     WHEN 'bucket' THEN 's3b_%'
     ELSE 's3_%' END;
   FOR r IN
-    SELECT nspname FROM pg_namespace
-    WHERE nspname ~ '^s3[bcq]_[a-z0-9._-]{1,58}$'
-      AND nspname LIKE v_prefix
-    ORDER BY nspname
+    SELECT p.nspname FROM pg_namespace p
+    WHERE p.nspname ~ '^s3[bcq]_[a-z0-9._-]{1,58}$'
+      AND p.nspname LIKE v_prefix
+      AND NOT EXISTS (SELECT 1 FROM s3p.namespaces n WHERE n.schema_name = p.nspname)
+    ORDER BY p.nspname
   LOOP
     v_kind := CASE substr(r.nspname, 1, 3)
       WHEN 's3c' THEN 'cache'
@@ -531,6 +579,11 @@ BEGIN
     AND (p_kind IS NULL OR n.kind = p_kind);
   RETURN adopted;
 END $$;
+
+CREATE OR REPLACE FUNCTION s3p.reconcile_namespaces()
+RETURNS int LANGUAGE sql AS $$
+  SELECT s3p.adopt_namespaces(NULL);
+$$;
 
 -- In-place migration from layout v10 (per-bucket schemas catalogued in
 -- s3p.buckets) to v11 (kind-prefixed namespaces catalogued in s3p.namespaces).

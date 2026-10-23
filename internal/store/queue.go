@@ -147,7 +147,6 @@ func (s *Store) ReceiveMessages(ctx context.Context, queue string, max, visibili
 	rows, err := s.pool.Query(ctx, `WITH picked AS (
 		SELECT id FROM `+sc+`.messages
 		WHERE visible_at <= now() AND expires_at > now()
-		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = 'queue' AND name = $4)
 		ORDER BY id
 		FOR UPDATE SKIP LOCKED
 		LIMIT $1
@@ -161,7 +160,7 @@ func (s *Store) ReceiveMessages(ctx context.Context, queue string, max, visibili
 		RETURNING m.id, m.msg_id, m.body, m.body_size, m.attrs, m.receipt, m.receive_count, m.sent_at
 	)
 	SELECT id, msg_id, body, body_size, attrs, receipt, receive_count, sent_at FROM upd ORDER BY id`,
-		max, token, visibility, queue)
+		max, token, visibility)
 	if isMissingBucketSchema(err) {
 		return nil, nil
 	}

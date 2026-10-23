@@ -42,7 +42,7 @@ type Server struct {
 	metrics     *metrics
 	readOnly    bool
 	draining    atomic.Bool
-	origin      *objcache.Tier
+	origins     *objcache.Registry
 	metricsHook func(io.Writer)
 }
 
@@ -52,6 +52,7 @@ func (s *Server) SetMetricsHook(f func(io.Writer)) { s.metricsHook = f }
 func New(st *store.Store, log *slog.Logger, readOnly bool) *Server {
 	return &Server{
 		store: st, log: log, metrics: newMetrics(), readOnly: readOnly,
+		origins: objcache.NewRegistry(st, log),
 	}
 }
 
@@ -107,8 +108,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, errAccessDenied("gateway is read-only"), s.log)
 		return
 	}
-	if s.origin != nil {
-		s.serveOrigin(w, r, bucket, key)
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		s.serveOrigin(w, r, origin, bucket, key)
 		return
 	}
 	q := r.URL.Query()
@@ -588,8 +589,8 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket st
 		}
 		keys = append(keys, o.Key)
 	}
-	if s.origin != nil {
-		err = s.origin.DeleteMany(r.Context(), bucket, keys)
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		err = origin.DeleteMany(r.Context(), bucket, keys)
 	} else {
 		err = s.store.DeleteMany(r.Context(), bucket, keys)
 	}
@@ -639,8 +640,8 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, b
 		alg = &algorithm
 	}
 	var id string
-	if s.origin != nil {
-		id, err = s.origin.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		id, err = origin.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
 	} else {
 		id, err = s.store.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
 	}
@@ -669,8 +670,8 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 		return
 	}
 	var writer *store.ChunkWriter
-	if s.origin != nil {
-		writer, err = s.origin.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		writer, err = origin.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
 	} else {
 		writer, err = s.store.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
 	}
@@ -748,8 +749,8 @@ func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 		listed = append(listed, store.ListedPart{PartNo: int32(p.PartNumber), ETag: stripETag(p.ETag), Checksum: cs})
 	}
 	var done *store.Completed
-	if s.origin != nil {
-		done, err = s.origin.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		done, err = origin.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
 	} else {
 		done, err = s.store.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
 	}
@@ -779,8 +780,8 @@ func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bu
 		ok  bool
 		err error
 	)
-	if s.origin != nil {
-		ok, err = s.origin.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		ok, err = origin.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
 	} else {
 		ok, err = s.store.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
 	}
@@ -836,8 +837,8 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 				rows []store.Listed
 				err  error
 			)
-			if s.origin != nil {
-				rows, err = s.origin.List(r.Context(), bucket, prefix, after, 1024)
+			if origin := s.originFor(r.Context(), bucket); origin != nil {
+				rows, err = origin.List(r.Context(), bucket, prefix, after, 1024)
 			} else {
 				rows, err = s.store.List(r.Context(), bucket, prefix, bound, after, 1024)
 			}

@@ -73,9 +73,7 @@ func (s *Store) MetaKind(ctx context.Context, kind ns.Kind, name, key string) (*
 	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
 		parts, part_ends, etag, user_metadata, content_type, inline_data, inline_data IS NOT NULL,
 		expires_at, origin_etag
-		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())
-		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = $2 AND name = $3)`,
-		key, string(kind), name).
+		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`, key).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
 			&m.ContentType, &inline, &hasInline, &expires, &origin)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
@@ -125,9 +123,7 @@ func (s *Store) MetaHeaderKind(ctx context.Context, kind ns.Kind, name, key stri
 	var origin pgtype.Text
 	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
 		parts, part_ends, etag, user_metadata, content_type, expires_at, origin_etag
-		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())
-		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = $2 AND name = $3)`,
-		key, string(kind), name).
+		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`, key).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
 			&m.ContentType, &expires, &origin)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
@@ -870,48 +866,63 @@ func (s *Store) Delete(ctx context.Context, bucket, key string) (bool, error) {
 // it unpublishes. Locks are taken in sorted order so concurrent batches cannot
 // deadlock.
 func (s *Store) DeleteMany(ctx context.Context, bucket string, keys []string) error {
+	_, err := s.DeleteManyKind(ctx, ns.Bucket, bucket, keys)
+	return err
+}
+
+// DeleteManyKind removes keys from a bucket or cache namespace and returns the
+// number of live keys that were deleted.
+func (s *Store) DeleteManyKind(ctx context.Context, kind ns.Kind, name string, keys []string) (int64, error) {
 	if len(keys) == 0 {
-		return nil
+		return 0, nil
 	}
-	sc, err := bucketSQLIdent(bucket)
+	sc, err := nsSQLIdent(kind, name)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	sorted := append([]string(nil), keys...)
 	sort.Strings(sorted)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0) # hashtextextended(k,1))
-		FROM unnest($2::text[]) AS k`, bucket, sorted); err != nil {
-		return err
+		FROM unnest($2::text[]) AS k`, name, sorted); err != nil {
+		return 0, err
 	}
-	_, err = tx.Exec(ctx, `WITH doomed AS (
+	var deleted int64
+	err = tx.QueryRow(ctx, `WITH doomed AS (
 		DELETE FROM `+sc+`.objects WHERE key = ANY($1::text[])
-		RETURNING file_id, parts
+		RETURNING key, file_id, parts, (expires_at IS NULL OR expires_at > now()) AS live
 	), dead AS (
-		SELECT file_id FROM doomed UNION ALL SELECT unnest(parts) FROM doomed
+		SELECT file_id FROM doomed WHERE file_id IS NOT NULL
+		UNION ALL
+		SELECT unnest(parts) FROM doomed WHERE parts IS NOT NULL
+	), queued AS (
+		INSERT INTO `+sc+`.garbage (file_id)
+		SELECT DISTINCT d.file_id FROM dead d
+		WHERE d.file_id IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
+		    WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id
+		      AND NOT (o.key = ANY($1::text[])))
+		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
+		    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
+		      AND NOT (o.key = ANY($1::text[])))
+		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
+		ON CONFLICT DO NOTHING
 	)
-	INSERT INTO `+sc+`.garbage (file_id)
-	SELECT DISTINCT d.file_id FROM dead d
-	WHERE d.file_id IS NOT NULL
-	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
-	    WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id
-	      AND NOT (o.key = ANY($1::text[])))
-	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
-	    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
-	      AND NOT (o.key = ANY($1::text[])))
-	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
-	ON CONFLICT DO NOTHING`, keys)
+	SELECT count(*) FILTER (WHERE live) FROM doomed`, keys).Scan(&deleted)
 	if isMissingBucketSchema(err) {
-		return nil
+		return 0, nil
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
 
 type Listed struct {
@@ -937,9 +948,8 @@ func (s *Store) ListKind(ctx context.Context, kind ns.Kind, name, prefix, prefix
 		WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
 		  AND key COLLATE "C" > $3
 		  AND (expires_at IS NULL OR expires_at > now())
-		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = $5 AND name = $6)
 		ORDER BY key COLLATE "C" LIMIT $4`
-	rows, err := s.pool.Query(ctx, query, prefix, prefixEnd, after, limit, string(kind), name)
+	rows, err := s.pool.Query(ctx, query, prefix, prefixEnd, after, limit)
 	if isMissingBucketSchema(err) {
 		return nil, nil
 	}

@@ -133,9 +133,8 @@ func readCopySource(ctx context.Context, tx pgx.Tx, srcSchema, srcBucket, srcKey
 	err := tx.QueryRow(ctx, `SELECT file_id, size, sha256, etag, user_metadata, content_type,
 		parts, part_ends, EXTRACT(EPOCH FROM created_at)::float8, inline_data, inline_data IS NOT NULL
 		FROM `+srcSchema+`.objects
-		WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())
-		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = 'bucket' AND name = $2)`,
-		srcKey, srcBucket).
+		WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`,
+		srcKey).
 		Scan(&srcFile, &src.Size, &src.SHA256, &src.ETag, &src.UserMetadata, &src.ContentType,
 			&src.Parts, &src.PartEnds, &srcEpoch, &srcInline, &srcHasInline)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {

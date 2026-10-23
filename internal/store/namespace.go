@@ -111,17 +111,26 @@ func (s *Store) EnsureQueue(ctx context.Context, name string, attrs map[string]a
 	return s.EnsureNamespace(ctx, ns.Queue, name, nil, attrs)
 }
 
-// NamespaceExists reports whether the namespace is registered.
+// NamespaceExists reports whether the namespace schema exists in PostgreSQL,
+// reconciling its catalog row on first access if it was restored out-of-band.
 func (s *Store) NamespaceExists(ctx context.Context, kind ns.Kind, name string) (bool, error) {
-	if _, _, err := NewNamespaceRef(kind, name); err != nil {
+	sc, err := nsSQLIdent(kind, name)
+	if err != nil {
 		return false, err
 	}
-	var one int
-	err := s.pool.QueryRow(ctx, "SELECT 1 FROM s3p.namespaces WHERE kind = $1 AND name = $2", string(kind), name).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+	table := "objects"
+	if kind == ns.Queue {
+		table = "messages"
 	}
-	return err == nil, err
+	var present bool
+	if err := s.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL",
+		sc+"."+table).Scan(&present); err != nil {
+		return false, err
+	}
+	if present && !s.known(kind, name) {
+		_, _ = s.Adopt(ctx, kind, name)
+	}
+	return present, nil
 }
 
 func (s *Store) BucketExists(ctx context.Context, name string) (bool, error) {
@@ -362,16 +371,23 @@ func (s *Store) NamespaceAttrs(ctx context.Context, kind ns.Kind, name string) (
 	return out, true, nil
 }
 
-// SetNamespaceAttrs merges attrs into a namespace.
+// SetNamespaceAttrs merges attrs into a namespace and its per-schema meta table.
 func (s *Store) SetNamespaceAttrs(ctx context.Context, kind ns.Kind, name string, attrs map[string]any) error {
+	sc, err := nsSQLIdent(kind, name)
+	if err != nil {
+		return err
+	}
 	b, err := json.Marshal(attrs)
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx,
+	if _, err := s.pool.Exec(ctx,
 		"UPDATE s3p.namespaces SET attrs = attrs || $3::jsonb WHERE kind = $1 AND name = $2",
-		string(kind), name, b)
-	return err
+		string(kind), name, b); err != nil {
+		return err
+	}
+	_, _ = s.pool.Exec(ctx, "UPDATE "+sc+".meta SET attrs = attrs || $1::jsonb", b)
+	return nil
 }
 
 type quotaState struct {

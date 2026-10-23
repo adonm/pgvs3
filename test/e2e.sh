@@ -206,28 +206,26 @@ docker exec "$PGVS3_TEST_PG_CONTAINER" pg_dump -U postgres -Fc -n "\"s3b_$CLONE_
 .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$CLONE_CLI" >/dev/null || fail "pgvs3 drop --force"
 expect 404 "$A/$CLONE_CLI/inline.txt"
 docker exec -i "$PGVS3_TEST_PG_CONTAINER" pg_restore --single-transaction -U postgres -d pgvs3 < "$TMP/bucket.dump"
-# Restored schemas stay inert until explicitly adopted; maintenance no longer reconciles.
-expect 404 "$A/$CLONE_CLI/inline.txt"
-expect 404 -X PUT -H "x-amz-copy-source: /$CLONE_CLI/inline.txt" "$A/$SRC_B/unadopted-copy.txt"
-doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
-echo "$doctor_out" | grep -Eq 'orphan_schemas=[1-9]' || fail "restored schema not reported as orphan: $doctor_out"
-adopt_out=$(.tmp/pgvs3/pgvs3 adopt --url "$PGVS3_TEST_DB_URL" --kind bucket "$CLONE_CLI")
-echo "$adopt_out" | grep -q "=adopted kind=bucket" || fail "pgvs3 adopt: $adopt_out"
+# Restored schemas are immediately live (no manual adoption step required) and
+# carry their own metadata in <schema>.meta; reap/maintenance reconciles the
+# catalog and file_ids sequence automatically.
+expect 200 -I "$A/$CLONE_CLI"
 [ "$(s3 "$B/$CLONE_CLI/inline.txt")" = 'inline-val' ] || fail "restored bucket inline read"
 s3 "$B/$CLONE_CLI/cross-copy.bin" -o "$TMP/restored.bin"
 cmp "$TMP/one.bin" "$TMP/restored.bin" || fail "restored bucket chunked read"
+.tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null
 .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$SRC_B" >/dev/null
 .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$CLONE_CLI" >/dev/null
 
 # A catalog row whose schema vanished must not block layout checks, and
-# `adopt --all` prunes it.
+# maintenance (`reap`) prunes it automatically.
 MISSING="missing-$RUN"
 expect 200 -X PUT "$A/$MISSING"
 docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -q -c \
   "SET client_min_messages=warning; DROP SCHEMA \"s3b_$MISSING\" CASCADE"
 doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
 echo "$doctor_out" | grep -q "missing_schemas=1" || fail "missing schema not reported: $doctor_out"
-.tmp/pgvs3/pgvs3 adopt --url "$PGVS3_TEST_DB_URL" --all --kind bucket >/dev/null || fail "adopt --all with a missing schema"
+.tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null || fail "reap with a missing schema"
 doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
 echo "$doctor_out" | grep -q "missing_schemas=0" || fail "missing schema not pruned: $doctor_out"
 
@@ -622,7 +620,7 @@ echo "$doctor10" | grep -q "layout=11" || fail "migrated layout: $doctor10"
 echo "$doctor10" | grep -q "buckets=1" || fail "migrated bucket count: $doctor10"
 docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d postgres -c "DROP DATABASE \"$V10_DB\"" >/dev/null
 
-# --- S3 cache tier over a filesystem origin (thanos objstore) ---------------
+# --- S3 cache tier stored in PostgreSQL (no external gateway state) ---------
 ORIGIN_DIR="$TMP/origin"
 mkdir -p "$ORIGIN_DIR"
 cat > "$TMP/origin.yaml" <<YAML
@@ -630,76 +628,77 @@ type: filesystem
 config:
   directory: $ORIGIN_DIR
 YAML
-read -r ocache_port < <(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-.tmp/pgvs3/pgvs3 serve --url "$PGVS3_TEST_DB_URL" --addr "127.0.0.1:$ocache_port" \
-  --origin-config "$TMP/origin.yaml" --cache-namespace "ocache-$RUN" --cache-ttl 0s \
-  > "$TMP/ocache.log" 2>&1 &
-ocache_pid=$!
-for _ in $(seq 1 120); do
-  curl -fsS --max-time 1 "http://127.0.0.1:$ocache_port/healthz" >/dev/null 2>&1 && break
-  sleep .25
-done
-OCACHE="http://127.0.0.1:$ocache_port"
-OCACHE_PID=$ocache_pid OCACHE_ENDPOINT="$OCACHE" OCACHE_DIR="$ORIGIN_DIR" OCACHE_RUN="$RUN" \
+# Persist the origin config for bucket `edge` inside PostgreSQL; both running
+# gateways ($A and $B, started without --origin-config) discover it from PG.
+.tmp/pgvs3/pgvs3 origin --url "$PGVS3_TEST_DB_URL" --bucket edge \
+  --cache-namespace "ocache-$RUN" --cache-ttl 0s set "$TMP/origin.yaml" | grep -q "origin_set=edge" || fail "pgvs3 origin set"
+.tmp/pgvs3/pgvs3 origin --url "$PGVS3_TEST_DB_URL" list | grep -q "origin=edge" || fail "pgvs3 origin list"
+sleep 1.2
+OCACHE="$A"
+OCACHE_ENDPOINT_A="$A" OCACHE_ENDPOINT_B="$B" OCACHE_DIR="$ORIGIN_DIR" OCACHE_RUN="$RUN" \
 E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
 import os, boto3
 from botocore.config import Config
-c = boto3.client('s3', endpoint_url=os.environ['OCACHE_ENDPOINT'],
+cfg = Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+ca = boto3.client('s3', endpoint_url=os.environ['OCACHE_ENDPOINT_A'],
     aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
-    region_name='us-east-1', config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
+    region_name='us-east-1', config=cfg)
+cb = boto3.client('s3', endpoint_url=os.environ['OCACHE_ENDPOINT_B'],
+    aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
+    region_name='us-east-1', config=cfg)
 b = 'edge'
 k = os.environ['OCACHE_RUN'] + '/obj.bin'
 body = b'origin-payload-' + b'x' * 4000
-put_res = c.put_object(Bucket=b, Key=k, Body=body, ContentType='application/octet-stream', Metadata={'tier': 'write-through'})
+put_res = ca.put_object(Bucket=b, Key=k, Body=body, ContentType='application/octet-stream', Metadata={'tier': 'write-through'})
 assert put_res.get('ETag', '').strip('"'), put_res
-# Write-through: the very first GET/HEAD after PUT must be a cache HIT without re-pulling from the origin.
-get_res = c.get_object(Bucket=b, Key=k)
+# Write-through across gateways: written on A, immediately read on B as a cache HIT without re-pulling from the origin.
+get_res = cb.get_object(Bucket=b, Key=k)
 assert get_res['Body'].read() == body
 assert get_res['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', get_res['ResponseMetadata']['HTTPHeaders']
 assert {mk.lower(): mv for mk, mv in get_res.get('Metadata', {}).items()} == {'tier': 'write-through'}, get_res.get('Metadata')
-head = c.head_object(Bucket=b, Key=k)
+head = cb.head_object(Bucket=b, Key=k)
 assert head['ContentLength'] == len(body)
 assert head['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', head['ResponseMetadata']['HTTPHeaders']
 try:
-    c.get_object(Bucket=b, Key=k, IfNoneMatch=head['ETag'])
+    cb.get_object(Bucket=b, Key=k, IfNoneMatch=head['ETag'])
     raise AssertionError('expected 304 Not Modified')
-except c.exceptions.ClientError as exc:
+except cb.exceptions.ClientError as exc:
     assert exc.response['Error']['Code'] == '304', exc.response
-assert c.get_object(Bucket=b, Key=k, Range='bytes=0-15')['Body'].read() == body[:16]
-delim = c.list_objects_v2(Bucket=b, Prefix='', Delimiter='/')
+assert cb.get_object(Bucket=b, Key=k, Range='bytes=0-15')['Body'].read() == body[:16]
+delim = cb.list_objects_v2(Bucket=b, Prefix='', Delimiter='/')
 assert any(cp['Prefix'] == os.environ['OCACHE_RUN'] + '/' for cp in delim.get('CommonPrefixes', [])), delim
 # CopyObject through the cache tier writes through to the origin and caches the destination immediately.
 copy_k = os.environ['OCACHE_RUN'] + '/copied.bin'
-c.copy_object(Bucket=b, Key=copy_k, CopySource={'Bucket': b, 'Key': k})
-copy_get = c.get_object(Bucket=b, Key=copy_k)
+ca.copy_object(Bucket=b, Key=copy_k, CopySource={'Bucket': b, 'Key': k})
+copy_get = cb.get_object(Bucket=b, Key=copy_k)
 assert copy_get['Body'].read() == body
 assert copy_get['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', copy_get['ResponseMetadata']['HTTPHeaders']
 assert os.path.exists(os.path.join(os.environ['OCACHE_DIR'], b, copy_k))
-# Multipart upload through the cache tier writes through to the origin and is immediately a cache HIT.
+# Multipart upload through the cache tier writes through to the origin and is immediately a cache HIT on B.
 mp_k = os.environ['OCACHE_RUN'] + '/mp.bin'
 mp_body = b'part-payload-' * 1000
-up = c.create_multipart_upload(Bucket=b, Key=mp_k)
-part = c.upload_part(Bucket=b, Key=mp_k, UploadId=up['UploadId'], PartNumber=1, Body=mp_body)
-c.complete_multipart_upload(Bucket=b, Key=mp_k, UploadId=up['UploadId'],
+up = ca.create_multipart_upload(Bucket=b, Key=mp_k)
+part = ca.upload_part(Bucket=b, Key=mp_k, UploadId=up['UploadId'], PartNumber=1, Body=mp_body)
+ca.complete_multipart_upload(Bucket=b, Key=mp_k, UploadId=up['UploadId'],
     MultipartUpload={'Parts': [{'PartNumber': 1, 'ETag': part['ETag']}]})
-mp_get = c.get_object(Bucket=b, Key=mp_k)
+mp_get = cb.get_object(Bucket=b, Key=mp_k)
 assert mp_get['Body'].read() == mp_body
 assert mp_get['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', mp_get['ResponseMetadata']['HTTPHeaders']
 assert os.path.exists(os.path.join(os.environ['OCACHE_DIR'], b, mp_k))
 # 0-byte object through the cache tier must report Content-Length: 0.
 empty_k = os.environ['OCACHE_RUN'] + '/empty.bin'
-c.put_object(Bucket=b, Key=empty_k, Body=b'')
-assert c.head_object(Bucket=b, Key=empty_k)['ContentLength'] == 0
-assert c.get_object(Bucket=b, Key=empty_k)['Body'].read() == b''
-c.delete_objects(Bucket=b, Delete={'Objects': [{'Key': empty_k}, {'Key': copy_k}, {'Key': mp_k}]})
+ca.put_object(Bucket=b, Key=empty_k, Body=b'')
+assert cb.head_object(Bucket=b, Key=empty_k)['ContentLength'] == 0
+assert cb.get_object(Bucket=b, Key=empty_k)['Body'].read() == b''
+ca.delete_objects(Bucket=b, Delete={'Objects': [{'Key': empty_k}, {'Key': copy_k}, {'Key': mp_k}]})
 assert not os.path.exists(os.path.join(os.environ['OCACHE_DIR'], b, mp_k))
 p = os.path.join(os.environ['OCACHE_DIR'], b, k)
 open(p, 'wb').write(b'origin-updated')
-assert c.get_object(Bucket=b, Key=k)['Body'].read() == b'origin-updated'
-keys = [o['Key'] for o in c.list_objects_v2(Bucket=b, Prefix=os.environ['OCACHE_RUN'] + '/').get('Contents', [])]
+assert cb.get_object(Bucket=b, Key=k)['Body'].read() == b'origin-updated'
+keys = [o['Key'] for o in cb.list_objects_v2(Bucket=b, Prefix=os.environ['OCACHE_RUN'] + '/').get('Contents', [])]
 assert k in keys, keys
-c.delete_object(Bucket=b, Key=k)
+ca.delete_object(Bucket=b, Key=k)
 assert not os.path.exists(p)
 print('s3cache ok')
 PY
@@ -734,10 +733,10 @@ curl -fsS "$OCACHE/edge/$RUN/big.bin" -o /dev/null
 rows=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
   "SELECT count(*) FROM \"s3c_ocache-$RUN\".objects WHERE key = 'edge/$RUN/big.bin'")
 [ "$rows" = 1 ] || fail "full GET was not cached ($rows rows)"
-curl -fsSI -H 'Range: bytes=1048576-1049599' "$OCACHE/edge/$RUN/big.bin" | grep -qi 'x-cache: HIT' || fail "cached 16 MiB range did not hit cache"
+curl -fsSI -H 'Range: bytes=1048576-1049599' "$B/edge/$RUN/big.bin" | grep -qi 'x-cache: HIT' || fail "cached 16 MiB range did not hit cache"
 stat_out=$(.tmp/pgvs3/pgvs3 stat --url "$PGVS3_TEST_DB_URL" --kind cache --name "ocache-$RUN")
 echo "$stat_out" | grep -Eq 'chunks=[1-9]' || fail "pgvs3 stat chunks: $stat_out"
-kill "$ocache_pid" 2>/dev/null || true
+.tmp/pgvs3/pgvs3 origin --url "$PGVS3_TEST_DB_URL" --bucket edge clear | grep -q "origin_cleared=edge" || fail "pgvs3 origin clear"
 
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
 export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY \

@@ -256,6 +256,9 @@ func (s *Store) Init(ctx context.Context) error {
 			return err
 		}
 	}
+	if _, err := tx.Exec(ctx, "SELECT s3p.reconcile_namespaces()"); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 

@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -172,58 +171,87 @@ func (s *Store) CacheMGet(ctx context.Context, name string, keys []string) ([][]
 }
 
 // CacheDel removes keys and returns the number of live keys that were deleted.
-// Keys are sorted before locking so concurrent batches cannot deadlock.
 func (s *Store) CacheDel(ctx context.Context, name string, keys []string) (int64, error) {
-	if len(keys) == 0 {
-		return 0, nil
-	}
+	return s.DeleteManyKind(ctx, ns.Cache, name, keys)
+}
+
+// CacheGetDel atomically returns and removes one cache key.
+func (s *Store) CacheGetDel(ctx context.Context, name, key string) ([]byte, bool, error) {
 	sc, err := nsSQLIdent(ns.Cache, name)
 	if err != nil {
-		return 0, err
+		return nil, false, err
 	}
-	sorted := append([]string(nil), keys...)
-	sort.Strings(sorted)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, err
+		return nil, false, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0) # hashtextextended(k,1))
-		FROM unnest($2::text[]) AS k`, name, sorted); err != nil {
-		return 0, err
+	if err := lockObjectKey(ctx, tx, sc, key); err != nil {
+		return nil, false, err
 	}
-	var deleted int64
-	err = tx.QueryRow(ctx, `WITH doomed AS (
-		DELETE FROM `+sc+`.objects WHERE key = ANY($1::text[])
-		RETURNING key, file_id, parts, (expires_at IS NULL OR expires_at > now()) AS live
-	), dead AS (
-		SELECT file_id FROM doomed WHERE file_id IS NOT NULL
-		UNION ALL
-		SELECT unnest(parts) FROM doomed WHERE parts IS NOT NULL
-	), queued AS (
-		INSERT INTO `+sc+`.garbage (file_id)
-		SELECT DISTINCT d.file_id FROM dead d
-		WHERE d.file_id IS NOT NULL
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
-		    WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id
-		      AND NOT (o.key = ANY($1::text[])))
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
-		    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
-		      AND NOT (o.key = ANY($1::text[])))
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
-		ON CONFLICT DO NOTHING
+	var (
+		size      int64
+		fileID    pgtype.Int8
+		parts     []int64
+		inline    []byte
+		hasInline bool
+		live      bool
 	)
-	SELECT count(*) FILTER (WHERE live) FROM doomed`, keys).Scan(&deleted)
-	if isMissingBucketSchema(err) {
-		return 0, nil
+	err = tx.QueryRow(ctx, `DELETE FROM `+sc+`.objects WHERE key = $1
+		RETURNING size, file_id, parts, inline_data, inline_data IS NOT NULL,
+		          (expires_at IS NULL OR expires_at > now())`, key).
+		Scan(&size, &fileID, &parts, &inline, &hasInline, &live)
+	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+		return nil, false, nil
 	}
 	if err != nil {
-		return 0, err
+		return nil, false, err
+	}
+	var val []byte
+	if live {
+		if hasInline {
+			val, err = decompressBlock(nil, inline, int(size))
+			if err != nil {
+				return nil, false, err
+			}
+		} else if fileID.Valid {
+			rows, qerr := tx.Query(ctx, `SELECT data FROM `+sc+`.chunks WHERE file_id = $1 ORDER BY no`, fileID.Int64)
+			if qerr != nil {
+				return nil, false, qerr
+			}
+			val = make([]byte, 0, size)
+			for rows.Next() {
+				var blk []byte
+				if err := rows.Scan(&blk); err != nil {
+					rows.Close()
+					return nil, false, err
+				}
+				rem := int(min(size-int64(len(val)), RowBytes))
+				dec, err := decompressBlock(nil, blk, rem)
+				if err != nil {
+					rows.Close()
+					return nil, false, err
+				}
+				val = append(val, dec...)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return nil, false, err
+			}
+		}
+	}
+	if fileID.Valid {
+		if err := queueFiles(ctx, tx, sc, fileID.Int64, parts); err != nil {
+			return nil, false, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, err
+		return nil, false, err
 	}
-	return deleted, nil
+	if !live {
+		return nil, false, nil
+	}
+	return val, true, nil
 }
 
 // CacheExists counts requested keys that exist (duplicates counted per Redis).

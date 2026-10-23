@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -11,11 +12,17 @@ import (
 	"github.com/adonm/pgvs3/internal/store"
 )
 
-// SetOrigin enables read-through and write-through caching over an origin object store.
-func (s *Server) SetOrigin(t *objcache.Tier) { s.origin = t }
+// SetOrigin sets the default read-through/write-through origin tier. Per-bucket
+// and global origins stored in PostgreSQL (`s3p.namespaces.attrs["origin"]`)
+// are also resolved dynamically by originFor.
+func (s *Server) SetOrigin(t *objcache.Tier) { s.origins.SetDefault(t) }
+
+func (s *Server) originFor(ctx context.Context, bucket string) *objcache.Tier {
+	return s.origins.ForBucket(ctx, bucket)
+}
 
 // serveOrigin handles S3 requests in cache-tier mode.
-func (s *Server) serveOrigin(w http.ResponseWriter, r *http.Request, bucket, key string) {
+func (s *Server) serveOrigin(w http.ResponseWriter, r *http.Request, origin *objcache.Tier, bucket, key string) {
 	q := r.URL.Query()
 	switch {
 	case bucket == "":
@@ -55,11 +62,11 @@ func (s *Server) serveOrigin(w http.ResponseWriter, r *http.Request, bucket, key
 			s.methodNotAllowed(w, r)
 		}
 	default:
-		s.originObject(w, r, bucket, key)
+		s.originObject(w, r, origin, bucket, key)
 	}
 }
 
-func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+func (s *Server) originObject(w http.ResponseWriter, r *http.Request, origin *objcache.Tier, bucket, key string) {
 	if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, r, errAccessDenied("gateway is read-only"), s.log)
 		return
@@ -67,7 +74,7 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodHead:
-		obj, err := s.origin.Head(r.Context(), bucket, key)
+		obj, err := origin.Head(r.Context(), bucket, key)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, r, errNoSuchKey(), s.log)
@@ -98,7 +105,7 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			writeError(w, r, errInvalidRange(), s.log)
 			return
 		}
-		obj, err := s.origin.Open(r.Context(), bucket, key, first, last, suffix)
+		obj, err := origin.Open(r.Context(), bucket, key, first, last, suffix)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, r, errNoSuchKey(), s.log)
@@ -139,7 +146,7 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			return
 		}
 		if r.Header.Get("x-amz-copy-source") != "" {
-			s.copyOriginObject(w, r, bucket, key)
+			s.copyOriginObject(w, r, origin, bucket, key)
 			return
 		}
 		meta, err := parseMetadata(r.Header)
@@ -161,7 +168,7 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		if len(in.h) > 0 {
 			body = &integrityReader{r: r.Body, in: in}
 		}
-		m, err := s.origin.Upload(r.Context(), bucket, key, body, meta, ct)
+		m, err := origin.Upload(r.Context(), bucket, key, body, meta, ct)
 		if err != nil {
 			writeError(w, r, s.ingestError(err), s.log)
 			return
@@ -195,7 +202,7 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			s.abortMultipartUpload(w, r, bucket, key, q)
 			return
 		}
-		if err := s.origin.Delete(r.Context(), bucket, key); err != nil {
+		if err := origin.Delete(r.Context(), bucket, key); err != nil {
 			writeError(w, r, errInternal(err, s.log), s.log)
 			return
 		}
@@ -206,7 +213,7 @@ func (s *Server) originObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	}
 }
 
-func (s *Server) copyOriginObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+func (s *Server) copyOriginObject(w http.ResponseWriter, r *http.Request, origin *objcache.Tier, bucket, key string) {
 	srcBucket, srcKey, err := parseCopySource(r.Header.Get("x-amz-copy-source"), bucket)
 	if err != nil {
 		writeError(w, r, errInvalidRequest("invalid x-amz-copy-source"), s.log)
@@ -227,7 +234,7 @@ func (s *Server) copyOriginObject(w http.ResponseWriter, r *http.Request, bucket
 			return
 		}
 	}
-	out, err := s.origin.Copy(r.Context(), srcBucket, srcKey, bucket, key, meta, ct, replace)
+	out, err := origin.Copy(r.Context(), srcBucket, srcKey, bucket, key, meta, ct, replace)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, r, errNoSuchKey(), s.log)

@@ -33,6 +33,7 @@ var subcommands = map[string]func([]string) int{
 	"clone":   cloneNS,
 	"drop":    dropNS,
 	"adopt":   adoptNS,
+	"origin":  originCmd,
 	"migrate": migrateNS,
 	"version": func([]string) int { fmt.Println(version); return 0 },
 }
@@ -313,6 +314,86 @@ func orAll(kind string) string {
 		return "all"
 	}
 	return kind
+}
+
+func originCmd(args []string) int {
+	var (
+		bucket    *string
+		cacheNS   *string
+		ttl       *time.Duration
+		retention *time.Duration
+		fills     *int
+	)
+	return withStore("origin", args, 30*time.Second, true, func(fs *flag.FlagSet) {
+		bucket = fs.String("bucket", "", "restrict origin passthrough to one bucket (default: global)")
+		cacheNS = fs.String("cache-namespace", "origin", "cache namespace in PostgreSQL")
+		ttl = fs.Duration("cache-ttl", time.Minute, "origin revalidation interval")
+		retention = fs.Duration("cache-retention", 24*time.Hour, "idle eviction interval")
+		fills = fs.Int("fill-concurrency", 8, "concurrent origin cache fills")
+	}, func(ctx context.Context, st *store.Store, rest []string) int {
+		action := "list"
+		if len(rest) > 0 {
+			action = rest[0]
+			rest = rest[1:]
+		}
+		switch action {
+		case "set":
+			if len(rest) != 1 {
+				fmt.Fprintln(os.Stderr, "usage: pgvs3 origin set [--bucket B] [--cache-namespace NS] <origin.yaml>")
+				return 2
+			}
+			raw, err := os.ReadFile(rest[0])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			sp := objcache.Spec{
+				Namespace:  *cacheNS,
+				TTL:        ttl.String(),
+				Retention:  retention.String(),
+				MaxFills:   *fills,
+				ConfigYAML: string(raw),
+			}
+			if err := objcache.SaveSpec(ctx, st, *bucket, sp); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			scope := *bucket
+			if scope == "" {
+				scope = "global"
+			}
+			fmt.Printf("origin_set=%s cache=%s\n", scope, *cacheNS)
+			return 0
+		case "clear":
+			if err := objcache.ClearSpec(ctx, st, *bucket, *cacheNS); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			scope := *bucket
+			if scope == "" {
+				scope = "global"
+			}
+			fmt.Printf("origin_cleared=%s\n", scope)
+			return 0
+		case "list":
+			specs, err := objcache.ListSpecs(ctx, st)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			for _, sp := range specs {
+				scope := sp.Bucket
+				if scope == "" {
+					scope = "global"
+				}
+				fmt.Printf("origin=%s cache=%s ttl=%s retention=%s\n", scope, sp.Namespace, sp.TTL, sp.Retention)
+			}
+			return 0
+		default:
+			fmt.Fprintf(os.Stderr, "unknown origin action %q (set, clear or list)\n", action)
+			return 2
+		}
+	})
 }
 
 func health(args []string) int {

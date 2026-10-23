@@ -113,8 +113,8 @@ func (s *Server) listParts(w http.ResponseWriter, r *http.Request, bucket, key s
 		next      int32
 		err       error
 	)
-	if s.origin != nil {
-		parts, truncated, next, err = s.origin.ListParts(r.Context(), uploadID, bucket, key, max, marker)
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		parts, truncated, next, err = origin.ListParts(r.Context(), uploadID, bucket, key, max, marker)
 	} else {
 		parts, truncated, next, err = s.store.ListParts(r.Context(), uploadID, bucket, key, max, marker)
 	}

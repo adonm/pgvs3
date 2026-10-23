@@ -42,16 +42,16 @@ enforces authentication, authorization, and TLS.
 ```sh
 pgvs3 doctor --url "$PGVS3_URL"                         # PG 18+, layout v11, per-namespace settings
 pgvs3 stat   --url "$PGVS3_URL" [--kind K] [--name N] --json
-pgvs3 reap   --url "$PGVS3_URL" --all                   # garbage + TTL sweep
+pgvs3 reap   --url "$PGVS3_URL" --all                   # reconcile schemas + garbage + TTL sweep
 pgvs3 clone  --url "$PGVS3_URL" [--kind bucket|cache] <src> <dst>
 pgvs3 drop   --url "$PGVS3_URL" [--kind bucket|cache|queue] [--force] <name>
-pgvs3 adopt  --url "$PGVS3_URL" [--kind K] [--all] [name...]
+pgvs3 origin --url "$PGVS3_URL" [--bucket B] set|clear|list [origin.yaml]
 pgvs3 migrate --url "$PGVS3_URL"                        # layout v10 -> v11
 ```
 
 In normal operation, one gateway per cluster runs background maintenance every
-minute (coordinated via `pg_try_advisory_lock`), expiring abandoned multipart
-uploads and reaping up to
+minute (coordinated via `pg_try_advisory_lock`), reconciling restored or
+dropped namespace schemas, expiring abandoned multipart uploads and reaping up to
 65,536 chunk rows (~508 MiB) per pass of files deleted longer ago than
 `--reap-grace` (default `10m`), chaining additional passes immediately when a
 pass saturates its row budget.
@@ -76,15 +76,12 @@ captures exactly one bucket, cache DB or queue:
   pg_dump -Fc -n '"s3b_lake"' "$PGVS3_URL" > lake.dump
   pg_restore --single-transaction -d "$PGVS3_URL" lake.dump
   ```
-  A restored `s3b_*` schema is inert until it is explicitly adopted:
-  ```sh
-  pgvs3 adopt --url "$PGVS3_URL" --kind bucket lake
-  ```
-  Adoption inserts the catalog row and advances `s3p.file_ids` past the
-  schema's highest `file_id`. `pgvs3 adopt --all --kind bucket` adopts every
-  matching schema and prunes catalog rows whose schema no longer exists.
-  Requests for an unadopted schema return `404`, and `pgvs3 doctor` reports it
-  under `orphan_schemas`.
+  Each namespace schema carries its own `meta` table (quota, attributes, and
+  origin config), so a restored `s3b_*`, `s3c_*`, or `s3q_*` schema is
+  **immediately live** on the next request with no manual CLI step. On first
+  access or on the next maintenance tick (`s3p.reconcile_namespaces()`),
+  `s3p.namespaces` and `s3p.file_ids` are reconciled automatically ($O(1)$ in
+  steady state; only newly restored schemas are inspected).
 - **Whole-namespace clone (server-side):**
   ```sh
   pgvs3 clone --url "$PGVS3_URL" lake lake-staging
@@ -203,6 +200,10 @@ transaction and is not returned to the consumer.
 
 ## Cache tier in front of another object store
 
+Origin configurations live inside PostgreSQL (`s3p.namespaces.attrs["origin"]`
+and `<schema>.meta.attrs`), so gateways remain completely stateless and need no
+local config files on disk:
+
 ```sh
 cat > origin.yaml <<'YAML'
 type: s3
@@ -212,8 +213,17 @@ config:
   access_key: ...
   secret_key: ...
 YAML
-pgvs3 serve --origin-config origin.yaml --cache-namespace origin --cache-ttl 5m
+# Attach an origin to a single bucket (other buckets remain durable PG buckets):
+pgvs3 origin --url "$PGVS3_URL" --bucket edge --cache-namespace origin --cache-ttl 5m set origin.yaml
+# Or attach a global origin for all buckets:
+pgvs3 origin --url "$PGVS3_URL" --cache-namespace origin --cache-ttl 5m set origin.yaml
+pgvs3 origin --url "$PGVS3_URL" list
+pgvs3 origin --url "$PGVS3_URL" --bucket edge clear
 ```
+
+Every running gateway discovers new or updated origin configs from PostgreSQL
+within ~1 second (`--origin-config` on `pgvs3 serve` is still accepted as a
+process-local fallback).
 
 Every S3 `GET` and `HEAD` is served from `s3c_<namespace>` (`X-Cache: HIT`)
 without contacting the origin while within `--cache-ttl`, or when the cached

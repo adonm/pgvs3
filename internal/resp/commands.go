@@ -269,7 +269,7 @@ func cmdGetDel(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessi
 	if err != nil {
 		return err
 	}
-	val, ok, err := s.store.CacheGet(ctx, b, k)
+	val, ok, err := s.store.CacheGetDel(ctx, b, k)
 	if err != nil {
 		return err
 	}
@@ -277,7 +277,6 @@ func cmdGetDel(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessi
 		conn.WriteNull()
 		return nil
 	}
-	_, _ = s.store.CacheDel(ctx, b, []string{k})
 	writeBulk(conn, val)
 	return nil
 }
