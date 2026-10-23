@@ -1,0 +1,33 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pgvs3
+spec:
+  podSelector:
+    matchLabels: { app: pgvs3 }
+  policyTypes:
+    - Ingress
+    {{- if not .Values.networkPolicy.egress.allowAll }}
+    - Egress
+    {{- end }}
+  ingress:
+    {{- with .Values.networkPolicy.ingress.from }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - { protocol: TCP, port: 8014 }
+    {{- else }}
+    []
+    {{- end }}
+  {{- if not .Values.networkPolicy.egress.allowAll }}
+  egress:
+    - to: []
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    {{- with .Values.networkPolicy.egress.rules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

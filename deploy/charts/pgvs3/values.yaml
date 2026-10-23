@@ -1,5 +1,6 @@
 replicas: 3
 image: ghcr.io/adonm/pgvs3:latest
+imagePullPolicy: IfNotPresent
 # Secret with a `url` key (standard libpq/pgx URL; sslmode controls DB TLS).
 urlSecretName: pgvs3-db
 # Keep below the container memory limit; Go uses it as a soft heap ceiling.
@@ -15,6 +16,47 @@ topologySpread:
 resources:
   requests: { cpu: 250m, memory: 256Mi }
   limits: { memory: 4Gi }
+# Let in-flight transfers finish after the 5s drain window.
+terminationGracePeriodSeconds: 60
+automountServiceAccountToken: false
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  # distroless/static:nonroot runs as 65532; fsGroup makes the /tmp emptyDir
+  # writable for cache spooling under a read-only root filesystem.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+# Cache fills and origin uploads spool to /tmp; it must be writable even with
+# a read-only root filesystem.
+tmpDir:
+  sizeLimit: 1Gi
+# Ingress is default-deny. The default allows clients in the release namespace;
+# add namespaceSelector/podSelector entries for other namespaces.
+networkPolicy:
+  enabled: true
+  ingress:
+    from:
+      - podSelector: {}
+  egress:
+    # Keep true unless PostgreSQL and DNS are covered by explicit rules below.
+    allowAll: true
+    rules: []
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  relabelings: []
+  metricRelabelings: []
 podDisruptionBudget:
   enabled: true
   minAvailable: 1

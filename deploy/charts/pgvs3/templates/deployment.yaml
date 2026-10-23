@@ -8,8 +8,26 @@ spec:
     matchLabels: { app: pgvs3 }
   template:
     metadata:
-      labels: { app: pgvs3 }
+      labels:
+        app: pgvs3
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            {{- toYaml .Values.tmpDir | nindent 12 }}
       {{- if .Values.topologySpread.enabled }}
       topologySpreadConstraints:
         - maxSkew: {{ .Values.topologySpread.maxSkew }}
@@ -21,7 +39,11 @@ spec:
       containers:
         - name: pgvs3
           image: {{ .Values.image }}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           env:
             - name: PGVS3_URL
               valueFrom:
@@ -30,6 +52,8 @@ spec:
             - { name: GOMEMLIMIT, value: {{ .Values.gomemlimit | quote }} }
           ports:
             - { containerPort: 8014, name: s3 }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
           startupProbe:
             httpGet: { path: /healthz, port: 8014 }
             periodSeconds: 5

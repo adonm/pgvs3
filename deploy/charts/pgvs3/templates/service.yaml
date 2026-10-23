@@ -2,6 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: pgvs3
+  labels: { app: pgvs3 }
 spec:
   selector: { app: pgvs3 }
   ports:
