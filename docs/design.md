@@ -103,7 +103,7 @@ are explicitly out of scope and return errors or are ignored by design:
 | S3 | IAM/bucket policies, versioning, ACLs, Object Lock, tags, lifecycle, replication, event notifications, SSE-C, SSE-KMS, DSSE-KMS, multipart `FULL_OBJECT` checksums |
 | SQS | high-throughput FIFO mode, fair queues |
 | RESP | RESP3, `MULTI`/`EXEC`/`WATCH` |
-| Layout | migrations older than the previous layout; arbitrary schema changes without a version bump |
+| Layout | incompatible changes without a migration; editing the frozen baseline |
 
 The one versioning affordance is a read-only `ListObjectVersions` shim: it
 reports each current object as the `null` version so test harnesses and

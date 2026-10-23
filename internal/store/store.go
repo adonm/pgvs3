@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"embed"
 	"errors"
 	"fmt"
 	"io"
@@ -17,11 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-//go:embed schema.sql
-var schemaFS embed.FS
-
-// LayoutVersion is the storage layout this binary reads and writes. There is
-// no in-place migration: a different layout requires a fresh database.
+// LayoutVersion is the on-disk compatibility marker this binary reads and
+// writes. Incremental schema changes live in internal/store/migrations.
 const LayoutVersion = 11
 
 const (
@@ -207,8 +203,8 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // disables the guard. The size is sampled at most once every five seconds.
 func (s *Store) SetMaxDBBytes(n int64) { s.maxDBBytes = n }
 
-// Init installs the layout once, under a session advisory lock, and refuses
-// any other layout version rather than misreading it.
+// Init applies pending goose migrations under a session advisory lock and
+// refuses a layout version this binary cannot read.
 func (s *Store) Init(ctx context.Context) error {
 	const lock int64 = 0x70677673 // "pgvs"
 	conn, err := s.pool.Acquire(ctx)
@@ -228,14 +224,8 @@ func (s *Store) Init(ctx context.Context) error {
 	if versionNum < 180000 {
 		return fmt.Errorf("pgvs3 requires PostgreSQL 18 or later (found %d)", versionNum)
 	}
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-
 	var marked, legacy bool
-	if err := tx.QueryRow(ctx,
+	if err := conn.QueryRow(ctx,
 		"SELECT to_regclass('s3p.layout') IS NOT NULL, to_regclass('s3p.buckets') IS NOT NULL").
 		Scan(&marked, &legacy); err != nil {
 		return err
@@ -245,24 +235,27 @@ func (s *Store) Init(ctx context.Context) error {
 	}
 	if marked {
 		var found pgtype.Int4
-		if err := tx.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&found); err != nil {
+		if err := conn.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&found); err != nil {
 			return err
 		}
 		if !found.Valid || found.Int32 != LayoutVersion {
 			return fmt.Errorf("s3p holds storage layout %v; this pgvs3 reads v%d (run `pgvs3 migrate` for v10, or use a fresh database)", found.Int32, LayoutVersion)
 		}
 	}
-	schema, err := schemaFS.ReadFile("schema.sql")
+	if err := s.gooseUp(ctx); err != nil {
+		return err
+	}
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, string(schema)); err != nil {
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	var found pgtype.Int4
+	if err := tx.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&found); err != nil {
 		return err
 	}
-	if !marked {
-		if _, err := tx.Exec(ctx, "INSERT INTO s3p.layout (version) VALUES ($1)", LayoutVersion); err != nil {
-			return err
-		}
+	if !found.Valid || found.Int32 != LayoutVersion {
+		return fmt.Errorf("s3p holds storage layout %v; this pgvs3 reads v%d", found.Int32, LayoutVersion)
 	}
 	if _, err := tx.Exec(ctx, "SELECT s3p.reconcile_namespaces()"); err != nil {
 		return err
@@ -293,7 +286,7 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 		return err
 	}
 	defer conn.Release()
-	for _, rel := range []string{"s3p.layout", "s3p.namespaces", "s3p.file_ids", "s3p.origin_listing", "s3p.origin_listing_state"} {
+	for _, rel := range []string{"s3p.layout", "s3p.namespaces", "s3p.file_ids", "s3p.origin_listing", "s3p.origin_listing_state", "s3p.goose_db_version"} {
 		var exists bool
 		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", rel).Scan(&exists); err != nil {
 			return err

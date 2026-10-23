@@ -20,8 +20,9 @@ The gateway is written in Go, holds zero in-process state, and ships as a
 > port. Presigned URLs are rejected because a scoped link would otherwise
 > grant unscoped access. See [docs/design.md](docs/design.md).
 
-**Status: early alpha.** `pgvs3 migrate` upgrades a layout v10 database to v11
-in place. Older or unsupported layouts require a fresh database.
+**Status: early alpha.** `pgvs3 migrate` applies pending schema migrations
+(including a layout v10 database to v11) in place. Older or unsupported layouts
+require a fresh database.
 
 ## Quick start
 
@@ -264,7 +265,7 @@ Subcommands:
 - `pgvs3 origin [--bucket B] [--cache-namespace NS] set|clear|list [origin.yaml]`
   — persist or remove global or per-bucket S3 origin cache configs inside
   PostgreSQL (gateways discover them automatically with no external files).
-- `pgvs3 migrate` — upgrade a layout v10 database to v11 in place.
+- `pgvs3 migrate` — apply pending schema migrations (including v10 → v11).
 - `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v11, and table settings.
 - `pgvs3 reap [--all]` — reconcile schemas and run garbage collection immediately.
 - `pgvs3 health` — poll `/readyz` for container health checks.

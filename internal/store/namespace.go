@@ -272,27 +272,10 @@ func (s *Store) Namespaces(ctx context.Context, kind ns.Kind) ([]NamespaceInfo, 
 	})
 }
 
-// Migrate upgrades a layout v10 database in place. It returns the number of
-// buckets migrated and is a no-op on an already-current database.
+// Migrate applies pending goose migrations, including the in-place v10 -> v11
+// upgrade. It returns the number of bucket namespaces that appeared during the
+// run and is a no-op on an already-current database.
 func (s *Store) Migrate(ctx context.Context) (int, error) {
-	var v pgtype.Int4
-	err := s.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&v)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("no s3p.layout row: not a pgvs3 database")
-	}
-	if err != nil {
-		return 0, err
-	}
-	if !v.Valid {
-		return 0, fmt.Errorf("s3p.layout is empty")
-	}
-	switch v.Int32 {
-	case LayoutVersion:
-		return 0, nil
-	case 10:
-	default:
-		return 0, fmt.Errorf("cannot migrate layout v%d to v%d", v.Int32, LayoutVersion)
-	}
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return 0, err
@@ -302,18 +285,37 @@ func (s *Store) Migrate(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", int64(0x70677673))
-	schema, err := schemaFS.ReadFile("schema.sql")
-	if err != nil {
+
+	var exists bool
+	if err := conn.QueryRow(ctx, "SELECT to_regclass('s3p.layout') IS NOT NULL").Scan(&exists); err != nil {
 		return 0, err
 	}
-	if _, err := conn.Exec(ctx, string(schema)); err != nil {
+	if !exists {
+		return 0, fmt.Errorf("no s3p.layout row: not a pgvs3 database")
+	}
+	var v pgtype.Int4
+	if err := conn.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&v); err != nil {
 		return 0, err
 	}
+	if !v.Valid {
+		return 0, fmt.Errorf("s3p.layout is empty")
+	}
+	if v.Int32 != 10 && v.Int32 != LayoutVersion {
+		return 0, fmt.Errorf("cannot migrate layout v%d to v%d", v.Int32, LayoutVersion)
+	}
+	before := s.countBuckets(ctx)
+	if err := s.gooseUp(ctx); err != nil {
+		return 0, err
+	}
+	return s.countBuckets(ctx) - before, nil
+}
+
+func (s *Store) countBuckets(ctx context.Context) int {
 	var n int
-	if err := conn.QueryRow(ctx, "SELECT s3p.migrate_v10()").Scan(&n); err != nil {
-		return 0, err
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM s3p.namespaces WHERE kind = 'bucket'").Scan(&n); err != nil {
+		return 0
 	}
-	return n, nil
+	return n
 }
 
 // Adopt registers one existing namespace schema. Returns "adopted", "exists"

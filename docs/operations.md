@@ -133,7 +133,8 @@ All state lives in PostgreSQL; there is no sidecar store to back up.
 ## Schema upgrades
 
 Gateways refuse to start against a layout other than v11. Back up first, stop
-the gateways, and run the in-place migration from layout v10:
+the gateways, and apply pending migrations (including the in-place v10 → v11
+upgrade):
 
 ```sh
 pg_dump -Fc "$PGVS3_URL" > pgvs3-pre-migrate.dump
@@ -141,12 +142,17 @@ pgvs3 migrate --url "$PGVS3_URL"       # prints migrated_buckets=N layout=11
 pgvs3 doctor  --url "$PGVS3_URL"
 ```
 
-The migration keeps every bucket schema and object in place. It copies the
+Migrations are goose SQL files in `internal/store/migrations/`; the applied
+history lives in `s3p.goose_db_version`. `00001_baseline.sql` is the frozen v11
+baseline, `00002_v10_to_v11.sql` performs the in-place upgrade, and later
+migrations are additive. `pgvs3 migrate` applies every pending migration;
+running it again after an upgrade is a no-op unless a newer migration exists.
+
+The v10 migration keeps every bucket schema and object in place. It copies the
 `s3p.buckets` catalog into `s3p.namespaces`, adds `objects.origin_etag`, applies
 the v11 table settings, recreates per-schema helper functions, and renames the
 old catalog table to `v10_buckets` instead of dropping it. Schemas restored
-outside the catalog are adopted as part of the upgrade. Running `pgvs3 migrate`
-again on a v11 database is a no-op.
+outside the catalog are adopted as part of the upgrade.
 
 Layouts older than v10, and future breaking changes without a migration
 function, still require copying data into a fresh database via DuckDB/rclone

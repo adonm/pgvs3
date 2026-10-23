@@ -301,3 +301,47 @@ func TestCacheBasics(t *testing.T) {
 		t.Fatalf("decr: %d %v", n, err)
 	}
 }
+
+func TestGooseMigrationsAndIdempotentInit(t *testing.T) {
+	ctx := testCtx
+	var gooseVersion int64
+	if err := testStore.pool.QueryRow(ctx,
+		"SELECT max(version_id) FROM s3p.goose_db_version").Scan(&gooseVersion); err != nil {
+		t.Fatal(err)
+	}
+	if gooseVersion != 3 {
+		t.Fatalf("goose version = %d, want 3", gooseVersion)
+	}
+	var layout int
+	if err := testStore.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&layout); err != nil {
+		t.Fatal(err)
+	}
+	if layout != LayoutVersion {
+		t.Fatalf("layout = %d, want %d", layout, LayoutVersion)
+	}
+	if err := testStore.Init(ctx); err != nil {
+		t.Fatalf("second Init: %v", err)
+	}
+	n, err := testStore.Migrate(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("Migrate on current layout: n=%d err=%v", n, err)
+	}
+}
+
+func TestInitAdoptsExistingLayoutWithoutGooseHistory(t *testing.T) {
+	ctx := testCtx
+	if _, err := testStore.pool.Exec(ctx, "DROP TABLE IF EXISTS s3p.goose_db_version"); err != nil {
+		t.Fatal(err)
+	}
+	if err := testStore.Init(ctx); err != nil {
+		t.Fatalf("Init without goose history: %v", err)
+	}
+	var version int64
+	if err := testStore.pool.QueryRow(ctx,
+		"SELECT max(version_id) FROM s3p.goose_db_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Fatalf("goose version after adoption = %d, want 3", version)
+	}
+}

@@ -64,21 +64,23 @@ Format code before committing:
 mise exec go -- gofmt -w cmd internal test
 ```
 
-## Storage layout changes
+## Schema migrations
 
-`internal/store/schema.sql` defines layout `v11` (`store.LayoutVersion = 11`).
-Namespaces are PostgreSQL schemas typed by prefix: `s3b_` bucket, `s3c_` cache
-(UNLOGGED) and `s3q_` queue. Objects up to the kind's inline ceiling live in
-`objects.inline_data`; larger objects use 8,120-byte rows in `chunks`.
+Migrations live in `internal/store/migrations/` and are applied with
+[goose](https://github.com/pressly/goose). `store.LayoutVersion` remains the
+on-disk compatibility marker; goose owns incremental changes.
 
-Any incompatible schema change must:
-
-1. Increment `store.LayoutVersion` in `internal/store/store.go`.
-2. Update `internal/store/schema.sql` and document the page/TOAST math.
-3. Fail fast on startup when connected to an older layout version.
-4. Add an idempotent `s3p.migrate_vN()` function and wire it into `pgvs3
-   migrate`; keep the previous catalog/tables readable rather than dropping
-   them. Migrations run only when the operator asks for them.
+- `00001_baseline.sql` is the frozen v11 baseline. Do not edit it.
+- Add `000NN_description.sql` with `-- +goose Up`; wrap PL/pgSQL blocks in
+  `-- +goose StatementBegin` / `-- +goose StatementEnd`.
+- `pgvs3 migrate` applies every pending migration, including the in-place
+  v10 → v11 upgrade. `Init` applies them under the same advisory lock.
+- Increment `store.LayoutVersion` only when an older binary cannot read the
+  new schema; otherwise a goose migration is enough.
+- For an incompatible layout jump, add an idempotent `s3p.migrate_vN()` and
+  keep the previous catalog/tables readable rather than dropping them.
+- Run `just test`, `just integration`, and `pgvs3 migrate` against a copy of
+  the target database before merging.
 
 ## Performance invariants
 
