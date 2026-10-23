@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type metrics struct {
@@ -20,7 +19,7 @@ func newMetrics() *metrics {
 	return &metrics{counters: map[string]*atomic.Int64{}}
 }
 
-func (m *metrics) observe(command string, status int, _ time.Duration, _ int64) {
+func (m *metrics) observe(command string, status int) {
 	key := command + "|" + strconv.Itoa(status)
 	m.mu.Lock()
 	c, ok := m.counters[key]

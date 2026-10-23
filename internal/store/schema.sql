@@ -67,6 +67,13 @@ BEGIN
 
   PERFORM pg_advisory_xact_lock(hashtextextended('s3p.ns', 0) # hashtextextended(p_kind || ':' || p_name, 1));
 
+  IF p_quota IS NULL AND p_attrs IS NULL
+     AND (to_regclass(format('%I.objects', v_schema)) IS NOT NULL
+          OR to_regclass(format('%I.messages', v_schema)) IS NOT NULL)
+     AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = p_kind AND name = p_name) THEN
+    RETURN v_schema;
+  END IF;
+
   INSERT INTO s3p.namespaces (kind, name, schema_name, quota_bytes, attrs)
   VALUES (p_kind, p_name, v_schema, p_quota, coalesce(p_attrs, '{}'::jsonb))
   ON CONFLICT (kind, name) DO UPDATE

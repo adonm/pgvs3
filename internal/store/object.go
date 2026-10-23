@@ -923,7 +923,12 @@ type Listed struct {
 
 // List returns key-ordered objects in [prefix, prefixEnd) with key > after.
 func (s *Store) List(ctx context.Context, bucket, prefix, prefixEnd, after string, limit int) ([]Listed, error) {
-	sc, err := bucketSQLIdent(bucket)
+	return s.ListKind(ctx, ns.Bucket, bucket, prefix, prefixEnd, after, limit)
+}
+
+// ListKind returns key-ordered objects in a bucket or cache namespace.
+func (s *Store) ListKind(ctx context.Context, kind ns.Kind, name, prefix, prefixEnd, after string, limit int) ([]Listed, error) {
+	sc, err := nsSQLIdent(kind, name)
 	if err != nil {
 		return nil, err
 	}
@@ -932,9 +937,9 @@ func (s *Store) List(ctx context.Context, bucket, prefix, prefixEnd, after strin
 		WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
 		  AND key COLLATE "C" > $3
 		  AND (expires_at IS NULL OR expires_at > now())
-		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = 'bucket' AND name = $5)
+		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = $5 AND name = $6)
 		ORDER BY key COLLATE "C" LIMIT $4`
-	rows, err := s.pool.Query(ctx, query, prefix, prefixEnd, after, limit, bucket)
+	rows, err := s.pool.Query(ctx, query, prefix, prefixEnd, after, limit, string(kind), name)
 	if isMissingBucketSchema(err) {
 		return nil, nil
 	}

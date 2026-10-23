@@ -375,12 +375,25 @@ assert ra.incr('counter') == 1
 assert rb.incrby('counter', 41) == 42
 assert ra.decr('counter') == 41
 
-# MSET / MGET / EXISTS / DEL.
+# MSET / MGET / EXISTS / DEL / KEYS / SCAN / INFO.
 assert ra.mset({'k1': b'v1', 'k2': b'v2', 'k3': b'v3'}) is True
 assert rb.mget(['k1', 'missing', 'k3']) == [b'v1', None, b'v3']
 assert rb.exists('k1', 'k2', 'missing') == 2
+assert sorted(rb.keys('k*')) == [b'k1', b'k2', b'k3']
+cursor, scanned = rb.scan(cursor=0, match='k*', count=10)
+assert cursor == 0 and sorted(scanned) == [b'k1', b'k2', b'k3'], (cursor, scanned)
+assert rb.info().get('db0', {}).get('keys', 0) >= 3
 assert ra.delete('k1', 'k2', 'missing') == 2
 assert rb.exists('k1', 'k2') == 0
+
+# Cross-namespace and s3:// writes over RESP are rejected even when the bucket
+# name matches the active cache namespace.
+for bad_key in ('s3://cache/forbid', f"s3://{os.environ['E2E_BUCKET']}/forbid"):
+    try:
+        ra.set(bad_key, b'nope')
+        raise AssertionError(f'write to {bad_key} should fail')
+    except redis.ResponseError as exc:
+        assert 'cross-namespace' in str(exc), exc
 
 # Large compressible value (> 64 KiB -> compressed 8,120-byte blocks in `chunks`)
 # and GETRANGE slicing across block boundaries.

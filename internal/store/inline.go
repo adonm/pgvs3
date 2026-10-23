@@ -58,6 +58,11 @@ func (s *Store) PutInlineKind(ctx context.Context, kind ns.Kind, name, key strin
 	if userMeta == nil {
 		userMeta = []string{}
 	}
+	if !s.known(kind, name) {
+		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
+			return nil, err
+		}
+	}
 	query := "SELECT " + sc + ".put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
 	var result string
 	err = s.pool.QueryRow(ctx, query,

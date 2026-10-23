@@ -213,23 +213,7 @@ func (s *Store) DeleteMessage(ctx context.Context, queue, receipt string) (bool,
 	if tag.RowsAffected() > 0 {
 		return true, nil
 	}
-	// No row matched: either the message is gone (a repeated delete, which SQS
-	// treats as success) or it was re-received and the handle is stale.
-	id, perr := strconv.ParseInt(receiptMsgID(receipt), 10, 64)
-	if perr != nil {
-		return false, ErrReceiptInvalid
-	}
-	var exists bool
-	if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+sc+".messages WHERE id = $1)", id).Scan(&exists); err != nil {
-		if isMissingBucketSchema(err) {
-			return false, ErrReceiptInvalid
-		}
-		return false, err
-	}
-	if exists {
-		return false, ErrReceiptStale
-	}
-	return true, nil
+	return s.classifyMissingReceipt(ctx, sc, receipt)
 }
 
 // ChangeVisibility extends or resets one message's visibility timeout.
@@ -250,8 +234,18 @@ func (s *Store) ChangeVisibility(ctx context.Context, queue, receipt string, vis
 	if tag.RowsAffected() > 0 {
 		return true, nil
 	}
-	id, perr := strconv.ParseInt(receiptMsgID(receipt), 10, 64)
-	if perr != nil {
+	if _, err := s.classifyMissingReceipt(ctx, sc, receipt); err != nil {
+		return false, err
+	}
+	return false, ErrReceiptInvalid
+}
+
+// classifyMissingReceipt distinguishes an already-deleted message (returns
+// true, nil) from a handle superseded by a later receive (ErrReceiptStale) or a
+// malformed handle (ErrReceiptInvalid).
+func (s *Store) classifyMissingReceipt(ctx context.Context, sc, receipt string) (bool, error) {
+	id, err := strconv.ParseInt(receiptMsgID(receipt), 10, 64)
+	if err != nil {
 		return false, ErrReceiptInvalid
 	}
 	var exists bool
@@ -264,7 +258,7 @@ func (s *Store) ChangeVisibility(ctx context.Context, queue, receipt string, vis
 	if exists {
 		return false, ErrReceiptStale
 	}
-	return false, ErrReceiptInvalid
+	return true, nil
 }
 
 // Redrive moves messages by receipt from one queue into a dead-letter queue.
