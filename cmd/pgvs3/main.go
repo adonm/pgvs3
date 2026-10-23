@@ -76,6 +76,9 @@ func serve(args []string) int {
 		cacheTTL  = fs.Duration("cache-ttl", envDuration("PGVS3_CACHE_TTL", time.Minute), "origin revalidation interval")
 		cacheKeep = fs.Duration("cache-retention", envDuration("PGVS3_CACHE_RETENTION", 24*time.Hour), "evict cached objects after this idle period")
 		cacheNS   = fs.String("cache-namespace", env("PGVS3_CACHE_NAMESPACE", "origin"), "cache namespace for origin objects")
+		fillMax   = fs.Int("fill-concurrency", envInt("PGVS3_FILL_CONCURRENCY", 8), "concurrent origin cache fills")
+		sqsMax    = fs.Int("queue-concurrency", envInt("PGVS3_QUEUE_CONCURRENCY", 16), "concurrent SQS requests")
+		respMax   = fs.Int("resp-concurrency", envInt("PGVS3_RESP_CONCURRENCY", 32), "concurrent RESP batches")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -114,7 +117,7 @@ func serve(args []string) int {
 			log.Error("reading origin config", "err", err)
 			return 1
 		}
-		origin, err = objcache.New(log, cfg, st, *cacheNS, *cacheTTL, *cacheKeep)
+		origin, err = objcache.New(log, cfg, st, *cacheNS, *cacheTTL, *cacheKeep, *fillMax)
 		if err != nil {
 			log.Error("building origin cache", "err", err)
 			return 1
@@ -123,7 +126,7 @@ func serve(args []string) int {
 		log.Info("origin cache enabled", "namespace", *cacheNS, "ttl", *cacheTTL)
 	}
 
-	g := gateway.New(st, log, *readOnly, origin)
+	g := gateway.New(st, log, *readOnly, origin, gateway.Limits{SQS: *sqsMax, RESP: *respMax})
 	go func() {
 		<-ctx.Done()
 		g.SetDraining(true)

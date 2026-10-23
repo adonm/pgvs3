@@ -28,10 +28,14 @@ type Server struct {
 	store    *store.Store
 	log      *slog.Logger
 	readOnly bool
+	sem      chan struct{}
 }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool) *Server {
-	return &Server{store: st, log: log, readOnly: readOnly}
+func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int) *Server {
+	if maxConc <= 0 {
+		maxConc = 16
+	}
+	return &Server{store: st, log: log, readOnly: readOnly, sem: make(chan struct{}, maxConc)}
 }
 
 // IsSQS reports whether r targets the SQS API.
@@ -47,6 +51,13 @@ func IsSQS(r *http.Request) bool {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-r.Context().Done():
+		http.Error(w, "canceled", http.StatusRequestTimeout)
+		return
+	}
 	if r.Method != http.MethodPost {
 		s.writeErr(w, r, http.StatusMethodNotAllowed, "InvalidAction", "Only POST is supported")
 		return

@@ -266,22 +266,60 @@ func (s *Store) SetNamespaceAttrs(ctx context.Context, kind ns.Kind, name string
 
 type quotaState struct {
 	checked time.Time
-	over    bool
+	size    int64
+	quota   int64
 }
 
-// overQuota reports the last maintenance-computed quota state. The gauge is
-// refreshed once per maintenance tick, so writes see at most one tick of lag.
-func (s *Store) overQuota(kind ns.Kind, name string) bool {
-	v, ok := s.quota.Load(nsKey(kind, name))
-	if !ok {
+// checkQuota enforces a namespace's quota against a gauge refreshed at most
+// once per second, adding the size of the incoming write. This makes the cap
+// near-hard (bounded by ~1s of writes) instead of once-per-maintenance-tick.
+func (s *Store) checkQuota(ctx context.Context, kind ns.Kind, name string, add int64) bool {
+	key := nsKey(kind, name)
+	var st quotaState
+	if v, ok := s.quota.Load(key); ok {
+		st = v.(quotaState)
+	}
+	if st.checked.IsZero() || time.Since(st.checked) > time.Second {
+		var q pgtype.Int8
+		err := s.pool.QueryRow(ctx,
+			"SELECT quota_bytes FROM s3p.namespaces WHERE kind = $1 AND name = $2",
+			string(kind), name).Scan(&q)
+		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+			return false
+		}
+		if err != nil || !q.Valid {
+			s.quota.Store(key, quotaState{checked: time.Now()})
+			return false
+		}
+		st = quotaState{checked: time.Now(), quota: q.Int64, size: s.namespaceSize(ctx, kind, name)}
+		s.quota.Store(key, st)
+	}
+	if st.quota <= 0 {
 		return false
 	}
-	q := v.(quotaState)
-	return q.over && time.Since(q.checked) < 5*time.Minute
+	return st.size+add > st.quota
 }
 
-func (s *Store) setQuotaState(kind ns.Kind, name string, over bool) {
-	s.quota.Store(nsKey(kind, name), quotaState{checked: time.Now(), over: over})
+func (s *Store) namespaceSize(ctx context.Context, kind ns.Kind, name string) int64 {
+	sc, err := kind.Schema(name)
+	if err != nil {
+		return 0
+	}
+	table := "objects"
+	if kind == ns.Queue {
+		table = "messages"
+	}
+	var size int64
+	err = s.pool.QueryRow(ctx, "SELECT pg_total_relation_size($1::regclass)",
+		quoteIdent(sc)+"."+table).Scan(&size)
+	if err != nil {
+		return 0
+	}
+	return size
+}
+
+func (s *Store) setQuotaState(kind ns.Kind, name string, size, quota int64) {
+	s.quota.Store(nsKey(kind, name), quotaState{checked: time.Now(), size: size, quota: quota})
 }
 
 // checkNamespaceTables validates the per-namespace table settings the gateway

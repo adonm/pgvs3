@@ -11,6 +11,14 @@ import (
 	"github.com/adonm/pgvs3/internal/ns"
 )
 
+func totalBodies(msgs []OutMessage) int64 {
+	var n int64
+	for _, m := range msgs {
+		n += int64(len(m.Body))
+	}
+	return n
+}
+
 func md5Hex(b []byte) string {
 	sum := md5.Sum(b)
 	return hex.EncodeToString(sum[:])
@@ -59,7 +67,7 @@ func (s *Store) SendMessages(ctx context.Context, queue string, msgs []OutMessag
 	if len(msgs) == 0 {
 		return nil, nil
 	}
-	if s.overQuota(ns.Queue, queue) {
+	if s.checkQuota(ctx, ns.Queue, queue, totalBodies(msgs)) {
 		return nil, ErrQuotaExceeded
 	}
 	sc, err := nsSQLIdent(ns.Queue, queue)

@@ -31,7 +31,7 @@ func (s *Store) PutInlineKind(ctx context.Context, kind ns.Kind, name, key strin
 	if int64(len(data)) > int64(kind.InlineMax()) {
 		return nil, ErrInlineTooLarge
 	}
-	if s.overQuota(kind, name) {
+	if s.checkQuota(ctx, kind, name, int64(len(data))) {
 		return nil, ErrQuotaExceeded
 	}
 	sc, err := nsSQLIdent(kind, name)

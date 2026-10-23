@@ -171,4 +171,15 @@ mtime still match, and downloaded otherwise. **Ranges of objects larger than
 downloading the whole object, which is what DuckDB footer and row-group reads
 need; a full GET still populates the cache. `PUT` writes through to the origin
 and refreshes the cache; `DELETE` removes both. `--cache-retention` evicts idle
-entries. Supported origin types are `s3`, `filesystem` and `inmem`.
+entries. Fills are bounded by `--fill-concurrency` and the origin body is
+buffered (memory ≤8 MiB, otherwise a temp file) before the PostgreSQL writer
+opens, so origin latency never consumes pool connections. Supported origin
+types are `s3`, `filesystem` and `inmem`.
+
+## Admission control
+
+`--queue-concurrency` (default 16) and `--resp-concurrency` (default 32) bound
+in-flight protocol work, and `--fill-concurrency` (default 8) bounds cache
+fills. Together they keep a queue backlog or cache storm from occupying all
+`--pool-max` connections; raise them only together with the pool and
+PostgreSQL `max_connections`.

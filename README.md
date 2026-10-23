@@ -100,7 +100,10 @@ SELECT * FROM lake.events;
   confined to cache namespaces.
 - **Accelerating cache tier (`--origin-config`).** With a Thanos objstore YAML
   file, every S3 `GET` becomes a read-through cache in `s3c_<namespace>` with
-  TTL revalidation and write-through `PUT`/`DELETE`. Supported origins: `s3`,
+  TTL revalidation and write-through `PUT`/`DELETE`. Ranges above 8 MiB are
+  passed through to the origin, and fills are bounded (`--fill-concurrency`)
+  and spooled to memory or a temp file before touching PostgreSQL, so a slow
+  origin never pins a database connection. Supported origins: `s3`,
   `filesystem` and `inmem`.
 - **Immutable files, atomic publish.** Writes stream into `chunks` via
   binary `COPY` under a new `file_id` and publish in the same transaction.
@@ -198,10 +201,13 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `PSETEX`, `GETSET`, `GETDEL`, `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`,
   `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`,
   `INCR`, `DECR`, `INCRBY`, `DECRBY`, `STRLEN`, `GETRANGE`, `APPEND`,
-  `SETRANGE`, `SCAN`, `TYPE`, `MULTI`/`EXEC`/`DISCARD`, `SELECT`,
+  `SETRANGE`, `SCAN`, `TYPE`, `SELECT`,
   `FLUSHDB`, `DBSIZE`, `KEYS`, `INFO`, and `HELLO 2`/`3`. Pipelined `GET` and
   `SET` bursts automatically coalesce into single-query `CacheMGet` /
   `CacheMSet` database round trips. `EXPIRE` honours `NX`/`XX`/`GT`/`LT`.
+  `MULTI`/`EXEC`/`WATCH` are rejected explicitly (use a pipeline; in
+  `redis-py` pass `transaction=False`) because pgvs3 has no cross-command
+  snapshot, and pretending otherwise would lose updates.
 - **Out of scope:** IAM/bucket policies, versioning, object tags, Object Lock,
   ACLs, lifecycle rules, replication, event notifications, SSE-C/DSSE-KMS, and
   multipart `FULL_OBJECT` checksums.
@@ -223,6 +229,9 @@ Every flag maps to an environment variable.
 | `--cache-ttl` | `PGVS3_CACHE_TTL` | `1m` | Origin revalidation interval (`0` = always revalidate). |
 | `--cache-retention` | `PGVS3_CACHE_RETENTION` | `24h` | Evict idle cached objects after this period. |
 | `--cache-namespace` | `PGVS3_CACHE_NAMESPACE` | `origin` | Cache namespace holding origin objects. |
+| `--fill-concurrency` | `PGVS3_FILL_CONCURRENCY` | `8` | Concurrent origin cache fills; bounds pool use while downloading. |
+| `--queue-concurrency` | `PGVS3_QUEUE_CONCURRENCY` | `16` | Concurrent in-flight SQS requests. |
+| `--resp-concurrency` | `PGVS3_RESP_CONCURRENCY` | `32` | Concurrent in-flight RESP batches. |
 
 Subcommands:
 

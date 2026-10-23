@@ -242,7 +242,7 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 	if t.nsKind == "" {
 		t.nsKind = ns.Bucket
 	}
-	if s.overQuota(t.nsKind, t.bucket) {
+	if s.checkQuota(ctx, t.nsKind, t.bucket, 0) {
 		return nil, ErrQuotaExceeded
 	}
 	sc, err := nsSQLIdent(t.nsKind, t.bucket)

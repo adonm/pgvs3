@@ -129,7 +129,7 @@ func (s *Store) refreshQuotas(ctx context.Context, infos []NamespaceInfo) {
 		if err := s.pool.QueryRow(ctx, "SELECT pg_total_relation_size($1::regclass)", q+"."+table).Scan(&size); err != nil {
 			continue
 		}
-		s.setQuotaState(n.Kind, n.Name, size > *n.Quota)
+		s.setQuotaState(n.Kind, n.Name, size, *n.Quota)
 	}
 }
 

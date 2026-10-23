@@ -26,7 +26,11 @@ func (s *Store) CacheMSet(ctx context.Context, name string, keys []string, vals 
 			return nil
 		}
 	}
-	if s.overQuota(ns.Cache, name) {
+	var add int64
+	for _, v := range vals {
+		add += int64(len(v))
+	}
+	if s.checkQuota(ctx, ns.Cache, name, add) {
 		return ErrQuotaExceeded
 	}
 	if !s.known(ns.Cache, name) {

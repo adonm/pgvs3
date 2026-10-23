@@ -350,6 +350,13 @@ for i in range(64):
     pipe.get(f'p:{i}')
 assert pipe.execute() == [f'val-{i}'.encode() for i in range(64)]
 
+# MULTI/WATCH are rejected explicitly instead of pretending to be atomic.
+try:
+    ra.pipeline(transaction=True).set('multi-key', b'x').execute()
+    raise AssertionError('MULTI should be rejected')
+except redis.ResponseError as exc:
+    assert 'MULTI' in str(exc), exc
+
 # Cross-protocol S3 <-> RESP unified bucket access.
 s3c = boto3.client('s3', endpoint_url=ep_a,
     aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
@@ -457,6 +464,18 @@ c.delete_object(Bucket=b, Key=k)
 assert not os.path.exists(p)
 print('s3cache ok')
 PY
+
+# Quota is enforced on the write path, within ~1s of a change.
+docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
+  "UPDATE s3p.namespaces SET quota_bytes = 1 WHERE kind = 'cache' AND name = 'cache'" >/dev/null
+sleep 1.2
+if curl -fsS -X PUT --data-binary 'quota' "$A/_cache/cache/quota-test" >/dev/null 2>&1; then
+  fail "quota was not enforced on a cache write"
+fi
+docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
+  "UPDATE s3p.namespaces SET quota_bytes = NULL WHERE kind = 'cache' AND name = 'cache'" >/dev/null
+sleep 1.2
+curl -fsS -X PUT --data-binary 'quota' "$A/_cache/cache/quota-test" >/dev/null || fail "cache write after quota reset"
 
 # A cold range on a large origin object must be passed through, not cached whole.
 python3 - "$ORIGIN_DIR" "$RUN" <<'PY'

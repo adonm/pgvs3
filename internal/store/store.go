@@ -44,7 +44,7 @@ type Store struct {
 	log       *slog.Logger
 
 	knownNS sync.Map // "kind\x00name" -> struct{}
-	quota   sync.Map // "kind\x00name" -> overQuota{boot, over} gauge
+	quota   sync.Map // "kind\x00name" -> quotaState gauge
 
 	fileIDMu    sync.Mutex
 	fileIDBlock []int64

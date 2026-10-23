@@ -26,11 +26,18 @@ type Gateway struct {
 	resp *resp.Server
 }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool, origin *objcache.Tier) *Gateway {
+// Limits bounds concurrent in-flight work per protocol so one workload cannot
+// occupy the whole PostgreSQL pool.
+type Limits struct {
+	SQS  int
+	RESP int
+}
+
+func New(st *store.Store, log *slog.Logger, readOnly bool, origin *objcache.Tier, lim Limits) *Gateway {
 	g := &Gateway{
 		s3:   s3.New(st, log, readOnly),
-		sqs:  sqs.New(st, log, readOnly),
-		resp: resp.New(st, log, readOnly),
+		sqs:  sqs.New(st, log, readOnly, lim.SQS),
+		resp: resp.New(st, log, readOnly, lim.RESP),
 	}
 	if origin != nil {
 		g.s3.SetOrigin(origin)

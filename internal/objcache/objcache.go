@@ -3,6 +3,7 @@
 package objcache
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -33,8 +35,14 @@ type Tier struct {
 	namespace string
 	ttl       time.Duration
 	retention time.Duration
+	fills     chan struct{}
 	log       *slog.Logger
 }
+
+// memFillMax is the largest origin body buffered in memory before writing to
+// PostgreSQL. Larger fills spool to a temp file so the database connection is
+// never held while waiting on the origin network.
+const memFillMax = 8 << 20
 
 // Config is the subset of the Thanos objstore config pgvs3 ships with.
 type Config struct {
@@ -45,7 +53,7 @@ type Config struct {
 
 // New builds a Tier. config accepts `type: s3|filesystem|inmem` plus the
 // provider's `config:` block, matching Thanos objstore YAML.
-func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl, retention time.Duration) (*Tier, error) {
+func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl, retention time.Duration, maxFills int) (*Tier, error) {
 	var c Config
 	if err := yaml.UnmarshalStrict(config, &c); err != nil {
 		return nil, fmt.Errorf("parse origin config: %w", err)
@@ -83,7 +91,11 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 	if retention <= 0 {
 		retention = 24 * time.Hour
 	}
-	return &Tier{origin: b, store: st, namespace: namespace, ttl: ttl, retention: retention, log: log}, nil
+	if maxFills <= 0 {
+		maxFills = 8
+	}
+	return &Tier{origin: b, store: st, namespace: namespace, ttl: ttl,
+		retention: retention, fills: make(chan struct{}, maxFills), log: log}, nil
 }
 
 func (t *Tier) Name() string                  { return t.namespace }
@@ -117,14 +129,19 @@ func (t *Tier) Ensure(ctx context.Context, bucket, key string) (*store.Meta, err
 		return m, nil
 	}
 
-	rc, gerr := t.origin.Get(ctx, ck)
-	if gerr != nil {
-		if t.origin.IsObjNotFoundErr(gerr) {
-			return nil, store.ErrNotFound
-		}
-		return nil, gerr
+	// Bound concurrent fills and fetch the body before touching PostgreSQL:
+	// a slow origin must never pin a pool connection.
+	select {
+	case t.fills <- struct{}{}:
+		defer func() { <-t.fills }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	defer rc.Close()
+	src, cleanup, err := t.fetch(ctx, ck, attrs.Size)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
 
 	exp := time.Now().Add(t.retention)
 	ct := contentTypeFor(key)
@@ -133,7 +150,7 @@ func (t *Tier) Ensure(ctx context.Context, bucket, key string) (*store.Meta, err
 	if werr != nil {
 		return nil, werr
 	}
-	if _, err := io.Copy(w, rc); err != nil {
+	if _, err := io.Copy(w, src); err != nil {
 		w.Abort()
 		return nil, err
 	}
@@ -158,6 +175,42 @@ type Object struct {
 	Start, End   int64
 	Ranged       bool
 	Hit          bool
+}
+
+// fetch downloads the origin body into memory (small) or a temp file (large).
+func (t *Tier) fetch(ctx context.Context, ck string, size int64) (io.Reader, func(), error) {
+	rc, err := t.origin.Get(ctx, ck)
+	if err != nil {
+		if t.origin.IsObjNotFoundErr(err) {
+			return nil, nil, store.ErrNotFound
+		}
+		return nil, nil, err
+	}
+	defer rc.Close()
+
+	if size <= memFillMax {
+		buf, err := io.ReadAll(io.LimitReader(rc, memFillMax+1))
+		if err != nil {
+			return nil, nil, err
+		}
+		return bytes.NewReader(buf), func() {}, nil
+	}
+	tmp, err := os.CreateTemp("", "pgvs3-fill-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	name := tmp.Name()
+	if _, err := io.Copy(tmp, rc); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return nil, nil, err
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return nil, nil, err
+	}
+	return tmp, func() { tmp.Close(); os.Remove(name) }, nil
 }
 
 // Open serves [first,last] (or the whole object) with a cache hit, a whole

@@ -2,7 +2,6 @@ package resp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -27,11 +26,16 @@ type Server struct {
 	log      *slog.Logger
 	readOnly bool
 	metrics  *metrics
+	sem      chan struct{}
 }
 
 // New returns a RESP server over the shared store.
-func New(st *store.Store, log *slog.Logger, readOnly bool) *Server {
-	return &Server{store: st, log: log, readOnly: readOnly, metrics: newMetrics()}
+func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int) *Server {
+	if maxConc <= 0 {
+		maxConc = 32
+	}
+	return &Server{store: st, log: log, readOnly: readOnly, metrics: newMetrics(),
+		sem: make(chan struct{}, maxConc)}
 }
 
 // Metrics writes this server's Prometheus counters.
@@ -45,10 +49,8 @@ type respCmd struct {
 }
 
 type respSession struct {
-	bucket  string
-	proto   int
-	inMulti bool
-	queued  []respCmd
+	bucket string
+	proto  int
 }
 
 func (s *Server) serveRESP(ctx context.Context, conn net.Conn) {
@@ -84,16 +86,14 @@ func (s *Server) serveRESP(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) execRESPBatch(ctx context.Context, bw *bufio.Writer, sess *respSession, batch []respCmd) bool {
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-ctx.Done():
+		writeRESPError(bw, "ERR server shutting down")
+		return true
+	}
 	for i := 0; i < len(batch); i++ {
-		if sess.inMulti {
-			switch batch[i].name {
-			case "EXEC", "DISCARD", "MULTI":
-			default:
-				sess.queued = append(sess.queued, batch[i])
-				writeRESPSimple(bw, "QUEUED")
-				continue
-			}
-		}
 		// Coalesce consecutive pipelined GETs on the same bucket into a single
 		// CacheMGet query.
 		if batch[i].name == "GET" && len(batch[i].args) == 1 {
@@ -194,44 +194,10 @@ func (s *Server) execRESPCommand(ctx context.Context, bw *bufio.Writer, sess *re
 
 	args := cmd.args
 	switch cmd.name {
-	case "MULTI":
-		if sess.inMulti {
-			writeRESPError(bw, "ERR MULTI calls can not be nested")
-			return false
-		}
-		sess.inMulti = true
-		sess.queued = sess.queued[:0]
-		writeRESPSimple(bw, "OK")
-	case "DISCARD":
-		if !sess.inMulti {
-			writeRESPError(bw, "ERR DISCARD without MULTI")
-			return false
-		}
-		sess.inMulti = false
-		sess.queued = sess.queued[:0]
-		writeRESPSimple(bw, "OK")
-	case "EXEC":
-		if !sess.inMulti {
-			writeRESPError(bw, "ERR EXEC without MULTI")
-			return false
-		}
-		sess.inMulti = false
-		queued := sess.queued
-		sess.queued = nil
-		if len(queued) == 0 {
-			writeRESPArrayHeader(bw, 0)
-			return false
-		}
-		var inner bytes.Buffer
-		ib := bufio.NewWriter(&inner)
-		for _, q := range queued {
-			s.execRESPCommand(ctx, ib, sess, q)
-		}
-		_ = ib.Flush()
-		writeRESPArrayHeader(bw, len(queued))
-		_, _ = bw.Write(inner.Bytes())
-	case "WATCH", "UNWATCH":
-		writeRESPSimple(bw, "OK")
+	case "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH":
+		// Atomic transaction blocks are deliberately unsupported: pretending
+		// otherwise would silently lose updates. Pipelines (MULTI-free) work.
+		writeRESPError(bw, "ERR MULTI/EXEC/WATCH are not supported; use a pipeline (redis-py: transaction=False)")
 	case "TYPE":
 		if len(args) != 1 {
 			writeRESPError(bw, "ERR wrong number of arguments for 'type' command")
