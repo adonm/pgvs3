@@ -73,7 +73,9 @@ func (s *Store) MetaKind(ctx context.Context, kind ns.Kind, name, key string) (*
 	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
 		parts, part_ends, etag, user_metadata, content_type, inline_data, inline_data IS NOT NULL,
 		expires_at, origin_etag
-		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`, key).
+		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())
+		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = $2 AND name = $3)`,
+		key, string(kind), name).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
 			&m.ContentType, &inline, &hasInline, &expires, &origin)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
@@ -123,7 +125,9 @@ func (s *Store) MetaHeaderKind(ctx context.Context, kind ns.Kind, name, key stri
 	var origin pgtype.Text
 	err = s.pool.QueryRow(ctx, `SELECT file_id, size, sha256, EXTRACT(EPOCH FROM created_at)::float8,
 		parts, part_ends, etag, user_metadata, content_type, expires_at, origin_etag
-		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())`, key).
+		FROM `+sc+`.objects WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())
+		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = $2 AND name = $3)`,
+		key, string(kind), name).
 		Scan(&fileID, &m.Size, &m.SHA256, &epoch, &parts, &ends, &m.ETag, &m.UserMetadata,
 			&m.ContentType, &expires, &origin)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
@@ -928,8 +932,9 @@ func (s *Store) List(ctx context.Context, bucket, prefix, prefixEnd, after strin
 		WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
 		  AND key COLLATE "C" > $3
 		  AND (expires_at IS NULL OR expires_at > now())
+		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = 'bucket' AND name = $5)
 		ORDER BY key COLLATE "C" LIMIT $4`
-	rows, err := s.pool.Query(ctx, query, prefix, prefixEnd, after, limit)
+	rows, err := s.pool.Query(ctx, query, prefix, prefixEnd, after, limit, bucket)
 	if isMissingBucketSchema(err) {
 		return nil, nil
 	}

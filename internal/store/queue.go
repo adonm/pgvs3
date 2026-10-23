@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/ns"
@@ -27,6 +29,10 @@ func md5Hex(b []byte) string {
 // ErrReceiptInvalid is returned when a receipt handle does not match a
 // currently visible message.
 var ErrReceiptInvalid = errors.New("receipt handle is invalid")
+
+// ErrReceiptStale is returned when the message still exists but the handle was
+// superseded by a later receive (the consumer took too long).
+var ErrReceiptStale = errors.New("receipt handle is stale")
 
 // Message is one received queue message.
 type Message struct {
@@ -141,6 +147,7 @@ func (s *Store) ReceiveMessages(ctx context.Context, queue string, max, visibili
 	rows, err := s.pool.Query(ctx, `WITH picked AS (
 		SELECT id FROM `+sc+`.messages
 		WHERE visible_at <= now() AND expires_at > now()
+		  AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = 'queue' AND name = $4)
 		ORDER BY id
 		FOR UPDATE SKIP LOCKED
 		LIMIT $1
@@ -154,7 +161,7 @@ func (s *Store) ReceiveMessages(ctx context.Context, queue string, max, visibili
 		RETURNING m.id, m.msg_id, m.body, m.body_size, m.attrs, m.receipt, m.receive_count, m.sent_at
 	)
 	SELECT id, msg_id, body, body_size, attrs, receipt, receive_count, sent_at FROM upd ORDER BY id`,
-		max, token, visibility)
+		max, token, visibility, queue)
 	if isMissingBucketSchema(err) {
 		return nil, nil
 	}
@@ -203,13 +210,24 @@ func (s *Store) DeleteMessage(ctx context.Context, queue, receipt string) (bool,
 	if err != nil {
 		return false, err
 	}
-	if tag.RowsAffected() == 0 {
-		// Deleting an already-deleted message is idempotent in SQS.
-		var exists bool
-		if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+sc+".messages WHERE receipt = $1)", receipt).Scan(&exists); err != nil && !isMissingBucketSchema(err) {
-			return false, err
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+	// No row matched: either the message is gone (a repeated delete, which SQS
+	// treats as success) or it was re-received and the handle is stale.
+	id, perr := strconv.ParseInt(receiptMsgID(receipt), 10, 64)
+	if perr != nil {
+		return false, ErrReceiptInvalid
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+sc+".messages WHERE id = $1)", id).Scan(&exists); err != nil {
+		if isMissingBucketSchema(err) {
+			return false, ErrReceiptInvalid
 		}
-		return false, nil
+		return false, err
+	}
+	if exists {
+		return false, ErrReceiptStale
 	}
 	return true, nil
 }
@@ -224,12 +242,106 @@ func (s *Store) ChangeVisibility(ctx context.Context, queue, receipt string, vis
 		SET visible_at = now() + make_interval(secs => $2)
 		WHERE receipt = $1`, receipt, visibility)
 	if isMissingBucketSchema(err) {
-		return false, nil
+		return false, ErrReceiptInvalid
 	}
 	if err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+	id, perr := strconv.ParseInt(receiptMsgID(receipt), 10, 64)
+	if perr != nil {
+		return false, ErrReceiptInvalid
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+sc+".messages WHERE id = $1)", id).Scan(&exists); err != nil {
+		if isMissingBucketSchema(err) {
+			return false, ErrReceiptInvalid
+		}
+		return false, err
+	}
+	if exists {
+		return false, ErrReceiptStale
+	}
+	return false, ErrReceiptInvalid
+}
+
+// Redrive moves messages by receipt from one queue into a dead-letter queue.
+func (s *Store) Redrive(ctx context.Context, src, dst string, receipts []string, expires time.Time) (int, error) {
+	if len(receipts) == 0 {
+		return 0, nil
+	}
+	ssc, err := nsSQLIdent(ns.Queue, src)
+	if err != nil {
+		return 0, err
+	}
+	dsc, err := nsSQLIdent(ns.Queue, dst)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	rows, err := tx.Query(ctx, `SELECT msg_id, body, body_size, attrs, sent_at FROM `+ssc+`.messages
+		WHERE receipt = ANY($1::text[]) FOR UPDATE`, receipts)
+	if err != nil {
+		return 0, err
+	}
+	var (
+		ids    []string
+		bodies [][]byte
+		sizes  []int32
+		attrs  [][]byte
+		sent   []time.Time
+	)
+	for rows.Next() {
+		var id string
+		var body []byte
+		var size int32
+		var a []byte
+		var ts time.Time
+		if err := rows.Scan(&id, &body, &size, &a, &ts); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+		bodies = append(bodies, body)
+		sizes = append(sizes, size)
+		attrs = append(attrs, a)
+		sent = append(sent, ts)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+dsc+`.messages
+		(msg_id, body, body_size, attrs, visible_at, expires_at, sent_at)
+		SELECT id, b, sz, a, now(), $6, ts
+		FROM unnest($1::text[], $2::bytea[], $3::int4[], $4::bytea[], $5::timestamptz[])
+		  AS t(id, b, sz, a, ts)
+		ON CONFLICT (msg_id) DO NOTHING`, ids, bodies, sizes, attrs, sent, expires); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM "+ssc+".messages WHERE receipt = ANY($1::text[])", receipts); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
+func receiptMsgID(receipt string) string {
+	if i := strings.LastIndexByte(receipt, ':'); i >= 0 && i+1 < len(receipt) {
+		return receipt[i+1:]
+	}
+	return ""
 }
 
 // PurgeQueue removes every message.

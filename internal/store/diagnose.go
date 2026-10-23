@@ -22,6 +22,8 @@ type Diagnosis struct {
 	Objects          int64  `json:"objects"`
 	GarbageFiles     int64  `json:"garbage_files"`
 	DatabaseBytes    int64  `json:"database_bytes"`
+	OrphanSchemas    int64  `json:"orphan_schemas"`
+	MissingSchemas   int64  `json:"missing_schemas"`
 }
 
 func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
@@ -55,6 +57,13 @@ func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 			d.Caches++
 		}
 		q := quoteIdent(n.Schema)
+		var present bool
+		if err := s.pool.QueryRow(ctx, "SELECT to_regnamespace($1) IS NOT NULL", n.Schema).Scan(&present); err != nil {
+			return d, err
+		}
+		if !present {
+			continue
+		}
 		if n.Kind == ns.Queue {
 			var hasReceipt bool
 			if err := s.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", q+".messages_receipt").Scan(&hasReceipt); err != nil || !hasReceipt {
@@ -85,6 +94,15 @@ func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 			d.Objects += objs
 			d.GarbageFiles += garb
 		}
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM pg_namespace p
+		  WHERE p.nspname ~ '^s3[bcq]_[a-z0-9._-]{1,58}$'
+		    AND NOT EXISTS (SELECT 1 FROM s3p.namespaces n WHERE n.schema_name = p.nspname)),
+		(SELECT count(*) FROM s3p.namespaces n
+		  WHERE to_regnamespace(format('%I', n.schema_name)) IS NULL)`).
+		Scan(&d.OrphanSchemas, &d.MissingSchemas); err != nil {
+		return d, err
 	}
 	if err := s.pool.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&d.DatabaseBytes); err != nil {
 		return d, err

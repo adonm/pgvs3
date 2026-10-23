@@ -27,9 +27,6 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", lock)
 
-	if _, err := conn.Exec(ctx, "SELECT s3p.reconcile_namespaces()"); err != nil {
-		return err
-	}
 	infos, err := s.Namespaces(ctx, "")
 	if err != nil {
 		return err

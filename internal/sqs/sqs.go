@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -177,6 +178,60 @@ func errUnsupported(op string) *apiError {
 	return &apiError{http.StatusBadRequest, "InvalidAction", "unsupported action " + op}
 }
 
+type redrivePolicy struct {
+	Target string
+	Max    int
+}
+
+// parseRedrive parses a RedrivePolicy attribute value.
+func parseRedrive(raw string) *redrivePolicy {
+	if raw == "" {
+		return nil
+	}
+	var p struct {
+		DeadLetterTargetArn string `json:"deadLetterTargetArn"`
+		MaxReceiveCount     any    `json:"maxReceiveCount"`
+	}
+	if json.Unmarshal([]byte(raw), &p) != nil {
+		return nil
+	}
+	target := p.DeadLetterTargetArn
+	if i := strings.LastIndexByte(target, ':'); i >= 0 {
+		target = target[i+1:]
+	}
+	max := 0
+	switch v := p.MaxReceiveCount.(type) {
+	case float64:
+		max = int(v)
+	case string:
+		max = atoi(v)
+	}
+	if target == "" || max < 1 {
+		return nil
+	}
+	return &redrivePolicy{Target: target, Max: max}
+}
+
+// validateRedrive checks a RedrivePolicy attribute against the catalog.
+func (s *Server) validateRedrive(ctx context.Context, attrs map[string]any) *apiError {
+	raw, ok := attrs["RedrivePolicy"].(string)
+	if !ok || raw == "" {
+		return nil
+	}
+	p := parseRedrive(raw)
+	if p == nil || p.Max > 1000 {
+		return errBad("invalid RedrivePolicy")
+	}
+	ok, err := s.store.NamespaceExists(ctx, ns.Queue, p.Target)
+	if err != nil {
+		return errBad(err.Error())
+	}
+	if !ok {
+		return errBad("dead-letter target queue does not exist")
+	}
+	return nil
+}
+
 func (s *Server) writeErr(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
 	if strings.HasPrefix(r.Header.Get("X-Amz-Target"), "AmazonSQS.") {
 		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -313,6 +368,9 @@ func (s *Server) dispatch(ctx context.Context, r *http.Request, op string, in in
 				attrs[k] = v
 			}
 		}
+		if apiErr := s.validateRedrive(ctx, attrs); apiErr != nil {
+			return nil, apiErr
+		}
 		if err := s.store.EnsureQueue(ctx, name, attrs); err != nil {
 			return nil, errBad(err.Error())
 		}
@@ -381,6 +439,9 @@ func (s *Server) dispatch(ctx context.Context, r *http.Request, op string, in in
 			return nil, perr
 		}
 		if _, err := s.store.DeleteMessage(ctx, name, in.str("ReceiptHandle")); err != nil {
+			if errors.Is(err, store.ErrReceiptStale) || errors.Is(err, store.ErrReceiptInvalid) {
+				return nil, errReceipt()
+			}
 			return nil, errBad(err.Error())
 		}
 		return map[string]any{}, nil
@@ -419,12 +480,12 @@ func (s *Server) dispatch(ctx context.Context, r *http.Request, op string, in in
 			return nil, perr
 		}
 		vis := in.int("VisibilityTimeout", 30)
-		ok, err := s.store.ChangeVisibility(ctx, name, in.str("ReceiptHandle"), vis)
+		_, err := s.store.ChangeVisibility(ctx, name, in.str("ReceiptHandle"), vis)
+		if errors.Is(err, store.ErrReceiptStale) || errors.Is(err, store.ErrReceiptInvalid) {
+			return nil, errReceipt()
+		}
 		if err != nil {
 			return nil, errBad(err.Error())
-		}
-		if !ok {
-			return nil, errReceipt()
 		}
 		return map[string]any{}, nil
 
@@ -488,6 +549,16 @@ func (s *Server) dispatch(ctx context.Context, r *http.Request, op string, in in
 		attrs := map[string]any{}
 		if in.json != nil {
 			_ = json.Unmarshal(in.raw("Attributes"), &attrs)
+		} else if in.form != nil {
+			for k, v := range in.form {
+				if strings.HasPrefix(k, "Attribute.") && strings.HasSuffix(k, ".Name") {
+					idx := strings.TrimSuffix(strings.TrimPrefix(k, "Attribute."), ".Name")
+					attrs[v[0]] = in.form.Get("Attribute." + idx + ".Value")
+				}
+			}
+		}
+		if apiErr := s.validateRedrive(ctx, attrs); apiErr != nil {
+			return nil, apiErr
 		}
 		if err := s.store.SetNamespaceAttrs(ctx, ns.Queue, name, attrs); err != nil {
 			return nil, errBad(err.Error())
@@ -582,7 +653,20 @@ func (s *Server) receive(ctx context.Context, r *http.Request, in input) (any, *
 		return nil, perr
 	}
 	maxN := in.int("MaxNumberOfMessages", 1)
-	vis := in.int("VisibilityTimeout", s.attrInt(ctx, name, "VisibilityTimeout", 30))
+	attrs, aerr := s.queueAttrs(ctx, name)
+	if aerr != nil {
+		var apiErr *apiError
+		if errors.As(aerr, &apiErr) {
+			return nil, apiErr
+		}
+		return nil, errBad(aerr.Error())
+	}
+	visDefault := 30
+	if n, err := strconv.Atoi(attrs["VisibilityTimeout"]); err == nil {
+		visDefault = n
+	}
+	vis := in.int("VisibilityTimeout", visDefault)
+	pol := parseRedrive(attrs["RedrivePolicy"])
 	wait := min(in.int("WaitTimeSeconds", 0), 20)
 	deadline := time.Now().Add(time.Duration(wait) * time.Second)
 	for {
@@ -591,6 +675,24 @@ func (s *Server) receive(ctx context.Context, r *http.Request, in input) (any, *
 			return nil, errBad(err.Error())
 		}
 		if len(msgs) > 0 || time.Now().After(deadline) {
+			if pol != nil {
+				var keep []store.Message
+				var dead []string
+				for _, m := range msgs {
+					if int(m.ReceiveCount) > pol.Max {
+						dead = append(dead, m.Receipt)
+					} else {
+						keep = append(keep, m)
+					}
+				}
+				if len(dead) > 0 {
+					if _, err := s.store.Redrive(ctx, name, pol.Target, dead,
+						time.Now().Add(s.retention(ctx, pol.Target))); err != nil {
+						return nil, errBad(err.Error())
+					}
+				}
+				msgs = keep
+			}
 			if in.json != nil {
 				return map[string]any{"Messages": jsonMessages(msgs)}, nil
 			}

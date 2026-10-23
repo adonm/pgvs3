@@ -45,11 +45,13 @@ pgvs3 stat   --url "$PGVS3_URL" [--kind K] [--name N] --json
 pgvs3 reap   --url "$PGVS3_URL" --all                   # garbage + TTL sweep
 pgvs3 clone  --url "$PGVS3_URL" [--kind bucket|cache] <src> <dst>
 pgvs3 drop   --url "$PGVS3_URL" [--kind bucket|cache|queue] [--force] <name>
+pgvs3 adopt  --url "$PGVS3_URL" [--kind K] [--all] [name...]
+pgvs3 migrate --url "$PGVS3_URL"                        # layout v10 -> v11
 ```
 
 In normal operation, one gateway per cluster runs background maintenance every
-minute (coordinated via `pg_try_advisory_lock`), reconciling restored/dropped
-`s3b_<bucket>` schemas, expiring abandoned multipart uploads, and reaping up to
+minute (coordinated via `pg_try_advisory_lock`), expiring abandoned multipart
+uploads and reaping up to
 65,536 chunk rows (~508 MiB) per pass of files deleted longer ago than
 `--reap-grace` (default `10m`), chaining additional passes immediately when a
 pass saturates its row budget.
@@ -74,9 +76,15 @@ captures exactly one bucket, cache DB or queue:
   pg_dump -Fc -n '"s3b_lake"' "$PGVS3_URL" > lake.dump
   pg_restore --single-transaction -d "$PGVS3_URL" lake.dump
   ```
-  On the next maintenance tick (or gateway startup / `pgvs3 reap`),
-  `s3p.reconcile_buckets()` automatically registers any restored `s3b_*` schema
-  in `s3p.buckets` and advances `s3p.file_ids` past its highest `file_id`.
+  A restored `s3b_*` schema is inert until it is explicitly adopted:
+  ```sh
+  pgvs3 adopt --url "$PGVS3_URL" --kind bucket lake
+  ```
+  Adoption inserts the catalog row and advances `s3p.file_ids` past the
+  schema's highest `file_id`. `pgvs3 adopt --all --kind bucket` adopts every
+  matching schema and prunes catalog rows whose schema no longer exists.
+  Requests for an unadopted schema return `404`, and `pgvs3 doctor` reports it
+  under `orphan_schemas`.
 - **Whole-namespace clone (server-side):**
   ```sh
   pgvs3 clone --url "$PGVS3_URL" lake lake-staging
@@ -106,10 +114,25 @@ All state lives in PostgreSQL; there is no sidecar store to back up.
 
 ## Schema upgrades
 
-Layout v10 is not backwards-compatible with earlier alpha layouts, and gateways
-refuse to start against a mismatched version. To migrate across breaking
-layouts, copy data into a fresh database via DuckDB/rclone and switch
-`PGVS3_URL`.
+Gateways refuse to start against a layout other than v11. Back up first, stop
+the gateways, and run the in-place migration from layout v10:
+
+```sh
+pg_dump -Fc "$PGVS3_URL" > pgvs3-pre-migrate.dump
+pgvs3 migrate --url "$PGVS3_URL"       # prints migrated_buckets=N layout=11
+pgvs3 doctor  --url "$PGVS3_URL"
+```
+
+The migration keeps every bucket schema and object in place. It copies the
+`s3p.buckets` catalog into `s3p.namespaces`, adds `objects.origin_etag`, applies
+the v11 table settings, recreates per-schema helper functions, and renames the
+old catalog table to `v10_buckets` instead of dropping it. Schemas restored
+outside the catalog are adopted as part of the upgrade. Running `pgvs3 migrate`
+again on a v11 database is a no-op.
+
+Layouts older than v10, and future breaking changes without a migration
+function, still require copying data into a fresh database via DuckDB/rclone
+and switching `PGVS3_URL`.
 
 ## Graceful shutdown, standbys, and Kubernetes
 
@@ -146,10 +169,29 @@ aws --endpoint-url http://127.0.0.1:8014 sqs receive-message \
 ```
 
 Queues store `VisibilityTimeout`, `DelaySeconds`, `MaximumMessageSize`,
-`MessageRetentionPeriod` and `ReceiveMessageWaitTimeSeconds` in
-`s3p.namespaces.attrs`. Receive leases a batch with `FOR UPDATE SKIP LOCKED`;
-`DeleteMessage`/`ChangeMessageVisibility` match on the receipt handle, which is
-covered by the partial `messages_receipt` index so acks never scan the queue.
+`MessageRetentionPeriod`, `ReceiveMessageWaitTimeSeconds` and `RedrivePolicy`
+in `s3p.namespaces.attrs`. Receive leases a batch with `FOR UPDATE SKIP
+LOCKED`; `DeleteMessage`/`ChangeMessageVisibility` match on the receipt handle,
+which is covered by the partial `messages_receipt` index so acks never scan the
+queue.
+
+Receipt handles are superseded when a visibility timeout expires and the
+message is received again. Deleting with the old handle returns
+`ReceiptHandleIsInvalid` instead of silently acknowledging the new delivery;
+repeating the winning delete is idempotent.
+
+Set `RedrivePolicy` on the source queue to move poisoned messages to a
+dead-letter queue:
+
+```sh
+aws --endpoint-url http://127.0.0.1:8014 sqs set-queue-attributes \
+  --queue-url http://127.0.0.1:8014/jobs \
+  --attributes 'RedrivePolicy={"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:jobs-dlq","maxReceiveCount":"5"}'
+```
+
+The target queue must exist. On the receive that would exceed
+`maxReceiveCount`, the message is moved into the dead-letter queue in one
+transaction and is not returned to the consumer.
 
 ## Cache tier in front of another object store
 

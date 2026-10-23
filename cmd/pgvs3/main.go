@@ -35,7 +35,7 @@ func run() int {
 		fn   func([]string) int
 	}{
 		{"health", health}, {"reap", reap}, {"doctor", doctor}, {"stat", stat},
-		{"clone", cloneNS}, {"drop", dropNS}, {"version", nil},
+		{"clone", cloneNS}, {"drop", dropNS}, {"adopt", adoptNS}, {"migrate", migrateNS}, {"version", nil},
 	} {
 		if i := indexArg(args, cmd.name); i >= 0 && cmd.fn != nil {
 			return cmd.fn(removeArg(args, i))
@@ -245,6 +245,68 @@ func dropNS(args []string) int {
 	}
 }
 
+func migrateNS(args []string) int {
+	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+	defer cancel()
+	st := mustStore(ctx, *url)
+	defer st.Close()
+	n, err := st.Migrate(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Printf("migrated_buckets=%d layout=%d\n", n, store.LayoutVersion)
+	return 0
+}
+
+func adoptNS(args []string) int {
+	fs := flag.NewFlagSet("adopt", flag.ContinueOnError)
+	url := fs.String("url", env("PGVS3_URL", "postgres://localhost/pgvs3"), "PostgreSQL URL")
+	kind := fs.String("kind", "", "bucket, cache or queue (default: all)")
+	all := fs.Bool("all", false, "adopt every matching schema")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	st := mustStore(ctx, *url)
+	defer st.Close()
+	if err := st.CheckLayout(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if *all || len(fs.Args()) == 0 {
+		n, err := st.AdoptAll(ctx, ns.Kind(*kind))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Printf("adopted=%d kind=%s\n", n, orAll(*kind))
+		return 0
+	}
+	for _, name := range fs.Args() {
+		outcome, err := st.Adopt(ctx, ns.Kind(*kind), name)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Printf("%s=%s kind=%s\n", name, outcome, orAll(*kind))
+	}
+	return 0
+}
+
+func orAll(kind string) string {
+	if kind == "" {
+		return "all"
+	}
+	return kind
+}
+
 func health(args []string) int {
 	fs := flag.NewFlagSet("health", flag.ContinueOnError)
 	u := fs.String("url", env("PGVS3_HEALTH_URL", "http://127.0.0.1:8014/readyz"), "readiness URL")
@@ -314,9 +376,9 @@ func doctor(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("server_version_num=%d layout=%d namespaces=%d buckets=%d queues=%d caches=%d configured=%v objects=%d garbage=%d db=%d MiB\n",
+	fmt.Printf("server_version_num=%d layout=%d namespaces=%d buckets=%d queues=%d caches=%d configured=%v objects=%d garbage=%d orphan_schemas=%d missing_schemas=%d db=%d MiB\n",
 		d.ServerVersion, d.Layout, d.Namespaces, d.Buckets, d.Queues, d.Caches,
-		d.ChunksConfigured, d.Objects, d.GarbageFiles, d.DatabaseBytes>>20)
+		d.ChunksConfigured, d.Objects, d.GarbageFiles, d.OrphanSchemas, d.MissingSchemas, d.DatabaseBytes>>20)
 	if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured {
 		return 1
 	}

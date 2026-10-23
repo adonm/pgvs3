@@ -223,29 +223,18 @@ func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	if s.readOnly {
-		ok, err := s.store.BucketExists(r.Context(), bucket)
-		if err != nil {
-			if errors.Is(err, store.ErrInvalidBucket) {
-				writeError(w, r, errInvalidBucketName(), s.log)
-				return
-			}
-			writeError(w, r, errInternal(err, s.log), s.log)
+	ok, err := s.store.BucketExists(r.Context(), bucket)
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidBucket) {
+			writeError(w, r, errInvalidBucketName(), s.log)
 			return
 		}
-		if !ok {
-			writeError(w, r, errNoSuchBucket(), s.log)
-			return
-		}
-	} else {
-		if err := s.store.CreateBucket(r.Context(), bucket); err != nil {
-			if errors.Is(err, store.ErrInvalidBucket) {
-				writeError(w, r, errInvalidBucketName(), s.log)
-				return
-			}
-			writeError(w, r, errInternal(err, s.log), s.log)
-			return
-		}
+		writeError(w, r, errInternal(err, s.log), s.log)
+		return
+	}
+	if !ok {
+		writeError(w, r, errNoSuchBucket(), s.log)
+		return
 	}
 	w.Header().Set("x-amz-bucket-region", "us-east-1")
 	w.WriteHeader(http.StatusOK)

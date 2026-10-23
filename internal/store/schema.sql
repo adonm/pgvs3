@@ -460,48 +460,133 @@ BEGIN
   RETURN 'ok';
 END $$;
 
--- Reconciles restored or manually dropped namespace schemas with
--- s3p.namespaces and keeps s3p.file_ids ahead of stored chunks.
-CREATE OR REPLACE FUNCTION s3p.reconcile_namespaces()
-RETURNS void LANGUAGE plpgsql AS $$
+-- Registers one on-disk namespace schema in the catalog. Explicit only:
+-- a restore or an operator-created schema never becomes a live bucket by
+-- accident. Returns 'adopted', 'exists' or 'missing'.
+CREATE OR REPLACE FUNCTION s3p.adopt_namespace(p_kind text, p_name text)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  v_schema text := s3p.namespace_schema(p_kind, p_name);
+  v_table text := CASE WHEN p_kind = 'queue' THEN 'messages' ELSE 'objects' END;
+  v_max bigint;
+BEGIN
+  IF to_regclass(format('%I.%I', v_schema, v_table)) IS NULL THEN
+    RETURN 'missing';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('s3p.ns', 0) # hashtextextended(p_kind || ':' || p_name, 1));
+  IF EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = p_kind AND name = p_name) THEN
+    RETURN 'exists';
+  END IF;
+  INSERT INTO s3p.namespaces (kind, name, schema_name) VALUES (p_kind, p_name, v_schema);
+  IF p_kind <> 'queue' THEN
+    EXECUTE format('SELECT COALESCE(max(file_id), 0) FROM %I.chunks', v_schema) INTO v_max;
+    IF v_max > 0 THEN
+      PERFORM setval('s3p.file_ids',
+        GREATEST((SELECT last_value FROM s3p.file_ids), v_max), true);
+    END IF;
+  END IF;
+  RETURN 'adopted';
+END $$;
+
+-- Adopts every matching schema (optionally one kind) and prunes catalog rows
+-- whose schema has disappeared. Returns the number newly adopted.
+CREATE OR REPLACE FUNCTION s3p.adopt_namespaces(p_kind text DEFAULT NULL)
+RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
   r record;
   v_kind text;
   v_name text;
-  v_max bigint := 0;
-  v_cur bigint;
+  v_prefix text;
+  adopted int := 0;
 BEGIN
-  DELETE FROM s3p.namespaces n
-  WHERE to_regnamespace(format('%I', n.schema_name)) IS NULL;
-
+  v_prefix := CASE p_kind
+    WHEN 'cache' THEN 's3c_%'
+    WHEN 'queue' THEN 's3q_%'
+    WHEN 'bucket' THEN 's3b_%'
+    ELSE 's3_%' END;
   FOR r IN
     SELECT nspname FROM pg_namespace
-    WHERE nspname ~ '^s3[b c q]_[a-z0-9._-]{1,58}$'
+    WHERE nspname ~ '^s3[bcq]_[a-z0-9._-]{1,58}$'
+      AND nspname LIKE v_prefix
+    ORDER BY nspname
   LOOP
     v_kind := CASE substr(r.nspname, 1, 3)
       WHEN 's3c' THEN 'cache'
       WHEN 's3q' THEN 'queue'
       ELSE 'bucket' END;
     v_name := substr(r.nspname, 5);
-    IF v_kind = 'queue' THEN
-      IF to_regclass(format('%I.messages', r.nspname)) IS NULL THEN CONTINUE; END IF;
-    ELSE
-      IF to_regclass(format('%I.objects', r.nspname)) IS NULL OR
-         to_regclass(format('%I.chunks', r.nspname)) IS NULL OR
-         to_regclass(format('%I.garbage_by_age', r.nspname)) IS NULL THEN
-        CONTINUE;
-      END IF;
-    END IF;
-    INSERT INTO s3p.namespaces (kind, name, schema_name)
-    VALUES (v_kind, v_name, r.nspname)
-    ON CONFLICT (kind, name) DO NOTHING;
-    IF v_kind <> 'queue' THEN
-      EXECUTE format('SELECT COALESCE(max(file_id), 0) FROM %I.chunks', r.nspname) INTO v_cur;
-      IF v_cur > v_max THEN v_max := v_cur; END IF;
+    IF s3p.adopt_namespace(v_kind, v_name) = 'adopted' THEN
+      adopted := adopted + 1;
     END IF;
   END LOOP;
+  DELETE FROM s3p.namespaces n
+  WHERE to_regnamespace(format('%I', n.schema_name)) IS NULL
+    AND (p_kind IS NULL OR n.kind = p_kind);
+  RETURN adopted;
+END $$;
 
-  IF v_max > 0 THEN
-    PERFORM setval('s3p.file_ids', GREATEST((SELECT last_value FROM s3p.file_ids), v_max), true);
+-- In-place migration from layout v10 (per-bucket schemas catalogued in
+-- s3p.buckets) to v11 (kind-prefixed namespaces catalogued in s3p.namespaces).
+-- Bucket tables and every byte stay in place; only the catalog, per-schema
+-- helper functions and one new column change. Legacy objects stay readable
+-- through the renamed v10_buckets table.
+CREATE OR REPLACE FUNCTION s3p.migrate_v10()
+RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+  r record;
+  n int := 0;
+BEGIN
+  IF to_regclass('s3p.buckets') IS NULL THEN
+    RAISE EXCEPTION 'layout v10 catalog (s3p.buckets) not found';
   END IF;
+
+  FOR r IN SELECT name, schema_name, created_at FROM s3p.buckets ORDER BY name LOOP
+    CONTINUE WHEN to_regclass(format('%I.objects', r.schema_name)) IS NULL;
+    EXECUTE format(
+      'ALTER TABLE %I.objects ADD COLUMN IF NOT EXISTS origin_etag text',
+      r.schema_name);
+    EXECUTE format(
+      'ALTER TABLE %I.objects SET (fillfactor = 85, toast_tuple_target = 8160)',
+      r.schema_name);
+    EXECUTE format(
+      'ALTER TABLE %I.chunks SET (toast_tuple_target = 8160, ' ||
+      'autovacuum_vacuum_scale_factor = 0.01, autovacuum_analyze_scale_factor = 0.02, ' ||
+      'autovacuum_vacuum_threshold = 1000)', r.schema_name);
+    -- Re-run the namespace DDL so per-schema functions match this binary.
+    PERFORM s3p.ensure_namespace('bucket', r.name, NULL, NULL);
+    UPDATE s3p.namespaces SET created_at = r.created_at
+     WHERE kind = 'bucket' AND name = r.name;
+    n := n + 1;
+  END LOOP;
+
+  -- Bucket schemas restored without their catalog row become visible only
+  -- after the operator asks; during migration they are part of the upgrade.
+  FOR r IN
+    SELECT nspname FROM pg_namespace
+     WHERE nspname ~ '^s3b_[a-z0-9._-]{1,58}$'
+       AND NOT EXISTS (SELECT 1 FROM s3p.buckets b WHERE b.schema_name = nspname)
+     ORDER BY nspname
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE %I.objects ADD COLUMN IF NOT EXISTS origin_etag text',
+      r.nspname);
+    EXECUTE format(
+      'ALTER TABLE %I.chunks SET (toast_tuple_target = 8160, ' ||
+      'autovacuum_vacuum_scale_factor = 0.01, autovacuum_analyze_scale_factor = 0.02, ' ||
+      'autovacuum_vacuum_threshold = 1000)', r.nspname);
+    PERFORM s3p.ensure_namespace('bucket', substr(r.nspname, 5), NULL, NULL);
+    n := n + 1;
+  END LOOP;
+
+  PERFORM s3p.adopt_namespaces('bucket');
+
+  DROP FUNCTION IF EXISTS s3p.ensure_bucket(text);
+  DROP FUNCTION IF EXISTS s3p.bucket_schema(text);
+  DROP FUNCTION IF EXISTS s3p.clone_bucket(text, text);
+  DROP FUNCTION IF EXISTS s3p.drop_bucket(text, boolean);
+  DROP FUNCTION IF EXISTS s3p.reconcile_buckets();
+
+  ALTER TABLE s3p.buckets RENAME TO v10_buckets;
+  UPDATE s3p.layout SET version = 11;
+  RETURN n;
 END $$;

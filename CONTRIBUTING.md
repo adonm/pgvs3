@@ -45,8 +45,10 @@ Any incompatible schema change must:
 
 1. Increment `store.LayoutVersion` in `internal/store/store.go`.
 2. Update `internal/store/schema.sql` and document the page/TOAST math.
-3. Fail fast on startup when connected to an older layout version (there are no
-   automatic in-place migrations).
+3. Fail fast on startup when connected to an older layout version.
+4. Add an idempotent `s3p.migrate_vN()` function and wire it into `pgvs3
+   migrate`; keep the previous catalog/tables readable rather than dropping
+   them. Migrations run only when the operator asks for them.
 
 ## Performance invariants
 

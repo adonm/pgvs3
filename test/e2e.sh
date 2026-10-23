@@ -206,12 +206,29 @@ docker exec "$PGVS3_TEST_PG_CONTAINER" pg_dump -U postgres -Fc -n "\"s3b_$CLONE_
 .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$CLONE_CLI" >/dev/null || fail "pgvs3 drop --force"
 expect 404 "$A/$CLONE_CLI/inline.txt"
 docker exec -i "$PGVS3_TEST_PG_CONTAINER" pg_restore --single-transaction -U postgres -d pgvs3 < "$TMP/bucket.dump"
-.tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null
+# Restored schemas stay inert until explicitly adopted; maintenance no longer reconciles.
+expect 404 "$A/$CLONE_CLI/inline.txt"
+doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
+echo "$doctor_out" | grep -Eq 'orphan_schemas=[1-9]' || fail "restored schema not reported as orphan: $doctor_out"
+adopt_out=$(.tmp/pgvs3/pgvs3 adopt --url "$PGVS3_TEST_DB_URL" --kind bucket "$CLONE_CLI")
+echo "$adopt_out" | grep -q "=adopted kind=bucket" || fail "pgvs3 adopt: $adopt_out"
 [ "$(s3 "$B/$CLONE_CLI/inline.txt")" = 'inline-val' ] || fail "restored bucket inline read"
 s3 "$B/$CLONE_CLI/cross-copy.bin" -o "$TMP/restored.bin"
 cmp "$TMP/one.bin" "$TMP/restored.bin" || fail "restored bucket chunked read"
 .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$SRC_B" >/dev/null
 .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$CLONE_CLI" >/dev/null
+
+# A catalog row whose schema vanished must not block layout checks, and
+# `adopt --all` prunes it.
+MISSING="missing-$RUN"
+expect 200 -X PUT "$A/$MISSING"
+docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -q -c \
+  "SET client_min_messages=warning; DROP SCHEMA \"s3b_$MISSING\" CASCADE"
+doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
+echo "$doctor_out" | grep -q "missing_schemas=1" || fail "missing schema not reported: $doctor_out"
+.tmp/pgvs3/pgvs3 adopt --url "$PGVS3_TEST_DB_URL" --all --kind bucket >/dev/null || fail "adopt --all with a missing schema"
+doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
+echo "$doctor_out" | grep -q "missing_schemas=0" || fail "missing schema not pruned: $doctor_out"
 
 # CRC64NVME / FULL_OBJECT checksum on a single PUT.
 crc64=$(python3 -c 'import base64,struct; print(base64.b64encode(struct.pack(">Q",0xAE8B14860A799888)).decode())')
@@ -375,8 +392,9 @@ comp_bytes=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -A
 # --- SQS queue protocol ----------------------------------------------------
 E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" E2E_RUN="$RUN" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
-import os, time, boto3
+import json, os, time, boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 ep = os.environ['E2E_ENDPOINT']
 sqs = boto3.client('sqs', endpoint_url=ep, aws_access_key_id=os.environ['E2E_KEY'],
     aws_secret_access_key=os.environ['E2E_SECRET'], region_name='us-east-1',
@@ -399,6 +417,46 @@ for m in again:
     sqs.delete_message(QueueUrl=url, ReceiptHandle=m['ReceiptHandle'])
 attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=['All'])['Attributes']
 assert int(attrs['ApproximateNumberOfMessages']) == 0, attrs
+
+# A superseded receipt is rejected instead of silently acknowledging someone
+# else's delivery; repeating the winning delete stays idempotent.
+stale_name = 'stale-' + os.environ['E2E_RUN'].lower().replace('_', '-')
+stale_url = sqs.create_queue(QueueName=stale_name, Attributes={'VisibilityTimeout': '1'})['QueueUrl']
+sqs.send_message(QueueUrl=stale_url, MessageBody='stale-ack')
+h1 = sqs.receive_message(QueueUrl=stale_url, MaxNumberOfMessages=1)['Messages'][0]['ReceiptHandle']
+time.sleep(1.2)
+h2 = sqs.receive_message(QueueUrl=stale_url, MaxNumberOfMessages=1)['Messages'][0]['ReceiptHandle']
+assert h1 != h2, (h1, h2)
+try:
+    sqs.delete_message(QueueUrl=stale_url, ReceiptHandle=h1)
+except ClientError as e:
+    assert e.response['Error']['Code'] == 'ReceiptHandleIsInvalid', e.response
+else:
+    raise AssertionError('stale receipt was accepted')
+sqs.delete_message(QueueUrl=stale_url, ReceiptHandle=h2)
+sqs.delete_message(QueueUrl=stale_url, ReceiptHandle=h2)
+sqs.delete_queue(QueueUrl=stale_url)
+
+# RedrivePolicy moves a message to the dead-letter queue on the receive that
+# exceeds maxReceiveCount, and that receive does not return it.
+run = os.environ['E2E_RUN'].lower().replace('_', '-')
+dl_name = 'dl-' + run
+dl_url = sqs.create_queue(QueueName=dl_name)['QueueUrl']
+src_name = 'src-' + run
+redrive = json.dumps({'deadLetterTargetArn': 'arn:aws:sqs:us-east-1:000000000000:' + dl_name,
+                      'maxReceiveCount': '1'})
+src_url = sqs.create_queue(QueueName=src_name,
+    Attributes={'VisibilityTimeout': '0', 'RedrivePolicy': redrive})['QueueUrl']
+sqs.send_message(QueueUrl=src_url, MessageBody='doomed')
+first = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=1).get('Messages', [])
+assert first and first[0]['Body'] == 'doomed', first
+second = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=1).get('Messages', [])
+assert not second, second
+dead = sqs.receive_message(QueueUrl=dl_url, MaxNumberOfMessages=1).get('Messages', [])
+assert dead and dead[0]['Body'] == 'doomed', dead
+sqs.delete_message(QueueUrl=dl_url, ReceiptHandle=dead[0]['ReceiptHandle'])
+sqs.delete_queue(QueueUrl=src_url)
+sqs.delete_queue(QueueUrl=dl_url)
 sqs.purge_queue(QueueUrl=url)
 sqs.delete_queue(QueueUrl=url)
 try:
@@ -420,6 +478,86 @@ plan=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c "
 ")
 echo "$plan" | grep -q "messages_receipt" || fail "SQS ack does not use messages_receipt: $plan"
 .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --kind queue --force "$QIDX" >/dev/null
+
+# --- layout v10 -> v11 in-place migration -----------------------------------
+V10_DB="pgvs3_v10_${RUN//-/_}"
+V10_URL="${PGVS3_TEST_DB_URL%/*}/$V10_DB"
+docker exec "$PGVS3_TEST_PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d postgres \
+  -c "DROP DATABASE IF EXISTS \"$V10_DB\"" -c "CREATE DATABASE \"$V10_DB\"" >/dev/null
+docker exec -i "$PGVS3_TEST_PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d "$V10_DB" >/dev/null <<'SQL'
+CREATE SCHEMA s3p;
+CREATE TABLE s3p.layout (version int4 NOT NULL);
+INSERT INTO s3p.layout VALUES (10);
+CREATE SEQUENCE s3p.file_ids CACHE 64;
+CREATE TABLE s3p.buckets (
+  name        text COLLATE "C" PRIMARY KEY,
+  schema_name text COLLATE "C" NOT NULL UNIQUE,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT bucket_name_shape CHECK (name ~ '^[a-z0-9._-]{1,58}$'));
+CREATE SCHEMA "s3b_legacy";
+CREATE TABLE "s3b_legacy".objects (
+  key           text COLLATE "C" PRIMARY KEY,
+  file_id       bigint,
+  size          int8 NOT NULL,
+  sha256        bytea NOT NULL,
+  etag          text NOT NULL,
+  user_metadata text[] NOT NULL DEFAULT '{}'::text[],
+  content_type  text NOT NULL DEFAULT 'application/octet-stream',
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  expires_at    timestamptz,
+  parts         int8[],
+  part_ends     int8[],
+  inline_data   bytea STORAGE EXTERNAL);
+CREATE TABLE "s3b_legacy".chunks (
+  file_id int8 NOT NULL, no int4 NOT NULL, data bytea STORAGE EXTERNAL NOT NULL,
+  PRIMARY KEY (file_id, no));
+CREATE TABLE "s3b_legacy".uploads (
+  upload_id          text PRIMARY KEY,
+  key                text COLLATE "C" NOT NULL,
+  checksum_algorithm text,
+  user_metadata      text[] NOT NULL DEFAULT '{}'::text[],
+  content_type       text NOT NULL DEFAULT 'application/octet-stream',
+  created_at         timestamptz NOT NULL DEFAULT now());
+CREATE TABLE "s3b_legacy".upload_parts (
+  upload_id text NOT NULL REFERENCES "s3b_legacy".uploads ON DELETE CASCADE,
+  part_no   int4 NOT NULL, file_id int8 NOT NULL, size int8 NOT NULL,
+  sha256 bytea NOT NULL, md5 bytea NOT NULL, checksum text,
+  PRIMARY KEY (upload_id, part_no));
+CREATE TABLE "s3b_legacy".object_part_checksums (
+  key text COLLATE "C" NOT NULL, part_no int4 NOT NULL, file_id int8 NOT NULL,
+  algorithm text NOT NULL, value text NOT NULL, PRIMARY KEY (key, part_no),
+  FOREIGN KEY (key) REFERENCES "s3b_legacy".objects (key)
+    ON UPDATE CASCADE ON DELETE CASCADE);
+CREATE TABLE "s3b_legacy".garbage (
+  file_id int8 PRIMARY KEY, queued_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO s3p.buckets (name, schema_name) VALUES ('legacy', 's3b_legacy');
+INSERT INTO "s3b_legacy".objects (key, size, sha256, etag, inline_data)
+  VALUES ('inline.txt', 5, decode(repeat('00', 32), 'hex'),
+          '0123456789abcdef0123456789abcdef', 'hello');
+INSERT INTO "s3b_legacy".objects (key, file_id, size, sha256, etag)
+  VALUES ('chunked.bin', 42, 5, decode(repeat('11', 32), 'hex'),
+          'fedcba9876543210fedcba9876543210');
+INSERT INTO "s3b_legacy".chunks VALUES (42, 0, 'chunk');
+SELECT setval('s3p.file_ids', 42);
+SQL
+migrate_out=$(.tmp/pgvs3/pgvs3 migrate --url "$V10_URL")
+echo "$migrate_out" | grep -q "migrated_buckets=1 layout=11" || fail "migrate: $migrate_out"
+.tmp/pgvs3/pgvs3 migrate --url "$V10_URL" | grep -q "migrated_buckets=0 layout=11" || fail "migrate is not idempotent"
+v10_state=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d "$V10_DB" -At -c "
+  SELECT (SELECT version FROM s3p.layout) || '|' ||
+         (SELECT count(*) FROM s3p.namespaces WHERE kind = 'bucket' AND name = 'legacy') || '|' ||
+         (SELECT count(*) FROM \"s3b_legacy\".chunks) || '|' ||
+         (SELECT count(*) FROM information_schema.columns WHERE table_schema = 's3b_legacy'
+            AND table_name = 'objects' AND column_name = 'origin_etag') || '|' ||
+         (to_regclass('s3p.v10_buckets') IS NOT NULL) || '|' ||
+         (SELECT string_agg(key || ':' || coalesce(encode(inline_data, 'escape'), '-') || ':' ||
+                            coalesce(file_id::text, '-'), ',' ORDER BY key)
+            FROM \"s3b_legacy\".objects);")
+[ "$v10_state" = '11|1|1|1|true|chunked.bin:-:42,inline.txt:hello:-' ] || fail "v10 migration state: $v10_state"
+doctor10=$(.tmp/pgvs3/pgvs3 doctor --url "$V10_URL")
+echo "$doctor10" | grep -q "layout=11" || fail "migrated layout: $doctor10"
+echo "$doctor10" | grep -q "buckets=1" || fail "migrated bucket count: $doctor10"
+docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d postgres -c "DROP DATABASE \"$V10_DB\"" >/dev/null
 
 # --- S3 cache tier over a filesystem origin (thanos objstore) ---------------
 ORIGIN_DIR="$TMP/origin"

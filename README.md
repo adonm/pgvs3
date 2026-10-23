@@ -17,8 +17,8 @@ The gateway is written in Go, holds zero in-process state, and ships as a
 > loopback interface, private VPC/VLAN, or behind a service mesh that enforces
 > access control and TLS.
 
-**Status: early alpha.** Storage layout changes require a fresh database (no
-in-place migrations).
+**Status: early alpha.** `pgvs3 migrate` upgrades a layout v10 database to v11
+in place. Older or unsupported layouts require a fresh database.
 
 ## Quick start
 
@@ -241,7 +241,11 @@ Subcommands:
 - `pgvs3 clone [--kind bucket|cache] <src> <dst>` — clone inside PostgreSQL.
 - `pgvs3 drop [--kind bucket|cache|queue] [--force] <name>` — drop a namespace
   schema (`DROP SCHEMA CASCADE`).
-- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v11, and table settings.
+- `pgvs3 adopt [--kind K] [--all] [name...]` — register restored schemas;
+  nothing is visible until it is adopted.
+- `pgvs3 migrate` — upgrade a layout v10 database to v11 in place.
+- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v11, table settings,
+  and report orphan or missing schemas.
 - `pgvs3 reap [--all]` — run garbage collection immediately.
 - `pgvs3 health` — poll `/readyz` for container health checks.
 

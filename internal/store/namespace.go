@@ -252,6 +252,93 @@ func (s *Store) namespaceSchemas(ctx context.Context, kind ns.Kind) ([]string, e
 	return out, nil
 }
 
+// Migrate upgrades a layout v10 database in place. It returns the number of
+// buckets migrated and is a no-op on an already-current database.
+func (s *Store) Migrate(ctx context.Context) (int, error) {
+	var v pgtype.Int4
+	err := s.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("no s3p.layout row: not a pgvs3 database")
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !v.Valid {
+		return 0, fmt.Errorf("s3p.layout is empty")
+	}
+	switch v.Int32 {
+	case LayoutVersion:
+		return 0, nil
+	case 10:
+	default:
+		return 0, fmt.Errorf("cannot migrate layout v%d to v%d", v.Int32, LayoutVersion)
+	}
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", int64(0x70677673)); err != nil {
+		return 0, err
+	}
+	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", int64(0x70677673))
+	schema, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		return 0, err
+	}
+	if _, err := conn.Exec(ctx, string(schema)); err != nil {
+		return 0, err
+	}
+	var n int
+	if err := conn.QueryRow(ctx, "SELECT s3p.migrate_v10()").Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// Adopt registers one existing namespace schema. Returns "adopted", "exists"
+// or "missing".
+func (s *Store) Adopt(ctx context.Context, kind ns.Kind, name string) (string, error) {
+	if _, _, err := NewNamespaceRef(kind, name); err != nil {
+		return "", err
+	}
+	var outcome string
+	if err := s.pool.QueryRow(ctx, "SELECT s3p.adopt_namespace($1,$2)", string(kind), name).Scan(&outcome); err != nil {
+		return "", err
+	}
+	if outcome == "adopted" || outcome == "exists" {
+		s.markKnown(kind, name)
+	}
+	return outcome, nil
+}
+
+// AdoptAll adopts every matching schema (all kinds when kind is empty) and
+// prunes catalog rows whose schema has vanished.
+func (s *Store) AdoptAll(ctx context.Context, kind ns.Kind) (int, error) {
+	var arg any
+	if kind != "" {
+		if !kind.Valid() {
+			return 0, ns.ErrUnknownKind
+		}
+		arg = string(kind)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx, "SELECT s3p.adopt_namespaces($1)", arg).Scan(&n); err != nil {
+		return 0, err
+	}
+	s.knownNS.Range(func(k, _ any) bool {
+		s.knownNS.Delete(k)
+		return true
+	})
+	infos, err := s.Namespaces(ctx, "")
+	if err == nil {
+		for _, n := range infos {
+			s.markKnown(n.Kind, n.Name)
+		}
+	}
+	return n, nil
+}
+
 // SetNamespaceAttrs merges attrs into a namespace.
 func (s *Store) SetNamespaceAttrs(ctx context.Context, kind ns.Kind, name string, attrs map[string]any) error {
 	b, err := json.Marshal(attrs)
@@ -332,7 +419,14 @@ func (s *Store) checkNamespaceTables(ctx context.Context, conn *pgxpool.Conn) er
 	for _, n := range infos {
 		q := quoteIdent(n.Schema)
 		if n.Kind == ns.Queue {
-			for _, rel := range []string{q + ".messages", q + ".messages_ready", q + ".messages_receipt"} {
+			var present bool
+			if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", q+".messages").Scan(&present); err != nil {
+				return err
+			}
+			if !present {
+				continue
+			}
+			for _, rel := range []string{q + ".messages_ready", q + ".messages_receipt"} {
 				var exists bool
 				if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", rel).Scan(&exists); err != nil {
 					return err
@@ -341,6 +435,13 @@ func (s *Store) checkNamespaceTables(ctx context.Context, conn *pgxpool.Conn) er
 					return fmt.Errorf("required queue relation %s is missing", rel)
 				}
 			}
+			continue
+		}
+		var present bool
+		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", q+".objects").Scan(&present); err != nil {
+			return err
+		}
+		if !present {
 			continue
 		}
 		var kind string

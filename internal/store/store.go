@@ -241,7 +241,7 @@ func (s *Store) Init(ctx context.Context) error {
 			return err
 		}
 		if !found.Valid || found.Int32 != LayoutVersion {
-			return fmt.Errorf("s3p holds storage layout %v; this pgvs3 reads v%d (use a fresh database)", found.Int32, LayoutVersion)
+			return fmt.Errorf("s3p holds storage layout %v; this pgvs3 reads v%d (run `pgvs3 migrate` for v10, or use a fresh database)", found.Int32, LayoutVersion)
 		}
 	}
 	schema, err := schemaFS.ReadFile("schema.sql")
@@ -256,9 +256,6 @@ func (s *Store) Init(ctx context.Context) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(ctx, "SELECT s3p.reconcile_namespaces()"); err != nil {
-		return err
-	}
 	return tx.Commit(ctx)
 }
 
@@ -270,7 +267,7 @@ func (s *Store) CheckLayout(ctx context.Context) error {
 		return err
 	}
 	if !version.Valid || version.Int32 != LayoutVersion {
-		return fmt.Errorf("storage layout is %v, want v%d", version.Int32, LayoutVersion)
+		return fmt.Errorf("storage layout is %v, want v%d (run `pgvs3 migrate` for v10)", version.Int32, LayoutVersion)
 	}
 	return nil
 }
@@ -295,7 +292,8 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 		"s3p.ensure_namespace(text,text,bigint,jsonb)",
 		"s3p.drop_namespace(text,text,boolean)",
 		"s3p.clone_namespace(text,text,text)",
-		"s3p.reconcile_namespaces()",
+		"s3p.adopt_namespace(text,text)",
+		"s3p.adopt_namespaces(text)",
 	} {
 		var exists bool
 		if err := conn.QueryRow(ctx, "SELECT to_regprocedure($1) IS NOT NULL", fn).Scan(&exists); err != nil {
