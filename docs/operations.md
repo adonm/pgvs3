@@ -174,9 +174,11 @@ and switching `PGVS3_URL`.
   Hardened defaults include a nonroot read-only root filesystem with a writable
   `/tmp` emptyDir, no service-account token automount, a 60s termination grace
   period, and a default-deny NetworkPolicy that allows same-namespace clients.
-  Add `networkPolicy.ingress.from` peers for other namespaces. Setting
-  `networkPolicy.egress.allowAll=false` also requires explicit DNS and PostgreSQL
-  egress rules. An optional Prometheus Operator `ServiceMonitor` is available.
+  Add `networkPolicy.ingress.from` peers for other namespaces. Some CNIs also
+  evaluate kubelet probes against the policy; add the node CIDR to
+  `ingress.from` if probes fail. Setting `networkPolicy.egress.allowAll=false`
+  also requires explicit DNS and PostgreSQL egress rules. An optional
+  Prometheus Operator `ServiceMonitor` is available.
   Ensure PostgreSQL `max_connections` exceeds `replicas × PGVS3_POOL_MAX × 2`
   (main pool + chunk pool).
 - **Failure handling:**

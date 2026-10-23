@@ -40,7 +40,9 @@ containerSecurityContext:
 tmpDir:
   sizeLimit: 10Gi
 # Ingress is default-deny. The default allows clients in the release namespace;
-# add namespaceSelector/podSelector entries for other namespaces.
+# add namespaceSelector/podSelector entries for other namespaces. Some CNIs
+# evaluate kubelet HTTP probes against this policy; add the node CIDR to
+# ingress.from if readiness/liveness probes fail.
 networkPolicy:
   enabled: true
   ingress:
