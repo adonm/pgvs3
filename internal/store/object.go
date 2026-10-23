@@ -213,10 +213,12 @@ type result struct {
 // response started, the rest arrive in row order from PostgreSQL.
 type Body struct {
 	cur    []byte
+	chunk  []byte // base of cur when cur came from the chunk pool
 	ch     <-chan result
 	cancel context.CancelFunc
 	err    error
 	once   sync.Once
+	static bool
 
 	// Direct mode: one piece streamed synchronously from pgx rows, with no
 	// goroutine/channel hop on the common single-file read path.
@@ -230,16 +232,26 @@ type Body struct {
 }
 
 func (b *Body) Read(p []byte) (int, error) {
+	if b.static {
+		if len(b.cur) == 0 {
+			return 0, io.EOF
+		}
+		n := copy(p, b.cur)
+		b.cur = b.cur[n:]
+		return n, nil
+	}
 	if b.rows != nil {
 		for len(b.cur) == 0 {
 			if b.err != nil {
 				return 0, b.err
 			}
+			b.releaseChunk()
 			chunk, err := b.nextChunk()
 			if err != nil {
 				b.err = err
 				return 0, err
 			}
+			b.chunk = chunk
 			b.cur = chunk
 		}
 		n := copy(p, b.cur)
@@ -250,6 +262,7 @@ func (b *Body) Read(p []byte) (int, error) {
 		if b.err != nil {
 			return 0, b.err
 		}
+		b.releaseChunk()
 		r, ok := <-b.ch
 		if !ok {
 			b.err = io.EOF
@@ -259,6 +272,7 @@ func (b *Body) Read(p []byte) (int, error) {
 			b.err = r.err
 			return 0, r.err
 		}
+		b.chunk = r.b
 		b.cur = r.b
 	}
 	n := copy(p, b.cur)
@@ -279,9 +293,13 @@ func (b *Body) WriteTo(w io.Writer) (int64, error) {
 		return err
 	}
 	if err := write(b.cur); err != nil {
+		b.releaseChunk()
 		return n, err
 	}
-	b.cur = nil
+	b.releaseChunk()
+	if b.static {
+		return n, nil
+	}
 	if b.rows != nil {
 		for {
 			chunk, err := b.nextChunk()
@@ -291,9 +309,13 @@ func (b *Body) WriteTo(w io.Writer) (int64, error) {
 			if err != nil {
 				return n, err
 			}
+			b.chunk = chunk
+			b.cur = chunk
 			if err := write(chunk); err != nil {
+				b.releaseChunk()
 				return n, err
 			}
+			b.releaseChunk()
 		}
 	}
 	for {
@@ -312,14 +334,27 @@ func (b *Body) WriteTo(w io.Writer) (int64, error) {
 			b.err = r.err
 			return n, r.err
 		}
+		b.chunk = r.b
+		b.cur = r.b
 		if err := write(r.b); err != nil {
+			b.releaseChunk()
 			return n, err
 		}
+		b.releaseChunk()
+	}
+}
+
+func (b *Body) releaseChunk() {
+	if b.chunk != nil {
+		putChunkBuf(b.chunk)
+		b.chunk = nil
+		b.cur = nil
 	}
 }
 
 func (b *Body) Close() error {
 	b.once.Do(func() {
+		b.releaseChunk()
 		if b.rows != nil {
 			b.rows.Close()
 		}
@@ -338,6 +373,25 @@ var decompPool = sync.Pool{New: func() any {
 	return &buf
 }}
 
+const chunkBufCap = chunkSize + RowBytes
+
+var chunkBufPool = sync.Pool{New: func() any {
+	buf := make([]byte, 0, chunkBufCap)
+	return &buf
+}}
+
+func getChunkBuf() []byte {
+	buf := chunkBufPool.Get().(*[]byte)
+	return (*buf)[:0]
+}
+
+func putChunkBuf(buf []byte) {
+	if cap(buf) < chunkBufCap {
+		return
+	}
+	chunkBufPool.Put(&buf)
+}
+
 // decodeRow decompresses one stored chunk row into its logical length.
 func decodeRow(dst []byte, segLen int64, no int32, stored []byte) ([]byte, error) {
 	want := int(min(int64(RowBytes), segLen-int64(no)*RowBytes))
@@ -355,13 +409,19 @@ func (b *Body) nextChunk() ([]byte, error) {
 	if span := b.spanEnd - b.spanStart + 1; span < capHint {
 		capHint = span + RowBytes
 	}
-	out := make([]byte, 0, int(capHint))
+	var out []byte
+	if capHint >= chunkSize {
+		out = getChunkBuf()
+	} else {
+		out = make([]byte, 0, int(capHint))
+	}
 	maybe := decompPool.Get().(*[]byte)
 	defer decompPool.Put(maybe)
 	decomp := *maybe
 	for b.rows.Next() {
 		raw := b.rows.RawValues()
 		if len(raw) != 2 || raw[0] == nil || raw[1] == nil {
+			putChunkBuf(out)
 			return nil, fmt.Errorf("file %d rows %d..=%d: unexpected row shape", b.piece.fileID, b.piece.lo, b.piece.hi)
 		}
 		no := int32(uint32(raw[0][0])<<24 | uint32(raw[0][1])<<16 | uint32(raw[0][2])<<8 | uint32(raw[0][3]))
@@ -377,6 +437,7 @@ func (b *Body) nextChunk() ([]byte, error) {
 		}
 		dec, err := decodeRow(decomp[:0], b.piece.segLen, no, raw[1])
 		if err != nil {
+			putChunkBuf(out)
 			return nil, err
 		}
 		appendRow(&out, b.piece.base, no, dec, b.spanStart, b.spanEnd)
@@ -388,6 +449,7 @@ func (b *Body) nextChunk() ([]byte, error) {
 			}
 			dec, err := decodeRow(decomp[:0], b.piece.segLen, b.next, data)
 			if err != nil {
+				putChunkBuf(out)
 				return nil, err
 			}
 			appendRow(&out, b.piece.base, b.next, dec, b.spanStart, b.spanEnd)
@@ -399,14 +461,17 @@ func (b *Body) nextChunk() ([]byte, error) {
 		}
 	}
 	if err := b.rows.Err(); err != nil {
+		putChunkBuf(out)
 		return nil, err
 	}
 	if b.next <= b.piece.hi {
+		putChunkBuf(out)
 		return nil, fmt.Errorf("file %d rows %d..=%d: row %d missing", b.piece.fileID, b.piece.lo, b.piece.hi, b.next)
 	}
 	if len(out) > 0 {
 		return out, nil
 	}
+	putChunkBuf(out)
 	return nil, io.EOF
 }
 
@@ -455,9 +520,7 @@ func (s *Store) GetBodyKind(ctx context.Context, kind ns.Kind, name, key string,
 }
 
 func bytesBody(data []byte) *Body {
-	ch := make(chan result)
-	close(ch)
-	return &Body{cur: data, ch: ch}
+	return &Body{cur: data, static: true}
 }
 
 func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc, schema string, p piece, start, end int64) (*Body, error) {
@@ -691,7 +754,13 @@ func streamRows(ctx context.Context, q querier, schema string, p piece, start, e
 	if span := end - start + 1; span < capHint {
 		capHint = span + RowBytes
 	}
-	out := make([]byte, 0, int(capHint))
+	var out []byte
+	if capHint >= chunkSize {
+		out = getChunkBuf()
+	} else {
+		out = make([]byte, 0, int(capHint))
+	}
+	defer func() { putChunkBuf(out) }()
 	var early map[int32][]byte
 	maybe := decompPool.Get().(*[]byte)
 	defer decompPool.Put(maybe)
@@ -733,7 +802,12 @@ func streamRows(ctx context.Context, q querier, schema string, p piece, start, e
 			if !send(out) {
 				return ctx.Err()
 			}
-			out = make([]byte, 0, int(capHint))
+			out = nil
+			if capHint >= chunkSize {
+				out = getChunkBuf()
+			} else {
+				out = make([]byte, 0, int(capHint))
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -742,8 +816,11 @@ func streamRows(ctx context.Context, q querier, schema string, p piece, start, e
 	if next <= p.hi {
 		return fmt.Errorf("file %d rows %d..=%d: row %d missing", p.fileID, p.lo, p.hi, next)
 	}
-	if len(out) > 0 && !send(out) {
-		return ctx.Err()
+	if len(out) > 0 {
+		if !send(out) {
+			return ctx.Err()
+		}
+		out = nil
 	}
 	return nil
 }
