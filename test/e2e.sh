@@ -208,6 +208,7 @@ expect 404 "$A/$CLONE_CLI/inline.txt"
 docker exec -i "$PGVS3_TEST_PG_CONTAINER" pg_restore --single-transaction -U postgres -d pgvs3 < "$TMP/bucket.dump"
 # Restored schemas stay inert until explicitly adopted; maintenance no longer reconciles.
 expect 404 "$A/$CLONE_CLI/inline.txt"
+expect 404 -X PUT -H "x-amz-copy-source: /$CLONE_CLI/inline.txt" "$A/$SRC_B/unadopted-copy.txt"
 doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
 echo "$doctor_out" | grep -Eq 'orphan_schemas=[1-9]' || fail "restored schema not reported as orphan: $doctor_out"
 adopt_out=$(.tmp/pgvs3/pgvs3 adopt --url "$PGVS3_TEST_DB_URL" --kind bucket "$CLONE_CLI")
@@ -480,12 +481,18 @@ except ClientError as e:
     assert e.response['Error']['Code'] == 'ReceiptHandleIsInvalid', e.response
 else:
     raise AssertionError('stale receipt was accepted')
-sqs.delete_message(QueueUrl=stale_url, ReceiptHandle=h2)
+dbatch = sqs.delete_message_batch(QueueUrl=stale_url, Entries=[
+    {'Id': 'stale', 'ReceiptHandle': h1},
+    {'Id': 'live', 'ReceiptHandle': h2},
+])
+assert [e['Id'] for e in dbatch.get('Successful', [])] == ['live'], dbatch
+assert len(dbatch.get('Failed', [])) == 1 and dbatch['Failed'][0]['Id'] == 'stale', dbatch
+assert dbatch['Failed'][0]['Code'] == 'ReceiptHandleIsInvalid', dbatch
 sqs.delete_message(QueueUrl=stale_url, ReceiptHandle=h2)
 sqs.delete_queue(QueueUrl=stale_url)
 
 # RedrivePolicy moves a message to the dead-letter queue on the receive that
-# exceeds maxReceiveCount, and that receive does not return it.
+# exceeds maxReceiveCount, and that receive skips past it to any live message.
 run = os.environ['E2E_RUN'].lower().replace('_', '-')
 dl_name = 'dl-' + run
 dl_url = sqs.create_queue(QueueName=dl_name)['QueueUrl']
@@ -497,8 +504,10 @@ src_url = sqs.create_queue(QueueName=src_name,
 sqs.send_message(QueueUrl=src_url, MessageBody='doomed')
 first = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=1).get('Messages', [])
 assert first and first[0]['Body'] == 'doomed', first
+sqs.send_message(QueueUrl=src_url, MessageBody='survivor')
 second = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=1).get('Messages', [])
-assert not second, second
+assert len(second) == 1 and second[0]['Body'] == 'survivor', second
+sqs.delete_message(QueueUrl=src_url, ReceiptHandle=second[0]['ReceiptHandle'])
 dead = sqs.receive_message(QueueUrl=dl_url, MaxNumberOfMessages=1).get('Messages', [])
 assert dead and dead[0]['Body'] == 'doomed', dead
 sqs.delete_message(QueueUrl=dl_url, ReceiptHandle=dead[0]['ReceiptHandle'])
@@ -524,6 +533,13 @@ plan=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c "
   EXPLAIN (COSTS OFF) DELETE FROM \"s3q_$QIDX\".messages WHERE receipt = 'x';
 ")
 echo "$plan" | grep -q "messages_receipt" || fail "SQS ack does not use messages_receipt: $plan"
+# Legacy Query/XML protocol (form-encoded POST body).
+curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data "Action=SendMessage&QueueUrl=$A/$QIDX&MessageBody=query-xml" "$A/" | grep -q '<SendMessageResponse' || fail "SQS Query SendMessage XML"
+curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data "Action=ReceiveMessage&QueueUrl=$A/$QIDX&MaxNumberOfMessages=1" "$A/" | grep -q '<Body>query-xml</Body>' || fail "SQS Query ReceiveMessage XML"
+curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data "Action=PurgeQueue&QueueUrl=$A/$QIDX" "$A/" | grep -q '<PurgeQueueResponse' || fail "SQS Query PurgeQueue XML"
 .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --kind queue --force "$QIDX" >/dev/null
 
 # --- layout v10 -> v11 in-place migration -----------------------------------

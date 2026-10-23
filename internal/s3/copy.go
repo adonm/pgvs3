@@ -61,7 +61,7 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		case errors.Is(err, store.ErrPrecondition):
 			writeError(w, r, errPreconditionFailed(), s.log)
 		default:
-			writeError(w, r, errInternal(err, s.log), s.log)
+			writeError(w, r, s.ingestError(err), s.log)
 		}
 		return
 	}

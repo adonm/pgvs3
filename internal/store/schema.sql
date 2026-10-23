@@ -49,62 +49,39 @@ BEGIN
   END;
 END $$;
 
--- Idempotently creates a namespace's schema, tables, indexes and SQL helpers.
-CREATE OR REPLACE FUNCTION s3p.ensure_namespace(
-  p_kind text, p_name text, p_quota int8 DEFAULT NULL, p_attrs jsonb DEFAULT NULL
-) RETURNS text LANGUAGE plpgsql AS $$
-DECLARE
-  v_schema text := s3p.namespace_schema(p_kind, p_name);
-  v_persist text := CASE WHEN p_kind = 'cache' THEN 'UNLOGGED' ELSE '' END;
-  v_inline int := CASE WHEN p_kind = 'bucket' THEN 65536 ELSE 8120 END;
+-- Creates the table and indexes for a queue namespace (`s3q_<name>`).
+CREATE OR REPLACE FUNCTION s3p.ensure_queue_schema(p_schema text)
+RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-  IF to_regclass(format('%I.objects', v_schema)) IS NOT NULL
-     OR to_regclass(format('%I.messages', v_schema)) IS NOT NULL THEN
-    IF EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = p_kind AND name = p_name) THEN
-      RETURN v_schema;
-    END IF;
-  END IF;
+  EXECUTE format($ddl$
+    CREATE TABLE IF NOT EXISTS %1$I.messages (
+      id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      msg_id             text NOT NULL UNIQUE,
+      body               bytea NOT NULL,
+      body_size          int4 NOT NULL CHECK (body_size >= 0 AND octet_length(body) <= body_size),
+      attrs              bytea,
+      visible_at         timestamptz NOT NULL DEFAULT now(),
+      receipt            text,
+      receive_count      int4 NOT NULL DEFAULT 0,
+      first_received_at  timestamptz,
+      sent_at            timestamptz NOT NULL DEFAULT now(),
+      expires_at         timestamptz NOT NULL
+    ) WITH (fillfactor = 80);
+    CREATE INDEX IF NOT EXISTS messages_ready ON %1$I.messages (visible_at, id);
+    CREATE INDEX IF NOT EXISTS messages_expiry ON %1$I.messages (expires_at);
+    CREATE INDEX IF NOT EXISTS messages_receipt ON %1$I.messages (receipt)
+      WHERE receipt IS NOT NULL;
+  $ddl$, p_schema);
+END $$;
 
-  PERFORM pg_advisory_xact_lock(hashtextextended('s3p.ns', 0) # hashtextextended(p_kind || ':' || p_name, 1));
-
-  IF p_quota IS NULL AND p_attrs IS NULL
-     AND (to_regclass(format('%I.objects', v_schema)) IS NOT NULL
-          OR to_regclass(format('%I.messages', v_schema)) IS NOT NULL)
-     AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = p_kind AND name = p_name) THEN
-    RETURN v_schema;
-  END IF;
-
-  INSERT INTO s3p.namespaces (kind, name, schema_name, quota_bytes, attrs)
-  VALUES (p_kind, p_name, v_schema, p_quota, coalesce(p_attrs, '{}'::jsonb))
-  ON CONFLICT (kind, name) DO UPDATE
-    SET quota_bytes = coalesce(EXCLUDED.quota_bytes, s3p.namespaces.quota_bytes),
-        attrs = s3p.namespaces.attrs || EXCLUDED.attrs;
-
-  EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', v_schema);
-
-  IF p_kind = 'queue' THEN
-    EXECUTE format($ddl$
-      CREATE TABLE IF NOT EXISTS %1$I.messages (
-        id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-        msg_id             text NOT NULL UNIQUE,
-        body               bytea NOT NULL,
-        body_size          int4 NOT NULL CHECK (body_size >= 0 AND octet_length(body) <= body_size),
-        attrs              bytea,
-        visible_at         timestamptz NOT NULL DEFAULT now(),
-        receipt            text,
-        receive_count      int4 NOT NULL DEFAULT 0,
-        first_received_at  timestamptz,
-        sent_at            timestamptz NOT NULL DEFAULT now(),
-        expires_at         timestamptz NOT NULL
-      ) WITH (fillfactor = 80);
-      CREATE INDEX IF NOT EXISTS messages_ready ON %1$I.messages (visible_at, id);
-      CREATE INDEX IF NOT EXISTS messages_expiry ON %1$I.messages (expires_at);
-      CREATE INDEX IF NOT EXISTS messages_receipt ON %1$I.messages (receipt)
-        WHERE receipt IS NOT NULL;
-    $ddl$, v_schema);
-    RETURN v_schema;
-  END IF;
-
+-- Creates the tables, indexes and PL/pgSQL helpers for a bucket (`s3b_<name>`)
+-- or cache (`s3c_<name>`) namespace.
+CREATE OR REPLACE FUNCTION s3p.ensure_object_schema(p_schema text, p_kind text)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  v_persist text := CASE WHEN p_kind = 'cache' THEN 'UNLOGGED' ELSE '' END;
+  v_inline  int  := CASE WHEN p_kind = 'bucket' THEN 65536 ELSE 8120 END;
+BEGIN
   EXECUTE format($ddl$
     CREATE %2$s TABLE IF NOT EXISTS %1$I.objects (
       key           text COLLATE "C" PRIMARY KEY,
@@ -164,34 +141,34 @@ BEGIN
     );
     CREATE INDEX IF NOT EXISTS garbage_by_age ON %1$I.garbage (queued_at, file_id);
 
-      CREATE TABLE IF NOT EXISTS %1$I.uploads (
-        upload_id          text PRIMARY KEY,
-        key                text COLLATE "C" NOT NULL,
-        checksum_algorithm text CHECK (checksum_algorithm IN ('CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256')),
-        user_metadata      text[] NOT NULL DEFAULT '{}'::text[],
-        content_type       text NOT NULL DEFAULT 'application/octet-stream',
-        created_at         timestamptz NOT NULL DEFAULT now(),
-        CONSTRAINT upload_metadata_shape CHECK (
-          cardinality(user_metadata) <= 128 AND cardinality(user_metadata) %% 2 = 0 AND
-          octet_length(content_type) BETWEEN 1 AND 1024)
-      );
-      CREATE INDEX IF NOT EXISTS uploads_by_key ON %1$I.uploads (key, upload_id);
-      CREATE INDEX IF NOT EXISTS uploads_by_age ON %1$I.uploads (created_at, upload_id);
+    CREATE TABLE IF NOT EXISTS %1$I.uploads (
+      upload_id          text PRIMARY KEY,
+      key                text COLLATE "C" NOT NULL,
+      checksum_algorithm text CHECK (checksum_algorithm IN ('CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256')),
+      user_metadata      text[] NOT NULL DEFAULT '{}'::text[],
+      content_type       text NOT NULL DEFAULT 'application/octet-stream',
+      created_at         timestamptz NOT NULL DEFAULT now(),
+      CONSTRAINT upload_metadata_shape CHECK (
+        cardinality(user_metadata) <= 128 AND cardinality(user_metadata) %% 2 = 0 AND
+        octet_length(content_type) BETWEEN 1 AND 1024)
+    );
+    CREATE INDEX IF NOT EXISTS uploads_by_key ON %1$I.uploads (key, upload_id);
+    CREATE INDEX IF NOT EXISTS uploads_by_age ON %1$I.uploads (created_at, upload_id);
 
-      CREATE TABLE IF NOT EXISTS %1$I.upload_parts (
-        upload_id text NOT NULL REFERENCES %1$I.uploads ON DELETE CASCADE,
-        part_no   int4 NOT NULL,
-        file_id   int8 NOT NULL,
-        size      int8 NOT NULL,
-        sha256    bytea NOT NULL,
-        md5       bytea NOT NULL,
-        checksum  text,
-        PRIMARY KEY (upload_id, part_no),
-        CONSTRAINT part_shape CHECK (part_no BETWEEN 1 AND 10000 AND size >= 0 AND
-          size <= 2147483648::int8 * 8120 AND octet_length(sha256) = 32 AND
-          octet_length(md5) = 16 AND (checksum IS NULL OR octet_length(checksum) BETWEEN 1 AND 128))
-      );
-      CREATE INDEX IF NOT EXISTS upload_parts_file_id_idx ON %1$I.upload_parts (file_id);
+    CREATE TABLE IF NOT EXISTS %1$I.upload_parts (
+      upload_id text NOT NULL REFERENCES %1$I.uploads ON DELETE CASCADE,
+      part_no   int4 NOT NULL,
+      file_id   int8 NOT NULL,
+      size      int8 NOT NULL,
+      sha256    bytea NOT NULL,
+      md5       bytea NOT NULL,
+      checksum  text,
+      PRIMARY KEY (upload_id, part_no),
+      CONSTRAINT part_shape CHECK (part_no BETWEEN 1 AND 10000 AND size >= 0 AND
+        size <= 2147483648::int8 * 8120 AND octet_length(sha256) = 32 AND
+        octet_length(md5) = 16 AND (checksum IS NULL OR octet_length(checksum) BETWEEN 1 AND 128))
+    );
+    CREATE INDEX IF NOT EXISTS upload_parts_file_id_idx ON %1$I.upload_parts (file_id);
 
     CREATE %2$s TABLE IF NOT EXISTS %1$I.object_part_checksums (
       key       text COLLATE "C" NOT NULL,
@@ -203,13 +180,22 @@ BEGIN
       FOREIGN KEY (key) REFERENCES %1$I.objects (key)
         ON UPDATE CASCADE ON DELETE CASCADE
     );
-  $ddl$, v_schema, v_persist, v_inline);
-
-  IF p_kind = 'bucket' THEN
-    EXECUTE format($ddl$    $ddl$, v_schema);
-  END IF;
+  $ddl$, p_schema, v_persist, v_inline);
 
   EXECUTE format($fn$
+    -- Queues candidate file_ids that are no longer referenced by any object or
+    -- in-progress multipart upload in this namespace.
+    CREATE OR REPLACE FUNCTION %1$I.queue_garbage(p_files int8[])
+    RETURNS void LANGUAGE sql AS $body$
+      INSERT INTO %1$I.garbage (file_id)
+      SELECT DISTINCT f FROM unnest(p_files) AS f
+      WHERE f IS NOT NULL AND f <> 0
+        AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
+        AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
+        AND NOT EXISTS (SELECT 1 FROM %1$I.upload_parts p WHERE p.file_id = f)
+      ON CONFLICT DO NOTHING;
+    $body$;
+
     CREATE OR REPLACE FUNCTION %1$I.publish_object(
       p_key text, p_file_id int8, p_size int8, p_sha256 bytea,
       p_etag text, p_meta text[], p_ct text, p_cond text DEFAULT 'none',
@@ -253,13 +239,7 @@ BEGIN
         origin_etag = EXCLUDED.origin_etag,
         parts = NULL, part_ends = NULL, inline_data = NULL, created_at = now();
       IF found_old AND old_file IS NOT NULL THEN
-        INSERT INTO %1$I.garbage (file_id)
-        SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
-        WHERE f IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
-          AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
-          AND NOT EXISTS (SELECT 1 FROM %1$I.upload_parts p WHERE p.file_id = f)
-        ON CONFLICT DO NOTHING;
+        PERFORM %1$I.queue_garbage(COALESCE(old_parts, ARRAY[]::int8[]) || old_file);
       END IF;
       RETURN 'ok';
     END $body$;
@@ -316,13 +296,7 @@ BEGIN
         parts = NULL, part_ends = NULL, inline_data = EXCLUDED.inline_data,
         created_at = now();
       IF found_old AND old_file IS NOT NULL THEN
-        INSERT INTO %1$I.garbage (file_id)
-        SELECT f FROM unnest(COALESCE(old_parts, ARRAY[]::int8[]) || old_file) AS f
-        WHERE f IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
-          AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
-          AND NOT EXISTS (SELECT 1 FROM %1$I.upload_parts p WHERE p.file_id = f)
-        ON CONFLICT DO NOTHING;
+        PERFORM %1$I.queue_garbage(COALESCE(old_parts, ARRAY[]::int8[]) || old_file);
       END IF;
       RETURN 'ok';
     END $body$;
@@ -331,7 +305,9 @@ BEGIN
     -- chain passes until the backlog is drained.
     CREATE OR REPLACE FUNCTION %1$I.expire_objects(p_max int DEFAULT 4096)
     RETURNS int LANGUAGE plpgsql AS $body$
-    DECLARE removed int := 0;
+    DECLARE
+      removed int := 0;
+      dead_files int8[];
     BEGIN
       WITH victims AS (
         SELECT key FROM %1$I.objects
@@ -340,24 +316,20 @@ BEGIN
         FOR UPDATE SKIP LOCKED
       ), doomed AS (
         DELETE FROM %1$I.objects o USING victims v WHERE o.key = v.key
-        RETURNING o.key, o.file_id, o.parts
+        RETURNING o.file_id, o.parts
       ), dead AS (
         SELECT file_id FROM doomed WHERE file_id IS NOT NULL
         UNION ALL
         SELECT unnest(parts) FROM doomed WHERE parts IS NOT NULL
-      ), queued AS (
-        INSERT INTO %1$I.garbage (file_id)
-        SELECT DISTINCT d.file_id FROM dead d
-        WHERE d.file_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.file_id IS NOT NULL AND o.file_id = d.file_id)
-          AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id])
-          AND NOT EXISTS (SELECT 1 FROM %1$I.upload_parts p WHERE p.file_id = d.file_id)
-        ON CONFLICT DO NOTHING
       )
-      SELECT count(*)::int INTO removed FROM doomed;
-      RETURN removed;
+      SELECT (SELECT count(*)::int FROM doomed), array_agg(file_id)
+        INTO removed, dead_files FROM dead;
+      IF dead_files IS NOT NULL THEN
+        PERFORM %1$I.queue_garbage(dead_files);
+      END IF;
+      RETURN COALESCE(removed, 0);
     END $body$;
-  $fn$, v_schema, hashtextextended(v_schema, 0), v_inline);
+  $fn$, p_schema, hashtextextended(p_schema, 0), v_inline);
 
   IF p_kind = 'bucket' THEN
     EXECUTE format($fn$
@@ -370,12 +342,7 @@ BEGIN
         DELETE FROM %1$I.upload_parts WHERE upload_id = p_upload AND part_no = p_no
           RETURNING file_id INTO old;
         IF old IS NOT NULL THEN
-          INSERT INTO %1$I.garbage (file_id)
-          SELECT old
-          WHERE NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.file_id IS NOT NULL AND o.file_id = old)
-            AND NOT EXISTS (SELECT 1 FROM %1$I.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[old])
-            AND NOT EXISTS (SELECT 1 FROM %1$I.upload_parts p WHERE p.file_id = old)
-          ON CONFLICT DO NOTHING;
+          PERFORM %1$I.queue_garbage(ARRAY[old]);
         END IF;
         INSERT INTO %1$I.upload_parts (upload_id, part_no, file_id, size, sha256, md5, checksum)
         VALUES (p_upload, p_no, p_file_id, p_size, p_sha, p_md5, p_checksum);
@@ -400,9 +367,46 @@ BEGIN
         END LOOP;
         RETURN removed;
       END $body$;
-    $fn$, v_schema);
+    $fn$, p_schema);
+  END IF;
+END $$;
+
+-- Idempotently creates a namespace's schema, tables, indexes and SQL helpers.
+CREATE OR REPLACE FUNCTION s3p.ensure_namespace(
+  p_kind text, p_name text, p_quota int8 DEFAULT NULL, p_attrs jsonb DEFAULT NULL
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  v_schema text := s3p.namespace_schema(p_kind, p_name);
+BEGIN
+  IF to_regclass(format('%I.objects', v_schema)) IS NOT NULL
+     OR to_regclass(format('%I.messages', v_schema)) IS NOT NULL THEN
+    IF EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = p_kind AND name = p_name) THEN
+      RETURN v_schema;
+    END IF;
   END IF;
 
+  PERFORM pg_advisory_xact_lock(hashtextextended('s3p.ns', 0) # hashtextextended(p_kind || ':' || p_name, 1));
+
+  IF p_quota IS NULL AND p_attrs IS NULL
+     AND (to_regclass(format('%I.objects', v_schema)) IS NOT NULL
+          OR to_regclass(format('%I.messages', v_schema)) IS NOT NULL)
+     AND EXISTS (SELECT 1 FROM s3p.namespaces WHERE kind = p_kind AND name = p_name) THEN
+    RETURN v_schema;
+  END IF;
+
+  INSERT INTO s3p.namespaces (kind, name, schema_name, quota_bytes, attrs)
+  VALUES (p_kind, p_name, v_schema, p_quota, coalesce(p_attrs, '{}'::jsonb))
+  ON CONFLICT (kind, name) DO UPDATE
+    SET quota_bytes = coalesce(EXCLUDED.quota_bytes, s3p.namespaces.quota_bytes),
+        attrs = s3p.namespaces.attrs || EXCLUDED.attrs;
+
+  EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', v_schema);
+
+  IF p_kind = 'queue' THEN
+    PERFORM s3p.ensure_queue_schema(v_schema);
+  ELSE
+    PERFORM s3p.ensure_object_schema(v_schema, p_kind);
+  END IF;
   RETURN v_schema;
 END $$;
 

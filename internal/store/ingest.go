@@ -529,13 +529,7 @@ func queueFileIDs(ctx context.Context, tx pgx.Tx, schema string, ids []int64) er
 	if len(ids) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO `+schema+`.garbage (file_id)
-		SELECT f FROM unnest($1::int8[]) AS f
-		WHERE f <> 0
-		  AND NOT EXISTS (SELECT 1 FROM `+schema+`.objects o WHERE o.file_id IS NOT NULL AND o.file_id = f)
-		  AND NOT EXISTS (SELECT 1 FROM `+schema+`.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[f])
-		  AND NOT EXISTS (SELECT 1 FROM `+schema+`.upload_parts p WHERE p.file_id = f)
-		ON CONFLICT DO NOTHING`, ids)
+	_, err := tx.Exec(ctx, "SELECT "+schema+".queue_garbage($1::int8[])", ids)
 	return err
 }
 
