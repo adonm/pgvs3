@@ -294,6 +294,27 @@ single-request uploads buffer the body (memory ≤8 MiB, otherwise a temp file)
 before opening a PostgreSQL writer so origin latency never holds pool
 connections. Supported origin types are `s3`, `filesystem` and `inmem`.
 
+## Profiling
+
+`--pprof-addr` starts an optional Go pprof listener without exposing it on the
+S3 port. It is off by default; bind it to `127.0.0.1` on a host you control.
+
+```sh
+pgvs3 serve --url "$PGVS3_URL" --pprof-addr 127.0.0.1:6060
+
+# CPU flame graph for the running gateway.
+go tool pprof -seconds 30 -http=127.0.0.1:6061 \
+  http://127.0.0.1:6060/debug/pprof/profile
+
+# Capture a profile for offline pprof/FlameGraph use.
+curl -fsS 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30' \
+  -o cpu.pb.gz
+go tool pprof -top ./pgvs3 cpu.pb.gz
+```
+
+For database-side query and wait analysis, run
+[pgbot](https://pgbot.dev/) against the same database with a `pg_monitor` role.
+
 ## Admission control
 
 `--queue-concurrency` (default 16) and `--resp-concurrency` (default 32) bound

@@ -249,6 +249,7 @@ Every flag maps to an environment variable.
 | `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long overwritten/deleted files stay readable before GC. |
 | `--read-only` | `PGVS3_READ_ONLY` | `false` | Reject writes and skip DDL/reaping (for PostgreSQL standbys). |
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | Log verbosity (`debug`, `info`, `warn`, `error`). |
+| `--pprof-addr` | `PGVS3_PPROF_ADDR` | unset | Optional loopback address for Go `net/http/pprof`, e.g. `127.0.0.1:6060`. |
 | `--max-conns` | `PGVS3_MAX_CONNS` | `4096` | Concurrent client connections before shedding load. |
 | `--origin-config` | `PGVS3_ORIGIN_CONFIG` | unset | objstore YAML file; enables the S3 cache tier. |
 | `--cache-ttl` | `PGVS3_CACHE_TTL` | `1m` | Origin revalidation interval (`0` = always revalidate). |

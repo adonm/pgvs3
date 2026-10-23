@@ -59,6 +59,10 @@ func runSQS(endpoint, queue, op string, size int64, workers, pipeline int, durat
 		},
 	}
 	queueURL := endpoint + "/" + queue
+	if err := sqsCall(c, endpoint, "CreateQueue", map[string]any{"QueueName": queue}, nil); err != nil {
+		fmt.Fprintln(os.Stderr, "create queue:", err)
+		return
+	}
 	payload := bytes.Repeat([]byte("q"), int(size))
 
 	var (

@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -93,6 +95,7 @@ func serve(args []string) int {
 		reapGrace = fs.Duration("reap-grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "how long deleted files stay readable")
 		readOnly  = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating requests")
 		logLevel  = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
+		pprofAddr = fs.String("pprof-addr", env("PGVS3_PPROF_ADDR", ""), "optional loopback address for net/http/pprof, e.g. 127.0.0.1:6060")
 		originCfg = fs.String("origin-config", env("PGVS3_ORIGIN_CONFIG", ""), "objstore YAML file: serve S3 as a read-through cache")
 		cacheTTL  = fs.Duration("cache-ttl", envDuration("PGVS3_CACHE_TTL", time.Minute), "origin revalidation interval")
 		cacheKeep = fs.Duration("cache-retention", envDuration("PGVS3_CACHE_RETENTION", 24*time.Hour), "evict cached objects after this idle period")
@@ -154,6 +157,14 @@ func serve(args []string) int {
 		<-ctx.Done()
 		g.SetDraining(true)
 	}()
+	if *pprofAddr != "" {
+		go func() {
+			log.Info("pprof listening", "addr", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, http.DefaultServeMux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("pprof server", "err", err)
+			}
+		}()
+	}
 	srv := gateway.NewHTTPServer(*addr, g, log)
 	log.Info("pgvs3 starting", "version", version, "addr", *addr)
 	if err := gateway.Run(ctx, srv, g, 5*time.Second, *maxConns, log); err != nil {
