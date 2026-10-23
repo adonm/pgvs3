@@ -5,7 +5,6 @@ package objcache
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,8 +16,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-kit/log"
+	"github.com/jackc/pgx/v5"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/objstore/providers/s3"
@@ -37,7 +38,9 @@ type Tier struct {
 	ttl       time.Duration
 	retention time.Duration
 	fills     chan struct{}
+	completes chan struct{}
 	group     singleflight.Group
+	meta      *s3Meta
 	log       *slog.Logger
 }
 
@@ -45,6 +48,10 @@ type Tier struct {
 // PostgreSQL. Larger bodies spool to a temp file so a database connection is
 // never held while waiting on the origin network.
 const memFillMax = 8 << 20
+
+// maxListingEntries bounds one origin listing refresh. Beyond this the direct
+// walk is used and the index is not built, keeping memory bounded.
+const maxListingEntries = 1_000_000
 
 // fullCacheMax is the largest object downloaded whole to satisfy a range
 // request. Above it, ranges are passed through to the origin so a footer read
@@ -101,6 +108,14 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 	if maxFills <= 0 {
 		maxFills = 8
 	}
+	var meta *s3Meta
+	if strings.EqualFold(c.Type, "s3") {
+		if m, err := newS3Meta(c); err == nil {
+			meta = m
+		} else {
+			log.Warn("origin metadata unavailable; falling back to extension content types", "err", err)
+		}
+	}
 	return &Tier{
 		origin:    b,
 		store:     st,
@@ -108,6 +123,8 @@ func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl
 		ttl:       ttl,
 		retention: retention,
 		fills:     make(chan struct{}, maxFills),
+		completes: make(chan struct{}, maxFills),
+		meta:      meta,
 		log:       log,
 	}, nil
 }
@@ -138,33 +155,6 @@ func (o *Object) ContentLength() int64 {
 	return o.End - o.Start + 1
 }
 
-// Ensure returns fresh metadata for bucket/key, downloading from the origin
-// when the cached copy is missing, stale or a different version.
-func (t *Tier) Ensure(ctx context.Context, bucket, key string) (*store.Meta, error) {
-	ck := t.key(bucket, key)
-	m, err := t.store.MetaHeaderKind(ctx, ns.Cache, t.namespace, ck)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-	if err == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl {
-		return m, nil
-	}
-	attrs, aerr := t.origin.Attributes(ctx, ck)
-	if aerr != nil {
-		if t.origin.IsObjNotFoundErr(aerr) {
-			return nil, store.ErrNotFound
-		}
-		return nil, aerr
-	}
-	version := versionFor(attrs)
-	if err == nil && m.Size == attrs.Size && m.OriginETag == version {
-		t.touch(ctx, ck)
-		m.CreatedAt = time.Now()
-		return m, nil
-	}
-	return t.fill(ctx, ck, key, attrs.Size, version)
-}
-
 // Head returns metadata for bucket/key without downloading the origin body on a
 // cache miss.
 func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
@@ -175,30 +165,34 @@ func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 	}
 	if err == nil && t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl {
 		return &Object{
-			Size: m.Size, ETag: m.ETag, ContentType: m.ContentType,
+			Size: m.Size, ETag: originETag(m), ContentType: m.ContentType,
 			UserMetadata: m.UserMetadata, LastModified: m.CreatedAt,
 			End: max(m.Size-1, 0), Hit: true,
 		}, nil
 	}
-	attrs, aerr := t.origin.Attributes(ctx, ck)
+	a, aerr := t.attrs(ctx, ck, key)
 	if aerr != nil {
 		if t.origin.IsObjNotFoundErr(aerr) {
 			return nil, store.ErrNotFound
 		}
 		return nil, aerr
 	}
-	version := versionFor(attrs)
-	if err == nil && m.Size == attrs.Size && m.OriginETag == version {
+	version := versionFor(a)
+	if err == nil && m.Size == a.Size && m.OriginETag == version {
 		t.touch(ctx, ck)
 		return &Object{
-			Size: m.Size, ETag: m.ETag, ContentType: m.ContentType,
+			Size: m.Size, ETag: originETag(m), ContentType: m.ContentType,
 			UserMetadata: m.UserMetadata, LastModified: time.Now(),
 			End: max(m.Size-1, 0), Hit: true,
 		}, nil
 	}
+	ct := a.ContentType
+	if ct == "" {
+		ct = contentTypeFor(key)
+	}
 	return &Object{
-		Size: attrs.Size, ETag: etagFor(version), ContentType: contentTypeFor(key),
-		LastModified: attrs.LastModified, End: max(attrs.Size-1, 0),
+		Size: a.Size, ETag: etagForAttrs(a), ContentType: ct,
+		LastModified: a.LastModified, End: max(a.Size-1, 0),
 	}, nil
 }
 
@@ -217,31 +211,40 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 		size    int64
 		version string
 		lastMod time.Time
+		ct      string
+		a       originAttrs
 	)
 	if valid {
 		size = m.Size
 		lastMod = m.CreatedAt
+		ct = m.ContentType
 	} else {
-		attrs, err := t.origin.Attributes(ctx, ck)
+		var err error
+		a, err = t.attrs(ctx, ck, key)
 		if err != nil {
 			if t.origin.IsObjNotFoundErr(err) {
 				return nil, store.ErrNotFound
 			}
 			return nil, err
 		}
-		size = attrs.Size
-		lastMod = attrs.LastModified
-		version = versionFor(attrs)
+		size = a.Size
+		lastMod = a.LastModified
+		version = versionFor(a)
+		ct = a.ContentType
 		if merr == nil {
 			if m.Size == size && m.OriginETag == version {
 				t.touch(ctx, ck)
 				valid = true
+				ct = m.ContentType
 			} else {
 				// Origin moved on: never serve stale bytes.
 				_, _ = t.store.CacheDel(ctx, t.namespace, []string{ck})
 				m, merr = nil, store.ErrNotFound
 			}
 		}
+	}
+	if ct == "" {
+		ct = contentTypeFor(key)
 	}
 
 	start, end, ranged := resolveRange(size, first, last, suffix)
@@ -251,13 +254,13 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 	if size == 0 {
 		if !valid {
 			var err error
-			m, err = t.fill(ctx, ck, key, 0, version)
+			m, err = t.fill(ctx, ck, key, 0, version, ct)
 			if err != nil {
 				return nil, err
 			}
 		}
 		return &Object{
-			Size: 0, ETag: m.ETag, ContentType: m.ContentType,
+			Size: 0, ETag: originETag(m), ContentType: m.ContentType,
 			UserMetadata: m.UserMetadata, LastModified: m.CreatedAt,
 			Body: io.NopCloser(bytes.NewReader(nil)), Hit: valid,
 		}, nil
@@ -266,7 +269,7 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 	length := end - start + 1
 	if valid || length == size || size <= fullCacheMax {
 		if !valid {
-			if _, err := t.fill(ctx, ck, key, size, version); err != nil {
+			if _, err := t.fill(ctx, ck, key, size, version, ct); err != nil {
 				return nil, err
 			}
 		}
@@ -275,7 +278,7 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 			return nil, err
 		}
 		return &Object{
-			Size: sm.Size, ETag: sm.ETag, ContentType: sm.ContentType,
+			Size: sm.Size, ETag: originETagSlice(sm), ContentType: sm.ContentType,
 			UserMetadata: sm.UserMetadata, LastModified: sm.CreatedAt,
 			Body: body, Start: sm.Start, End: sm.End,
 			Ranged: ranged, Hit: valid,
@@ -290,7 +293,7 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 		return nil, err
 	}
 	return &Object{
-		Size: size, ETag: etagFor(version), ContentType: contentTypeFor(key),
+		Size: size, ETag: etagForAttrs(a), ContentType: ct,
 		LastModified: lastMod, Body: rc, Start: start, End: end, Ranged: ranged,
 	}, nil
 }
@@ -299,7 +302,7 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, first, last, suffix
 // cache namespace with version, and returns the stored metadata. Concurrent
 // fills for the same ck coalesce via singleflight so a thundering herd on a
 // cold key pulls from the origin only once.
-func (t *Tier) fill(ctx context.Context, ck, key string, _ int64, version string) (*store.Meta, error) {
+func (t *Tier) fill(ctx context.Context, ck, key string, _ int64, version, ct string) (*store.Meta, error) {
 	ch := t.group.DoChan(ck, func() (any, error) {
 		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 		defer cancel()
@@ -322,7 +325,7 @@ func (t *Tier) fill(ctx context.Context, ck, key string, _ int64, version string
 			return nil, err
 		}
 		defer cleanup()
-		return t.storeSpooled(fillCtx, ck, nil, contentTypeFor(key), version, sp)
+		return t.storeSpooled(fillCtx, ck, nil, ct, version, sp)
 	})
 	select {
 	case res := <-ch:
@@ -421,10 +424,23 @@ func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, u
 		return nil, err
 	}
 	var version string
-	if attrs, err := t.origin.Attributes(ctx, ck); err == nil {
-		version = versionFor(attrs)
+	var attrs originAttrs
+	if a, err := t.attrs(ctx, ck, key); err == nil {
+		attrs = a
+		version = versionFor(a)
 	}
-	return t.storeSpooled(ctx, ck, userMeta, contentType, version, sp)
+	m, err := t.storeSpooled(ctx, ck, userMeta, contentType, version, sp)
+	if err != nil {
+		return nil, err
+	}
+	if !attrs.LastModified.IsZero() {
+		m.ETag = etagForAttrs(attrs)
+		_ = t.store.UpsertOriginEntry(ctx, t.namespace, store.OriginListEntry{
+			Key: ck, Size: sp.size, ETag: etagForAttrs(attrs),
+			ContentType: contentType, LastModified: attrs.LastModified,
+		})
+	}
+	return m, nil
 }
 
 // Copy copies srcBucket/srcKey to dstBucket/dstKey with write-through caching:
@@ -458,22 +474,43 @@ func (t *Tier) StartPart(ctx context.Context, uploadID, bucket, key string, part
 func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string, listed []store.ListedPart) (*store.Completed, error) {
 	ck := t.key(bucket, key)
 	exp := time.Now().Add(t.retention)
-	done, err := t.store.CompleteUploadKind(ctx, ns.Cache, uploadID, t.namespace, ck, listed, &exp)
+	select {
+	case t.completes <- struct{}{}:
+		defer func() { <-t.completes }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	done, err := t.store.CompleteUploadKindUpload(ctx, ns.Cache, uploadID, t.namespace, ck, listed, &exp,
+		func(ctx context.Context, tx pgx.Tx, schema string, ids []int64) error {
+			pr, pw := io.Pipe()
+			errCh := make(chan error, 1)
+			go func() {
+				err := store.StreamChunks(ctx, tx, schema, ids, pw)
+				_ = pw.CloseWithError(err)
+				errCh <- err
+			}()
+			upErr := t.origin.Upload(ctx, ck, pr)
+			if upErr != nil {
+				_ = pr.CloseWithError(upErr)
+			} else {
+				_ = pr.Close()
+			}
+			streamErr := <-errCh
+			if upErr != nil {
+				return upErr
+			}
+			return streamErr
+		})
 	if err != nil {
 		return nil, err
 	}
-	_, body, err := t.store.GetBodyKind(ctx, ns.Cache, t.namespace, ck, 0, -1, -1, nil)
-	if err != nil {
-		return nil, err
-	}
-	upErr := t.origin.Upload(ctx, ck, body)
-	_ = body.Close()
-	if upErr != nil {
-		_, _ = t.store.CacheDel(ctx, t.namespace, []string{ck})
-		return nil, upErr
-	}
-	if attrs, err := t.origin.Attributes(ctx, ck); err == nil {
-		t.setOriginETag(ctx, ck, versionFor(attrs))
+	if a, err := t.attrs(ctx, ck, key); err == nil {
+		t.setOriginETag(ctx, ck, versionFor(a))
+		done.ETag = etagForAttrs(a)
+		_ = t.store.UpsertOriginEntry(ctx, t.namespace, store.OriginListEntry{
+			Key: ck, Size: done.Size, ETag: etagForAttrs(a),
+			ContentType: done.ContentType, LastModified: a.LastModified,
+		})
 	}
 	done.Bucket = bucket
 	done.Key = key
@@ -507,35 +544,106 @@ func (t *Tier) Delete(ctx context.Context, bucket, key string) error {
 		return err
 	}
 	_, _ = t.store.CacheDel(ctx, t.namespace, []string{ck})
+	_ = t.store.DeleteOriginEntries(ctx, t.namespace, []string{ck})
 	return nil
 }
 
-// DeleteMany removes each key from the origin and evicts them from the cache in
-// a single batch.
-func (t *Tier) DeleteMany(ctx context.Context, bucket string, keys []string) error {
-	cks := make([]string, 0, len(keys))
+// DeleteResult is the outcome of one origin delete. A nil Err means the key
+// was deleted or did not exist (both are success in S3 DeleteObjects).
+type DeleteResult struct {
+	Key string
+	Err error
+}
+
+// DeleteMany removes each key from the origin and evicts successful keys from
+// the cache. It continues past per-key failures so the S3 layer can return
+// S3-shaped per-key results.
+func (t *Tier) DeleteMany(ctx context.Context, bucket string, keys []string) []DeleteResult {
+	results := make([]DeleteResult, 0, len(keys))
+	evict := make([]string, 0, len(keys))
 	for _, k := range keys {
 		ck := t.key(bucket, k)
 		if err := t.origin.Delete(ctx, ck); err != nil && !t.origin.IsObjNotFoundErr(err) {
-			return err
+			results = append(results, DeleteResult{Key: k, Err: err})
+			continue
 		}
-		cks = append(cks, ck)
+		evict = append(evict, ck)
+		results = append(results, DeleteResult{Key: k})
 	}
-	_, _ = t.store.CacheDel(ctx, t.namespace, cks)
-	return nil
+	if len(evict) > 0 {
+		_, _ = t.store.CacheDel(ctx, t.namespace, evict)
+		_ = t.store.DeleteOriginEntries(ctx, t.namespace, evict)
+	}
+	return results
 }
 
-// Exists reports whether the object exists at the origin.
-func (t *Tier) Exists(ctx context.Context, bucket, key string) (bool, error) {
-	return t.origin.Exists(ctx, t.key(bucket, key))
-}
-
-// List returns up to limit origin keys under prefix in lexical order, using
-// cached metadata when fresh so warm keys avoid per-key origin HEAD calls.
+// List returns up to limit origin keys under prefix in lexical order. It
+// serves from the PostgreSQL listing index when that prefix is fresh, and
+// rebuilds the index from the origin on a cold or stale prefix. If the rebuild
+// fails (for example an origin outage) it falls back to a direct walk.
 func (t *Tier) List(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
+	pfx := bucket + "/" + prefix
+	prefixEnd := pfx + "\U0010FFFF"
+	if t.store != nil {
+		rows, fresh, err := t.store.ListOrigin(ctx, t.namespace, pfx, prefixEnd, bucket+"/"+after, limit, t.ttl)
+		if err == nil && fresh {
+			return listedFromEntries(rows, bucket), nil
+		}
+		if err := t.refreshListing(ctx, bucket, prefix); err != nil {
+			t.log.Warn("origin listing refresh failed; falling back to direct walk", "bucket", bucket, "prefix", prefix, "err", err)
+			return t.listDirect(ctx, bucket, prefix, after, limit)
+		}
+		rows, fresh, err = t.store.ListOrigin(ctx, t.namespace, pfx, prefixEnd, bucket+"/"+after, limit, t.ttl)
+		if err == nil && fresh {
+			return listedFromEntries(rows, bucket), nil
+		}
+	}
+	return t.listDirect(ctx, bucket, prefix, after, limit)
+}
+
+func (t *Tier) refreshListing(ctx context.Context, bucket, prefix string) error {
+	pfx := bucket + "/" + prefix
+	_, err, _ := t.group.Do("listing:"+pfx, func() (any, error) {
+		listCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		if err := t.store.EnsureNamespace(listCtx, ns.Cache, t.namespace, nil, nil); err != nil {
+			return nil, err
+		}
+		dir := bucket + "/"
+		if i := strings.LastIndexByte(pfx, '/'); i >= 0 {
+			dir = pfx[:i+1]
+		}
+		entries := make([]store.OriginListEntry, 0, 1024)
+		err := t.origin.Iter(listCtx, dir, func(name string) error {
+			if strings.HasSuffix(name, "/") || !strings.HasPrefix(name, pfx) {
+				return nil
+			}
+			if len(entries) >= maxListingEntries {
+				return fmt.Errorf("origin listing exceeds %d keys", maxListingEntries)
+			}
+			a, err := t.attrs(listCtx, name, strings.TrimPrefix(name, bucket+"/"))
+			if err != nil {
+				return err
+			}
+			entries = append(entries, store.OriginListEntry{
+				Key: name, Size: a.Size, ETag: etagForAttrs(a),
+				ContentType: a.ContentType, LastModified: a.LastModified,
+			})
+			return nil
+		}, objstore.WithRecursiveIter())
+		if err != nil {
+			return nil, err
+		}
+		return nil, t.store.ReplaceOriginListing(listCtx, t.namespace, pfx, pfx+"\U0010FFFF", entries)
+	})
+	return err
+}
+
+// listDirect is the pre-index fallback: one origin walk plus metadata lookups.
+func (t *Tier) listDirect(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error) {
 	pfx := bucket + "/" + prefix
 	dir := bucket + "/"
 	if i := strings.LastIndexByte(pfx, '/'); i >= 0 {
@@ -577,15 +685,26 @@ func (t *Tier) List(ctx context.Context, bucket, prefix, after string, limit int
 			out = append(out, c)
 			continue
 		}
-		attrs, err := t.origin.Attributes(ctx, bucket+"/"+rel)
+		a, err := t.attrs(ctx, bucket+"/"+rel, rel)
 		if err != nil {
 			continue
 		}
 		out = append(out, store.Listed{
-			Key: rel, Size: attrs.Size, ETag: etagFor(versionFor(attrs)), CreatedAt: attrs.LastModified,
+			Key: rel, Size: a.Size, ETag: etagForAttrs(a), CreatedAt: a.LastModified,
 		})
 	}
 	return out, nil
+}
+
+func listedFromEntries(entries []store.OriginListEntry, bucket string) []store.Listed {
+	out := make([]store.Listed, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, store.Listed{
+			Key: strings.TrimPrefix(e.Key, bucket+"/"), Size: e.Size,
+			ETag: e.ETag, CreatedAt: e.LastModified,
+		})
+	}
+	return out
 }
 
 // resolveRange maps S3 range headers onto [start,end].
@@ -601,13 +720,73 @@ func resolveRange(size, first, last, suffix int64) (int64, int64, bool) {
 	return start, end, first > 0 || last >= 0
 }
 
-func versionFor(attrs objstore.ObjectAttributes) string {
+func versionFor(a originAttrs) string {
+	if a.ETag != "" {
+		return a.ETag
+	}
+	return fmt.Sprintf("%d-%d", a.Size, a.LastModified.UnixNano())
+}
+
+func etagForAttrs(a originAttrs) string {
+	if a.ETag != "" {
+		return a.ETag
+	}
+	return versionFor(a)
+}
+
+func etagForObjstore(attrs objstore.ObjectAttributes) string {
+	if attrs.Version != nil {
+		if v := textVersion(attrs.Version.Value); v != "" {
+			return v
+		}
+	}
 	return fmt.Sprintf("%d-%d", attrs.Size, attrs.LastModified.UnixNano())
 }
 
-func etagFor(version string) string {
-	sum := md5.Sum([]byte(version))
-	return hex.EncodeToString(sum[:])
+// textVersion keeps S3-style ASCII ETags and hex-encodes provider versions
+// that are raw bytes (the filesystem provider stores binary xattrs).
+func textVersion(v string) string {
+	if v == "" {
+		return ""
+	}
+	if utf8.ValidString(v) {
+		return v
+	}
+	return hex.EncodeToString([]byte(v))
+}
+
+func originETag(m *store.Meta) string {
+	if m.OriginETag != "" {
+		return m.OriginETag
+	}
+	return m.ETag
+}
+
+func originETagSlice(m *store.SliceMeta) string {
+	if m.OriginETag != "" {
+		return m.OriginETag
+	}
+	return m.ETag
+}
+
+// attrs returns origin metadata. The optional S3 statter supplies the exact
+// ETag and Content-Type; objstore remains the fallback for local providers and
+// for S3 configurations without static credentials.
+func (t *Tier) attrs(ctx context.Context, ck, key string) (originAttrs, error) {
+	if t.meta != nil {
+		if a, err := t.meta.attrs(ctx, ck); err == nil {
+			return a, nil
+		}
+	}
+	a, err := t.origin.Attributes(ctx, ck)
+	if err != nil {
+		return originAttrs{}, err
+	}
+	out := originAttrs{Size: a.Size, LastModified: a.LastModified}
+	if a.Version != nil {
+		out.ETag = textVersion(a.Version.Value)
+	}
+	return out, nil
 }
 
 func (t *Tier) touch(ctx context.Context, ck string) {

@@ -43,6 +43,10 @@ type Store struct {
 	chunkPool *pgxpool.Pool
 	log       *slog.Logger
 
+	maxDBBytes int64
+	dbSize     atomic.Int64
+	dbSizeAt   atomic.Int64
+
 	knownNS sync.Map // "kind\x00name" -> struct{}
 	quota   sync.Map // "kind\x00name" -> quotaState gauge
 
@@ -199,6 +203,10 @@ func (s *Store) Close() {
 }
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
+// SetMaxDBBytes installs a write-admission cap on pg_database_size. Zero
+// disables the guard. The size is sampled at most once every five seconds.
+func (s *Store) SetMaxDBBytes(n int64) { s.maxDBBytes = n }
+
 // Init installs the layout once, under a session advisory lock, and refuses
 // any other layout version rather than misreading it.
 func (s *Store) Init(ctx context.Context) error {
@@ -259,6 +267,9 @@ func (s *Store) Init(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, "SELECT s3p.reconcile_namespaces()"); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, "SELECT s3p.upgrade_queue_schemas()"); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -282,7 +293,7 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 		return err
 	}
 	defer conn.Release()
-	for _, rel := range []string{"s3p.layout", "s3p.namespaces", "s3p.file_ids"} {
+	for _, rel := range []string{"s3p.layout", "s3p.namespaces", "s3p.file_ids", "s3p.origin_listing", "s3p.origin_listing_state"} {
 		var exists bool
 		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", rel).Scan(&exists); err != nil {
 			return err
@@ -297,6 +308,7 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 		"s3p.clone_namespace(text,text,text)",
 		"s3p.adopt_namespace(text,text)",
 		"s3p.adopt_namespaces(text)",
+		"s3p.upgrade_queue_schemas()",
 	} {
 		var exists bool
 		if err := conn.QueryRow(ctx, "SELECT to_regprocedure($1) IS NOT NULL", fn).Scan(&exists); err != nil {

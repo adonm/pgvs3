@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/adonm/pgvs3/internal/objcache"
+	"github.com/adonm/pgvs3/internal/reqguard"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
@@ -87,6 +88,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { s.metrics.observe(r.Method, rw.status, time.Since(start), rw.n) }()
 	w.Header().Set("x-amz-request-id", requestIDHeader())
+	if reqguard.Presigned(r.URL.Query()) {
+		writeError(rw, r, apiErr("InvalidRequest", reqguard.PresignRejection, http.StatusBadRequest), s.log)
+		return
+	}
 	s.log.Debug("request", "method", r.Method, "host", r.Host, "path", r.URL.Path, "query", r.URL.RawQuery)
 	s.serve(rw, r)
 }
@@ -94,7 +99,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) SetDraining(v bool) { s.draining.Store(v) }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	prepareBody(r)
+	if err := prepareBody(r); err != nil {
+		writeError(w, r, err, s.log)
+		return
+	}
 	if strings.HasPrefix(r.URL.EscapedPath(), CachePrefix) {
 		s.serveCacheHTTP(w, r)
 		return
@@ -242,6 +250,14 @@ func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket strin
 }
 
 func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	if r.Header.Get("x-amz-bucket-object-lock-enabled") != "" {
+		writeError(w, r, errNotImplemented(), s.log)
+		return
+	}
+	if err := validateWriteHeaders(r); err != nil {
+		writeError(w, r, err, s.log)
+		return
+	}
 	src := strings.TrimPrefix(strings.TrimSpace(r.Header.Get("x-amz-copy-source")), "/")
 	if src == "" {
 		src = strings.TrimPrefix(strings.TrimSpace(r.URL.Query().Get("clone")), "/")
@@ -466,7 +482,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		writeError(w, r, errNotImplemented(), s.log)
 		return
 	}
-	if err := validateSSE(r); err != nil {
+	if err := validateWriteHeaders(r); err != nil {
 		writeError(w, r, err, s.log)
 		return
 	}
@@ -516,6 +532,8 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 				writeError(w, r, errNoSuchBucket(), s.log)
 			case errors.Is(err, store.ErrPrecondition):
 				writeError(w, r, errPreconditionFailed(), s.log)
+			case errors.Is(err, store.ErrQuotaExceeded):
+				writeError(w, r, apiErr("InsufficientStorage", "The database or namespace is over its storage budget.", http.StatusInsufficientStorage), s.log)
 			default:
 				writeError(w, r, s.ingestError(err), s.log)
 			}
@@ -578,6 +596,10 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket, ke
 }
 
 func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
+	if r.Header.Get("x-amz-bypass-governance-retention") != "" {
+		writeError(w, r, errNotImplemented(), s.log)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
 	if err != nil {
 		writeError(w, r, bodyError(err), s.log)
@@ -607,19 +629,30 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket st
 		}
 		keys = append(keys, o.Key)
 	}
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		err = origin.DeleteMany(r.Context(), bucket, keys)
-	} else {
-		err = s.store.DeleteMany(r.Context(), bucket, keys)
-	}
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
 	out := deleteResult{Xmlns: s3Namespace}
-	if !req.Quiet {
-		for _, k := range keys {
-			out.Deleted = append(out.Deleted, deletedXML{Key: k})
+	if origin := s.originFor(r.Context(), bucket); origin != nil {
+		for _, res := range origin.DeleteMany(r.Context(), bucket, keys) {
+			if res.Err != nil {
+				s.log.Warn("origin delete failed", "bucket", bucket, "key", res.Key, "err", res.Err)
+				out.Errors = append(out.Errors, deleteErrXML{
+					Key: res.Key, Code: "InternalError",
+					Message: "The object could not be deleted.",
+				})
+				continue
+			}
+			if !req.Quiet {
+				out.Deleted = append(out.Deleted, deletedXML{Key: res.Key})
+			}
+		}
+	} else {
+		if err := s.store.DeleteMany(r.Context(), bucket, keys); err != nil {
+			writeError(w, r, errInternal(err, s.log), s.log)
+			return
+		}
+		if !req.Quiet {
+			for _, k := range keys {
+				out.Deleted = append(out.Deleted, deletedXML{Key: k})
+			}
 		}
 	}
 	writeXML(w, http.StatusOK, out)
@@ -630,7 +663,7 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, b
 		writeError(w, r, errNotImplemented(), s.log)
 		return
 	}
-	if err := validateSSE(r); err != nil {
+	if err := validateWriteHeaders(r); err != nil {
 		writeError(w, r, err, s.log)
 		return
 	}
@@ -677,6 +710,10 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, b
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+	if err := validateWriteHeaders(r); err != nil {
+		writeError(w, r, err, s.log)
+		return
+	}
 	partNo, err := strconv.ParseInt(q.Get("partNumber"), 10, 32)
 	if err != nil || partNo < 1 || partNo > 10000 {
 		writeError(w, r, errInvalidPart(), s.log)
@@ -731,6 +768,10 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 }
 
 func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+	if err := validateWriteHeaders(r); err != nil {
+		writeError(w, r, err, s.log)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	if err != nil {
 		writeError(w, r, bodyError(err), s.log)
@@ -935,12 +976,18 @@ func (s *Server) metaError(w http.ResponseWriter, r *http.Request, _ string, err
 		writeError(w, r, errNoSuchKey(), s.log)
 	case errors.Is(err, store.ErrInvalidBucket):
 		writeError(w, r, errInvalidBucketName(), s.log)
+	case errors.Is(err, store.ErrQuotaExceeded):
+		writeError(w, r, apiErr("InsufficientStorage", "The database or namespace is over its storage budget.", http.StatusInsufficientStorage), s.log)
 	default:
 		writeError(w, r, errInternal(err, s.log), s.log)
 	}
 }
 
 func (s *Server) ingestError(err error) error {
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return ae
+	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "objects_bucket_fkey" {
 		return errNoSuchBucket()
@@ -956,12 +1003,18 @@ func (s *Server) ingestError(err error) error {
 		return errNoSuchUpload()
 	case errors.Is(err, store.ErrMissingChecksum):
 		return errInvalidRequest("part lacks the upload's checksum")
+	case errors.Is(err, store.ErrQuotaExceeded):
+		return apiErr("InsufficientStorage", "The database or namespace is over its storage budget.", http.StatusInsufficientStorage)
 	default:
 		return errInternal(err, s.log)
 	}
 }
 
 func bodyError(err error) error {
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return ae
+	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return apiErr("IncompleteBody", "The request body terminated unexpectedly.", http.StatusBadRequest)
 	}

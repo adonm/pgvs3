@@ -33,6 +33,7 @@ type ReadCondition struct {
 type SliceMeta struct {
 	Size         int64
 	ETag         string
+	OriginETag   string
 	UserMetadata []string
 	ContentType  string
 	CreatedAt    time.Time
@@ -428,7 +429,7 @@ func (s *Store) GetBodyKind(ctx context.Context, kind ns.Kind, name, key string,
 			return nil, nil, ErrInvalidRange
 		}
 		sm := &SliceMeta{
-			Size: m.Size, ETag: m.ETag, UserMetadata: m.UserMetadata,
+			Size: m.Size, ETag: m.ETag, OriginETag: m.OriginETag, UserMetadata: m.UserMetadata,
 			ContentType: m.ContentType, CreatedAt: m.CreatedAt,
 			FileID: m.FileID, Parts: m.Parts, PartEnds: m.PartEnds,
 			Start: mstart, End: mend,

@@ -89,6 +89,7 @@ func serve(args []string) int {
 		addr      = fs.String("addr", env("PGVS3_ADDR", "0.0.0.0:8014"), "S3/SQS/HTTP/RESP listen address")
 		poolMax   = fs.Int("pool-max", envInt("PGVS3_POOL_MAX", 64), "PostgreSQL connections per gateway")
 		maxConns  = fs.Int("max-conns", envInt("PGVS3_MAX_CONNS", 4096), "concurrent client connections")
+		maxDB     = fs.Int64("max-db-bytes", envInt64("PGVS3_MAX_DB_BYTES", 0), "reject writes when pg_database_size exceeds this (0 = unlimited)")
 		reapGrace = fs.Duration("reap-grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "how long deleted files stay readable")
 		readOnly  = fs.Bool("read-only", envBool("PGVS3_READ_ONLY"), "reject mutating requests")
 		logLevel  = fs.String("log-level", env("PGVS3_LOG_LEVEL", "info"), "debug, info, warn or error")
@@ -113,6 +114,7 @@ func serve(args []string) int {
 		return 1
 	}
 	defer st.Close()
+	st.SetMaxDBBytes(*maxDB)
 
 	if *readOnly {
 		if err := st.CheckLayout(ctx); err != nil {
@@ -522,6 +524,15 @@ func envBool(key string) bool {
 func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}

@@ -23,7 +23,7 @@ type copyObjectResult struct {
 }
 
 func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if err := validateSSE(r); err != nil {
+	if err := validateWriteHeaders(r); err != nil {
 		writeError(w, r, err, s.log)
 		return
 	}

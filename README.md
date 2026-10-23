@@ -12,10 +12,13 @@ cached blobs live there too — one database to run, back up, and replicate.
 The gateway is written in Go, holds zero in-process state, and ships as a
 ~14 MB distroless static container built with [ko](https://ko.build/).
 
-> **Private-network only.** pgvs3 does not validate S3 signatures or
-> credentials; signed and unsigned requests are both accepted. Run it on a
-> loopback interface, private VPC/VLAN, or behind a service mesh that enforces
-> access control and TLS.
+> **Trusted networks only — permanently.** pgvs3 does not authenticate,
+> authorize, or encrypt connections, and does not validate S3 signatures or
+> credentials. Authentication is not part of the design and is not a future
+> goal. Run it on a loopback interface, private VPC/VLAN, or behind a service
+> mesh that enforces access control and TLS, and treat `:8014` like a database
+> port. Presigned URLs are rejected because a scoped link would otherwise
+> grant unscoped access. See [docs/design.md](docs/design.md).
 
 **Status: early alpha.** `pgvs3 migrate` upgrades a layout v10 database to v11
 in place. Older or unsupported layouts require a fresh database.
@@ -194,10 +197,14 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `DeleteMessage`, `DeleteMessageBatch`, `ChangeMessageVisibility`,
   `ChangeMessageVisibilityBatch`, `GetQueueAttributes`, `SetQueueAttributes`
   over both the JSON (`AmazonSQS.*`) and Query (`Action=`) protocols, with
-  visibility timeouts, delays, retention and long polling.
+  visibility timeouts, delays, retention and long polling. FIFO queues support
+  `MessageGroupId` ordering, a five-minute `MessageDeduplicationId` window
+  (explicit or content-based), and `SequenceNumber`; high-throughput FIFO mode
+  is not implemented.
 - **S3 cache tier:** read-through and write-through `GET`/`HEAD`/`PUT`/`CopyObject`/multipart uploads/`DELETE`/`DeleteObjects`/`ListObjectsV2` in front of an
   objstore origin (`X-Cache: HIT|MISS`), with TTL revalidation (`--cache-ttl`) and idle eviction
-  (`--cache-retention`).
+  (`--cache-retention`). `ListObjectsV2` is served from a PostgreSQL listing index that is
+  rebuilt from the origin on a cold or stale prefix; write-through updates keep it current.
 - **RESP (Redis/Valkey) cache protocol on `:8014`:** supports `GET`, `SET`
   (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `SETNX`, `SETEX`,
   `PSETEX`, `GETSET`, `GETDEL`, `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`,
@@ -213,9 +220,12 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `MULTI`/`EXEC`/`WATCH` are rejected explicitly (use a pipeline; in
   `redis-py` pass `transaction=False`) because pgvs3 has no cross-command
   snapshot, and pretending otherwise would lose updates.
-- **Out of scope:** IAM/bucket policies, versioning, object tags, Object Lock,
-  ACLs, lifecycle rules, replication, event notifications, SSE-C/DSSE-KMS, and
-  multipart `FULL_OBJECT` checksums.
+- **Out of scope (not roadmap):** authentication/authorization, SigV4
+  validation, presigned URLs, TLS termination, audit logging, per-tenant
+  isolation, IAM/bucket policies, versioning, object tags, Object Lock, ACLs,
+  lifecycle rules, replication, event notifications, SSE-C/SSE-KMS/DSSE-KMS, and
+  multipart `FULL_OBJECT` checksums. The network is the security boundary; see
+  [docs/design.md](docs/design.md).
 
 ## Configuration and CLI
 
@@ -226,6 +236,7 @@ Every flag maps to an environment variable.
 | `--url` | `PGVS3_URL` | `postgres://localhost/pgvs3` | PostgreSQL connection URL (use `sslmode` for DB TLS). |
 | `--addr` | `PGVS3_ADDR` | `0.0.0.0:8014` | Listen address for S3, HTTP, `/healthz`, `/readyz`, and `/metrics`. |
 | `--pool-max` | `PGVS3_POOL_MAX` | `64` | Max PostgreSQL connections per gateway pod. |
+| `--max-db-bytes` | `PGVS3_MAX_DB_BYTES` | `0` | Reject writes when `pg_database_size` exceeds this (0 = unlimited). |
 | `--reap-grace` | `PGVS3_REAP_GRACE` | `10m` | How long overwritten/deleted files stay readable before GC. |
 | `--read-only` | `PGVS3_READ_ONLY` | `false` | Reject writes and skip DDL/reaping (for PostgreSQL standbys). |
 | `--log-level` | `PGVS3_LOG_LEVEL` | `info` | Log verbosity (`debug`, `info`, `warn`, `error`). |
@@ -293,6 +304,8 @@ just bench      # DuckDB httpfs + DuckLake benchmark suite
 
 Further reading:
 
+- [docs/design.md](docs/design.md) — design and shape, trust model, and scope
+  boundaries
 - [docs/performance.md](docs/performance.md) — storage layout, read/write paths,
   and DuckDB tuning
 - [docs/benchmarks.md](docs/benchmarks.md) — full benchmark tables and S3
@@ -300,6 +313,8 @@ Further reading:
 - [docs/operations.md](docs/operations.md) — deployment, probes, backups, and
   failure recovery
 - [docs/partitioning.md](docs/partitioning.md) — why `s3p.chunks` is unpartitioned
+- [docs/proposals/hardening-options.md](docs/proposals/hardening-options.md) —
+  open compatibility and hardening options under review
 - [CONTRIBUTING.md](CONTRIBUTING.md) — development workflow and invariants
 
 ## License

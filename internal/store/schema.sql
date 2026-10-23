@@ -32,6 +32,29 @@ CREATE TABLE IF NOT EXISTS s3p.namespaces (
   CONSTRAINT namespace_name_shape CHECK (name ~ '^[a-z0-9._-]{1,58}$')
 );
 
+-- Cache-tier origin listing index. Additive to layout v11: a missing index is
+-- rebuilt from the origin on demand, so it is never a source of truth.
+CREATE TABLE IF NOT EXISTS s3p.origin_listing (
+  kind         text NOT NULL DEFAULT 'cache' CHECK (kind = 'cache'),
+  namespace    text COLLATE "C" NOT NULL,
+  key          text COLLATE "C" NOT NULL,
+  size         int8 NOT NULL,
+  etag         text NOT NULL,
+  content_type text NOT NULL DEFAULT '',
+  last_modified timestamptz NOT NULL,
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (namespace, key),
+  FOREIGN KEY (kind, namespace) REFERENCES s3p.namespaces (kind, name) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS s3p.origin_listing_state (
+  namespace    text COLLATE "C" NOT NULL,
+  prefix       text COLLATE "C" NOT NULL,
+  refreshed_at timestamptz NOT NULL,
+  complete     bool NOT NULL DEFAULT false,
+  PRIMARY KEY (namespace, prefix)
+);
+
 CREATE OR REPLACE FUNCTION s3p.namespace_schema(p_kind text, p_name text)
 RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
 BEGIN
@@ -60,6 +83,8 @@ BEGIN
       body               bytea NOT NULL,
       body_size          int4 NOT NULL CHECK (body_size >= 0 AND octet_length(body) <= body_size),
       attrs              bytea,
+      group_id           text,
+      dedup_id           text,
       visible_at         timestamptz NOT NULL DEFAULT now(),
       receipt            text,
       receive_count      int4 NOT NULL DEFAULT 0,
@@ -67,10 +92,21 @@ BEGIN
       sent_at            timestamptz NOT NULL DEFAULT now(),
       expires_at         timestamptz NOT NULL
     ) WITH (fillfactor = 80);
+    ALTER TABLE %1$I.messages ADD COLUMN IF NOT EXISTS group_id text;
+    ALTER TABLE %1$I.messages ADD COLUMN IF NOT EXISTS dedup_id text;
     CREATE INDEX IF NOT EXISTS messages_ready ON %1$I.messages (visible_at, id);
+    CREATE INDEX IF NOT EXISTS messages_group_ready ON %1$I.messages (group_id, id)
+      WHERE group_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS messages_expiry ON %1$I.messages (expires_at);
     CREATE INDEX IF NOT EXISTS messages_receipt ON %1$I.messages (receipt)
       WHERE receipt IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS %1$I.dedup (
+      dedup_id   text PRIMARY KEY,
+      msg_id     text NOT NULL,
+      sequence   bigint GENERATED ALWAYS AS IDENTITY,
+      expires_at timestamptz NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS dedup_expiry ON %1$I.dedup (expires_at);
     CREATE TABLE IF NOT EXISTS %1$I.meta (
       singleton   bool PRIMARY KEY DEFAULT true CHECK (singleton),
       kind        text NOT NULL,
@@ -453,6 +489,8 @@ BEGIN
   END IF;
   EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', v_schema);
   DELETE FROM s3p.namespaces WHERE kind = p_kind AND name = p_name;
+  DELETE FROM s3p.origin_listing WHERE namespace = p_name;
+  DELETE FROM s3p.origin_listing_state WHERE namespace = p_name;
   RETURN 'deleted';
 END $$;
 
@@ -577,6 +615,12 @@ BEGIN
   DELETE FROM s3p.namespaces n
   WHERE to_regnamespace(format('%I', n.schema_name)) IS NULL
     AND (p_kind IS NULL OR n.kind = p_kind);
+  DELETE FROM s3p.origin_listing l
+  WHERE NOT EXISTS (SELECT 1 FROM s3p.namespaces n
+                    WHERE n.kind = 'cache' AND n.name = l.namespace);
+  DELETE FROM s3p.origin_listing_state s
+  WHERE NOT EXISTS (SELECT 1 FROM s3p.namespaces n
+                    WHERE n.kind = 'cache' AND n.name = s.namespace);
   RETURN adopted;
 END $$;
 
@@ -584,6 +628,21 @@ CREATE OR REPLACE FUNCTION s3p.reconcile_namespaces()
 RETURNS int LANGUAGE sql AS $$
   SELECT s3p.adopt_namespaces(NULL);
 $$;
+
+-- Applies additive queue DDL (FIFO columns, dedup table) to namespaces that
+-- already exist. Idempotent; runs on every non-read-only startup.
+CREATE OR REPLACE FUNCTION s3p.upgrade_queue_schemas()
+RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+  r record;
+  n int := 0;
+BEGIN
+  FOR r IN SELECT schema_name FROM s3p.namespaces WHERE kind = 'queue' LOOP
+    PERFORM s3p.ensure_queue_schema(r.schema_name);
+    n := n + 1;
+  END LOOP;
+  RETURN n;
+END $$;
 
 -- In-place migration from layout v10 (per-bucket schemas catalogued in
 -- s3p.buckets) to v11 (kind-prefixed namespaces catalogued in s3p.namespaces).

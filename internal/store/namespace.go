@@ -16,8 +16,9 @@ import (
 	"github.com/adonm/pgvs3/internal/ns"
 )
 
-// ErrQuotaExceeded is returned when a namespace is over its configured quota.
-var ErrQuotaExceeded = errors.New("namespace quota exceeded")
+// ErrQuotaExceeded is returned when a namespace or the database is over its
+// configured storage budget.
+var ErrQuotaExceeded = errors.New("namespace or database storage budget exceeded")
 
 // NewNamespaceRef validates a kind/name pair.
 func NewNamespaceRef(kind ns.Kind, name string) (ns.Kind, string, error) {
@@ -410,6 +411,9 @@ type quotaState struct {
 // once per second, adding the size of the incoming write. This makes the cap
 // near-hard (bounded by ~1s of writes) instead of once-per-maintenance-tick.
 func (s *Store) checkQuota(ctx context.Context, kind ns.Kind, name string, add int64) bool {
+	if s.overDBBudget(ctx, add) {
+		return true
+	}
 	key := nsKey(kind, name)
 	var st quotaState
 	if v, ok := s.quota.Load(key); ok {
@@ -458,6 +462,26 @@ func (s *Store) setQuotaState(kind ns.Kind, name string, size, quota int64) {
 	s.quota.Store(nsKey(kind, name), quotaState{checked: time.Now(), size: size, quota: quota})
 }
 
+// overDBBudget reports whether accepting add bytes would exceed the configured
+// pg_database_size cap. The sample is cached for five seconds per gateway.
+func (s *Store) overDBBudget(ctx context.Context, add int64) bool {
+	if s.maxDBBytes <= 0 {
+		return false
+	}
+	now := time.Now().UnixNano()
+	size := s.dbSize.Load()
+	if size == 0 || now-s.dbSizeAt.Load() > int64(5*time.Second) {
+		var n int64
+		if err := s.pool.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&n); err != nil {
+			return false
+		}
+		size = n
+		s.dbSize.Store(n)
+		s.dbSizeAt.Store(now)
+	}
+	return size+add > s.maxDBBytes
+}
+
 // checkNamespaceTables validates the per-namespace table settings the gateway
 // relies on: one 8,160-byte chunk tuple per page and the required indexes.
 func (s *Store) checkNamespaceTables(ctx context.Context, conn *pgxpool.Conn) error {
@@ -475,7 +499,7 @@ func (s *Store) checkNamespaceTables(ctx context.Context, conn *pgxpool.Conn) er
 			if !present {
 				continue
 			}
-			for _, rel := range []string{q + ".messages_ready", q + ".messages_receipt"} {
+			for _, rel := range []string{q + ".messages_ready", q + ".messages_receipt", q + ".messages_group_ready", q + ".dedup", q + ".dedup_expiry"} {
 				var exists bool
 				if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", rel).Scan(&exists); err != nil {
 					return err

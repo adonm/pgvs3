@@ -116,6 +116,10 @@ func (s *Server) getOriginObject(w http.ResponseWriter, r *http.Request, origin 
 }
 
 func (s *Server) putOriginObject(w http.ResponseWriter, r *http.Request, origin *objcache.Tier, bucket, key string) {
+	if err := validateWriteHeaders(r); err != nil {
+		writeError(w, r, err, s.log)
+		return
+	}
 	meta, err := parseMetadata(r.Header)
 	if err != nil {
 		writeError(w, r, err, s.log)

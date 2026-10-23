@@ -2,6 +2,13 @@
 
 pgvs3 is a stateless Go gateway over PostgreSQL 18+.
 
+## Scope
+
+pgvs3 is for trusted networks. Authentication, authorization, TLS
+termination, and presigned URLs are explicit non-goals, not unfinished work.
+Do not add them without an explicit project decision; see
+[docs/design.md](docs/design.md).
+
 ## Toolchain
 
 ```sh
@@ -87,4 +94,5 @@ Apache-2.0. See [LICENSE](LICENSE).
 | `internal/sqs` | SQS JSON and Query protocols |
 | `internal/resp` | RESP2 server |
 | `internal/objcache` | thanos-objstore read-through tier |
+| `internal/reqguard` | protocol-independent request policy checks (presigned URLs) |
 | `internal/gateway` | protocol mux and HTTP server |

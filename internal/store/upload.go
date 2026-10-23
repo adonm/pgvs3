@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -39,10 +40,11 @@ type ListedPart struct {
 
 // Completed describes a published multipart object.
 type Completed struct {
-	Bucket string
-	Key    string
-	ETag   string
-	Size   int64
+	Bucket      string
+	Key         string
+	ETag        string
+	Size        int64
+	ContentType string
 }
 
 // CompleteUpload validates the listed parts and publishes the ordered part
@@ -54,6 +56,18 @@ func (s *Store) CompleteUpload(ctx context.Context, uploadID, requestBucket, req
 // CompleteUploadKind validates the listed parts and publishes the multipart
 // object in a bucket or cache namespace.
 func (s *Store) CompleteUploadKind(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time) (*Completed, error) {
+	return s.completeUploadKind(ctx, kind, uploadID, requestBucket, requestKey, listed, expiresAt, nil)
+}
+
+// CompleteUploadKindUpload publishes only after upload has consumed the
+// selected object bytes. The callback runs inside the completion transaction,
+// before the object pointer is swapped, so a failed origin upload leaves the
+// cache unchanged. The callback must not use the transaction itself.
+func (s *Store) CompleteUploadKindUpload(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time, upload func(context.Context, pgx.Tx, string, []int64) error) (*Completed, error) {
+	return s.completeUploadKind(ctx, kind, uploadID, requestBucket, requestKey, listed, expiresAt, upload)
+}
+
+func (s *Store) completeUploadKind(ctx context.Context, kind ns.Kind, uploadID, requestBucket, requestKey string, listed []ListedPart, expiresAt *time.Time, beforePublish func(context.Context, pgx.Tx, string, []int64) error) (*Completed, error) {
 	sc, err := nsSQLIdent(kind, requestBucket)
 	if err != nil {
 		return nil, err
@@ -157,6 +171,11 @@ func (s *Store) CompleteUploadKind(ctx context.Context, kind ns.Kind, uploadID, 
 	if expiresAt != nil {
 		target = &writerTarget{expiresAt: expiresAt}
 	}
+	if beforePublish != nil {
+		if err := beforePublish(ctx, tx, sc, ids); err != nil {
+			return nil, err
+		}
+	}
 	if err := swapObjectParts(ctx, tx, sc, requestBucket, key, target, ids[0], size, shaAll.Sum(nil), etag, userMeta, contentType, ids, ends); err != nil {
 		return nil, err
 	}
@@ -186,7 +205,35 @@ func (s *Store) CompleteUploadKind(ctx context.Context, kind ns.Kind, uploadID, 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return &Completed{Bucket: requestBucket, Key: key, ETag: etag, Size: size}, nil
+	return &Completed{Bucket: requestBucket, Key: key, ETag: etag, Size: size, ContentType: contentType}, nil
+}
+
+// StreamChunks writes the concatenated chunk payloads for ids to w. It is
+// used by the cache tier to upload an assembled multipart object to the origin
+// before the cache publish commits.
+func StreamChunks(ctx context.Context, tx pgx.Tx, schema string, ids []int64, w io.Writer) error {
+	for _, id := range ids {
+		rows, err := tx.Query(ctx, `SELECT data FROM `+schema+`.chunks WHERE file_id = $1 ORDER BY no`, id)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var data []byte
+			if err := rows.Scan(&data); err != nil {
+				rows.Close()
+				return err
+			}
+			if _, err := w.Write(data); err != nil {
+				rows.Close()
+				return err
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // AbortUpload discards an in-progress multipart upload.

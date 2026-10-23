@@ -69,11 +69,20 @@ func TestQueryProtocolFormBodyAndReadOnly(t *testing.T) {
 	}
 
 	ro := New(nil, nil, true, 2)
-	req2 := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("Action=ListQueues"))
+	req2 := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("Action=SendMessage&QueueUrl=http://127.0.0.1/q&MessageBody=x"))
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec2 := httptest.NewRecorder()
 	ro.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 on read-only SQS, got %d", rec2.Code)
+		t.Fatalf("expected 403 on read-only SQS send, got %d", rec2.Code)
+	}
+
+	// Metadata-only operations remain available on a read-only gateway.
+	req3 := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("Action=ListQueueTags&QueueUrl=http://127.0.0.1/q"))
+	req3.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec3 := httptest.NewRecorder()
+	ro.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK || !strings.Contains(rec3.Body.String(), "<ListQueueTagsResponse") {
+		t.Fatalf("read-only metadata: code=%d body=%s", rec3.Code, rec3.Body.String())
 	}
 }

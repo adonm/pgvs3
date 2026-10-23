@@ -11,7 +11,7 @@ curl -fsS http://127.0.0.1:8014/readyz
 
 Buckets are created automatically on first write.
 
-## Network and security model
+## Trust model: no authentication
 
 The single listener (`--addr` / `PGVS3_ADDR`, default `0.0.0.0:8014`) serves:
 
@@ -20,10 +20,31 @@ The single listener (`--addr` / `PGVS3_ADDR`, default `0.0.0.0:8014`) serves:
   to `index.html`)
 - `/healthz`, `/readyz`, and `/metrics`
 
-**pgvs3 does not authenticate requests.** SigV4 headers and presigned URL
-parameters are accepted and ignored so standard S3 SDKs work out of the box.
-Always run the gateway inside a private network or behind a service mesh that
-enforces authentication, authorization, and TLS.
+**pgvs3 does not authenticate or authorize requests, and this is a permanent
+design decision, not a roadmap item.** There is no SigV4 validation, TLS
+termination, audit log, or per-tenant isolation. Header-based SigV4 is accepted
+and ignored so standard S3 SDKs work unchanged. Presigned URLs are rejected
+with `400 InvalidRequest`: a time-limited, object-scoped link would otherwise
+become an unscoped grant on the whole gateway. Presigned `POST` object forms
+are not implemented at all (`405`).
+
+The only access control is network placement. Run the gateway on loopback, a
+private VPC/VLAN, or behind a service mesh that enforces authentication,
+authorization, and TLS. Anyone who can reach `:8014` can read, overwrite, or
+delete every namespace, force-drop buckets, purge queues, and flush cache
+namespaces; treat the listener like a database port.
+
+| Control | Enforced by |
+| --- | --- |
+| Client identity and authorization | network / service mesh |
+| TLS in transit | service mesh or private network |
+| Audit and request attribution | service mesh / PostgreSQL logs |
+| Rate limiting and quotas | network / service mesh |
+| Bucket drop, queue purge, cache flush | network / service mesh |
+
+For Kubernetes, add a default-deny `NetworkPolicy` that admits only the
+application namespaces that need S3/SQS/RESP, and do not create a public
+`Ingress` or `LoadBalancer` Service for `:8014`.
 
 ## Probes and Prometheus metrics
 
@@ -137,8 +158,11 @@ and switching `PGVS3_URL`.
   the server continues accepting requests for 5 seconds so load balancers can
   deregister the pod, then waits for in-flight transfers to finish.
 - **Read-only standbys:** pass `--read-only` (`PGVS3_READ_ONLY=true`) when
-  pointing gateways at a PostgreSQL streaming standby. Mutating requests return
-  `405`/`403`, and schema initialization and reaping are skipped.
+  pointing gateways at a PostgreSQL streaming standby. Mutating S3 requests
+  return `405`/`403`, and schema initialization and reaping are skipped. SQS
+  allows metadata-only operations (`ListQueues`, `GetQueueUrl`,
+  `GetQueueAttributes`) but rejects sending, leasing, deleting, and purging
+  because even `ReceiveMessage` writes a lease.
 - **Kubernetes / Helm:** `deploy/charts/pgvs3` deploys a stateless multi-AZ
   `Deployment` with optional HPA (`autoscaling.enabled=true`) and `PodDisruptionBudget`.
   Ensure PostgreSQL `max_connections` exceeds `replicas × PGVS3_POOL_MAX × 2`
@@ -148,7 +172,10 @@ and switching `PGVS3_URL`.
   - *PostgreSQL restart:* reads retry once on a fresh connection; interrupted
     writes roll back cleanly.
   - *Full disk:* writes fail atomically without publishing partial objects.
-    Run `pgvs3 reap --all` and `VACUUM` / `pg_repack`, or expand storage.
+    Run `pgvs3 reap --all` and `VACUUM` / `pg_repack`, or expand storage. Set
+    `--max-db-bytes` (`PGVS3_MAX_DB_BYTES`) to reject writes before
+    `pg_database_size` crosses a budget; it is sampled at most once every five
+    seconds per gateway.
 
 `just fault` tests gateway loss, mid-upload PostgreSQL restarts, and high
 overwrite churn.

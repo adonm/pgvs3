@@ -5,6 +5,7 @@ package sqs
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/adonm/pgvs3/internal/ns"
+	"github.com/adonm/pgvs3/internal/reqguard"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
@@ -94,8 +96,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, http.StatusMethodNotAllowed, "InvalidAction", "Only POST is supported")
 		return
 	}
-	if s.readOnly {
-		s.writeErr(w, r, http.StatusForbidden, "AccessDenied", "gateway is read-only")
+	if reqguard.Presigned(r.URL.Query()) {
+		s.writeErr(w, r, http.StatusBadRequest, "InvalidRequest", reqguard.PresignRejection)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
@@ -128,6 +130,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	vals, err := parseFormValues(r.URL.RawQuery, body)
 	if err != nil {
 		s.writeErr(w, r, http.StatusBadRequest, "InvalidRequest", "malformed form body")
+		return
+	}
+	if reqguard.Presigned(vals) {
+		s.writeErr(w, r, http.StatusBadRequest, "InvalidRequest", reqguard.PresignRejection)
 		return
 	}
 	op := vals.Get("Action")
@@ -198,6 +204,16 @@ func (in input) int(name string, def int) int {
 		}
 	}
 	return def
+}
+
+// has reports whether the field was supplied, which matters for parameters
+// whose zero value is meaningful (for example FIFO DelaySeconds).
+func (in input) has(name string) bool {
+	if in.json != nil {
+		_, ok := in.json[name]
+		return ok
+	}
+	return in.form.Get(name) != ""
 }
 
 func (in input) raw(name string) json.RawMessage { return in.json[name] }
@@ -361,6 +377,8 @@ func defaultAttrs() map[string]any {
 		"MaximumMessageSize":            "262144",
 		"MessageRetentionPeriod":        "345600",
 		"ReceiveMessageWaitTimeSeconds": "0",
+		"FifoQueue":                     "false",
+		"ContentBasedDeduplication":     "false",
 	}
 }
 
@@ -381,6 +399,8 @@ func (s *Server) queueAttrs(ctx context.Context, name string) (map[string]string
 			out[k] = sv
 		} else if fv, ok := v.(float64); ok {
 			out[k] = strconv.FormatInt(int64(fv), 10)
+		} else if bv, ok := v.(bool); ok {
+			out[k] = strconv.FormatBool(bv)
 		}
 	}
 	return out, nil
@@ -434,6 +454,13 @@ func (s *Server) dispatch(ctx context.Context, r *http.Request, op string, in in
 	if !ok {
 		return nil, errUnsupported(op)
 	}
+	if s.readOnly && !readOnlyAllowed(op) {
+		return nil, &apiError{
+			status:  http.StatusForbidden,
+			code:    "AccessDenied",
+			message: "gateway is read-only; sending, leasing, deleting, or purging messages requires a writable primary",
+		}
+	}
 	// ReceiveMessage manages admission per DB poll so waiting long-pollers do
 	// not occupy the concurrency semaphore.
 	if op != "ReceiveMessage" {
@@ -450,12 +477,39 @@ func (s *Server) opNoop(_ context.Context, _ *http.Request, op string, in input)
 	return emptyOK(op, in), nil
 }
 
+// readOnlyAllowed reports whether op is safe on a read-only gateway. Message
+// leasing is excluded because ReceiveMessage writes visibility state.
+func readOnlyAllowed(op string) bool {
+	switch op {
+	case "ListQueues", "GetQueueUrl", "GetQueueAttributes", "ListQueueTags":
+		return true
+	}
+	return false
+}
+
 func (s *Server) opCreateQueue(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {
 	name := in.str("QueueName")
 	if !ns.ValidName(name) {
 		return nil, errBad("invalid queue name")
 	}
 	attrs := in.attrs()
+	fifo := attrBool(attrs, "FifoQueue") || strings.HasSuffix(name, ".fifo")
+	if fifo && !strings.HasSuffix(name, ".fifo") {
+		return nil, errBad("FIFO queue names must end with .fifo")
+	}
+	if fifo {
+		attrs["FifoQueue"] = "true"
+	}
+	if v, ok := attrs["ContentBasedDeduplication"]; ok {
+		if _, valid := parseBool(v); !valid {
+			return nil, errBad("ContentBasedDeduplication must be true or false")
+		}
+	}
+	for _, k := range []string{"DeduplicationScope", "FifoThroughputLimit"} {
+		if _, ok := attrs[k]; ok {
+			return nil, errBad("high-throughput FIFO attributes are not supported")
+		}
+	}
 	for k, v := range defaultAttrs() {
 		if _, ok := attrs[k]; !ok {
 			attrs[k] = v
@@ -468,6 +522,26 @@ func (s *Server) opCreateQueue(ctx context.Context, r *http.Request, _ string, i
 		return nil, errBad(err.Error())
 	}
 	return createQueueResponse{Xmlns: sqsNS, QueueUrl: queueURL(r, name)}, nil
+}
+
+func attrBool(attrs map[string]any, key string) bool {
+	v, ok := attrs[key]
+	if !ok {
+		return false
+	}
+	b, _ := parseBool(v)
+	return b
+}
+
+func parseBool(v any) (bool, bool) {
+	switch t := v.(type) {
+	case bool:
+		return t, true
+	case string:
+		b, err := strconv.ParseBool(t)
+		return b, err == nil
+	}
+	return false, false
 }
 
 func (s *Server) opGetQueueURL(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {
@@ -630,6 +704,9 @@ func (s *Server) opSetQueueAttrs(ctx context.Context, r *http.Request, op string
 		return nil, perr
 	}
 	attrs := in.attrs()
+	if _, ok := attrs["FifoQueue"]; ok {
+		return nil, errBad("FifoQueue cannot be changed")
+	}
 	if apiErr := s.validateRedrive(ctx, attrs); apiErr != nil {
 		return nil, apiErr
 	}
@@ -648,34 +725,90 @@ func (s *Server) opSendMessage(ctx context.Context, r *http.Request, _ string, i
 	if len(body) > 262144 {
 		return nil, errBad("message body exceeds 256 KiB")
 	}
-	delayDefault, retSecs := 0, 345600
-	if attrs, err := s.queueAttrs(ctx, name); err == nil {
-		if n, err := strconv.Atoi(attrs["DelaySeconds"]); err == nil {
-			delayDefault = n
+	attrs, aerr := s.queueAttrs(ctx, name)
+	if aerr != nil {
+		if ae, ok := aerr.(*apiError); ok {
+			return nil, ae
 		}
-		if n, err := strconv.Atoi(attrs["MessageRetentionPeriod"]); err == nil {
-			retSecs = n
+		return nil, errBad(aerr.Error())
+	}
+	fifo := strings.EqualFold(attrs["FifoQueue"], "true")
+	contentDedup := strings.EqualFold(attrs["ContentBasedDeduplication"], "true")
+	delayDefault := atoi(attrs["DelaySeconds"])
+	retSecs := atoi(attrs["MessageRetentionPeriod"])
+	if retSecs == 0 {
+		retSecs = 345600
+	}
+	delay := delayDefault
+	if in.has("DelaySeconds") {
+		delay = in.int("DelaySeconds", delayDefault)
+		if delay < 0 || delay > 900 {
+			return nil, errBad("invalid DelaySeconds")
 		}
 	}
+	groupID := in.str("MessageGroupId")
+	dedupID := in.str("MessageDeduplicationId")
+	if fifo && in.has("DelaySeconds") && delay != 0 {
+		return nil, errBad("per-message DelaySeconds is not supported for FIFO queues")
+	}
+	groupID, dedupID, ferr := fifoFields(fifo, contentDedup, body, groupID, dedupID)
+	if ferr != nil {
+		return nil, ferr
+	}
 	sent, err := s.store.SendMessages(ctx, name, []store.OutMessage{{
-		Body:  body,
-		Attrs: in.raw("MessageAttributes"),
-		Delay: in.int("DelaySeconds", delayDefault),
+		Body:    body,
+		Attrs:   in.raw("MessageAttributes"),
+		Delay:   delay,
+		GroupID: groupID,
+		DedupID: dedupID,
 	}}, time.Duration(retSecs)*time.Second)
 	if err != nil {
 		return nil, errBad(err.Error())
 	}
 	s.notify(name)
-	return sendMessageResponse{Xmlns: sqsNS, MessageId: sent[0].ID, MD5OfMessageBody: sent[0].MD5OfBody}, nil
+	resp := sendMessageResponse{Xmlns: sqsNS, MessageId: sent[0].ID, MD5OfMessageBody: sent[0].MD5OfBody}
+	if fifo {
+		resp.SequenceNumber = sent[0].SequenceNum
+	}
+	return resp, nil
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func fifoFields(fifo, contentDedup bool, body []byte, groupID, dedupID string) (string, string, *apiError) {
+	if !fifo {
+		return groupID, "", nil
+	}
+	if groupID == "" {
+		return "", "", errBad("MessageGroupId is required for FIFO queues")
+	}
+	if len(groupID) > 128 {
+		return "", "", errBad("MessageGroupId exceeds 128 characters")
+	}
+	if dedupID == "" && contentDedup {
+		dedupID = sha256Hex(body)
+	}
+	if dedupID == "" {
+		return "", "", errBad("MessageDeduplicationId is required for FIFO queues")
+	}
+	if len(dedupID) > 128 {
+		return "", "", errBad("MessageDeduplicationId exceeds 128 characters")
+	}
+	return groupID, dedupID, nil
 }
 
 type batchEntry struct {
-	ID                string          `json:"Id"`
-	MessageBody       string          `json:"MessageBody"`
-	DelaySeconds      int             `json:"DelaySeconds"`
-	ReceiptHandle     string          `json:"ReceiptHandle"`
-	VisibilityTimeout int             `json:"VisibilityTimeout"`
-	MessageAttributes json.RawMessage `json:"MessageAttributes"`
+	ID                     string          `json:"Id"`
+	MessageBody            string          `json:"MessageBody"`
+	DelaySeconds           int             `json:"DelaySeconds"`
+	MessageGroupId         string          `json:"MessageGroupId"`
+	MessageDeduplicationId string          `json:"MessageDeduplicationId"`
+	ReceiptHandle          string          `json:"ReceiptHandle"`
+	VisibilityTimeout      int             `json:"VisibilityTimeout"`
+	MessageAttributes      json.RawMessage `json:"MessageAttributes"`
 }
 
 func decodeBatchEntries(in input, prefix string) ([]batchEntry, *apiError) {
@@ -689,11 +822,13 @@ func decodeBatchEntries(in input, prefix string) ([]batchEntry, *apiError) {
 				break
 			}
 			entries = append(entries, batchEntry{
-				ID:                id,
-				MessageBody:       in.form.Get(fmt.Sprintf("%s.%d.MessageBody", prefix, i)),
-				DelaySeconds:      atoi(in.form.Get(fmt.Sprintf("%s.%d.DelaySeconds", prefix, i))),
-				ReceiptHandle:     in.form.Get(fmt.Sprintf("%s.%d.ReceiptHandle", prefix, i)),
-				VisibilityTimeout: atoi(in.form.Get(fmt.Sprintf("%s.%d.VisibilityTimeout", prefix, i))),
+				ID:                     id,
+				MessageBody:            in.form.Get(fmt.Sprintf("%s.%d.MessageBody", prefix, i)),
+				DelaySeconds:           atoi(in.form.Get(fmt.Sprintf("%s.%d.DelaySeconds", prefix, i))),
+				MessageGroupId:         in.form.Get(fmt.Sprintf("%s.%d.MessageGroupId", prefix, i)),
+				MessageDeduplicationId: in.form.Get(fmt.Sprintf("%s.%d.MessageDeduplicationId", prefix, i)),
+				ReceiptHandle:          in.form.Get(fmt.Sprintf("%s.%d.ReceiptHandle", prefix, i)),
+				VisibilityTimeout:      atoi(in.form.Get(fmt.Sprintf("%s.%d.VisibilityTimeout", prefix, i))),
 			})
 		}
 	}
@@ -715,20 +850,73 @@ func (s *Server) opSendMessageBatch(ctx context.Context, r *http.Request, _ stri
 	if perr != nil {
 		return nil, perr
 	}
-	msgs := make([]store.OutMessage, len(entries))
+	attrs, aerr := s.queueAttrs(ctx, name)
+	if aerr != nil {
+		if ae, ok := aerr.(*apiError); ok {
+			return nil, ae
+		}
+		return nil, errBad(aerr.Error())
+	}
+	fifo := strings.EqualFold(attrs["FifoQueue"], "true")
+	contentDedup := strings.EqualFold(attrs["ContentBasedDeduplication"], "true")
+	delayDefault := atoi(attrs["DelaySeconds"])
+	retSecs := atoi(attrs["MessageRetentionPeriod"])
+	if retSecs == 0 {
+		retSecs = 345600
+	}
+	msgs := make([]store.OutMessage, 0, len(entries))
+	idx := make([]int, 0, len(entries))
+	failed := make([]xmlBatchResultError, 0)
 	for i, e := range entries {
-		msgs[i] = store.OutMessage{Body: []byte(e.MessageBody), Attrs: e.MessageAttributes, Delay: e.DelaySeconds}
+		body := []byte(e.MessageBody)
+		if len(body) > 262144 {
+			failed = append(failed, xmlBatchResultError{
+				Id: e.ID, SenderFault: true, Code: "InvalidParameterValue",
+				Message: "message body exceeds 256 KiB",
+			})
+			continue
+		}
+		delay := delayDefault
+		if e.DelaySeconds != 0 {
+			delay = e.DelaySeconds
+		}
+		if fifo && e.DelaySeconds != 0 {
+			failed = append(failed, xmlBatchResultError{
+				Id: e.ID, SenderFault: true, Code: "InvalidParameterValue",
+				Message: "per-message DelaySeconds is not supported for FIFO queues",
+			})
+			continue
+		}
+		groupID, dedupID, ferr := fifoFields(fifo, contentDedup, body, e.MessageGroupId, e.MessageDeduplicationId)
+		if ferr != nil {
+			failed = append(failed, xmlBatchResultError{
+				Id: e.ID, SenderFault: true, Code: "InvalidParameterValue", Message: ferr.message,
+			})
+			continue
+		}
+		msgs = append(msgs, store.OutMessage{
+			Body: body, Attrs: e.MessageAttributes, Delay: delay,
+			GroupID: groupID, DedupID: dedupID,
+		})
+		idx = append(idx, i)
 	}
-	sent, err := s.store.SendMessages(ctx, name, msgs, s.retention(ctx, name))
-	if err != nil {
-		return nil, errBad(err.Error())
+	var sent []store.SentMessage
+	if len(msgs) > 0 {
+		var err error
+		sent, err = s.store.SendMessages(ctx, name, msgs, time.Duration(retSecs)*time.Second)
+		if err != nil {
+			return nil, errBad(err.Error())
+		}
+		s.notify(name)
 	}
-	s.notify(name)
-	ok := make([]xmlSendBatchResult, len(entries))
-	for i, e := range entries {
-		ok[i] = xmlSendBatchResult{Id: e.ID, MessageId: sent[i].ID, MD5OfMessageBody: sent[i].MD5OfBody}
+	ok := make([]xmlSendBatchResult, len(idx))
+	for j, i := range idx {
+		ok[j] = xmlSendBatchResult{Id: entries[i].ID, MessageId: sent[j].ID, MD5OfMessageBody: sent[j].MD5OfBody}
+		if fifo {
+			ok[j].SequenceNumber = sent[j].SequenceNum
+		}
 	}
-	return sendBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: []xmlBatchResultError{}}, nil
+	return sendBatchResponse{Xmlns: sqsNS, Successful: ok, Failed: failed}, nil
 }
 
 func (s *Server) opReceiveMessage(ctx context.Context, r *http.Request, _ string, in input) (any, *apiError) {
@@ -759,6 +947,7 @@ func (s *Server) opReceiveMessage(ctx context.Context, r *http.Request, _ string
 		visDefault = n
 	}
 	vis := in.int("VisibilityTimeout", visDefault)
+	fifo := strings.EqualFold(attrs["FifoQueue"], "true")
 	pol := parseRedrive(attrs["RedrivePolicy"])
 	waitDefault := 0
 	if n, err := strconv.Atoi(attrs["ReceiveMessageWaitTimeSeconds"]); err == nil {
@@ -772,7 +961,7 @@ func (s *Server) opReceiveMessage(ctx context.Context, r *http.Request, _ string
 		if !ok {
 			return nil, errBad("request canceled")
 		}
-		msgs, err := s.store.ReceiveMessages(ctx, name, maxN, vis, true)
+		msgs, err := s.store.ReceiveMessages(ctx, name, maxN, vis, true, fifo)
 		var redriveErr error
 		if err == nil && len(msgs) > 0 && pol != nil {
 			var keep []store.Message
@@ -845,6 +1034,16 @@ func jsonMessages(msgs []store.Message) []map[string]any {
 				"SentTimestamp":           strconv.FormatInt(m.SentAt.UnixMilli(), 10),
 			},
 		}
+		attrs := e["Attributes"].(map[string]string)
+		if m.GroupID != "" {
+			attrs["MessageGroupId"] = m.GroupID
+		}
+		if m.DedupID != "" {
+			attrs["MessageDeduplicationId"] = m.DedupID
+		}
+		if m.SequenceNum != "" && m.GroupID != "" {
+			attrs["SequenceNumber"] = m.SequenceNum
+		}
 		if len(m.Attrs) > 0 {
 			var attrs map[string]any
 			if json.Unmarshal(m.Attrs, &attrs) == nil {
@@ -859,12 +1058,22 @@ func jsonMessages(msgs []store.Message) []map[string]any {
 func xmlMessages(msgs []store.Message) []xmlMessage {
 	out := make([]xmlMessage, 0, len(msgs))
 	for _, m := range msgs {
+		attrs := []xmlAttribute{
+			{Name: "ApproximateReceiveCount", Value: strconv.Itoa(int(m.ReceiveCount))},
+			{Name: "SentTimestamp", Value: strconv.FormatInt(m.SentAt.UnixMilli(), 10)},
+		}
+		if m.GroupID != "" {
+			attrs = append(attrs, xmlAttribute{Name: "MessageGroupId", Value: m.GroupID})
+		}
+		if m.DedupID != "" {
+			attrs = append(attrs, xmlAttribute{Name: "MessageDeduplicationId", Value: m.DedupID})
+		}
+		if m.SequenceNum != "" && m.GroupID != "" {
+			attrs = append(attrs, xmlAttribute{Name: "SequenceNumber", Value: m.SequenceNum})
+		}
 		out = append(out, xmlMessage{
 			MessageId: m.ID, ReceiptHandle: m.Receipt, Body: string(m.Body), MD5OfBody: md5Hex(m.Body),
-			Attributes: []xmlAttribute{
-				{Name: "ApproximateReceiveCount", Value: strconv.Itoa(int(m.ReceiveCount))},
-				{Name: "SentTimestamp", Value: strconv.FormatInt(m.SentAt.UnixMilli(), 10)},
-			},
+			Attributes: attrs,
 		})
 	}
 	return out

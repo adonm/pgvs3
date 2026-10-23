@@ -46,6 +46,9 @@ curl -fsSI "$WEB/$BUCKET/$RUN/web/" | grep -qi 'content-type: text/html' || fail
 [ "$(curl -fsS "$B/$BUCKET/$RUN/one.bin" | wc -c)" = 1048576 ] || fail "unsigned GET"
 curl -fsS -X PUT --data-binary 'unsigned' "$B/$BUCKET/$RUN/noauth" >/dev/null || fail "unsigned PUT"
 [ "$(s3 "$A/$BUCKET/$RUN/noauth")" = unsigned ] || fail "unsigned PUT body"
+# Presigned URLs are rejected: auth is a network concern, not a gateway one.
+expect 400 "$A/$BUCKET/$RUN/one.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ak&X-Amz-Signature=abc"
+expect 400 "$A/$BUCKET/$RUN/one.bin?AWSAccessKeyId=ak&Signature=abc&Expires=1"
 expect 200 -X PUT --data-binary '' "$A/$BUCKET/$RUN/empty"
 [ "$(s3 "$B/$BUCKET/$RUN/empty" | wc -c)" = 0 ] || fail "empty object body"
 [ "$(s3 -I "$A/$BUCKET/$RUN/empty" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')" = 0 ] || fail "empty object HEAD"
@@ -73,6 +76,13 @@ cat "$TMP"/race.* > "$TMP/race.codes"
 [ "$(grep -c '^200$' "$TMP/race.codes")" = 1 ] || fail "exactly one conditional create must win"
 [ "$(grep -c '^412$' "$TMP/race.codes")" = 7 ] || fail "other conditional creates must be 412"
 s3 "$B/$BUCKET/$RUN/race.txt" | grep -Eq '^race-[0-9]+$' || fail "torn race object"
+
+# --- unsupported feature policy --------------------------------------------
+expect 501 -X PUT -H 'x-amz-server-side-encryption: aws:kms' --data-binary 'x' "$A/$BUCKET/$RUN/sse-kms"
+expect 200 -X PUT -H 'x-amz-server-side-encryption: AES256' --data-binary 'x' "$A/$BUCKET/$RUN/sse-aes"
+expect 501 -X PUT -H 'x-amz-object-lock-mode: COMPLIANCE' --data-binary 'x' "$A/$BUCKET/$RUN/lock"
+expect 501 -X PUT -H 'x-amz-tagging: a=b' --data-binary 'x' "$A/$BUCKET/$RUN/tag"
+expect 501 -X PUT -H 'x-amz-acl: public-read' --data-binary 'x' "$A/$BUCKET/$RUN/public"
 
 # --- listing, pagination and encoding --------------------------------------
 for i in 0 1 2 3 4; do
@@ -106,9 +116,12 @@ PY
 
 # --- batch delete ----------------------------------------------------------
 cat > "$TMP/delete.xml" <<XML
-<Delete><Object><Key>$RUN/page/0</Key></Object><Object><Key>$RUN/page/1</Key></Object><Object><Key>$RUN/page/2</Key></Object></Delete>
+<Delete><Object><Key>$RUN/page/0</Key></Object><Object><Key>$RUN/page/1</Key></Object><Object><Key>$RUN/page/2</Key></Object><Object><Key>$RUN/page/missing</Key></Object></Delete>
 XML
-expect 200 -X POST --data-binary @"$TMP/delete.xml" "$A/$BUCKET?delete"
+delete_resp=$(s3 -X POST --data-binary @"$TMP/delete.xml" "$A/$BUCKET?delete")
+for key in "$RUN/page/0" "$RUN/page/1" "$RUN/page/2" "$RUN/page/missing"; do
+  grep -q "<Deleted><Key>$key</Key></Deleted>" <<<"$delete_resp" || fail "DeleteObjects missing Deleted entry for $key"
+done
 expect 404 "$B/$BUCKET/$RUN/page/0"
 expect 404 "$B/$BUCKET/$RUN/page/1"
 
@@ -511,6 +524,42 @@ assert dead and dead[0]['Body'] == 'doomed', dead
 sqs.delete_message(QueueUrl=dl_url, ReceiptHandle=dead[0]['ReceiptHandle'])
 sqs.delete_queue(QueueUrl=src_url)
 sqs.delete_queue(QueueUrl=dl_url)
+
+# FIFO: one message per group per receive, dedup IDs, sequence numbers, and
+# content-based deduplication.
+fifo_name = 'f-' + run + '.fifo'
+fifo_url = sqs.create_queue(QueueName=fifo_name,
+    Attributes={'FifoQueue': 'true', 'ContentBasedDeduplication': 'true'})['QueueUrl']
+first = sqs.send_message(QueueUrl=fifo_url, MessageBody='a1', MessageGroupId='g',
+    MessageDeduplicationId='d1')
+dup = sqs.send_message(QueueUrl=fifo_url, MessageBody='a1-dup', MessageGroupId='g',
+    MessageDeduplicationId='d1')
+assert first['MessageId'] == dup['MessageId'], (first, dup)
+assert first.get('SequenceNumber'), first
+sqs.send_message(QueueUrl=fifo_url, MessageBody='a2', MessageGroupId='g',
+    MessageDeduplicationId='d2')
+sqs.send_message(QueueUrl=fifo_url, MessageBody='b1', MessageGroupId='h',
+    MessageDeduplicationId='d3')
+msgs = sqs.receive_message(QueueUrl=fifo_url, MaxNumberOfMessages=10,
+    WaitTimeSeconds=1).get('Messages', [])
+assert sorted(m['Body'] for m in msgs) == ['a1', 'b1'], msgs
+for m in msgs:
+    if m['Body'] == 'a1':
+        sqs.delete_message(QueueUrl=fifo_url, ReceiptHandle=m['ReceiptHandle'])
+nxt = sqs.receive_message(QueueUrl=fifo_url, MaxNumberOfMessages=10).get('Messages', [])
+assert [m['Body'] for m in nxt] == ['a2'], nxt
+for m in nxt:
+    sqs.delete_message(QueueUrl=fifo_url, ReceiptHandle=m['ReceiptHandle'])
+again = sqs.send_message(QueueUrl=fifo_url, MessageBody='a1-again', MessageGroupId='g',
+    MessageDeduplicationId='d1')
+assert again['MessageId'] == first['MessageId'], again
+c1 = sqs.send_message(QueueUrl=fifo_url, MessageBody='content', MessageGroupId='c')
+c2 = sqs.send_message(QueueUrl=fifo_url, MessageBody='content', MessageGroupId='c')
+assert c1['MessageId'] == c2['MessageId'], (c1, c2)
+fattrs = sqs.get_queue_attributes(QueueUrl=fifo_url, AttributeNames=['All'])['Attributes']
+assert fattrs.get('FifoQueue') == 'true', fattrs
+sqs.delete_queue(QueueUrl=fifo_url)
+
 sqs.purge_queue(QueueUrl=url)
 sqs.delete_queue(QueueUrl=url)
 try:

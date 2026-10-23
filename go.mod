@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/go-kit/log v0.2.1
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/minio/minio-go/v7 v7.0.95
 	github.com/thanos-io/objstore v0.0.0-20261009124658-72d3b9ff63af
 	github.com/tidwall/redcon v1.6.4
 	golang.org/x/sync v0.24.0
@@ -45,7 +46,6 @@ require (
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/minio/crc64nvme v1.0.2 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
-	github.com/minio/minio-go/v7 v7.0.95 // indirect
 	github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect

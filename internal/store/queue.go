@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/adonm/pgvs3/internal/ns"
 )
 
@@ -42,6 +44,9 @@ type Message struct {
 	Receipt      string
 	ReceiveCount int32
 	SentAt       time.Time
+	GroupID      string
+	DedupID      string
+	SequenceNum  string
 }
 
 // OutMessage is one message to enqueue.
@@ -85,10 +90,21 @@ func (s *Store) SendMessages(ctx context.Context, queue string, msgs []OutMessag
 			return nil, err
 		}
 	}
+	for _, m := range msgs {
+		if m.DedupID != "" {
+			return s.sendMessagesFIFO(ctx, queue, sc, msgs, retention)
+		}
+	}
+	return s.sendMessagesBulk(ctx, queue, sc, msgs, retention)
+}
+
+func (s *Store) sendMessagesBulk(ctx context.Context, queue, sc string, msgs []OutMessage, retention time.Duration) ([]SentMessage, error) {
 	ids := make([]string, len(msgs))
 	bodies := make([][]byte, len(msgs))
 	sizes := make([]int32, len(msgs))
 	attrs := make([][]byte, len(msgs))
+	groups := make([]string, len(msgs))
+	dedups := make([]string, len(msgs))
 	delays := make([]int32, len(msgs))
 	expiries := make([]time.Time, len(msgs))
 	now := time.Now()
@@ -97,16 +113,19 @@ func (s *Store) SendMessages(ctx context.Context, queue string, msgs []OutMessag
 		bodies[i] = compressBlock(nil, m.Body)
 		sizes[i] = int32(len(m.Body))
 		attrs[i] = m.Attrs
+		groups[i] = m.GroupID
+		dedups[i] = m.DedupID
 		delays[i] = int32(m.Delay)
 		expiries[i] = now.Add(retention)
 	}
 	rows, err := s.pool.Query(ctx, `INSERT INTO `+sc+`.messages
-		(msg_id, body, body_size, attrs, visible_at, expires_at, sent_at)
-		SELECT id, b, sz, a, now() + make_interval(secs => d), e, now()
-		FROM unnest($1::text[], $2::bytea[], $3::int4[], $4::bytea[], $5::int4[], $6::timestamptz[])
-		  AS t(id, b, sz, a, d, e)
-		RETURNING msg_id, sent_at`,
-		ids, bodies, sizes, attrs, delays, expiries)
+		(msg_id, body, body_size, attrs, group_id, dedup_id, visible_at, expires_at, sent_at)
+		SELECT id, b, sz, a, NULLIF(g, ''), NULLIF(d, ''),
+		       now() + make_interval(secs => dl), e, now()
+		FROM unnest($1::text[], $2::bytea[], $3::int4[], $4::bytea[], $5::text[], $6::text[], $7::int4[], $8::timestamptz[])
+		  AS t(id, b, sz, a, g, d, dl, e)
+		RETURNING msg_id, sent_at, id`,
+		ids, bodies, sizes, attrs, groups, dedups, delays, expiries)
 	if isMissingBucketSchema(err) {
 		if err := s.EnsureNamespace(ctx, ns.Queue, queue, nil, nil); err != nil {
 			return nil, err
@@ -116,15 +135,16 @@ func (s *Store) SendMessages(ctx context.Context, queue string, msgs []OutMessag
 	if err != nil {
 		return nil, err
 	}
-	byID := make(map[string]time.Time, len(ids))
+	byID := make(map[string]SentMessage, len(ids))
 	for rows.Next() {
 		var id string
 		var sent time.Time
-		if err := rows.Scan(&id, &sent); err != nil {
+		var seq int64
+		if err := rows.Scan(&id, &sent, &seq); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		byID[id] = sent
+		byID[id] = SentMessage{ID: id, SentAt: sent, SequenceNum: strconv.FormatInt(seq, 10)}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -132,35 +152,138 @@ func (s *Store) SendMessages(ctx context.Context, queue string, msgs []OutMessag
 	}
 	out := make([]SentMessage, len(msgs))
 	for i := range msgs {
-		out[i] = SentMessage{ID: ids[i], MD5OfBody: md5Hex(msgs[i].Body), SentAt: byID[ids[i]]}
+		out[i] = byID[ids[i]]
+		out[i].MD5OfBody = md5Hex(msgs[i].Body)
+		out[i].DedupID = msgs[i].DedupID
+	}
+	return out, nil
+}
+
+// sendMessagesFIFO serializes deduplication and enqueue in one transaction.
+// A duplicate dedup ID returns the original message ID and sequence number
+// without inserting another message.
+func (s *Store) sendMessagesFIFO(ctx context.Context, queue, sc string, msgs []OutMessage, retention time.Duration) ([]SentMessage, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	if _, err := tx.Exec(ctx, "DELETE FROM "+sc+".dedup WHERE expires_at <= now()"); err != nil {
+		return nil, err
+	}
+	out := make([]SentMessage, len(msgs))
+	for i, m := range msgs {
+		msgID := newToken(16)
+		if m.DedupID != "" {
+			var (
+				existingID string
+				sequence   int64
+				inserted   bool
+			)
+			err := tx.QueryRow(ctx, `INSERT INTO `+sc+`.dedup (dedup_id, msg_id, expires_at)
+				VALUES ($1, $2, now() + interval '5 minutes')
+				ON CONFLICT (dedup_id) DO UPDATE SET dedup_id = EXCLUDED.dedup_id
+				RETURNING msg_id, sequence, (xmax = 0)`, m.DedupID, msgID).
+				Scan(&existingID, &sequence, &inserted)
+			if err != nil {
+				return nil, err
+			}
+			if !inserted {
+				out[i] = SentMessage{
+					ID: existingID, MD5OfBody: md5Hex(m.Body), SentAt: time.Now(),
+					DedupID: m.DedupID, SequenceNum: strconv.FormatInt(sequence, 10),
+				}
+				continue
+			}
+		}
+		var rowID int64
+		err := tx.QueryRow(ctx, `INSERT INTO `+sc+`.messages
+			(msg_id, body, body_size, attrs, group_id, dedup_id, visible_at, expires_at, sent_at)
+			VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''),
+			        now() + make_interval(secs => $7), $8, now())
+			RETURNING id`,
+			msgID, compressBlock(nil, m.Body), int32(len(m.Body)), m.Attrs,
+			m.GroupID, m.DedupID, m.Delay, time.Now().Add(retention)).Scan(&rowID)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = SentMessage{
+			ID: msgID, MD5OfBody: md5Hex(m.Body), SentAt: time.Now(),
+			DedupID: m.DedupID, SequenceNum: strconv.FormatInt(rowID, 10),
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 // ReceiveMessages leases up to max visible messages for visibility seconds.
-func (s *Store) ReceiveMessages(ctx context.Context, queue string, max, visibility int, attrs bool) ([]Message, error) {
+// When fifo is true, a message group with an in-flight lease is skipped so
+// messages in that group are delivered one at a time in id order.
+func (s *Store) ReceiveMessages(ctx context.Context, queue string, max, visibility int, attrs, fifo bool) ([]Message, error) {
 	sc, err := nsSQLIdent(ns.Queue, queue)
 	if err != nil {
 		return nil, err
 	}
 	token := newToken(12)
-	rows, err := s.pool.Query(ctx, `WITH picked AS (
-		SELECT id FROM `+sc+`.messages
+	query := `WITH picked AS (
+		SELECT id FROM ` + sc + `.messages
 		WHERE visible_at <= now() AND expires_at > now()
 		ORDER BY id
 		FOR UPDATE SKIP LOCKED
 		LIMIT $1
 	), upd AS (
-		UPDATE `+sc+`.messages m
+		UPDATE ` + sc + `.messages m
 		SET receipt = $2 || ':' || m.id,
 		    visible_at = now() + make_interval(secs => $3),
 		    receive_count = m.receive_count + 1,
 		    first_received_at = coalesce(m.first_received_at, now())
 		FROM picked WHERE m.id = picked.id
-		RETURNING m.id, m.msg_id, m.body, m.body_size, m.attrs, m.receipt, m.receive_count, m.sent_at
+		RETURNING m.id, m.msg_id, m.body, m.body_size, m.attrs, m.receipt, m.receive_count, m.sent_at,
+		          m.group_id, m.dedup_id
 	)
-	SELECT id, msg_id, body, body_size, attrs, receipt, receive_count, sent_at FROM upd ORDER BY id`,
-		max, token, visibility)
+	SELECT id, msg_id, body, body_size, attrs, receipt, receive_count, sent_at,
+	       coalesce(group_id, ''), coalesce(dedup_id, '')
+	FROM upd ORDER BY id`
+	args := []any{max, token, visibility}
+	if fifo {
+		query = `WITH groups AS (
+			SELECT DISTINCT m.group_id
+			FROM ` + sc + `.messages m
+			WHERE m.visible_at <= now() AND m.expires_at > now()
+			  AND m.group_id IS NOT NULL
+			  AND NOT EXISTS (
+			    SELECT 1 FROM ` + sc + `.messages o
+			    WHERE o.group_id = m.group_id
+			      AND o.visible_at > now() AND o.receipt IS NOT NULL)
+			LIMIT $1
+		), candidates AS (
+			SELECT DISTINCT ON (m.group_id) m.id
+			FROM ` + sc + `.messages m
+			JOIN groups g ON g.group_id = m.group_id
+			WHERE m.visible_at <= now() AND m.expires_at > now()
+			ORDER BY m.group_id, m.id
+		), picked AS (
+			SELECT m.id
+			FROM ` + sc + `.messages m
+			JOIN candidates c ON c.id = m.id
+			FOR UPDATE OF m SKIP LOCKED
+		), upd AS (
+			UPDATE ` + sc + `.messages m
+			SET receipt = $2 || ':' || m.id,
+			    visible_at = now() + make_interval(secs => $3),
+			    receive_count = m.receive_count + 1,
+			    first_received_at = coalesce(m.first_received_at, now())
+			FROM picked WHERE m.id = picked.id
+			RETURNING m.id, m.msg_id, m.body, m.body_size, m.attrs, m.receipt, m.receive_count, m.sent_at,
+			          m.group_id, m.dedup_id
+		)
+		SELECT id, msg_id, body, body_size, attrs, receipt, receive_count, sent_at,
+		       coalesce(group_id, ''), coalesce(dedup_id, '')
+		FROM upd ORDER BY id`
+	}
+	rows, err := s.pool.Query(ctx, query, args...)
 	if isMissingBucketSchema(err) {
 		return nil, nil
 	}
@@ -179,15 +302,20 @@ func (s *Store) ReceiveMessages(ctx context.Context, queue string, max, visibili
 			receipt  string
 			count    int32
 			sent     time.Time
+			groupID  string
+			dedupID  string
 		)
-		if err := rows.Scan(&id, &msgID, &body, &size, &msgAttrs, &receipt, &count, &sent); err != nil {
+		if err := rows.Scan(&id, &msgID, &body, &size, &msgAttrs, &receipt, &count, &sent, &groupID, &dedupID); err != nil {
 			return nil, err
 		}
 		raw, err := decompressBlock(nil, body, int(size))
 		if err != nil {
 			return nil, err
 		}
-		m := Message{ID: msgID, Body: raw, Receipt: receipt, ReceiveCount: count, SentAt: sent}
+		m := Message{
+			ID: msgID, Body: raw, Receipt: receipt, ReceiveCount: count, SentAt: sent,
+			GroupID: groupID, DedupID: dedupID, SequenceNum: strconv.FormatInt(id, 10),
+		}
 		if attrs {
 			m.Attrs = msgAttrs
 		}
@@ -278,7 +406,7 @@ func (s *Store) Redrive(ctx context.Context, src, dst string, receipts []string,
 		return 0, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	rows, err := tx.Query(ctx, `SELECT msg_id, body, body_size, attrs, sent_at FROM `+ssc+`.messages
+	rows, err := tx.Query(ctx, `SELECT msg_id, body, body_size, attrs, sent_at, group_id, dedup_id FROM `+ssc+`.messages
 		WHERE receipt = ANY($1::text[]) FOR UPDATE`, receipts)
 	if err != nil {
 		return 0, err
@@ -289,6 +417,8 @@ func (s *Store) Redrive(ctx context.Context, src, dst string, receipts []string,
 		sizes  []int32
 		attrs  [][]byte
 		sent   []time.Time
+		groups []string
+		dedups []string
 	)
 	for rows.Next() {
 		var id string
@@ -296,7 +426,8 @@ func (s *Store) Redrive(ctx context.Context, src, dst string, receipts []string,
 		var size int32
 		var a []byte
 		var ts time.Time
-		if err := rows.Scan(&id, &body, &size, &a, &ts); err != nil {
+		var g, d pgtype.Text
+		if err := rows.Scan(&id, &body, &size, &a, &ts, &g, &d); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -305,6 +436,8 @@ func (s *Store) Redrive(ctx context.Context, src, dst string, receipts []string,
 		sizes = append(sizes, size)
 		attrs = append(attrs, a)
 		sent = append(sent, ts)
+		groups = append(groups, g.String)
+		dedups = append(dedups, d.String)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -314,11 +447,18 @@ func (s *Store) Redrive(ctx context.Context, src, dst string, receipts []string,
 		return 0, nil
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO `+dsc+`.messages
-		(msg_id, body, body_size, attrs, visible_at, expires_at, sent_at)
-		SELECT id, b, sz, a, now(), $6, ts
-		FROM unnest($1::text[], $2::bytea[], $3::int4[], $4::bytea[], $5::timestamptz[])
-		  AS t(id, b, sz, a, ts)
-		ON CONFLICT (msg_id) DO NOTHING`, ids, bodies, sizes, attrs, sent, expires); err != nil {
+		(msg_id, body, body_size, attrs, group_id, dedup_id, visible_at, expires_at, sent_at)
+		SELECT id, b, sz, a, NULLIF(g, ''), NULLIF(d, ''), now(), $8, ts
+		FROM unnest($1::text[], $2::bytea[], $3::int4[], $4::bytea[], $5::timestamptz[], $6::text[], $7::text[])
+		  AS t(id, b, sz, a, ts, g, d)
+		ON CONFLICT (msg_id) DO NOTHING`, ids, bodies, sizes, attrs, sent, groups, dedups, expires); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+dsc+`.dedup (dedup_id, msg_id, expires_at)
+		SELECT d, id, now() + interval '5 minutes'
+		FROM unnest($1::text[], $2::text[]) AS t(id, d)
+		WHERE d IS NOT NULL AND d <> ''
+		ON CONFLICT (dedup_id) DO NOTHING`, ids, dedups); err != nil {
 		return 0, err
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM "+ssc+".messages WHERE receipt = ANY($1::text[])", receipts); err != nil {
@@ -341,6 +481,9 @@ func receiptMsgID(receipt string) string {
 func (s *Store) PurgeQueue(ctx context.Context, queue string) error {
 	sc, err := nsSQLIdent(ns.Queue, queue)
 	if err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx, "DELETE FROM "+sc+".dedup"); err != nil && !isMissingBucketSchema(err) {
 		return err
 	}
 	_, err = s.pool.Exec(ctx, "DELETE FROM "+sc+".messages")
@@ -381,5 +524,6 @@ func (s *Store) ExpireQueueMessages(ctx context.Context, queue string, max int) 
 	if err != nil {
 		return 0, err
 	}
+	_, _ = s.pool.Exec(ctx, "DELETE FROM "+sc+".dedup WHERE expires_at <= now()")
 	return tag.RowsAffected(), nil
 }

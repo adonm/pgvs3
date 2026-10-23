@@ -32,6 +32,7 @@ type sendMessageResponse struct {
 	Xmlns            string   `xml:"xmlns,attr" json:"-"`
 	MessageId        string   `xml:"SendMessageResult>MessageId" json:"MessageId"`
 	MD5OfMessageBody string   `xml:"SendMessageResult>MD5OfMessageBody" json:"MD5OfMessageBody"`
+	SequenceNumber   string   `xml:"SendMessageResult>SequenceNumber,omitempty" json:"SequenceNumber,omitempty"`
 }
 
 type sendBatchResponse struct {
@@ -45,6 +46,7 @@ type xmlSendBatchResult struct {
 	Id               string `xml:"Id" json:"Id"`
 	MessageId        string `xml:"MessageId" json:"MessageId"`
 	MD5OfMessageBody string `xml:"MD5OfMessageBody" json:"MD5OfMessageBody"`
+	SequenceNumber   string `xml:"SequenceNumber,omitempty" json:"SequenceNumber,omitempty"`
 }
 
 type xmlBatchOK struct {
