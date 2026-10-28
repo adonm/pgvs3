@@ -325,10 +325,10 @@ func newOrigin(c Config) (*origin, error) {
 		return newHTTPBucket(c)
 	case "filesystem":
 		return newFSBucket(c)
-	case "inmem":
+	case "ephemeral":
 		return newTempBucket(c)
 	default:
-		return nil, fmt.Errorf("unsupported origin type %q (s3, http, filesystem or inmem)", c.Type)
+		return nil, fmt.Errorf("unsupported origin type %q (s3, http, filesystem or ephemeral)", c.Type)
 	}
 }
 
@@ -904,11 +904,11 @@ func newFSBucket(c Config) (*origin, error) {
 }
 
 func newTempBucket(c Config) (*origin, error) {
-	dir, err := os.MkdirTemp("", "pgvs3-inmem-")
+	dir, err := os.MkdirTemp("", "pgvs3-ephemeral-")
 	if err != nil {
 		return nil, err
 	}
-	o, err := openLocalBucket("inmem", c.Prefix, dir, true)
+	o, err := openLocalBucket("ephemeral", c.Prefix, dir, true)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 	}

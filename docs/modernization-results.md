@@ -481,10 +481,10 @@ fresh databases; there is no migration from v24.
   still returns the same not-found result. Partial schemas (an undefined table or
   function) propagate as storage errors instead of reading as empty, and doctor
   lists queue namespaces that lack stream functions.
-- **Local origins collapse into one implementation.** `filesystem` and `inmem`
-  share one `os.Root`-based implementation. `inmem` keeps its name because
-  `origin set` accepts it, but it now stores in a private temporary directory that
-  is removed on close. Keys the local origin cannot represent are rejected with 400
+- **Local origins collapse into one implementation.** `filesystem` and `ephemeral`
+  share one `os.Root`-based implementation. The temporary-directory origin kept its
+  old type name in this round because `origin set` accepted it; it now stores in a
+  private temporary directory that is removed on close. Keys the local origin cannot represent are rejected with 400
   before any body is acknowledged. Overwrites write a temporary file under
   `.pgvs3-tmp` and rename it under the lock, so concurrent readers never see
   partial bytes.
@@ -541,7 +541,7 @@ Known gaps, deliberately not handled in this round:
   `NoSuchBucket` through the store-backed server. Global origins have no bucket rows,
   so the fix needs an origin-level bucket rule.
 - The local origin paths were not benchmarked. Syscall counts changed: fewer per
-  ranged filesystem read, and more per overwrite and per `inmem` read.
+  ranged filesystem read, and more per overwrite and per `ephemeral` read.
 - `test/fault.sh` and `test/interop.sh` were neither run (they need Docker) nor
   trimmed. They still contain fixed sleeps and SKIP branches that exit 0.
 - Stream function bodies are created per queue schema from a function stored in the

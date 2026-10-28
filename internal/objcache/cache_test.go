@@ -50,8 +50,8 @@ func TestOriginETag(t *testing.T) {
 
 func TestRegistryReplacementAndFallback(t *testing.T) {
 	r := NewRegistry(nil, nil, true)
-	global := Spec{Namespace: "global", Config: `{"type":"inmem"}`}
-	bucket := Spec{Namespace: "bucket", Config: `{"type":"inmem"}`}
+	global := Spec{Namespace: "global", Config: `{"type":"ephemeral"}`}
+	bucket := Spec{Namespace: "bucket", Config: `{"type":"ephemeral"}`}
 	wanted := map[string]Spec{"": global, "lake": bucket}
 	r.replace(wanted)
 	defer r.replace(nil)
@@ -583,7 +583,7 @@ func TestOriginCapabilitySets(t *testing.T) {
 		{"http-read-only", httpReadOnly, readCaps},
 		{"http-writable", httpWritable, readCaps | capWrite},
 		{"filesystem", files, originCapabilitiesAll},
-		{"inmem", memory, originCapabilitiesAll},
+		{"ephemeral", memory, originCapabilitiesAll},
 		{"s3", objects, originCapabilitiesAll},
 	}
 	for _, tc := range tests {
@@ -734,7 +734,7 @@ func TestSharedPrefixBehavior(t *testing.T) {
 			},
 		},
 		{
-			name: "inmem",
+			name: "ephemeral",
 			open: func(t *testing.T) (*origin, string) {
 				return newTestTempOrigin(t, "/tenant/"), ""
 			},
@@ -803,7 +803,7 @@ func TestOriginConformance(t *testing.T) {
 		name    string
 		factory conformanceFactory
 	}{
-		{"inmem", conformanceMemFactory},
+		{"ephemeral", conformanceEphemeralFactory},
 		{"filesystem", conformanceFSFactory},
 		{"http-writable", conformanceHTTPFactory(false)},
 
@@ -1411,11 +1411,11 @@ func conformanceMetaValue(pairs []string, name string) string {
 	return ""
 }
 
-func conformanceMemFactory(t *testing.T, prefix string) conformanceFixture {
+func conformanceEphemeralFactory(t *testing.T, prefix string) conformanceFixture {
 	t.Helper()
-	o, err := newOrigin(Config{Type: "inmem", Prefix: prefix})
+	o, err := newOrigin(Config{Type: "ephemeral", Prefix: prefix})
 	if err != nil {
-		t.Fatalf("newOrigin(inmem): %v", err)
+		t.Fatalf("newOrigin(ephemeral): %v", err)
 	}
 	return conformanceFixture{
 		handle:        o,

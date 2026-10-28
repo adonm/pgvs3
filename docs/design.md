@@ -128,7 +128,7 @@ storage abstraction:
 | File | Owns |
 | --- | --- |
 | `cache.go` | Tier lifecycle, one namespace/TTL resolver, range planning, renewable fills, bounded spooling, foreground mutations and token-guarded outbox drain |
-| `origin.go` | Compiler-checked driver interface, capability/prefix/error boundary and S3, HTTP and local adapters; filesystem and `inmem` share one `os.Root` implementation |
+| `origin.go` | Compiler-checked driver interface, capability/prefix/error boundary and S3, HTTP and local adapters; filesystem and `ephemeral` share one `os.Root` implementation |
 | `registry.go` | Persisted configuration and one tier-replacement policy for global and per-bucket origins |
 
 Named sections follow the request lifecycle. Foreground mutations and outbox

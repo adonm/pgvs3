@@ -64,7 +64,7 @@ func TestBackendSelectionSharesAllCapabilities(t *testing.T) {
 			t.Fatalf("native capability selected %T", backend)
 		}
 	}
-	tier, err := objcache.NewReadOnly(nil, []byte(`{"type":"inmem"}`), nil, "origin", time.Minute, time.Hour, 1)
+	tier, err := objcache.NewReadOnly(nil, []byte(`{"type":"ephemeral"}`), nil, "origin", time.Minute, time.Hour, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

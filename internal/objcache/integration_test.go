@@ -1342,7 +1342,7 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 		t.Fatalf("metadata became a body: %v", err)
 	}
 
-	ro, err := NewReadOnly(nil, []byte(`{"type":"inmem"}`), testStore, f.tier.namespace, time.Hour, time.Hour, 1)
+	ro, err := NewReadOnly(nil, []byte(`{"type":"ephemeral"}`), testStore, f.tier.namespace, time.Hour, time.Hour, 1)
 	testutil.Must(t, err)
 	defer ro.Close()
 	ro.EnableRangeCache(64 << 10)

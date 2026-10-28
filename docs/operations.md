@@ -657,8 +657,8 @@ FROM s3p.pending_uploads;
 
 The production origin types are `s3` (SigV4 and object operations via the
 Apache-2.0 `internal/s3client` fork of `kelindar/s3`) and read-only
-`http`/`https`; `filesystem` and `inmem` are local/test providers. They share one
-on-disk implementation, and `inmem` uses a private temporary directory under
+`http`/`https`; `filesystem` and `ephemeral` are local/test providers. They share one
+on-disk implementation, and `ephemeral` uses a private temporary directory under
 `TMPDIR` that is removed on clean shutdown, so it needs a writable temporary
 directory. Both keep in-flight writes in a `.pgvs3-tmp` directory at their root.
 User metadata is process-local for both, and keys that cannot be

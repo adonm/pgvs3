@@ -183,8 +183,8 @@ SELECT * FROM lake.events;
    process-wide payload budget (`--spool-max-bytes`); exhausted admission returns
    `503 SlowDown` before acknowledging a write. Write-back uploads retain a
    session key lock to preserve remote ordering. The production origins are
-  S3-compatible (`s3`) and read-only HTTP(S); `filesystem` and `inmem` remain
-  small local/test providers that share one on-disk implementation. `inmem`
+  S3-compatible (`s3`) and read-only HTTP(S); `filesystem` and `ephemeral` remain
+  small local/test providers that share one on-disk implementation. `ephemeral`
   keeps its objects in a private temporary directory under `TMPDIR`, removed on
   clean shutdown. Both keep in-flight writes in a `.pgvs3-tmp` directory at their
   root; that directory is hidden from listings and its name cannot be a key. User
