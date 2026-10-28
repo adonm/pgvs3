@@ -48,9 +48,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	tier, err := objcache.New(testutil.DiscardLogger(),
 		fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir),
 		originTestStore, fmt.Sprintf("origin-http-%d", os.Getpid()), 0, time.Hour, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	defer tier.Close()
 	srv := New(originTestStore, testutil.DiscardLogger(), false, 8)
 	srv.SetOrigin(tier)
@@ -60,41 +58,31 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	put := func(key, body string, headers map[string]string) *http.Response {
 		t.Helper()
 		req, err := http.NewRequest(http.MethodPut, httpSrv.URL+"/bkt/"+key, strings.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		sum := md5.Sum([]byte(body))
 		req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(sum[:]))
 		for name, value := range headers {
 			req.Header.Set(name, value)
 		}
 		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		return resp
 	}
 	read := func(key string) (int, string, http.Header) {
 		t.Helper()
 		req, _ := http.NewRequest(http.MethodGet, httpSrv.URL+"/bkt/"+key, nil)
 		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		defer resp.Body.Close()
 		b, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		return resp.StatusCode, string(b), resp.Header.Clone()
 	}
 
 	req, _ := http.NewRequest(http.MethodPut, httpSrv.URL+"/bkt/bad", strings.NewReader("new"))
 	req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(md5.New().Sum(nil)))
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("bad checksum status = %d", resp.StatusCode)
@@ -113,9 +101,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	req, _ = http.NewRequest(http.MethodPut, httpSrv.URL+"/bkt/obj", strings.NewReader("new"))
 	req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(md5.New().Sum(nil)))
 	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("replacement bad checksum status = %d", resp.StatusCode)
@@ -147,9 +133,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	copyReq.Header.Set("x-amz-copy-source", "/bkt/src")
 	copyReq.Header.Set("If-None-Match", "*")
 	resp, err = http.DefaultClient.Do(copyReq)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusPreconditionFailed {
 		t.Fatalf("copy destination precondition status = %d", resp.StatusCode)
@@ -161,18 +145,14 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	copyReq.Header.Set("x-amz-copy-source", "/bkt/src")
 	copyReq.Header.Set("x-amz-copy-source-if-match", `"00000000000000000000000000000000"`)
 	resp, err = http.DefaultClient.Do(copyReq)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusPreconditionFailed {
 		t.Fatalf("copy source precondition status = %d", resp.StatusCode)
 	}
 	srcHead, _ := http.NewRequest(http.MethodHead, httpSrv.URL+"/bkt/src", nil)
 	resp, err = http.DefaultClient.Do(srcHead)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	resp.Body.Close()
 	srcETag := resp.Header.Get("ETag")
 	copyReq, _ = http.NewRequest(http.MethodPut, httpSrv.URL+"/bkt/copied", nil)
@@ -180,9 +160,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	copyReq.Header.Set("x-amz-copy-source-if-match", srcETag)
 	copyReq.Header.Set("If-None-Match", "*")
 	resp, err = http.DefaultClient.Do(copyReq)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("successful conditional copy status = %d", resp.StatusCode)
@@ -193,9 +171,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	t.Run("origin multipart copy stays on origin backend", func(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/bkt/part-dest?uploads", nil)
 		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		var upload initiateMultipartUploadResult
 		err = xml.NewDecoder(resp.Body).Decode(&upload)
 		resp.Body.Close()
@@ -206,9 +182,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 		req, _ = http.NewRequest(http.MethodPut, httpSrv.URL+"/bkt/part-dest?partNumber=1&uploadId="+upload.UploadID, nil)
 		req.Header.Set("x-amz-copy-source", "/bkt/src")
 		resp, err = http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "<ETag>") {
@@ -221,9 +195,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	}
 	head, _ := http.NewRequest(http.MethodHead, httpSrv.URL+"/bkt/obj", nil)
 	resp, err = http.DefaultClient.Do(head)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	resp.Body.Close()
 	if got := resp.Header.Get("x-amz-meta-owner"); got != "first" {
 		t.Fatalf("metadata after eviction = %q", got)
@@ -231,86 +203,80 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
 		t.Fatalf("content type after eviction = %q", got)
 	}
-}
-
-func TestS3MissingBucketAndInvalidRange(t *testing.T) {
-	bucket := fmt.Sprintf("errbucket-%d", time.Now().UnixNano())
-	local := New(originTestStore, testutil.DiscardLogger(), false, 8)
-	httpSrv := httptest.NewServer(local)
-	defer httpSrv.Close()
-	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
-	do := func(method, path, body string, headers map[string]string) *http.Response {
-		t.Helper()
-		req, err := http.NewRequest(method, httpSrv.URL+path, strings.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
+	t.Run("encoded headers and error statuses", func(t *testing.T) {
+		bucket := fmt.Sprintf("errbucket-%d", time.Now().UnixNano())
+		local := New(originTestStore, testutil.DiscardLogger(), false, 8)
+		localSrv := httptest.NewServer(local)
+		defer localSrv.Close()
+		client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+		do := func(method, path, body string, headers map[string]string) *http.Response {
+			t.Helper()
+			req, err := http.NewRequest(method, localSrv.URL+path, strings.NewReader(body))
+			testutil.Must(t, err)
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+			resp, err := client.Do(req)
+			testutil.Must(t, err)
+			return resp
 		}
-		for k, v := range headers {
-			req.Header.Set(k, v)
+		if resp := do(http.MethodPut, "/"+bucket, "", nil); resp.StatusCode != http.StatusOK {
+			t.Fatalf("create bucket = %d", resp.StatusCode)
+		} else {
+			resp.Body.Close()
 		}
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatal(err)
+		if resp := do(http.MethodPut, "/"+bucket+"/ten", "0123456789", nil); resp.StatusCode != http.StatusOK {
+			t.Fatalf("put = %d", resp.StatusCode)
+		} else {
+			resp.Body.Close()
 		}
-		return resp
-	}
-	if resp := do(http.MethodPut, "/"+bucket, "", nil); resp.StatusCode != http.StatusOK {
-		t.Fatalf("create bucket = %d", resp.StatusCode)
-	} else {
-		resp.Body.Close()
-	}
-	if resp := do(http.MethodPut, "/"+bucket+"/ten", "0123456789", nil); resp.StatusCode != http.StatusOK {
-		t.Fatalf("put = %d", resp.StatusCode)
-	} else {
-		resp.Body.Close()
-	}
-	sum := crc32.ChecksumIEEE([]byte("0123456789"))
-	checksum := base64.StdEncoding.EncodeToString([]byte{byte(sum >> 24), byte(sum >> 16), byte(sum >> 8), byte(sum)})
-	if resp := do(http.MethodPut, "/"+bucket+"/encoded", "0123456789", map[string]string{
-		"Content-Encoding": "gzip", "Content-Type": "text/plain",
-		"x-amz-checksum-crc32": checksum,
-	}); resp.StatusCode != http.StatusOK {
-		t.Fatalf("put encoded = %d", resp.StatusCode)
-	} else {
-		resp.Body.Close()
-	}
-	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		resp := do(method, "/"+bucket+"/encoded", "", nil)
-		resp.Body.Close()
-		if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
-			t.Fatalf("%s Content-Encoding = %q", method, got)
+		sum := crc32.ChecksumIEEE([]byte("0123456789"))
+		checksum := base64.StdEncoding.EncodeToString([]byte{byte(sum >> 24), byte(sum >> 16), byte(sum >> 8), byte(sum)})
+		if resp := do(http.MethodPut, "/"+bucket+"/encoded", "0123456789", map[string]string{
+			"Content-Encoding": "gzip", "Content-Type": "text/plain",
+			"x-amz-checksum-crc32": checksum,
+		}); resp.StatusCode != http.StatusOK {
+			t.Fatalf("put encoded = %d", resp.StatusCode)
+		} else {
+			resp.Body.Close()
 		}
-		if resp.Header.Get("Last-Modified") == "" {
-			t.Fatalf("%s missing Last-Modified", method)
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			resp := do(method, "/"+bucket+"/encoded", "", nil)
+			resp.Body.Close()
+			if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+				t.Fatalf("%s Content-Encoding = %q", method, got)
+			}
+			if resp.Header.Get("Last-Modified") == "" {
+				t.Fatalf("%s missing Last-Modified", method)
+			}
+			if got := resp.Header.Get("x-amz-checksum-crc32"); got != checksum {
+				t.Fatalf("%s checksum = %q, want %q", method, got, checksum)
+			}
 		}
-		if got := resp.Header.Get("x-amz-checksum-crc32"); got != checksum {
-			t.Fatalf("%s checksum = %q, want %q", method, got, checksum)
+		for _, tc := range []struct{ method, path string }{
+			{http.MethodGet, "/missing/key"},
+			{http.MethodHead, "/missing/key"},
+			{http.MethodGet, "/missing"},
+			{http.MethodDelete, "/missing/key"},
+		} {
+			resp := do(tc.method, tc.path, "", nil)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("%s %s = %d, want 404", tc.method, tc.path, resp.StatusCode)
+			}
 		}
-	}
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodGet, "/missing/key"},
-		{http.MethodHead, "/missing/key"},
-		{http.MethodGet, "/missing"},
-		{http.MethodDelete, "/missing/key"},
-	} {
-		resp := do(tc.method, tc.path, "", nil)
-		resp.Body.Close()
+		resp := do(http.MethodGet, "/"+bucket+"/ten", "", map[string]string{"Range": "bytes=100-200"})
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+			t.Fatalf("invalid range = %d", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Content-Range"); got != "bytes */10" {
+			t.Fatalf("invalid range Content-Range = %q", got)
+		}
+		resp = do(http.MethodGet, "/"+bucket+"/nope", "", nil)
+		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("%s %s = %d, want 404", tc.method, tc.path, resp.StatusCode)
+			t.Fatalf("missing key = %d", resp.StatusCode)
 		}
-	}
-	resp := do(http.MethodGet, "/"+bucket+"/ten", "", map[string]string{"Range": "bytes=100-200"})
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
-		t.Fatalf("invalid range = %d", resp.StatusCode)
-	}
-	if got := resp.Header.Get("Content-Range"); got != "bytes */10" {
-		t.Fatalf("invalid range Content-Range = %q", got)
-	}
-
-	resp = do(http.MethodGet, "/"+bucket+"/nope", "", nil)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("missing key = %d", resp.StatusCode)
-	}
+	})
 }

@@ -70,16 +70,12 @@ func call(t *testing.T, base, method, path, body string) apiReply {
 		rdr = strings.NewReader(body)
 	}
 	req, err := http.NewRequest(method, base+path, rdr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if body != "" {
 		req.Header.Set("Content-Type", mediaType)
 	}
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	reply := apiReply{status: resp.StatusCode, header: resp.Header.Clone()}

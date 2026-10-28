@@ -61,9 +61,7 @@ func newFixture(t *testing.T) *fixture {
 	cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
 	tier, err := New(testutil.DiscardLogger(), cfg, testStore,
 		fmt.Sprintf("origin-%d", time.Now().UnixNano()), 0, 24*time.Hour, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	dropOnCleanup(t, ns.WriteBack, tier.namespace)
 	dropOnCleanup(t, ns.Cache, tier.namespace)
 	t.Cleanup(func() { _ = tier.Close() })
@@ -73,9 +71,7 @@ func newFixture(t *testing.T) *fixture {
 func (f *fixture) readOrigin(t *testing.T, key string) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(f.dir, key))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	return string(b)
 }
 
@@ -83,9 +79,7 @@ func readObject(t *testing.T, obj *Object) string {
 	t.Helper()
 	defer obj.Body.Close()
 	b, err := io.ReadAll(obj.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	return string(b)
 }
 
@@ -119,33 +113,23 @@ func TestTierLifecycle(t *testing.T) {
 		t.Fatalf("origin = %q", got)
 	}
 	head, err := f.tier.Head(ctx, "bkt", "a.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if head.Size != 5 || head.ContentType != "text/plain" || head.ETag == "" {
 		t.Fatalf("head = %+v", head)
 	}
 	obj, err := f.tier.Open(ctx, "bkt", "a.txt", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if got := readObject(t, obj); got != "alpha" {
 		t.Fatalf("open = %q", got)
 	}
 	obj, err = f.tier.Open(ctx, "bkt", "a.txt", store.Range(1, 3, -1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if got := readObject(t, obj); got != "lph" {
 		t.Fatalf("range = %q", got)
 	}
-	if err := os.WriteFile(filepath.Join(f.dir, "bkt", "b.txt"), []byte("beta"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, os.WriteFile(filepath.Join(f.dir, "bkt", "b.txt"), []byte("beta"), 0o644))
 	rows, err := f.tier.List(ctx, "bkt", "", "", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if len(rows) != 2 || rows[0].Key != "a.txt" || rows[1].Key != "b.txt" {
 		t.Fatalf("list = %+v", rows)
 	}
@@ -170,13 +154,9 @@ func TestTierLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		head, err := f.tier.Head(ctx, "bkt", "a.txt")
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		obj, err := f.tier.Open(ctx, "bkt", "a.txt", store.WholeObjectRange())
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if got := readObject(t, obj); got != "alpha" {
 			t.Fatalf("open = %q", got)
 		}
@@ -197,20 +177,14 @@ func TestTierPendingCompletion(t *testing.T) {
 		origin := &flakyOrigin{originHandle: f.tier.origin}
 		f.tier.origin = origin
 		uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp-fail", nil, "text/plain", "", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp-fail", 1, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if _, err := w.Write([]byte("nope")); err != nil {
 			t.Fatal(err)
 		}
 		pub, err := w.Finish(nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		origin.down.Store(true)
 		if _, err := f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-fail",
 			[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, store.WriteOptions{}); err == nil {
@@ -238,29 +212,21 @@ func TestTierPendingCompletion(t *testing.T) {
 		origin := &flakyOrigin{originHandle: f.tier.origin}
 		f.tier.origin = origin
 		uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp-old", nil, "text/plain", "", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp-old", 1, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if _, err := w.Write([]byte("new!")); err != nil {
 			t.Fatal(err)
 		}
 		pub, err := w.Finish(nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		origin.down.Store(true)
 		if _, err := f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-old",
 			[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, store.WriteOptions{}); err == nil {
 			t.Fatal("expected origin failure")
 		}
 		obj, err := f.tier.Open(ctx, "bkt", "mp-old", store.WholeObjectRange())
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if got := readObject(t, obj); got != "new!" {
 			t.Fatalf("pending read = %q, want completed cache body", got)
 		}
@@ -294,20 +260,14 @@ type s3Fixture struct {
 func newS3Fixture(t *testing.T, prefix string) *s3Fixture {
 	t.Helper()
 	cfg, err := testutil.S3()
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	bucket := fmt.Sprintf("pgvs3-test-%d", time.Now().UnixNano())
 	client, err := s3client.New(s3client.Config{
 		Endpoint: cfg.Endpoint, Bucket: bucket, AccessKey: cfg.AccessKey,
 		SecretKey: cfg.SecretKey, Insecure: true, PathStyle: true, Prefix: prefix,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := client.CreateBucket(testCtx); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
+	testutil.Must(t, client.CreateBucket(testCtx))
 	t.Cleanup(func() {
 		ctx := context.WithoutCancel(testCtx)
 		for obj, err := range client.Walk(ctx, "") {
@@ -333,9 +293,7 @@ func newS3Fixture(t *testing.T, prefix string) *s3Fixture {
 	}`, prefix, bucket, cfg.Endpoint, cfg.AccessKey, cfg.SecretKey)
 	tier, err := New(testutil.DiscardLogger(), originCfg, testStore,
 		fmt.Sprintf("origin-s3-%d", time.Now().UnixNano()), 0, 24*time.Hour, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	t.Cleanup(func() { _ = tier.Close() })
 	return &s3Fixture{tier: tier, client: client}
 }
@@ -343,14 +301,10 @@ func newS3Fixture(t *testing.T, prefix string) *s3Fixture {
 func (f *s3Fixture) readOrigin(t *testing.T, key string) string {
 	t.Helper()
 	obj, err := f.client.Get(testCtx, key, 0, -1, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	defer obj.Close()
 	b, err := io.ReadAll(obj)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	return string(b)
 }
 
@@ -364,9 +318,7 @@ func TestTierS3PrefixMetadataAndConditions(t *testing.T) {
 		t.Fatal(err)
 	}
 	attrs, err := f.tier.origin.Attributes(ctx, f.tier.key("bkt", "meta.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	metaValue := func(pairs []string, name string) string {
 		for i := 0; i+1 < len(pairs); i += 2 {
 			if pairs[i] == name {
@@ -429,9 +381,7 @@ func TestTierS3PrefixMetadataAndConditions(t *testing.T) {
 		t.Fatal(err)
 	}
 	head, err := f.tier.Head(ctx, "bkt", "meta.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if head.ContentType != "text/plain" || metaValue(head.UserMetadata, "owner") != "origin" ||
 		metaValue(head.UserMetadata, "x-amz-acl") != "public-read" {
 		t.Fatalf("origin metadata after eviction = %+v", head)
@@ -443,9 +393,7 @@ func TestTierS3PrefixMetadataAndConditions(t *testing.T) {
 		}
 	}
 	rows, err := f.tier.List(ctx, "bkt", "dir/", "", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if len(rows) != 2 || rows[0].Key != "dir/a" || rows[1].Key != "dir/b" {
 		t.Fatalf("prefixed list = %+v", rows)
 	}
@@ -461,21 +409,15 @@ func TestUnsupportedKeysRejectedBeforeCommit(t *testing.T) {
 	multipart := func(opts store.WriteOptions) func(*testing.T, *fixture, string) error {
 		return func(t *testing.T, f *fixture, key string) error {
 			uploadID, err := f.tier.CreateUpload(ctx, "bkt", key, nil, "text/plain", "", nil)
-			if err != nil {
-				t.Fatal(err)
-			}
+			testutil.Must(t, err)
 			defer f.tier.AbortUpload(ctx, uploadID, "bkt", key)
 			w, err := f.tier.StartPart(ctx, uploadID, "bkt", key, 1, 0)
-			if err != nil {
-				t.Fatal(err)
-			}
+			testutil.Must(t, err)
 			if _, err := w.Write([]byte("part")); err != nil {
 				t.Fatal(err)
 			}
 			pub, err := w.Finish(nil)
-			if err != nil {
-				t.Fatal(err)
-			}
+			testutil.Must(t, err)
 			_, err = f.tier.CompleteUpload(ctx, uploadID, "bkt", key, []store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, opts)
 			return err
 		}
@@ -571,9 +513,7 @@ func TestFillCoalescing(t *testing.T) {
 	}
 	cache := fmt.Sprintf("origin-cross-fill-%d", time.Now().UnixNano())
 	for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
-		if err := testStore.EnsureNamespace(ctx, kind, cache, nil, nil); err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, testStore.EnsureNamespace(ctx, kind, cache, nil, nil))
 	}
 	t.Cleanup(func() {
 		for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
@@ -666,9 +606,7 @@ func TestFillCoalescing(t *testing.T) {
 		close(blocked.release)
 		select {
 		case err := <-owner:
-			if err != nil {
-				t.Fatal(err)
-			}
+			testutil.Must(t, err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("owner did not finish")
 		}
@@ -731,9 +669,7 @@ func TestStaleFillCannotOverwriteNewerCacheVersion(t *testing.T) {
 		t.Fatalf("stale fill served %q, want the newer version", got)
 	}
 	m, err := testStore.MetaHeader(ctx, store.ObjectRef{NS: ns.WriteBackRef(cache), Key: slow.key("bkt", "race")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if m.Size != int64(len(newer)) {
 		t.Fatalf("write-back size after stale fill = %d, want %d", m.Size, len(newer))
 	}
@@ -804,24 +740,16 @@ func TestStaleMultipartFlushCannotOverwriteNewerWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	base, err := f.tier.origin.Attributes(ctx, f.tier.key("bkt", "race"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	uploadID, err := f.tier.CreateUpload(ctx, "bkt", "race", nil, "text/plain", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	w, err := f.tier.StartPart(ctx, uploadID, "bkt", "race", 1, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if _, err := w.Write([]byte("stale")); err != nil {
 		t.Fatal(err)
 	}
 	pub, err := w.Finish(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	exp := time.Now().Add(time.Hour)
 	if _, err := testStore.CompleteUploadPending(ctx, store.ObjectRef{NS: ns.WriteBackRef(f.tier.namespace), Key: f.tier.key("bkt", "race")}, uploadID, []store.ListedPart{{PartNo: 1, ETag: pub.ETag}},
 		store.WriteOptions{ExpiresAt: &exp}, store.PendingCompletion{BaseETag: base.ETag, LeaseOwner: "blocked"}); err != nil {
@@ -848,9 +776,7 @@ func TestStaleMultipartFlushCannotOverwriteNewerWrite(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("stale flush did not reach the origin")
 	}
-	if err := os.WriteFile(filepath.Join(f.dir, "bkt", "race"), []byte("new"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, os.WriteFile(filepath.Join(f.dir, "bkt", "race"), []byte("new"), 0o644))
 	close(blocked.release)
 	if err := <-errCh; !errors.Is(err, store.ErrPrecondition) {
 		t.Fatalf("stale flush error = %v, want ErrPrecondition", err)
@@ -870,39 +796,27 @@ func TestStaleMultipartFlushCannotOverwriteNewerWrite(t *testing.T) {
 func TestReadOnlyTier(t *testing.T) {
 	ctx := testCtx
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "bkt"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "bkt", "cold.txt"), []byte("cold"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, os.MkdirAll(filepath.Join(dir, "bkt"), 0o755))
+	testutil.Must(t, os.WriteFile(filepath.Join(dir, "bkt", "cold.txt"), []byte("cold"), 0o644))
 	cache := fmt.Sprintf("origin-ro-%d", time.Now().UnixNano())
 	cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
 	seed, err := New(testutil.DiscardLogger(), cfg, testStore, cache, 0, time.Hour, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if _, err := seed.Upload(ctx, "bkt", "warm.txt", strings.NewReader("older"), nil, "text/plain"); err != nil {
 		t.Fatal(err)
 	}
 	seed.Close()
-	if err := os.WriteFile(filepath.Join(dir, "bkt", "warm.txt"), []byte("newer"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, os.WriteFile(filepath.Join(dir, "bkt", "warm.txt"), []byte("newer"), 0o644))
 
 	tier, err := NewReadOnly(testutil.DiscardLogger(), cfg, testStore, cache, 0, time.Hour, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	defer tier.Close()
 	head, err := tier.Head(ctx, "bkt", "cold.txt")
 	if err != nil || head.Size != 4 {
 		t.Fatalf("cold head = %+v err=%v", head, err)
 	}
 	warm, err := tier.Open(ctx, "bkt", "warm.txt", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if got := readObject(t, warm); got != "newer" {
 		t.Fatalf("stale read-only open = %q", got)
 	}
@@ -913,9 +827,7 @@ func TestReadOnlyTier(t *testing.T) {
 		t.Fatalf("read-only Upload error = %v", err)
 	}
 	obj, err := tier.Open(ctx, "bkt", "cold.txt", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if got := readObject(t, obj); got != "cold" {
 		t.Fatalf("cold open = %q", got)
 	}
@@ -929,12 +841,8 @@ func TestReadOnlyTier(t *testing.T) {
 	t.Run("durable write-back row", func(t *testing.T) {
 		ctx := testCtx
 		cache := fmt.Sprintf("origin-ro-skip-%d", time.Now().UnixNano())
-		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
-			t.Fatal(err)
-		}
-		if err := testStore.EnsureNamespace(ctx, ns.WriteBack, cache, nil, nil); err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil))
+		testutil.Must(t, testStore.EnsureNamespace(ctx, ns.WriteBack, cache, nil, nil))
 		dropOnCleanup(t, ns.WriteBack, cache)
 		dropOnCleanup(t, ns.Cache, cache)
 		if _, err := testStore.PutInline(ctx, store.ObjectRef{NS: ns.WriteBackRef(cache), Key: "bkt/warm"},
@@ -957,9 +865,7 @@ func TestReadOnlyTier(t *testing.T) {
 			t.Fatalf("read-only head = %+v err=%v", head, err)
 		}
 		obj, err := tier.Open(ctx, "bkt", "warm", store.WholeObjectRange())
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if got := readObject(t, obj); got != "durable" {
 			t.Fatalf("read-only open = %q", got)
 		}
@@ -971,40 +877,26 @@ func TestReadOnlyTier(t *testing.T) {
 	t.Run("shared cache after origin removal", func(t *testing.T) {
 		ctx := testCtx
 		dir := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(dir, "bucket"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "bucket", "key"), []byte("shared"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, os.MkdirAll(filepath.Join(dir, "bucket"), 0o755))
+		testutil.Must(t, os.WriteFile(filepath.Join(dir, "bucket", "key"), []byte("shared"), 0o644))
 		cache := fmt.Sprintf("origin-shared-%d", time.Now().UnixNano())
 		dropOnCleanup(t, ns.WriteBack, cache)
 		dropOnCleanup(t, ns.Cache, cache)
 		cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
 		writer, err := New(testutil.DiscardLogger(), cfg, testStore, cache, time.Hour, time.Hour, 2)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		defer writer.Close()
 		obj, err := writer.Open(ctx, "bucket", "key", store.WholeObjectRange())
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if got := readObject(t, obj); got != "shared" {
 			t.Fatalf("writer open = %q", got)
 		}
-		if err := os.Remove(filepath.Join(dir, "bucket", "key")); err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, os.Remove(filepath.Join(dir, "bucket", "key")))
 		reader, err := NewReadOnly(testutil.DiscardLogger(), cfg, testStore, cache, time.Hour, time.Hour, 2)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		defer reader.Close()
 		obj, err = reader.Open(ctx, "bucket", "key", store.WholeObjectRange())
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if got := readObject(t, obj); got != "shared" {
 			t.Fatalf("read-only shared-cache open = %q", got)
 		}
@@ -1018,9 +910,7 @@ func TestResponseShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	obj, err := f.tier.Open(ctx, "bkt", "full.txt", store.Range(0, -1, -1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if !obj.Ranged {
 		t.Fatal("explicit bytes=0- range was not marked as ranged")
 	}
@@ -1034,9 +924,7 @@ func TestResponseShape(t *testing.T) {
 			t.Fatal(err)
 		}
 		obj, err := f.tier.Open(ctx, "bkt", "zero", store.WholeObjectRange())
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if got := readObject(t, obj); got != "" || obj.Size != 0 || obj.Ranged {
 			t.Fatalf("zero object = %+v body=%q", obj, got)
 		}
@@ -1050,24 +938,16 @@ func TestMultipartCompleteOriginPrecondition(t *testing.T) {
 		t.Fatal(err)
 	}
 	head, err := f.tier.Head(ctx, "bkt", "cond")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	uploadID, err := f.tier.CreateUpload(ctx, "bkt", "cond", nil, "text/plain", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	w, err := f.tier.StartPart(ctx, uploadID, "bkt", "cond", 1, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if _, err := w.Write([]byte("new")); err != nil {
 		t.Fatal(err)
 	}
 	pub, err := w.Finish(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	listed := []store.ListedPart{{PartNo: 1, ETag: pub.ETag}}
 	if _, err := f.tier.CompleteUpload(ctx, uploadID, "bkt", "cond", listed,
 		store.WriteOptions{Precondition: store.Precondition{Mode: store.IfMatch, ETag: "wrong"}}); !errors.Is(err, store.ErrPrecondition) {
@@ -1113,9 +993,7 @@ func TestColdWholeReadUsesOneOriginRequest(t *testing.T) {
 	f.tier.origin = counted
 
 	obj, err := f.tier.Open(ctx, "bkt", "cold.txt", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if got := readObject(t, obj); got != "cold" {
 		t.Fatalf("body = %q", got)
 	}
@@ -1127,9 +1005,7 @@ func TestColdWholeReadUsesOneOriginRequest(t *testing.T) {
 	}
 
 	obj, err = f.tier.Open(ctx, "bkt", "cold.txt", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	_ = readObject(t, obj)
 	if counted.gets.Load() != 1 || counted.heads.Load() != 0 {
 		t.Fatalf("warm read contacted origin: gets=%d heads=%d", counted.gets.Load(), counted.heads.Load())
@@ -1203,9 +1079,7 @@ func TestWriteBackAcks(t *testing.T) {
 				t.Fatalf("write-back size = %d, want %d", size, len(tc.want))
 			}
 			obj, err := f.tier.Open(ctx, "bkt", tc.key, store.WholeObjectRange())
-			if err != nil {
-				t.Fatal(err)
-			}
+			testutil.Must(t, err)
 			if got := readObject(t, obj); got != string(tc.want) {
 				t.Fatalf("cached write-back body length = %d, want %d", len(got), len(tc.want))
 			}
@@ -1267,9 +1141,7 @@ func TestListMergesPendingWriteBackObjects(t *testing.T) {
 func TestTierModelAcrossWorkers(t *testing.T) {
 	ctx := testCtx
 	mem, err := newTempBucket(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	cache := fmt.Sprintf("origin-model-%d", time.Now().UnixNano())
 	log := testutil.DiscardLogger()
 	newTier := func() *Tier {
@@ -1353,9 +1225,7 @@ func TestCacheResolutionLifecycle(t *testing.T) {
 					key := fmt.Sprintf("%s-%t-%s", kind, readOnly, state)
 					ck := f.tier.key("bkt", key)
 					a, err := f.tier.origin.Upload(ctx, ck, strings.NewReader("hello"), 5, originUpload{})
-					if err != nil {
-						t.Fatal(err)
-					}
+					testutil.Must(t, err)
 					version := versionFor(a)
 					switch state {
 					case "stale":
@@ -1365,15 +1235,11 @@ func TestCacheResolutionLifecycle(t *testing.T) {
 					case "deleted":
 						version = store.DeletedCacheVersion("test").String()
 					case "missing-origin":
-						if err := f.tier.origin.Delete(ctx, ck); err != nil {
-							t.Fatal(err)
-						}
+						testutil.Must(t, f.tier.origin.Delete(ctx, ck))
 					}
 					ref := store.ObjectRef{NS: ns.Ref{Kind: kind, Name: f.tier.namespace}, Key: ck}
 					m, err := testStore.PutInline(ctx, ref, []byte("hello"), store.WriteOptions{OriginETag: version})
-					if err != nil {
-						t.Fatal(err)
-					}
+					testutil.Must(t, err)
 					f.tier.readOnly, f.tier.ttl = readOnly, 0
 					if state == "fresh" {
 						f.tier.ttl = time.Hour
@@ -1415,9 +1281,7 @@ func TestSpooledPublicationMetadata(t *testing.T) {
 	<-f.tier.done
 	data := bytes.Repeat([]byte("encoded"), 16<<10)
 	sp, cleanup, err := spoolStream(testCtx, bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	defer cleanup()
 	sum := sha256.Sum256(data)
 	checksum := &store.Checksum{Name: "sha256", Value: base64.StdEncoding.EncodeToString(sum[:])}
@@ -1433,13 +1297,9 @@ func TestSpooledPublicationMetadata(t *testing.T) {
 		}
 		ref := f.tier.writeRef(fmt.Sprintf("bkt/metadata-%t", pending))
 		m, err := f.tier.storeSpooled(testCtx, ref, sp, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		stored, err := testStore.MetaHeader(testCtx, ref)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		for _, info := range []store.ObjectInfo{m.ObjectInfo, stored.ObjectInfo} {
 			if info.ContentEncoding != opts.ContentEncoding || info.ContentType != opts.ContentType ||
 				!info.OriginModified.Equal(modified) || info.ChecksumName != checksum.Name ||
@@ -1467,9 +1327,7 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 	rng := store.Range(100, 199, -1)
 	for pass := range 2 {
 		obj, err := f.tier.Open(testCtx, "bkt", "ranges", rng)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		if obj.Hit != (pass > 0) {
 			t.Fatalf("range pass %d hit=%t", pass, obj.Hit)
 		}
@@ -1485,15 +1343,11 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 	}
 
 	ro, err := NewReadOnly(nil, []byte(`{"type":"inmem"}`), testStore, f.tier.namespace, time.Hour, time.Hour, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	defer ro.Close()
 	ro.EnableRangeCache(64 << 10)
 	obj, err := ro.Open(testCtx, "bkt", "ranges", rng)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	if got := readObject(t, obj); got != string(data[100:200]) {
 		t.Fatal("replica-shaped tier missed shared range")
 	}
@@ -1501,16 +1355,12 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	obj, err = f.tier.Open(testCtx, "bkt", "ranges", rng)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, err)
 	_ = obj.Body.Close()
 	if counted.attributes != 2 {
 		t.Fatalf("expired metadata did not revalidate: %d", counted.attributes)
 	}
-	if err := f.tier.Delete(testCtx, "bkt", "ranges"); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, f.tier.Delete(testCtx, "bkt", "ranges"))
 	if _, err := ro.Open(testCtx, "bkt", "ranges", rng); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("delete exposed metadata/ranges: %v", err)
 	}
@@ -1520,12 +1370,8 @@ func TestParentHeadPublicationFencedByTombstone(t *testing.T) {
 	f := newFixture(t)
 	ck := f.tier.key("bkt", "fenced-head")
 	info := store.ObjectInfo{Size: 10 << 20, OriginETag: "old", ETag: "old", ContentType: "application/parquet"}
-	if err := f.tier.fenceReadCache(testCtx, ck); err != nil {
-		t.Fatal(err)
-	}
-	if err := testStore.Cache(f.tier.namespace).RememberOriginMetadata(testCtx, ck, info, time.Now(), time.Hour); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Must(t, f.tier.fenceReadCache(testCtx, ck))
+	testutil.Must(t, testStore.Cache(f.tier.namespace).RememberOriginMetadata(testCtx, ck, info, time.Now(), time.Hour))
 	got, err := testStore.Cache(f.tier.namespace).OriginMetadata(testCtx, ck, time.Hour)
 	if err != nil || got != nil {
 		t.Fatalf("late HEAD resurrected metadata: %+v %v", got, err)
@@ -1581,9 +1427,7 @@ func TestFillRenewal(t *testing.T) {
 			t.Fatal(err)
 		}
 		obj, err := f.tier.Open(testCtx, "bkt", "renewed", store.WholeObjectRange())
-		if err != nil {
-			t.Fatal(err)
-		}
+		testutil.Must(t, err)
 		defer obj.Body.Close()
 		data, err := io.ReadAll(obj.Body)
 		if err != nil || string(data) != "body" {
