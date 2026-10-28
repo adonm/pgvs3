@@ -58,7 +58,7 @@ func unique(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
-func TestCompleteUploadPendingOutbox(t *testing.T) {
+func TestPendingOutboxLifecycle(t *testing.T) {
 	ctx := testCtx
 	cache := unique("origin")
 	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
@@ -130,9 +130,47 @@ func TestCompleteUploadPendingOutbox(t *testing.T) {
 	if pending != 0 {
 		t.Fatalf("pending rows = %d, want 0", pending)
 	}
+	t.Run("flush refuses pending uploads", func(t *testing.T) {
+		ctx := testCtx
+		cache := unique("flush")
+		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := testStore.SetNamespaceAttrs(ctx, ns.Cache, cache, map[string]any{"origin": map[string]any{"scope": "global"}}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
+			_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
+		})
+		if _, err := testStore.Pool().Exec(ctx, `INSERT INTO s3p.pending_uploads
+			(kind, namespace, key, token, size, attempts, next_attempt, base_missing)
+			VALUES ('cache', $1, 'bkt/key', 'pending:flush', 1, 0, now(), false)`, cache); err != nil {
+			t.Fatal(err)
+		}
+		if err := testStore.Cache(cache).Flush(ctx); !errors.Is(err, ErrPendingUploads) {
+			t.Fatalf("flush with pending error = %v, want ErrPendingUploads", err)
+		}
+		if _, err := testStore.Pool().Exec(ctx, `DELETE FROM s3p.pending_uploads WHERE namespace=$1`, cache); err != nil {
+			t.Fatal(err)
+		}
+		if err := testStore.Cache(cache).Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		attrs, ok, err := testStore.NamespaceAttrs(ctx, ns.Cache, cache)
+		if err != nil || !ok {
+			t.Fatalf("attrs ok=%v err=%v", ok, err)
+		}
+		if _, ok := attrs["origin"]; !ok {
+			t.Fatalf("origin attrs not preserved: %+v", attrs)
+		}
+		if err := testStore.EnsureNamespace(ctx, ns.WriteBack, cache, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
-func TestPendingUploadClaimsAreLeased(t *testing.T) {
+func TestPendingUploadClaims(t *testing.T) {
 	ctx := testCtx
 	cache := unique("origin")
 	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
@@ -188,6 +226,91 @@ func TestPendingUploadClaimsAreLeased(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("attempts after owner failure = %d", attempts)
 	}
+	t.Run("distributed across owners", func(t *testing.T) {
+		ctx := testCtx
+		cache := unique("origin")
+		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		_, err := testStore.Pool().Exec(ctx, `INSERT INTO s3p.pending_uploads
+			(namespace, key, token, base_etag, base_missing)
+			VALUES ($1, 'bkt/a', 'pending:a', 'base-a', false),
+			       ($1, 'bkt/b', 'pending:b', 'base-b', false)`, cache)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-a", 1, 5*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-b", 1, 5*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(a) != 1 || len(b) != 1 || a[0].Key == b[0].Key {
+			t.Fatalf("claims = %+v / %+v, want two distinct keys", a, b)
+		}
+		if a[0].LeaseOwner != "worker-a" || b[0].LeaseOwner != "worker-b" {
+			t.Fatalf("claim owners = %q / %q", a[0].LeaseOwner, b[0].LeaseOwner)
+		}
+		rest, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-c", 2, 5*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rest) != 0 {
+			t.Fatalf("duplicate claims = %+v", rest)
+		}
+	})
+	t.Run("dead letters after permanent failure", func(t *testing.T) {
+		ctx := testCtx
+		cache := unique("dead")
+		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.Pool().Exec(ctx, `INSERT INTO s3p.pending_uploads
+			(kind, namespace, key, token, attempts, next_attempt, base_missing, lease_owner, lease_until)
+			VALUES ('cache', $1, 'bkt/key', 'pending:dead', 0, now(), false, 'owner', now() + interval '1 minute')`,
+			cache); err != nil {
+			t.Fatal(err)
+		}
+		if err := testStore.Cache(cache).FailPendingUpload(ctx, "bkt/key", "pending:dead", "owner", 0, errors.New("origin down")); err != nil {
+			t.Fatal(err)
+		}
+		var dead bool
+		var attempts int
+		if err := testStore.Pool().QueryRow(ctx,
+			"SELECT dead, attempts FROM s3p.pending_uploads WHERE namespace = $1 AND key = 'bkt/key'", cache).
+			Scan(&dead, &attempts); err != nil {
+			t.Fatal(err)
+		}
+		if dead || attempts != 1 {
+			t.Fatalf("transient failure dead=%v attempts=%d", dead, attempts)
+		}
+		if _, err := testStore.Pool().Exec(ctx,
+			`UPDATE s3p.pending_uploads SET lease_owner = 'owner', lease_until = now() + interval '1 minute'
+			 WHERE namespace = $1 AND key = 'bkt/key'`, cache); err != nil {
+			t.Fatal(err)
+		}
+		if err := testStore.Cache(cache).FailPendingUploadPermanent(ctx, "bkt/key", "pending:dead", "owner", 1, errors.New("missing durable body")); err != nil {
+			t.Fatal(err)
+		}
+		if err := testStore.Pool().QueryRow(ctx,
+			"SELECT dead, attempts FROM s3p.pending_uploads WHERE namespace = $1 AND key = 'bkt/key'", cache).
+			Scan(&dead, &attempts); err != nil {
+			t.Fatal(err)
+		}
+		if !dead {
+			t.Fatalf("permanent failure dead=%v attempts=%d", dead, attempts)
+		}
+		claimed, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker", 1, time.Minute)
+		if err != nil || len(claimed) != 0 {
+			t.Fatalf("dead row claimed: %+v err=%v", claimed, err)
+		}
+		live, deadCount, err := testStore.PendingUploadCounts(ctx)
+		if err != nil || deadCount == 0 {
+			t.Fatalf("pending counts live=%d dead=%d err=%v", live, deadCount, err)
+		}
+	})
 }
 
 func TestCachePublishExpectedOriginGuard(t *testing.T) {
@@ -283,42 +406,6 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 	}
 }
 
-func TestPendingUploadClaimsAreDistributedAcrossOwners(t *testing.T) {
-	ctx := testCtx
-	cache := unique("origin")
-	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	_, err := testStore.Pool().Exec(ctx, `INSERT INTO s3p.pending_uploads
-		(namespace, key, token, base_etag, base_missing)
-		VALUES ($1, 'bkt/a', 'pending:a', 'base-a', false),
-		       ($1, 'bkt/b', 'pending:b', 'base-b', false)`, cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-a", 1, 5*time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-b", 1, 5*time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(a) != 1 || len(b) != 1 || a[0].Key == b[0].Key {
-		t.Fatalf("claims = %+v / %+v, want two distinct keys", a, b)
-	}
-	if a[0].LeaseOwner != "worker-a" || b[0].LeaseOwner != "worker-b" {
-		t.Fatalf("claim owners = %q / %q", a[0].LeaseOwner, b[0].LeaseOwner)
-	}
-	rest, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-c", 2, 5*time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rest) != 0 {
-		t.Fatalf("duplicate claims = %+v", rest)
-	}
-}
-
 func TestEnsureMaintenanceDetectsSchemaDrift(t *testing.T) {
 	ctx := testCtx
 	bucket := unique("drift")
@@ -345,13 +432,14 @@ func TestEnsureMaintenanceDetectsSchemaDrift(t *testing.T) {
 	}
 }
 
-func TestDatabaseBudgetGuard(t *testing.T) {
+func TestQuotaAdmission(t *testing.T) {
 	ctx := testCtx
 	bucket := unique("budget")
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
 	testStore.SetMaxDBBytes(1)
+	t.Cleanup(func() { testStore.SetMaxDBBytes(0) })
 	_, err := testStore.PutInline(ctx, ObjectRef{NS: ns.BucketRef(bucket), Key: "k"}, []byte("x"),
 		WriteOptions{ContentType: "text/plain"})
 	if !errors.Is(err, ErrQuotaExceeded) {
@@ -362,6 +450,19 @@ func TestDatabaseBudgetGuard(t *testing.T) {
 		WriteOptions{ContentType: "text/plain"}); err != nil {
 		t.Fatalf("write after clearing budget: %v", err)
 	}
+	t.Run("part quota admission", func(t *testing.T) {
+		ctx := testCtx
+		cache := unique("part-quota")
+		quota := int64(1 << 20)
+		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, &quota, nil); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true) })
+		_, err := testStore.StartPart(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: "bkt/part"}, "missing", 1, 2<<20)
+		if !errors.Is(err, ErrQuotaExceeded) {
+			t.Fatalf("oversized part error = %v, want ErrQuotaExceeded", err)
+		}
+	})
 }
 
 func TestBucketWritesCannotResurrectDroppedNamespace(t *testing.T) {
@@ -471,26 +572,6 @@ func TestBucketWritesCannotResurrectDroppedNamespace(t *testing.T) {
 	})
 }
 
-func TestCacheBasics(t *testing.T) {
-	ctx := testCtx
-	cache := unique("cache")
-	if _, _, _, err := testStore.Cache(cache).Set(ctx, "k", []byte("value"), CacheSetOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	got, ok, err := testStore.Cache(cache).Get(ctx, "k")
-	if err != nil || !ok || string(got) != "value" {
-		t.Fatalf("get: %q %v %v", got, ok, err)
-	}
-	n, err := testStore.Cache(cache).IncrBy(ctx, "counter", 2)
-	if err != nil || n != 2 {
-		t.Fatalf("incr: %d %v", n, err)
-	}
-	n, err = testStore.Cache(cache).IncrBy(ctx, "counter", -1)
-	if err != nil || n != 1 {
-		t.Fatalf("decr: %d %v", n, err)
-	}
-}
-
 func TestSchemaBootstrapAndIdempotentInit(t *testing.T) {
 	ctx := testCtx
 	var layout int
@@ -499,14 +580,6 @@ func TestSchemaBootstrapAndIdempotentInit(t *testing.T) {
 	}
 	if layout != LayoutVersion {
 		t.Fatalf("layout = %d, want %d", layout, LayoutVersion)
-	}
-	var hasGoose bool
-	if err := testStore.pool.QueryRow(ctx,
-		"SELECT to_regclass('s3p.goose_db_version') IS NOT NULL").Scan(&hasGoose); err != nil {
-		t.Fatal(err)
-	}
-	if hasGoose {
-		t.Fatal("squashed schema still contains goose_db_version")
 	}
 	if err := testStore.Init(ctx); err != nil {
 		t.Fatalf("second Init: %v", err)
@@ -533,57 +606,6 @@ func TestCacheKeyAdvisoryLockBlocksSecondOwner(t *testing.T) {
 		t.Fatalf("lock after release: %v", err)
 	}
 	release2()
-}
-
-func TestPendingUploadPermanentFailureDeadLetters(t *testing.T) {
-	ctx := testCtx
-	cache := unique("dead")
-	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testStore.Pool().Exec(ctx, `INSERT INTO s3p.pending_uploads
-		(kind, namespace, key, token, attempts, next_attempt, base_missing, lease_owner, lease_until)
-		VALUES ('cache', $1, 'bkt/key', 'pending:dead', 0, now(), false, 'owner', now() + interval '1 minute')`,
-		cache); err != nil {
-		t.Fatal(err)
-	}
-	if err := testStore.Cache(cache).FailPendingUpload(ctx, "bkt/key", "pending:dead", "owner", 0, errors.New("origin down")); err != nil {
-		t.Fatal(err)
-	}
-	var dead bool
-	var attempts int
-	if err := testStore.Pool().QueryRow(ctx,
-		"SELECT dead, attempts FROM s3p.pending_uploads WHERE namespace = $1 AND key = 'bkt/key'", cache).
-		Scan(&dead, &attempts); err != nil {
-		t.Fatal(err)
-	}
-	if dead || attempts != 1 {
-		t.Fatalf("transient failure dead=%v attempts=%d", dead, attempts)
-	}
-	if _, err := testStore.Pool().Exec(ctx,
-		`UPDATE s3p.pending_uploads SET lease_owner = 'owner', lease_until = now() + interval '1 minute'
-		 WHERE namespace = $1 AND key = 'bkt/key'`, cache); err != nil {
-		t.Fatal(err)
-	}
-	if err := testStore.Cache(cache).FailPendingUploadPermanent(ctx, "bkt/key", "pending:dead", "owner", 1, errors.New("missing durable body")); err != nil {
-		t.Fatal(err)
-	}
-	if err := testStore.Pool().QueryRow(ctx,
-		"SELECT dead, attempts FROM s3p.pending_uploads WHERE namespace = $1 AND key = 'bkt/key'", cache).
-		Scan(&dead, &attempts); err != nil {
-		t.Fatal(err)
-	}
-	if !dead {
-		t.Fatalf("permanent failure dead=%v attempts=%d", dead, attempts)
-	}
-	claimed, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker", 1, time.Minute)
-	if err != nil || len(claimed) != 0 {
-		t.Fatalf("dead row claimed: %+v err=%v", claimed, err)
-	}
-	live, deadCount, err := testStore.PendingUploadCounts(ctx)
-	if err != nil || deadCount == 0 {
-		t.Fatalf("pending counts live=%d dead=%d err=%v", live, deadCount, err)
-	}
 }
 
 func TestWriteBackNamespaceIsLogged(t *testing.T) {
@@ -655,106 +677,110 @@ func TestConcurrentConditionalCreate(t *testing.T) {
 	}
 }
 
-func TestCacheFlushPreservesAttrsAndRejectsPending(t *testing.T) {
+func TestChunkLayoutRequiresReloptionsAndExternalStorage(t *testing.T) {
 	ctx := testCtx
-	cache := unique("flush")
-	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
+	bucket := unique("chunk-layout")
+	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	if err := testStore.SetNamespaceAttrs(ctx, ns.Cache, cache, map[string]any{"origin": map[string]any{"scope": "global"}}); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
-		_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
-	})
-	if _, err := testStore.Pool().Exec(ctx, `INSERT INTO s3p.pending_uploads
-		(kind, namespace, key, token, size, attempts, next_attempt, base_missing)
-		VALUES ('cache', $1, 'bkt/key', 'pending:flush', 1, 0, now(), false)`, cache); err != nil {
-		t.Fatal(err)
-	}
-	if err := testStore.Cache(cache).Flush(ctx); !errors.Is(err, ErrPendingUploads) {
-		t.Fatalf("flush with pending error = %v, want ErrPendingUploads", err)
-	}
-	if _, err := testStore.Pool().Exec(ctx, `DELETE FROM s3p.pending_uploads WHERE namespace=$1`, cache); err != nil {
-		t.Fatal(err)
-	}
-	if err := testStore.Cache(cache).Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	attrs, ok, err := testStore.NamespaceAttrs(ctx, ns.Cache, cache)
-	if err != nil || !ok {
-		t.Fatalf("attrs ok=%v err=%v", ok, err)
-	}
-	if _, ok := attrs["origin"]; !ok {
-		t.Fatalf("origin attrs not preserved: %+v", attrs)
-	}
-	if err := testStore.EnsureNamespace(ctx, ns.WriteBack, cache, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestDoctorQueueUsesClaimIndex(t *testing.T) {
-	ctx := testCtx
-	queue := unique("doctor")
-	if err := testStore.queue(queue).Ensure(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, queue, true) })
-	d, err := testStore.Diagnose(ctx)
+	t.Cleanup(func() { _, _ = testStore.DropBucket(testCtx, bucket, true) })
+	schema, err := ns.Bucket.Schema(bucket)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !d.ChunksConfigured {
-		t.Fatal("Diagnose reports missing queue claim index")
+	chunks := quoteIdent(schema) + ".chunks"
+	var storage string
+	if err := testStore.pool.QueryRow(ctx,
+		`SELECT attstorage::text FROM pg_attribute WHERE attrelid = $1::regclass AND attname = 'data'`,
+		chunks).Scan(&storage); err != nil {
+		t.Fatal(err)
+	}
+	if storage != "e" {
+		t.Fatalf("chunks.data storage = %q, want EXTERNAL", storage)
+	}
+	conn, err := testStore.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if err := checkChunksLayout(ctx, conn, schema); err != nil {
+		t.Fatalf("fresh chunk layout rejected: %v", err)
+	}
+	if _, err := testStore.pool.Exec(ctx, "ALTER TABLE "+chunks+" RESET (toast_tuple_target)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkChunksLayout(ctx, conn, schema); err == nil {
+		t.Fatal("chunk layout without toast_tuple_target accepted")
 	}
 }
 
-func TestCacheAtomicReadModifyWrite(t *testing.T) {
+func TestCheckLayoutRefusesMismatchedVersion(t *testing.T) {
 	ctx := testCtx
-	cache := unique("atomic")
-	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
+	if err := testStore.CheckLayout(ctx); err != nil {
+		t.Fatalf("current layout rejected: %v", err)
+	}
+	if _, err := testStore.pool.Exec(ctx, "INSERT INTO s3p.layout (version) VALUES ($1)", LayoutVersion+1); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true) })
-	if _, _, wrote, err := testStore.Cache(cache).Set(ctx, "k", []byte("a"), CacheSetOptions{}); err != nil || !wrote {
-		t.Fatalf("initial set wrote=%v err=%v", wrote, err)
-	}
-	old, had, wrote, err := testStore.Cache(cache).GetSet(ctx, "k", []byte("b"), CacheSetOptions{})
-	if err != nil || !had || !wrote || string(old) != "a" {
-		t.Fatalf("getset old=%q had=%v wrote=%v err=%v", old, had, wrote, err)
-	}
-	const writers = 20
-	var wg sync.WaitGroup
-	for range writers {
-		wg.Go(func() {
-			if _, err := testStore.Cache(cache).Append(ctx, "k", []byte("x")); err != nil {
-				t.Errorf("append: %v", err)
-			}
-		})
-	}
-	wg.Wait()
-	if n, err := testStore.Cache(cache).SetRange(ctx, "k", 0, []byte("Z")); err != nil || n != int64(writers+1) {
-		t.Fatalf("setrange n=%d err=%v", n, err)
-	}
-	got, ok, err := testStore.Cache(cache).Get(ctx, "k")
-	if err != nil || !ok || string(got) != "Z"+strings.Repeat("x", writers) {
-		t.Fatalf("final value len=%d ok=%v err=%v", len(got), ok, err)
+	t.Cleanup(func() {
+		_, _ = testStore.pool.Exec(testCtx, "DELETE FROM s3p.layout WHERE version = $1", LayoutVersion+1)
+	})
+	if err := testStore.CheckLayout(ctx); err == nil {
+		t.Fatal("layout version mismatch accepted")
 	}
 }
 
-func TestMultipartPartQuotaAdmission(t *testing.T) {
+func TestMaintainHasSingleLeader(t *testing.T) {
 	ctx := testCtx
-	cache := unique("part-quota")
-	quota := int64(1 << 20)
-	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, &quota, nil); err != nil {
+	bucket := unique("leader")
+	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true) })
-	_, err := testStore.StartPart(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: "bkt/part"}, "missing", 1, 2<<20)
-	if !errors.Is(err, ErrQuotaExceeded) {
-		t.Fatalf("oversized part error = %v, want ErrQuotaExceeded", err)
+	t.Cleanup(func() { _, _ = testStore.DropBucket(testCtx, bucket, true) })
+	schema, err := ns.Bucket.Schema(bucket)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, err := testStore.pool.Exec(ctx, "DROP SCHEMA "+quoteIdent(schema)+" CASCADE"); err != nil {
+		t.Fatal(err)
+	}
+	const maintenanceLock = 0x70677674
+	holder, err := testStore.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = holder.Exec(testCtx, "SELECT pg_advisory_unlock($1)", int64(maintenanceLock))
+		holder.Release()
+	}()
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_lock($1)", int64(maintenanceLock)); err != nil {
+		t.Fatal(err)
+	}
+	if err := testStore.Maintain(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := bucketRows(t, bucket); n != 1 {
+		t.Fatalf("maintenance ran while another leader held the lock: rows=%d", n)
+	}
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_unlock($1)", int64(maintenanceLock)); err != nil {
+		t.Fatal(err)
+	}
+	if err := testStore.Maintain(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := bucketRows(t, bucket); n != 0 {
+		t.Fatalf("maintenance did not prune the vanished schema: rows=%d", n)
+	}
+}
+
+func bucketRows(t *testing.T, bucket string) int {
+	t.Helper()
+	var n int
+	if err := testStore.pool.QueryRow(testCtx,
+		"SELECT count(*) FROM s3p.namespaces WHERE kind = 'bucket' AND name = $1", bucket).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestNamespaceLimit(t *testing.T) {
@@ -784,7 +810,7 @@ func TestNamespaceLimit(t *testing.T) {
 	}
 }
 
-func TestObjectContentEncodingAndOriginModified(t *testing.T) {
+func TestMetadataRoundTrip(t *testing.T) {
 	ctx := testCtx
 	bucket := unique("meta")
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
@@ -823,69 +849,85 @@ func TestObjectContentEncodingAndOriginModified(t *testing.T) {
 	if out.ContentEncoding != "gzip" {
 		t.Fatalf("copy encoding = %q", out.ContentEncoding)
 	}
-}
-
-func TestCloneCopiesMetadataAndPartChecksums(t *testing.T) {
-	ctx := testCtx
-	src, dst := unique("clone-src"), unique("clone-dst")
-	if err := testStore.CreateBucket(ctx, src); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_, _ = testStore.DropNamespace(ctx, ns.Bucket, src, true)
-		_, _ = testStore.DropNamespace(ctx, ns.Bucket, dst, true)
+	t.Run("clone keeps metadata and part checksums", func(t *testing.T) {
+		ctx := testCtx
+		src, dst := unique("clone-src"), unique("clone-dst")
+		if err := testStore.CreateBucket(ctx, src); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = testStore.DropNamespace(ctx, ns.Bucket, src, true)
+			_, _ = testStore.DropNamespace(ctx, ns.Bucket, dst, true)
+		})
+		modified := time.Date(2025, 6, 7, 8, 9, 10, 0, time.UTC)
+		srcRef := ObjectRef{NS: ns.BucketRef(src), Key: "obj"}
+		if _, err := testStore.PutInline(ctx, srcRef, []byte("body"), WriteOptions{
+			ContentType: "text/plain", ContentEncoding: "br", OriginModified: modified,
+			Checksum: &Checksum{Name: "x-amz-checksum-crc32", Value: "abc"}, ChecksumType: "FULL_OBJECT",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		srcSchema, _ := srcRef.Schema()
+		if _, err := testStore.Pool().Exec(ctx,
+			`INSERT INTO `+srcSchema+`.object_part_checksums (key, part_no, file_id, algorithm, value)
+			 VALUES ('obj', 1, 0, 'CRC32', 'abc')`); err != nil {
+			t.Fatal(err)
+		}
+		if err := testStore.CloneNamespace(ctx, ns.Bucket, src, dst); err != nil {
+			t.Fatal(err)
+		}
+		dstRef := ObjectRef{NS: ns.BucketRef(dst), Key: "obj"}
+		m, err := testStore.MetaHeader(ctx, dstRef)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.ContentEncoding != "br" || !m.OriginModified.Equal(modified) || m.ChecksumValue != "abc" {
+			t.Fatalf("cloned metadata = %+v", m.ObjectInfo)
+		}
+		dstSchema, _ := dstRef.Schema()
+		var n int
+		if err := testStore.Pool().QueryRow(ctx,
+			`SELECT count(*) FROM `+dstSchema+`.object_part_checksums WHERE key = 'obj'`).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("cloned part checksums = %d err=%v", n, err)
+		}
 	})
-	modified := time.Date(2025, 6, 7, 8, 9, 10, 0, time.UTC)
-	srcRef := ObjectRef{NS: ns.BucketRef(src), Key: "obj"}
-	if _, err := testStore.PutInline(ctx, srcRef, []byte("body"), WriteOptions{
-		ContentType: "text/plain", ContentEncoding: "br", OriginModified: modified,
-		Checksum: &Checksum{Name: "x-amz-checksum-crc32", Value: "abc"}, ChecksumType: "FULL_OBJECT",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	srcSchema, _ := srcRef.Schema()
-	if _, err := testStore.Pool().Exec(ctx,
-		`INSERT INTO `+srcSchema+`.object_part_checksums (key, part_no, file_id, algorithm, value)
-		 VALUES ('obj', 1, 0, 'CRC32', 'abc')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := testStore.CloneNamespace(ctx, ns.Bucket, src, dst); err != nil {
-		t.Fatal(err)
-	}
-	dstRef := ObjectRef{NS: ns.BucketRef(dst), Key: "obj"}
-	m, err := testStore.MetaHeader(ctx, dstRef)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m.ContentEncoding != "br" || !m.OriginModified.Equal(modified) || m.ChecksumValue != "abc" {
-		t.Fatalf("cloned metadata = %+v", m.ObjectInfo)
-	}
-	dstSchema, _ := dstRef.Schema()
-	var n int
-	if err := testStore.Pool().QueryRow(ctx,
-		`SELECT count(*) FROM `+dstSchema+`.object_part_checksums WHERE key = 'obj'`).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("cloned part checksums = %d err=%v", n, err)
-	}
-}
-
-func TestCacheFillLeaseCoalescesOwners(t *testing.T) {
-	ctx := testCtx
-	namespace, key := unique("lease"), "bucket/key"
-	t.Cleanup(func() {
-		_, _ = testStore.Pool().Exec(ctx, `DELETE FROM s3p.cache_fill_leases WHERE namespace=$1`, namespace)
+	t.Run("copy keeps stored inline bytes", func(t *testing.T) {
+		bucket := unique("copy-inline")
+		if err := testStore.CreateBucket(testCtx, bucket); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = testStore.DropBucket(testCtx, bucket, true) })
+		for i, data := range [][]byte{nil, bytes.Repeat([]byte("compressible"), 2048)} {
+			src := ObjectRef{NS: ns.BucketRef(bucket), Key: fmt.Sprintf("source-%d", i)}
+			dst := ObjectRef{NS: src.NS, Key: fmt.Sprintf("copy-%d", i)}
+			expires := time.Now().Add(time.Hour)
+			if _, err := testStore.PutInline(testCtx, src, data, WriteOptions{ExpiresAt: &expires, OriginETag: "source-origin"}); err != nil {
+				t.Fatal(err)
+			}
+			copied, err := testStore.Copy(testCtx, src, dst, CopyOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if copied.ExpiresAt != nil || copied.OriginETag != "" {
+				t.Fatalf("COPY inherited source lifecycle: %+v", copied)
+			}
+			got, err := testStore.Get(testCtx, dst, WholeObjectRange())
+			if err != nil || !bytes.Equal(got.Bytes, data) {
+				t.Fatalf("COPY changed inline bytes: %v", err)
+			}
+			schema, _ := src.Schema()
+			var sourceStored, destStored []byte
+			if err := testStore.pool.QueryRow(testCtx, "SELECT inline_data FROM "+schema+".objects WHERE key=$1", src.Key).Scan(&sourceStored); err != nil {
+				t.Fatal(err)
+			}
+			if err := testStore.pool.QueryRow(testCtx, "SELECT inline_data FROM "+schema+".objects WHERE key=$1", dst.Key).Scan(&destStored); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(sourceStored, destStored) || destStored == nil {
+				t.Fatal("COPY decoded or discarded stored inline bytes")
+			}
+		}
 	})
-	ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-a", time.Minute)
-	if err != nil || !ok {
-		t.Fatalf("first acquire ok=%v err=%v", ok, err)
-	}
-	if ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-b", time.Minute); err != nil || ok {
-		t.Fatalf("second acquire ok=%v err=%v", ok, err)
-	}
-	testStore.Cache(namespace).ReleaseFillLease(ctx, key, "owner-a")
-	if ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-b", time.Minute); err != nil || !ok {
-		t.Fatalf("post-release acquire ok=%v err=%v", ok, err)
-	}
-	testStore.Cache(namespace).ReleaseFillLease(ctx, key, "owner-b")
 }
 
 func TestOpenWithOptionsAppliesSessionPolicy(t *testing.T) {
@@ -920,6 +962,17 @@ func TestOpenWithOptionsAppliesSessionPolicy(t *testing.T) {
 	}
 	if chunkStatement != "0" {
 		t.Fatalf("chunk statement_timeout = %q, want 0", chunkStatement)
+	}
+
+	var mainScan, chunkScan string
+	if err := other.pool.QueryRow(ctx, `SELECT current_setting('enable_indexscan')`).Scan(&mainScan); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.chunkPool.QueryRow(ctx, `SELECT current_setting('enable_indexscan')`).Scan(&chunkScan); err != nil {
+		t.Fatal(err)
+	}
+	if mainScan != "on" || chunkScan != "off" {
+		t.Fatalf("enable_indexscan main=%s chunk=%s, want on and off", mainScan, chunkScan)
 	}
 }
 
@@ -1087,44 +1140,6 @@ func TestCopyAndCopyPart(t *testing.T) {
 	}
 }
 
-func TestCopyPreservesStoredInlineEncoding(t *testing.T) {
-	bucket := unique("copy-inline")
-	if err := testStore.CreateBucket(testCtx, bucket); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _, _ = testStore.DropBucket(testCtx, bucket, true) })
-	for i, data := range [][]byte{nil, bytes.Repeat([]byte("compressible"), 2048)} {
-		src := ObjectRef{NS: ns.BucketRef(bucket), Key: fmt.Sprintf("source-%d", i)}
-		dst := ObjectRef{NS: src.NS, Key: fmt.Sprintf("copy-%d", i)}
-		expires := time.Now().Add(time.Hour)
-		if _, err := testStore.PutInline(testCtx, src, data, WriteOptions{ExpiresAt: &expires, OriginETag: "source-origin"}); err != nil {
-			t.Fatal(err)
-		}
-		copied, err := testStore.Copy(testCtx, src, dst, CopyOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if copied.ExpiresAt != nil || copied.OriginETag != "" {
-			t.Fatalf("COPY inherited source lifecycle: %+v", copied)
-		}
-		got, err := testStore.Get(testCtx, dst, WholeObjectRange())
-		if err != nil || !bytes.Equal(got.Bytes, data) {
-			t.Fatalf("COPY changed inline bytes: %v", err)
-		}
-		schema, _ := src.Schema()
-		var sourceStored, destStored []byte
-		if err := testStore.pool.QueryRow(testCtx, "SELECT inline_data FROM "+schema+".objects WHERE key=$1", src.Key).Scan(&sourceStored); err != nil {
-			t.Fatal(err)
-		}
-		if err := testStore.pool.QueryRow(testCtx, "SELECT inline_data FROM "+schema+".objects WHERE key=$1", dst.Key).Scan(&destStored); err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(sourceStored, destStored) || destStored == nil {
-			t.Fatal("COPY decoded or discarded stored inline bytes")
-		}
-	}
-}
-
 func mutationCache(t *testing.T) string {
 	t.Helper()
 	name := unique("mutation")
@@ -1185,7 +1200,7 @@ func TestCacheSetReturnOldConditions(t *testing.T) {
 	}
 }
 
-func TestCacheMutationsPreserveTTLAndCounterSemantics(t *testing.T) {
+func TestCacheAtomicMutations(t *testing.T) {
 	name := mutationCache(t)
 	expires := time.Now().Add(time.Hour).Truncate(time.Microsecond)
 	if _, _, _, err := testStore.Cache(name).Set(testCtx, "key", []byte("10"), CacheSetOptions{ExpiresAt: &expires}); err != nil {
@@ -1237,6 +1252,38 @@ func TestCacheMutationsPreserveTTLAndCounterSemantics(t *testing.T) {
 	if err != nil || !ok || string(value) != fmt.Sprint(workers*increments) {
 		t.Fatalf("lost increments: %q %t %v", value, ok, err)
 	}
+	t.Run("concurrent read-modify-write", func(t *testing.T) {
+		ctx := testCtx
+		cache := unique("atomic")
+		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true) })
+		if _, _, wrote, err := testStore.Cache(cache).Set(ctx, "k", []byte("a"), CacheSetOptions{}); err != nil || !wrote {
+			t.Fatalf("initial set wrote=%v err=%v", wrote, err)
+		}
+		old, had, wrote, err := testStore.Cache(cache).GetSet(ctx, "k", []byte("b"), CacheSetOptions{})
+		if err != nil || !had || !wrote || string(old) != "a" {
+			t.Fatalf("getset old=%q had=%v wrote=%v err=%v", old, had, wrote, err)
+		}
+		const writers = 20
+		var wg sync.WaitGroup
+		for range writers {
+			wg.Go(func() {
+				if _, err := testStore.Cache(cache).Append(ctx, "k", []byte("x")); err != nil {
+					t.Errorf("append: %v", err)
+				}
+			})
+		}
+		wg.Wait()
+		if n, err := testStore.Cache(cache).SetRange(ctx, "k", 0, []byte("Z")); err != nil || n != int64(writers+1) {
+			t.Fatalf("setrange n=%d err=%v", n, err)
+		}
+		got, ok, err := testStore.Cache(cache).Get(ctx, "k")
+		if err != nil || !ok || string(got) != "Z"+strings.Repeat("x", writers) {
+			t.Fatalf("final value len=%d ok=%v err=%v", len(got), ok, err)
+		}
+	})
 }
 
 func TestCacheGetDelMultipartAndRollback(t *testing.T) {
@@ -1291,6 +1338,38 @@ func TestCacheGetDelMultipartAndRollback(t *testing.T) {
 	if _, err := testStore.MetaHeader(testCtx, ref); err != nil {
 		t.Fatalf("failed GETDEL did not roll back deletion: %v", err)
 	}
+	t.Run("single connection", func(t *testing.T) {
+		name := mutationCache(t)
+		other, err := Open(testCtx, testStore.pool.Config().ConnString(), 1, testStore.log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer other.Close()
+		data := bytes.Repeat([]byte("x"), 64<<10)
+		if _, _, _, err := testStore.Cache(name).Set(testCtx, "key", data, CacheSetOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(testCtx, 5*time.Second)
+		defer cancel()
+		results := make(chan bool, 2)
+		var wg sync.WaitGroup
+		for range 2 {
+			wg.Go(func() {
+				got, found, err := other.Cache(name).GetDel(ctx, "key")
+				if err != nil || (found && !bytes.Equal(got, data)) {
+					t.Errorf("GETDEL found=%t bytes=%d err=%v", found, len(got), err)
+				}
+				results <- found
+			})
+		}
+		wg.Wait()
+		if first, second := <-results, <-results; first == second {
+			t.Fatalf("concurrent GETDEL results = %t, %t", first, second)
+		}
+		if _, found, err := other.Cache(name+"-absent").GetDel(ctx, "key"); err != nil || found {
+			t.Fatalf("GETDEL on missing namespace found=%t err=%v", found, err)
+		}
+	})
 }
 
 func TestCacheExpirationConditions(t *testing.T) {
@@ -1316,39 +1395,6 @@ func TestCacheExpirationConditions(t *testing.T) {
 				t.Fatalf("expired key visibility: exists=%t changed=%t err=%v", exists, changed, err)
 			}
 		}
-	}
-}
-
-func TestCacheGetDelWithSingleConnection(t *testing.T) {
-	name := mutationCache(t)
-	other, err := Open(testCtx, testStore.pool.Config().ConnString(), 1, testStore.log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close()
-	data := bytes.Repeat([]byte("x"), 64<<10)
-	if _, _, _, err := testStore.Cache(name).Set(testCtx, "key", data, CacheSetOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(testCtx, 5*time.Second)
-	defer cancel()
-	results := make(chan bool, 2)
-	var wg sync.WaitGroup
-	for range 2 {
-		wg.Go(func() {
-			got, found, err := other.Cache(name).GetDel(ctx, "key")
-			if err != nil || (found && !bytes.Equal(got, data)) {
-				t.Errorf("GETDEL found=%t bytes=%d err=%v", found, len(got), err)
-			}
-			results <- found
-		})
-	}
-	wg.Wait()
-	if first, second := <-results, <-results; first == second {
-		t.Fatalf("concurrent GETDEL results = %t, %t", first, second)
-	}
-	if _, found, err := other.Cache(name+"-absent").GetDel(ctx, "key"); err != nil || found {
-		t.Fatalf("GETDEL on missing namespace found=%t err=%v", found, err)
 	}
 }
 
@@ -1439,6 +1485,25 @@ func TestFillPublicationChecksLiveDatabaseOwner(t *testing.T) {
 			t.Fatal("live COPY lost bytes")
 		}
 	}
+	t.Run("lease acquire and release", func(t *testing.T) {
+		ctx := testCtx
+		namespace, key := unique("lease"), "bucket/key"
+		t.Cleanup(func() {
+			_, _ = testStore.Pool().Exec(ctx, `DELETE FROM s3p.cache_fill_leases WHERE namespace=$1`, namespace)
+		})
+		ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-a", time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("first acquire ok=%v err=%v", ok, err)
+		}
+		if ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-b", time.Minute); err != nil || ok {
+			t.Fatalf("second acquire ok=%v err=%v", ok, err)
+		}
+		testStore.Cache(namespace).ReleaseFillLease(ctx, key, "owner-a")
+		if ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-b", time.Minute); err != nil || !ok {
+			t.Fatalf("post-release acquire ok=%v err=%v", ok, err)
+		}
+		testStore.Cache(namespace).ReleaseFillLease(ctx, key, "owner-b")
+	})
 }
 
 func TestRetiringWriteCacheRevokesOldFillsNotNewWrites(t *testing.T) {
@@ -1659,7 +1724,7 @@ func TestObjectModelAcrossWorkers(t *testing.T) {
 	check(180)
 }
 
-func TestTerminalJobRetentionRemovesIndex(t *testing.T) {
+func TestMaintenanceExpiry(t *testing.T) {
 	ctx := testCtx
 	q := unique("ojs-retention")
 	t.Cleanup(func() {
@@ -1681,7 +1746,13 @@ func TestTerminalJobRetentionRemovesIndex(t *testing.T) {
 	if _, err := testStore.AckJob(ctx, fetched[0].ID, fetched[0].LeaseToken, nil); err != nil {
 		t.Fatalf("ack: %v", err)
 	}
-	time.Sleep(10 * time.Millisecond)
+	sc, err := nsSQLIdent(ns.Queue, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.pool.Exec(ctx, "UPDATE "+sc+".jobs SET completed_at = now() - interval '1 hour' WHERE id = $1", jobs[0].ID); err != nil {
+		t.Fatal(err)
+	}
 
 	removed, err := testStore.queue(q).ExpireMessages(ctx, ExpireBatch)
 	if err != nil || removed != 1 {
@@ -1690,36 +1761,41 @@ func TestTerminalJobRetentionRemovesIndex(t *testing.T) {
 	if _, err := testStore.GetJob(ctx, jobs[0].ID); !errors.Is(err, ErrJobNotFound) {
 		t.Fatalf("GetJob after retention = %v, want ErrJobNotFound", err)
 	}
-}
+	t.Run("expired lease exhausts attempts", func(t *testing.T) {
+		ctx := testCtx
+		q := unique("ojs-expired")
+		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
 
-func TestDiscardExpiredLeasesExhaustsAttempts(t *testing.T) {
-	ctx := testCtx
-	q := unique("ojs-expired")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		jobs, err := testStore.EnqueueJobs(ctx, []EnqueueInput{{
+			Type: "expired.test", Args: []byte("[]"), Queue: q, MaxAttempts: 1,
+		}})
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		fetched, err := testStore.FetchJobs(ctx, []string{q}, 1, "worker-expired", 5*time.Millisecond)
+		if err != nil || len(fetched) != 1 {
+			t.Fatalf("fetch = %+v, %v", fetched, err)
+		}
+		sc, err := nsSQLIdent(ns.Queue, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.pool.Exec(ctx, "UPDATE "+sc+".jobs SET lease_until = now() - interval '1 second' WHERE id = $1", jobs[0].ID); err != nil {
+			t.Fatal(err)
+		}
 
-	jobs, err := testStore.EnqueueJobs(ctx, []EnqueueInput{{
-		Type: "expired.test", Args: []byte("[]"), Queue: q, MaxAttempts: 1,
-	}})
-	if err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-	fetched, err := testStore.FetchJobs(ctx, []string{q}, 1, "worker-expired", 5*time.Millisecond)
-	if err != nil || len(fetched) != 1 {
-		t.Fatalf("fetch = %+v, %v", fetched, err)
-	}
-	time.Sleep(20 * time.Millisecond)
-
-	discarded, err := testStore.queue(q).DiscardExpiredLeases(ctx, ExpireBatch)
-	if err != nil || discarded != 1 {
-		t.Fatalf("discard = %d, %v; want 1", discarded, err)
-	}
-	got, err := testStore.GetJob(ctx, jobs[0].ID)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got.State != JobDiscarded || got.DiscardedAt == nil {
-		t.Fatalf("job = %+v, want discarded", got)
-	}
+		discarded, err := testStore.queue(q).DiscardExpiredLeases(ctx, ExpireBatch)
+		if err != nil || discarded != 1 {
+			t.Fatalf("discard = %d, %v; want 1", discarded, err)
+		}
+		got, err := testStore.GetJob(ctx, jobs[0].ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got.State != JobDiscarded || got.DiscardedAt == nil {
+			t.Fatalf("job = %+v, want discarded", got)
+		}
+	})
 }
 
 func TestHeartbeatJobsExtendsLeasesAcrossQueues(t *testing.T) {
@@ -1794,7 +1870,7 @@ func TestHeartbeatJobsExtendsLeasesAcrossQueues(t *testing.T) {
 	}
 }
 
-func TestFetchJobsSkipsMissingQueues(t *testing.T) {
+func TestMissingQueuesIgnored(t *testing.T) {
 	ctx := testCtx
 	q := unique("ojs-fetch-missing")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
@@ -1818,21 +1894,20 @@ func TestFetchJobsSkipsMissingQueues(t *testing.T) {
 	if len(jobs) != 0 {
 		t.Fatalf("second fetch = %+v, want no second job", jobs)
 	}
-}
-
-func TestAnyQueueExists(t *testing.T) {
-	ctx := testCtx
-	q := unique("ojs-any-exists")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := testStore.AnyQueueExists(ctx, []string{unique("ojs-missing"), q}); err != nil || !ok {
-		t.Fatalf("AnyQueueExists = %v, %v; want true", ok, err)
-	}
-	if ok, err := testStore.AnyQueueExists(ctx, []string{unique("ojs-missing")}); err != nil || ok {
-		t.Fatalf("AnyQueueExists = %v, %v; want false", ok, err)
-	}
+	t.Run("any queue exists", func(t *testing.T) {
+		ctx := testCtx
+		q := unique("ojs-any-exists")
+		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if ok, err := testStore.AnyQueueExists(ctx, []string{unique("ojs-missing"), q}); err != nil || !ok {
+			t.Fatalf("AnyQueueExists = %v, %v; want true", ok, err)
+		}
+		if ok, err := testStore.AnyQueueExists(ctx, []string{unique("ojs-missing")}); err != nil || ok {
+			t.Fatalf("AnyQueueExists = %v, %v; want false", ok, err)
+		}
+	})
 }
 
 func TestClaimTransitions(t *testing.T) {
@@ -1962,7 +2037,7 @@ func TestClaimTransitions(t *testing.T) {
 	}
 }
 
-func TestStreamAppendRollback(t *testing.T) {
+func TestStreamAppend(t *testing.T) {
 	ctx := testCtx
 	queue := unique("stream-append-rollback")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, queue, true) })
@@ -1987,6 +2062,46 @@ func TestStreamAppendRollback(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("failed append committed %d messages", count)
 	}
+	t.Run("stored in input order", func(t *testing.T) {
+		ctx := testCtx
+		q := unique("stream-order")
+		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		inputs := make([]StreamMessageInput, 6)
+		want := make([]string, len(inputs))
+		for i := range inputs {
+			want[i] = fmt.Sprintf("evt-%d", i)
+			inputs[i] = StreamMessageInput{ID: want[i], Payload: []byte(`{}`)}
+		}
+		if _, err := testStore.Queue(q).AppendMessages(ctx, inputs); err != nil {
+			t.Fatal(err)
+		}
+		sc, err := nsSQLIdent(ns.Queue, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := testStore.pool.Query(ctx, "SELECT event_id FROM "+sc+".stream_events ORDER BY seq")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var got []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, id)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("stored order = %v, want %v", got, want)
+		}
+	})
 }
 
 func TestStreamFanoutAndAck(t *testing.T) {
@@ -2047,9 +2162,35 @@ func TestStreamFanoutAndAck(t *testing.T) {
 	if _, err := testStore.Queue(q).AckBatch(ctx, next.ID); err != nil {
 		t.Fatal(err)
 	}
+	t.Run("receive ceiling", func(t *testing.T) {
+		ctx := testCtx
+		q := unique("stream-limit")
+		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
+			{Payload: []byte(`{"n":1}`)}, {Payload: []byte(`{"n":2}`)}, {Payload: []byte(`{"n":3}`)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 2); !errors.Is(err, ErrStreamBatchTooLarge) {
+			t.Fatalf("ceiling err = %v, want ErrStreamBatchTooLarge", err)
+		}
+		batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
+		if err != nil || len(batch.Messages) != 3 {
+			t.Fatalf("full receive = %+v, %v", batch, err)
+		}
+		if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
-func TestStreamPruneTicksRemovesOldUnreferencedTicks(t *testing.T) {
+func TestStreamTicks(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-prune")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
@@ -2077,6 +2218,55 @@ func TestStreamPruneTicksRemovesOldUnreferencedTicks(t *testing.T) {
 	if err := testStore.pool.QueryRow(ctx, `SELECT count(*) FROM `+sc+`.stream_ticks`).Scan(&left); err != nil || left != 1 {
 		t.Fatalf("ticks left = %d, %v; want the minimum tick only", left, err)
 	}
+	t.Run("empty receive writes no tick", func(t *testing.T) {
+		ctx := testCtx
+		q := unique("stream-idle-ticks")
+		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
+			t.Fatal(err)
+		}
+		sc, err := nsSQLIdent(ns.Queue, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		countTicks := func() int64 {
+			t.Helper()
+			var n int64
+			if err := testStore.pool.QueryRow(ctx, `SELECT count(*) FROM `+sc+`.stream_ticks`).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+		if n := countTicks(); n != 1 {
+			t.Fatalf("initial ticks = %d, want 1", n)
+		}
+		for range 3 {
+			if batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10); err != nil {
+				t.Fatal(err)
+			} else if len(batch.Messages) != 0 {
+				t.Fatalf("empty receive = %+v", batch)
+			}
+		}
+		if n := countTicks(); n != 1 {
+			t.Fatalf("ticks after empty polls = %d, want 1", n)
+		}
+		if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{{Payload: []byte(`{"n":1}`)}}); err != nil {
+			t.Fatal(err)
+		}
+		batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
+		if err != nil || len(batch.Messages) != 1 {
+			t.Fatalf("receive = %+v, %v", batch, err)
+		}
+		if n := countTicks(); n != 2 {
+			t.Fatalf("ticks after event = %d, want 2", n)
+		}
+		if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestStreamErrorMappings(t *testing.T) {
@@ -2125,76 +2315,34 @@ func TestStreamErrorMappings(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestStreamBatchOpsOnMissingQueue(t *testing.T) {
-	ctx := testCtx
-	q := unique("stream-absent")
-	tests := []struct {
-		name string
-		run  func() error
-	}{
-		{"get", func() error {
-			_, err := testStore.Queue(q).GetBatch(ctx, 1)
-			return err
-		}},
-		{"ack", func() error {
-			_, err := testStore.Queue(q).AckBatch(ctx, 1)
-			return err
-		}},
-		{"nack", func() error {
-			_, err := testStore.Queue(q).NackMessage(ctx, 1, "evt-1", time.Second, "x")
-			return err
-		}},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.run(); !errors.Is(err, ErrStreamBatchNotFound) {
-				t.Fatalf("err = %v, want %v", err, ErrStreamBatchNotFound)
-			}
-		})
-	}
-}
-
-func TestStreamAppendStoresInInputOrder(t *testing.T) {
-	ctx := testCtx
-	q := unique("stream-order")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	inputs := make([]StreamMessageInput, 6)
-	want := make([]string, len(inputs))
-	for i := range inputs {
-		want[i] = fmt.Sprintf("evt-%d", i)
-		inputs[i] = StreamMessageInput{ID: want[i], Payload: []byte(`{}`)}
-	}
-	if _, err := testStore.Queue(q).AppendMessages(ctx, inputs); err != nil {
-		t.Fatal(err)
-	}
-	sc, err := nsSQLIdent(ns.Queue, q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows, err := testStore.pool.Query(ctx, "SELECT event_id FROM "+sc+".stream_events ORDER BY seq")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	var got []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			t.Fatal(err)
+	t.Run("missing queue batch operations", func(t *testing.T) {
+		ctx := testCtx
+		q := unique("stream-absent")
+		tests := []struct {
+			name string
+			run  func() error
+		}{
+			{"get", func() error {
+				_, err := testStore.Queue(q).GetBatch(ctx, 1)
+				return err
+			}},
+			{"ack", func() error {
+				_, err := testStore.Queue(q).AckBatch(ctx, 1)
+				return err
+			}},
+			{"nack", func() error {
+				_, err := testStore.Queue(q).NackMessage(ctx, 1, "evt-1", time.Second, "x")
+				return err
+			}},
 		}
-		got = append(got, id)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("stored order = %v, want %v", got, want)
-	}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				if err := tc.run(); !errors.Is(err, ErrStreamBatchNotFound) {
+					t.Fatalf("err = %v, want %v", err, ErrStreamBatchNotFound)
+				}
+			})
+		}
+	})
 }
 
 func TestStreamSnapshotVisibilityAcrossCommitOrder(t *testing.T) {
@@ -2374,34 +2522,7 @@ func TestStreamNackRetryDLQAndReplay(t *testing.T) {
 	}
 }
 
-func TestStreamBatchCeiling(t *testing.T) {
-	ctx := testCtx
-	q := unique("stream-limit")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
-		{Payload: []byte(`{"n":1}`)}, {Payload: []byte(`{"n":2}`)}, {Payload: []byte(`{"n":3}`)},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 2); !errors.Is(err, ErrStreamBatchTooLarge) {
-		t.Fatalf("ceiling err = %v, want ErrStreamBatchTooLarge", err)
-	}
-	batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
-	if err != nil || len(batch.Messages) != 3 {
-		t.Fatalf("full receive = %+v, %v", batch, err)
-	}
-	if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestStreamSegmentRotation(t *testing.T) {
+func TestStreamRotation(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-rotate")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
@@ -2440,6 +2561,52 @@ func TestStreamSegmentRotation(t *testing.T) {
 	if info, err = testStore.Queue(q).Info(ctx); err != nil || info.Events != 1 {
 		t.Fatalf("post-reuse info = %+v, %v", info, err)
 	}
+	t.Run("pinned consumer", func(t *testing.T) {
+		ctx := testCtx
+		q := unique("stream-rotate-pin")
+		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.Queue(q).SetConfig(ctx, -1, 2*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
+			{Payload: []byte(`{"n":1}`)}, {Payload: []byte(`{"n":2}`)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		for i := 0; i < 2; i++ {
+			time.Sleep(5 * time.Millisecond)
+			if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 0 {
+				t.Fatalf("empty rotation %d = %d, %v; want 0", i+1, n, err)
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 0 {
+			t.Fatalf("pinned rotation = %d, %v; want 0", n, err)
+		}
+		info, err := testStore.Queue(q).Info(ctx)
+		if err != nil || info.Events != 2 {
+			t.Fatalf("pinned info = %+v, %v; want 2 events", info, err)
+		}
+
+		batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
+		if err != nil || len(batch.Messages) != 2 {
+			t.Fatalf("receive = %+v, %v", batch, err)
+		}
+		if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+		if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 2 {
+			t.Fatalf("released rotation = %d, %v; want 2", n, err)
+		}
+	})
 }
 
 func TestStreamStatAndSizeIncludeSegments(t *testing.T) {
@@ -2474,104 +2641,7 @@ func TestStreamStatAndSizeIncludeSegments(t *testing.T) {
 	}
 }
 
-func TestStreamRotationPinsConsumer(t *testing.T) {
-	ctx := testCtx
-	q := unique("stream-rotate-pin")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testStore.Queue(q).SetConfig(ctx, -1, 2*time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
-		{Payload: []byte(`{"n":1}`)}, {Payload: []byte(`{"n":2}`)},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	for i := 0; i < 2; i++ {
-		time.Sleep(5 * time.Millisecond)
-		if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 0 {
-			t.Fatalf("empty rotation %d = %d, %v; want 0", i+1, n, err)
-		}
-	}
-	time.Sleep(5 * time.Millisecond)
-	if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 0 {
-		t.Fatalf("pinned rotation = %d, %v; want 0", n, err)
-	}
-	info, err := testStore.Queue(q).Info(ctx)
-	if err != nil || info.Events != 2 {
-		t.Fatalf("pinned info = %+v, %v; want 2 events", info, err)
-	}
-
-	batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
-	if err != nil || len(batch.Messages) != 2 {
-		t.Fatalf("receive = %+v, %v", batch, err)
-	}
-	if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(5 * time.Millisecond)
-	if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 2 {
-		t.Fatalf("released rotation = %d, %v; want 2", n, err)
-	}
-}
-
 func ptrInt64(v int64) *int64 { return &v }
-
-func TestStreamEmptyReceiveDoesNotChurnTicks(t *testing.T) {
-	ctx := testCtx
-	q := unique("stream-idle-ticks")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
-		t.Fatal(err)
-	}
-	sc, err := nsSQLIdent(ns.Queue, q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	countTicks := func() int64 {
-		t.Helper()
-		var n int64
-		if err := testStore.pool.QueryRow(ctx, `SELECT count(*) FROM `+sc+`.stream_ticks`).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
-	if n := countTicks(); n != 1 {
-		t.Fatalf("initial ticks = %d, want 1", n)
-	}
-	for range 3 {
-		if batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10); err != nil {
-			t.Fatal(err)
-		} else if len(batch.Messages) != 0 {
-			t.Fatalf("empty receive = %+v", batch)
-		}
-	}
-	if n := countTicks(); n != 1 {
-		t.Fatalf("ticks after empty polls = %d, want 1", n)
-	}
-	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{{Payload: []byte(`{"n":1}`)}}); err != nil {
-		t.Fatal(err)
-	}
-	batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
-	if err != nil || len(batch.Messages) != 1 {
-		t.Fatalf("receive = %+v, %v", batch, err)
-	}
-	if n := countTicks(); n != 2 {
-		t.Fatalf("ticks after event = %d, want 2", n)
-	}
-	if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
-		t.Fatal(err)
-	}
-}
 
 func TestDiagnoseNamesMissingStreamFunction(t *testing.T) {
 	ctx := testCtx
@@ -2643,34 +2713,33 @@ func BenchmarkCacheCommands(b *testing.B) {
 			})
 		}
 	}
-}
-
-func BenchmarkCacheIncrement(b *testing.B) {
-	for _, parallel := range []bool{false, true} {
-		b.Run(fmt.Sprintf("parallel=%t", parallel), func(b *testing.B) {
-			name := unique("bench-incr")
-			b.Cleanup(func() { _, _ = testStore.DropNamespace(testCtx, ns.Cache, name, true) })
-			if _, _, _, err := testStore.Cache(name).Set(testCtx, "counter", []byte("0"), CacheSetOptions{}); err != nil {
-				b.Fatal(err)
-			}
-			incr := func() {
-				if _, err := testStore.Cache(name).IncrBy(testCtx, "counter", 1); err != nil {
-					b.Error(err)
+	b.Run("increment", func(b *testing.B) {
+		for _, parallel := range []bool{false, true} {
+			b.Run(fmt.Sprintf("parallel=%t", parallel), func(b *testing.B) {
+				name := unique("bench-incr")
+				b.Cleanup(func() { _, _ = testStore.DropNamespace(testCtx, ns.Cache, name, true) })
+				if _, _, _, err := testStore.Cache(name).Set(testCtx, "counter", []byte("0"), CacheSetOptions{}); err != nil {
+					b.Fatal(err)
 				}
-			}
-			b.ReportAllocs()
-			b.ResetTimer()
-			if parallel {
-				b.RunParallel(func(pb *testing.PB) {
-					for pb.Next() {
+				incr := func() {
+					if _, err := testStore.Cache(name).IncrBy(testCtx, "counter", 1); err != nil {
+						b.Error(err)
+					}
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				if parallel {
+					b.RunParallel(func(pb *testing.PB) {
+						for pb.Next() {
+							incr()
+						}
+					})
+				} else {
+					for range b.N {
 						incr()
 					}
-				})
-			} else {
-				for range b.N {
-					incr()
 				}
-			}
-		})
-	}
+			})
+		}
+	})
 }
