@@ -7,7 +7,7 @@ were subsequently consolidated; see the current file map in
 [CONTRIBUTING.md](../../CONTRIBUTING.md#package-map).
 
 The capability map below records the pre-implementation review. The subsequent
-implementation uses layout **v24**: shared range parent metadata, one-round-trip
+implementation uses layout **v24** (the current baseline is **v25**): shared range parent metadata, one-round-trip
 cache shadow resolution, renewable owner-fenced fills, bounded shared spool bytes,
 and PostgreSQL 18 publication SQL. The S3 client experiments are isolated in the
 `test/s3clients` module (`just s3-clients`); the existing fork remains the production client because the
