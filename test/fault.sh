@@ -36,8 +36,9 @@ wait_pg() {
   return 1
 }
 
+curl -fsS -X PUT "$A/$BUCKET" >/dev/null
 head -c 1048576 /dev/urandom > "$TMP/base"
-s3 -X PUT --data-binary @"$TMP/base" "$A/$BUCKET/$RUN/base" >/dev/null
+[ "$(code -X PUT --data-binary @"$TMP/base" "$A/$BUCKET/$RUN/base")" = 200 ] || fail "baseline PUT"
 s3 "$B/$BUCKET/$RUN/base" -o "$TMP/base.out"
 cmp "$TMP/base" "$TMP/base.out" || fail "cross-gateway baseline"
 
@@ -49,7 +50,7 @@ cmp "$TMP/base" "$TMP/base.a" || fail "read after peer loss"
 
 # PostgreSQL restart: the gateway must reconnect and publish nothing torn.
 head -c 33554432 /dev/urandom > "$TMP/big"
-( s3 -X PUT --data-binary @"$TMP/big" "$A/$BUCKET/$RUN/big" > "$TMP/big.code" 2>/dev/null || true ) &
+( s3 -X PUT --data-binary @"$TMP/big" "$A/$BUCKET/$RUN/big" >/dev/null 2>&1 || true ) &
 putpid=$!
 sleep .1
 docker restart --time 1 "$PGVS3_TEST_PG_CONTAINER" >/dev/null
@@ -67,8 +68,10 @@ fi
 
 # Churn: overwrite/delete many keys while maintenance runs.
 for i in $(seq 1 200); do
-  printf 'v%d' "$i" | s3 -X PUT --data-binary @- "$A/$BUCKET/$RUN/churn" >/dev/null
-  if [ $((i % 7)) = 0 ]; then s3 -X DELETE "$A/$BUCKET/$RUN/churn" >/dev/null; fi
+  [ "$(printf 'v%d' "$i" | code -X PUT --data-binary @- "$A/$BUCKET/$RUN/churn")" = 200 ] || fail "churn PUT $i"
+  if [ $((i % 7)) = 0 ]; then
+    [ "$(code -X DELETE "$A/$BUCKET/$RUN/churn")" = 204 ] || fail "churn DELETE $i"
+  fi
 done
 s3 "$A/$BUCKET/$RUN/churn" | grep -Eq '^v[0-9]+$' || fail "churn object corrupt"
 echo "fault ok"
