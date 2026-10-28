@@ -902,22 +902,31 @@ func originConformance(t *testing.T, name string, factory conformanceFactory) {
 		},
 	}
 
+	probe := factory(t, "")
+	if probe.handle == nil {
+		t.Fatal("factory returned a nil origin handle")
+	}
+	t.Cleanup(func() { _ = probe.handle.Close() })
+	var selected []conformanceCase
 	for _, tc := range cases {
+		if tc.requirePrefix && !probe.prefixMapping {
+			t.Fatalf("%s does not map Config.Prefix to physical keys", name)
+		}
+		if tc.requireConflict && !probe.conflict {
+			continue
+		}
+		if tc.requires != 0 && !probe.handle.Supports(tc.requires) {
+			continue
+		}
+		selected = append(selected, tc)
+	}
+	for _, tc := range selected {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := factory(t, tc.prefix)
 			if fx.handle == nil {
 				t.Fatal("factory returned a nil origin handle")
 			}
 			t.Cleanup(func() { _ = fx.handle.Close() })
-			if tc.requirePrefix && !fx.prefixMapping {
-				t.Skipf("%s does not map Config.Prefix to physical keys", name)
-			}
-			if tc.requireConflict && !fx.conflict {
-				t.Skipf("%s test double cannot synthesize a conditional conflict", name)
-			}
-			if tc.requires != 0 && !fx.handle.Supports(tc.requires) {
-				t.Skipf("%s lacks %s (caps %s)", name, tc.requires, fx.handle.Capabilities())
-			}
 			tc.run(t, ctx, fx)
 		})
 	}
