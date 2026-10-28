@@ -180,7 +180,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 ## Package map
 
 Group related operations by capability, not one function/type per file. There
-are 47 Go files, including tests and the five-file `internal/s3client`. Use the
+are 48 Go files, including tests and the five-file `internal/s3client`. Use the
 named sections within each implementation rather than adding a file for every
 helper. Package boundaries, integration build tags and isolated benchmark
 dependencies stay separate. Shared orchestration belongs above specialized
@@ -189,6 +189,7 @@ block encoding, streaming reads and COPY loops, not inside them.
 | File | Responsibility |
 | --- | --- |
 | `internal/store/store.go` | Connections, embedded schema, namespace lifecycle, transactions, quotas and maintenance |
+| `internal/store/handles.go` | Cache and queue namespace handles; each validates its name and resolves its schema once |
 | `internal/store/object.go` | Object contracts, metadata, reads and block encoding |
 | `internal/store/write.go` | Inline/COPY publication, multipart lifecycle and server-side copies |
 | `internal/store/cache.go` | Cache mutations, origin metadata, fill fences and durable outbox persistence |

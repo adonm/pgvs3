@@ -401,7 +401,7 @@ RESP shares the `:8014` listener and speaks **RESP2 only**. `HELLO 2` is
 accepted; `HELLO 3` returns `NOPROTO`. Clients that negotiate RESP3 by default
 must opt out, for example `redis.Redis(..., protocol=2)` in recent `redis-py`
 releases. RESP batches are bounded by `--resp-concurrency`, and pipelined `GET`
-and `SET` bursts are coalesced into `CacheMGet`/`CacheMSet`.
+and `SET` bursts are coalesced into `Cache.MGet`/`Cache.MSet`.
 
 ## OJS (OpenJobSpec v1 core)
 

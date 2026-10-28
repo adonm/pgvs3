@@ -174,8 +174,8 @@ in an aggregate average. See [benchmarks.md](benchmarks.md).
   for GETSET, APPEND, SETRANGE and INCR. Transforms receive owned bytes and can
   run again after contention. Conditions and TTL preservation use the canonical
   writer; INCR remains inline-only and retains its cancellation-bounded retry
-  behavior. `CacheSet(ReturnOld)` uses this same atomic path.
-- `CacheGetDel` decodes `DELETE RETURNING` with the shared metadata decoder and
+  behavior. `Cache.Set(ReturnOld)` uses this same atomic path.
+- `Cache.GetDel` decodes `DELETE RETURNING` with the shared metadata decoder and
   reads the pinned body with the normal object reader before committing. It
   supports multipart bodies and rolls back on a corrupt/truncated read.
 - Cache expiration, including a past deadline, is one conditional UPDATE.

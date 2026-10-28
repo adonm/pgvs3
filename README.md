@@ -340,8 +340,8 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `FLUSHDB`, `DBSIZE`, `KEYS`, `INFO`, and `HELLO 2`. RESP3 is not supported:
   `HELLO 3` returns `NOPROTO`, and clients that default to RESP3 (for example
   recent `redis-py` releases) must be configured with `protocol=2`. Pipelined
-  `GET` bursts coalesce into one `CacheMGet`; consecutive `SET`s coalesce into
-  `CacheMSet` when redcon delivers them in the same read batch. `EXPIRE`
+  `GET` bursts coalesce into one `Cache.MGet`; consecutive `SET`s coalesce into
+  `Cache.MSet` when redcon delivers them in the same read batch. `EXPIRE`
   honours `NX`/`XX`/`GT`/`LT`.
   `MULTI`/`EXEC`/`WATCH` are rejected explicitly (use a pipeline; in
   `redis-py` pass `transaction=False`) because pgvs3 has no cross-command

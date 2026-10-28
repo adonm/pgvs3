@@ -329,12 +329,12 @@ earlier 19,715-line figure excluded the S3 client while it lived under
 `third_party`; it now lives in `internal/s3client`, so the first-party-only
 figures before and after that move are not directly comparable.
 
-| Whole-repo Go | Before | After |
-| --- | ---: | ---: |
-| Files | 51 | 47 |
-| Total lines | 35,750 | 35,292 |
-| Production lines | 21,567 | 21,069 |
-| Test lines | 14,183 | 14,223 |
+| Whole-repo Go | Before | After | Now |
+| --- | ---: | ---: | ---: |
+| Files | 51 | 47 | 48 |
+| Total lines | 35,750 | 35,292 | 35,440 |
+| Production lines | 21,567 | 21,069 | 21,142 |
+| Test lines | 14,183 | 14,223 | 14,298 |
 
 The client itself shrank from 1,852 to 1,728 production lines and from 1,336 to
 1,365 test lines while its ten files were merged into five. Adding those 1,728
@@ -401,6 +401,71 @@ The differences are below 1% and far inside the 20% budget.
 Separate matrices measured HEAD and 8 KiB footer ranges within 3%. The earlier
 10 MiB matrix outlier came from a temporary driver reusing one object key for
 10 MiB, 64 MiB and 1 GiB payloads; it was not a gateway regression.
+
+### Handles, splits, read views and loadgen
+
+This round keeps layout v24 and the S3, OJS and RESP behaviour. The **Now**
+column above counts the tree at `2857200`.
+
+- Namespaces are bound once. `Store.Cache(name)` and `Store.Queue(name)` validate
+  the name and resolve its schema when the handle is created, so cache and stream
+  methods stop repeating that work per call. OJS depends on the `store.QueueHandle`
+  interface, which keeps its HTTP tests on a small fake. Lifecycle methods stay
+  unexported on the concrete queue type.
+- Long functions were split. Top-level production functions longer than 80 lines
+  fell from 17 to 7, and the longest fell from 230 to 109 lines. The split covered
+  `serve`, `OpenWithOptions`, `ChunkWriter.run`, `copyObject`, `Diagnose` and
+  `StatNamespace`.
+- Object reads pass one `readView` value that carries the span, size, validators
+  and metadata. `newObject` is the only place that builds `&Object{...}`.
+  `openRange` takes four parameters instead of twelve, and the unused `resolveCache`
+  key argument is gone.
+- The load generator runs every protocol through one measurement harness.
+  `test/loadgen/main.go` fell from 751 to 612 lines. The 550-line target was not
+  reached: the remaining lines are flag declarations and per-protocol requests.
+- Not done: moving stream SQL into schema functions, which is a layout change that
+  needs an explicit decision, and collapsing the in-memory and filesystem origins.
+  Their keys mean different things (opaque strings versus paths), so a collapse
+  would change behaviour.
+
+Whole-repo lines rose by 148 in this round. Extracted helpers repeat signatures
+(the split adds 200 net lines), the handle file and its test adapter add code, and
+the loadgen harness shrank by 139. The gain is in complexity, not line count.
+
+### Paired checks for this round
+
+Old is the `ace432d` gateway build and new is the `7c756a2` build. The later
+commit `2857200` only drops an unused argument. Both sides used the same loadgen
+binary against the same PostgreSQL 18.6 database on one host (AMD Ryzen 7 7700X,
+16 threads, 61 GiB RAM, PostgreSQL defaults). Sessions alternated old, new, new,
+old. S3 workloads used fixed request counts of 100, 200, 400 and 6, and OJS and
+RESP used 5-second runs with 4 workers. Each row is the mean over its sessions:
+four, except OJS enqueue, which has eight. The 1 GiB row has only six requests per
+session, so it is a coarse check.
+
+| Workload | Old p50 | New p50 | Δ p50 | Old throughput | New throughput | Δ throughput |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 MiB GET, 1 worker | 10.13 ms | 10.58 ms | +4.4% | 861 MiB/s | 960 MiB/s | +11.6% |
+| 10 MiB GET, 4 workers | 10.53 ms | 10.55 ms | +0.2% | 3,822 MiB/s | 3,837 MiB/s | +0.4% |
+| 10 MiB range (1 MiB), 4 workers | 1.18 ms | 1.17 ms | -0.6% | 3,354 MiB/s | 3,354 MiB/s | 0.0% |
+| 1 GiB GET, 1 worker | 957 ms | 953 ms | -0.5% | 1,001 MiB/s | 1,070 MiB/s | +6.9% |
+| OJS enqueue (8 sessions) | 2.33 ms | 2.39 ms | +2.3% | 1,676 req/s | 1,619 req/s | -3.4% |
+| OJS fetch | 27.48 ms | 28.46 ms | +3.6% | 1,443 req/s | 1,394 req/s | -3.4% |
+| OJS stream send | 2.33 ms | 2.33 ms | -0.1% | 1,589 req/s | 1,676 req/s | +5.5% |
+| OJS stream cycle | 12.28 ms | 12.47 ms | +1.6% | 321 req/s | 322 req/s | +0.3% |
+| RESP SET, pipeline 4 | 1.75 ms | 1.76 ms | +0.4% | 1,976 req/s | 2,173 req/s | +10.0% |
+| RESP GET, pipeline 4 | 0.033 ms | 0.033 ms | 0.0% | 115,232 req/s | 114,349 req/s | -0.8% |
+
+Every row is inside the 20% budget. A first four-session enqueue pass showed
+-11.5% throughput; the eight-session repeat is the better estimate, and the only
+enqueue-path change sits inside the branch that runs before a queue is known.
+
+Gates on `2857200`: `go build`, `go vet` with and without `-tags=integration`,
+`go test -race ./...`, the integration suite under `-race` on a fresh database,
+s3t (36 of 36), `hk check --all --profile ci`, and `test/e2e.sh` with two gateways.
+The Docker CLI was unavailable in the working environment, so the contract run
+followed `deploy/bench/stack.sh contract` step for step against local PostgreSQL
+18.6 instead of the container.
 
 The [live file map](../CONTRIBUTING.md#package-map) describes the final structure.
 Package/build-tag boundaries, the isolated SDK benchmark module, streaming
