@@ -183,11 +183,14 @@ func (s *Server) objectRequest(w http.ResponseWriter, r *http.Request, bucket, k
 		return errNotImplemented()
 	}
 	c := routeContext{s: s, w: w, r: r, bucket: bucket, key: key, q: q}
-	found, err := c.dispatch(objectRoutes)
-	if !found {
+	rt := selectRoute(objectRoutes, r, q)
+	if rt == nil {
 		return errMethodNotAllowed()
 	}
-	return err
+	if err := s.requireOriginBucket(r.Context(), bucket); err != nil {
+		return err
+	}
+	return rt.run(&c)
 }
 
 func errMethodNotAllowed() *APIError {
@@ -195,12 +198,8 @@ func errMethodNotAllowed() *APIError {
 }
 
 func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
-	ok, err := s.store.BucketExists(r.Context(), bucket)
-	if err != nil {
+	if err := s.requireNativeBucket(r.Context(), bucket); err != nil {
 		return err
-	}
-	if !ok {
-		return errNoSuchBucket()
 	}
 	w.Header().Set("x-amz-bucket-region", "us-east-1")
 	w.WriteHeader(http.StatusOK)
@@ -406,26 +405,42 @@ var objectRoutes = []route{
 }
 
 var originBucketRoutes = []route{
-	{name: "origin-bucket-head", method: http.MethodHead, run: routeStatusOK},
+	{name: "origin-bucket-head", method: http.MethodHead, run: catalogRoute(func(c *routeContext) error {
+		return c.s.headBucket(c.w, c.r, c.bucket)
+	})},
 	{name: "origin-bucket-location", method: http.MethodGet, query: "location", run: func(c *routeContext) error {
 		c.s.getBucketLocation(c.w, c.r, c.bucket)
 		return nil
 	}},
-	{name: "origin-bucket-versions", method: http.MethodGet, query: "versions", run: func(c *routeContext) error {
+	{name: "origin-bucket-versions", method: http.MethodGet, query: "versions", run: catalogRoute(func(c *routeContext) error {
 		return c.s.listOriginObjectVersions(c.w, c.r, c.bucket, c.q)
-	}},
-	{name: "origin-bucket-uploads", method: http.MethodGet, query: "uploads", run: func(c *routeContext) error {
+	})},
+	{name: "origin-bucket-uploads", method: http.MethodGet, query: "uploads", run: catalogRoute(func(c *routeContext) error {
 		return c.s.listMultipartUploads(c.w, c.r, c.bucket, c.q)
-	}},
-	{name: "origin-bucket-list", method: http.MethodGet, run: func(c *routeContext) error {
+	})},
+	{name: "origin-bucket-list", method: http.MethodGet, run: catalogRoute(func(c *routeContext) error {
 		return c.s.listObjectsV2(c.w, c.r, c.bucket, c.q)
-	}},
+	})},
 	{name: "origin-bucket-copy", method: http.MethodPut, header: "x-amz-copy-source", run: routeNotImplemented},
-	{name: "origin-bucket-put", method: http.MethodPut, run: routeStatusOK},
-	{name: "origin-bucket-delete", method: http.MethodDelete, run: routeNotImplemented},
-	{name: "origin-bucket-delete-objects", method: http.MethodPost, query: "delete", run: func(c *routeContext) error {
-		return c.s.deleteObjects(c.w, c.r, c.bucket)
+	{name: "origin-bucket-put", method: http.MethodPut, run: func(c *routeContext) error {
+		if c.s.store == nil {
+			return routeStatusOK(c)
+		}
+		return c.s.createBucket(c.w, c.r, c.bucket)
 	}},
+	{name: "origin-bucket-delete", method: http.MethodDelete, run: routeNotImplemented},
+	{name: "origin-bucket-delete-objects", method: http.MethodPost, query: "delete", run: catalogRoute(func(c *routeContext) error {
+		return c.s.deleteObjects(c.w, c.r, c.bucket)
+	})},
+}
+
+func catalogRoute(run func(*routeContext) error) func(*routeContext) error {
+	return func(c *routeContext) error {
+		if err := c.s.requireOriginBucket(c.r.Context(), c.bucket); err != nil {
+			return err
+		}
+		return run(c)
+	}
 }
 
 func routeStatusOK(c *routeContext) error {

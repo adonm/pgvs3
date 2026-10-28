@@ -346,6 +346,11 @@ queues store their data directly in PostgreSQL.
 | **Range cache** | With `--range-cache-chunk`, cache aligned chunks of large objects independently; without it, ranges above 8 MiB pass through to the origin. |
 | **Listings** | Serve `ListObjectsV2` by merging the origin walk with live durable write-back objects, one bounded page in memory; no listing index or refresh generation. |
 
+Origins supply object data only. Every origin-backed bucket, per-bucket or
+global, needs a catalog row: bucket and object requests check it before the
+origin is contacted, and a missing row returns `NoSuchBucket`. Origins never
+create or drop buckets.
+
 Cross-worker safety:
 
 - **Stale fill fencing:** a read-through fill records the origin version it

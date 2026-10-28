@@ -159,6 +159,9 @@ SELECT * FROM lake.events;
 - **Accelerating cache tier (`--origin-config`).** With an S3, HTTP(S) or
   filesystem origin, S3 `GET`/`HEAD` become read-through cache reads in
   `s3c_<namespace>` (WAL-logged and replicated) with TTL revalidation.
+  A global origin serves only buckets that exist in the catalog: create each
+  bucket with `PUT /{bucket}` first. A missing bucket returns `404 NoSuchBucket`
+  before the origin is contacted.
   Writable origins also receive
   `PUT`/`COPY`/`DELETE` write-through; read-only HTTP(S) origins serve reads
   only. Request checksums are verified and conditional writes are enforced
@@ -414,7 +417,8 @@ Subcommands:
   revive dead-lettered rows after repairing the origin.
 - `pgvs3 origin [--bucket B] [--cache-namespace NS] set|clear|list [origin.json]`
   — persist or remove global or per-bucket origin cache configs inside
-  PostgreSQL (gateways discover them automatically with no external files).
+  PostgreSQL (gateways discover them automatically with no external files). A
+  global origin serves only buckets that exist in the catalog.
 - `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v25, table settings, per-queue stream functions,
   namespace drift, the 100-namespace supported scale, and reaper safety.
 - `pgvs3 reap [--all]` — reconcile schemas and run garbage collection immediately.

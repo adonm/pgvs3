@@ -7,16 +7,20 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/adonm/pgvs3/internal/testutil"
@@ -44,6 +48,8 @@ func TestMain(m *testing.M) {
 
 func TestOriginWriteValidationAndConditions(t *testing.T) {
 	ctx := originTestCtx
+	testutil.Must(t, originTestStore.CreateBucket(ctx, "bkt"))
+	t.Cleanup(func() { _, _ = originTestStore.DropBucket(ctx, "bkt", true) })
 	dir := t.TempDir()
 	tier, err := objcache.New(testutil.DiscardLogger(),
 		fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir),
@@ -279,4 +285,125 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 			t.Fatalf("missing key = %d", resp.StatusCode)
 		}
 	})
+}
+
+func TestOriginRequiresCatalogBucket(t *testing.T) {
+	ctx := originTestCtx
+	id := time.Now().UnixNano()
+	missing := fmt.Sprintf("ob-missing-%d", id)
+	native := fmt.Sprintf("ob-native-%d", id)
+	edge := fmt.Sprintf("ob-edge-%d", id)
+	edgeCache := fmt.Sprintf("ob-edge-cache-%d", id)
+	global := fmt.Sprintf("ob-global-%d", id)
+	ghost := fmt.Sprintf("ob-ghost-%d", id)
+	globalCache := fmt.Sprintf("ob-global-cache-%d", id)
+	t.Cleanup(func() {
+		for _, b := range []string{native, edge, global, ghost, missing} {
+			_, _ = originTestStore.DropBucket(ctx, b, true)
+		}
+		for _, c := range []string{edgeCache, globalCache} {
+			_, _ = originTestStore.DropNamespace(ctx, ns.Cache, c, true)
+			_, _ = originTestStore.DropNamespace(ctx, ns.WriteBack, c, true)
+		}
+	})
+
+	testutil.Must(t, originTestStore.CreateBucket(ctx, native))
+	testutil.Must(t, originTestStore.CreateBucket(ctx, global))
+	testutil.Must(t, objcache.SaveSpec(ctx, originTestStore, edge,
+		objcache.Spec{Namespace: edgeCache, Config: `{"type":"ephemeral"}`}))
+	originDir := t.TempDir()
+	globalTier, err := objcache.New(testutil.DiscardLogger(),
+		fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, originDir),
+		originTestStore, globalCache, 0, time.Hour, 2)
+	testutil.Must(t, err)
+	defer globalTier.Close()
+
+	nativeSrv := New(originTestStore, testutil.DiscardLogger(), false, 8)
+	nativeHTTP := httptest.NewServer(nativeSrv)
+	defer nativeHTTP.Close()
+	globalSrv := New(originTestStore, testutil.DiscardLogger(), false, 8)
+	globalSrv.SetOrigin(globalTier)
+	globalHTTP := httptest.NewServer(globalSrv)
+	defer globalHTTP.Close()
+
+	request := func(t *testing.T, base, method, path, body string, header map[string]string) (int, string, string) {
+		t.Helper()
+		req, err := http.NewRequest(method, base+path, strings.NewReader(body))
+		testutil.Must(t, err)
+		for k, v := range header {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		testutil.Must(t, err)
+		defer resp.Body.Close()
+		raw, err := io.ReadAll(resp.Body)
+		testutil.Must(t, err)
+		var e errorResponse
+		_ = xml.Unmarshal(raw, &e)
+		return resp.StatusCode, string(raw), e.Code
+	}
+
+	cases := []struct {
+		name   string
+		server string
+		bucket string
+		exists bool
+	}{
+		{"native missing", nativeHTTP.URL, missing, false},
+		{"native existing", nativeHTTP.URL, native, true},
+		{"per-bucket origin with row", nativeHTTP.URL, edge, true},
+		{"global origin with row", globalHTTP.URL, global, true},
+		{"global origin without row", globalHTTP.URL, ghost, false},
+	}
+	steps := []struct {
+		name, method, path string
+		header             map[string]string
+		body, wantBody     string
+		ok                 int
+	}{
+		{name: "HEAD bucket", method: http.MethodHead, path: "/{b}", ok: http.StatusOK},
+		{name: "LIST objects", method: http.MethodGet, path: "/{b}?list-type=2", ok: http.StatusOK},
+		{name: "PUT object", method: http.MethodPut, path: "/{b}/key", body: "payload", ok: http.StatusOK},
+		{name: "HEAD object", method: http.MethodHead, path: "/{b}/key", ok: http.StatusOK},
+		{name: "GET object", method: http.MethodGet, path: "/{b}/key", ok: http.StatusOK, wantBody: "payload"},
+		{name: "COPY object", method: http.MethodPut, path: "/{b}/copy",
+			header: map[string]string{"x-amz-copy-source": "/{b}/key"}, ok: http.StatusOK},
+		{name: "DELETE object", method: http.MethodDelete, path: "/{b}/key", ok: http.StatusNoContent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, st := range steps {
+				header := map[string]string{}
+				for k, v := range st.header {
+					header[k] = strings.ReplaceAll(v, "{b}", tc.bucket)
+				}
+				path := strings.ReplaceAll(st.path, "{b}", tc.bucket)
+				status, body, code := request(t, tc.server, st.method, path, st.body, header)
+				if !tc.exists {
+					if status != http.StatusNotFound || (st.method != http.MethodHead && code != "NoSuchBucket") {
+						t.Errorf("%s: status %d code %q, want 404 NoSuchBucket", st.name, status, code)
+					}
+					continue
+				}
+				if status != st.ok {
+					t.Errorf("%s: status %d, want %d (body %q)", st.name, status, st.ok, body)
+				}
+				if st.wantBody != "" && body != st.wantBody {
+					t.Errorf("%s: body %q, want %q", st.name, body, st.wantBody)
+				}
+			}
+		})
+	}
+
+	for _, b := range []string{missing, ghost} {
+		if ok, err := originTestStore.BucketExists(ctx, b); err != nil || ok {
+			t.Fatalf("bucket %q exists=%v err=%v after requests, want no catalog row", b, ok, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(originDir, ghost)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("global origin stored data for a bucket without a catalog row: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(originDir, global, "copy")); err != nil || string(got) != "payload" {
+		t.Fatalf("global origin copy = %q, %v; want payload", got, err)
+	}
 }

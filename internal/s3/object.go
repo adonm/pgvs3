@@ -609,11 +609,32 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, b
 	return nil
 }
 
-func (s *Server) localBucketExists(ctx context.Context, bucket string) (bool, error) {
+func (s *Server) requireNativeBucket(ctx context.Context, bucket string) error {
 	if s.store == nil || s.originFor(ctx, bucket) != nil {
-		return true, nil
+		return nil
 	}
-	return s.store.BucketExists(ctx, bucket)
+	return s.requireCatalogBucket(ctx, bucket)
+}
+
+func (s *Server) requireOriginBucket(ctx context.Context, bucket string) error {
+	if s.store == nil || s.originFor(ctx, bucket) == nil {
+		return nil
+	}
+	if !ns.ValidName(bucket) {
+		return errNoSuchBucket()
+	}
+	return s.requireCatalogBucket(ctx, bucket)
+}
+
+func (s *Server) requireCatalogBucket(ctx context.Context, bucket string) error {
+	ok, err := s.store.BucketExists(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errNoSuchBucket()
+	}
+	return nil
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) error {
@@ -666,12 +687,8 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 }
 
 func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) error {
-	exists, err := s.localBucketExists(r.Context(), bucket)
-	if err != nil {
+	if err := s.requireNativeBucket(r.Context(), bucket); err != nil {
 		return err
-	}
-	if !exists {
-		return errNoSuchBucket()
 	}
 	if err := validateWriteHeaders(r); err != nil {
 		return err
@@ -727,12 +744,8 @@ func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) error {
-	exists, err := s.localBucketExists(r.Context(), bucket)
-	if err != nil {
+	if err := s.requireNativeBucket(r.Context(), bucket); err != nil {
 		return err
-	}
-	if !exists {
-		return errNoSuchBucket()
 	}
 	ok, err := s.multipartBackendFor(r.Context(), bucket).AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
 	if err != nil {
@@ -759,6 +772,11 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	srcBucket, srcKey, err := parseCopySource(r.Header.Get("x-amz-copy-source"), bucket)
 	if err != nil {
 		return errInvalidRequest("invalid x-amz-copy-source")
+	}
+	if srcBucket != bucket {
+		if err := s.requireOriginBucket(r.Context(), srcBucket); err != nil {
+			return err
+		}
 	}
 	replace := strings.EqualFold(r.Header.Get("x-amz-metadata-directive"), "REPLACE")
 	contentEncoding := r.Header.Get("Content-Encoding")
@@ -885,6 +903,11 @@ func (s *Server) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, 
 	srcBucket, srcKey, err := parseCopySource(r.Header.Get("x-amz-copy-source"), bucket)
 	if err != nil {
 		return errInvalidRequest("invalid x-amz-copy-source")
+	}
+	if srcBucket != bucket {
+		if err := s.requireOriginBucket(r.Context(), srcBucket); err != nil {
+			return err
+		}
 	}
 	backend := s.multipartBackendFor(r.Context(), bucket)
 	if _, isOrigin := backend.(originBackend); !isOrigin {
@@ -1070,12 +1093,8 @@ func (s *Server) getObjectAttributes(w http.ResponseWriter, r *http.Request, buc
 }
 
 func (s *Server) listParts(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) error {
-	exists, err := s.localBucketExists(r.Context(), bucket)
-	if err != nil {
+	if err := s.requireNativeBucket(r.Context(), bucket); err != nil {
 		return err
-	}
-	if !exists {
-		return errNoSuchBucket()
 	}
 	uploadID := q.Get("uploadId")
 	max := 1000
@@ -1143,12 +1162,8 @@ func setPartChecksum(part *partXML, c *store.Checksum) {
 }
 
 func (s *Server) listMultipartUploads(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) error {
-	exists, err := s.localBucketExists(r.Context(), bucket)
-	if err != nil {
+	if err := s.requireNativeBucket(r.Context(), bucket); err != nil {
 		return err
-	}
-	if !exists {
-		return errNoSuchBucket()
 	}
 	prefix := q.Get("prefix")
 	max := 1000
@@ -1415,12 +1430,8 @@ func (s *Server) listObjectVersions(w http.ResponseWriter, r *http.Request, buck
 	if apiErr != nil {
 		return apiErr
 	}
-	exists, err := s.store.BucketExists(r.Context(), bucket)
-	if err != nil {
+	if err := s.requireNativeBucket(r.Context(), bucket); err != nil {
 		return err
-	}
-	if !exists {
-		return errNoSuchBucket()
 	}
 	rows, err := s.store.List(r.Context(), ns.BucketRef(bucket), prefix, prefixEnd(prefix), keyMarker, maxKeys+1)
 	if err != nil {

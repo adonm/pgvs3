@@ -16,8 +16,9 @@ curl -fsS -X PUT http://127.0.0.1:8014/lake
 ```
 
 Bucket creation is explicit. A write to a missing or deleted bucket returns
-`NoSuchBucket`; it never recreates the bucket. RESP cache namespaces and OJS
-queues are created on first use.
+`NoSuchBucket`; it never recreates the bucket. The catalog is the only source of
+bucket existence, including for buckets served by an origin. RESP cache
+namespaces and OJS queues are created on first use.
 
 ## Deployment topology
 
@@ -237,6 +238,11 @@ with `CreateBucket`/`PUT /{bucket}`; object writes do not create or recreate a
 bucket. A write to a deleted bucket returns `NoSuchBucket` even if a worker had
 cached the bucket's existence. Cache namespaces and queues keep first-use
 creation through their protocols.
+
+Origins never define buckets. A bucket served by an origin, per-bucket or
+global, needs a catalog row. Bucket and object requests to it check the catalog
+once before the origin is contacted, and return `NoSuchBucket` when the row is
+missing.
 
 Namespace quotas and `--max-db-bytes` are per-worker guardrails, not a
 cluster-wide hard quota: each gateway samples PostgreSQL size on its own.
@@ -551,9 +557,17 @@ pgvs3 origin --url "$PGVS3_URL" --bucket edge clear
 
 Origin configuration is JSON only.
 
+A global origin serves only buckets that exist in the catalog. Create each
+bucket with `PUT /{bucket}` before using it; on an origin-served bucket that
+request creates the catalog row and is idempotent. Object and listing requests to
+a bucket without a catalog row return `404 NoSuchBucket`, and the origin is not
+contacted. Per-bucket origins create their bucket row when you set them, so they
+need no extra step. This is a behaviour change: a global origin used to serve any
+bucket name.
+
 Every running gateway discovers new or updated origin configs from PostgreSQL
 within ~1 second (`--origin-config` on `pgvs3 serve` is still accepted as a
-process-local fallback).
+process-local fallback; it is a global origin and follows the same catalog rule).
 
 ### Cache modes
 
