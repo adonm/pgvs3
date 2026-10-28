@@ -2049,6 +2049,47 @@ func TestStreamFanoutAndAck(t *testing.T) {
 	}
 }
 
+func TestStreamAppendStoresInInputOrder(t *testing.T) {
+	ctx := testCtx
+	q := unique("stream-order")
+	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	inputs := make([]StreamMessageInput, 6)
+	want := make([]string, len(inputs))
+	for i := range inputs {
+		want[i] = fmt.Sprintf("evt-%d", i)
+		inputs[i] = StreamMessageInput{ID: want[i], Payload: []byte(`{}`)}
+	}
+	if _, err := testStore.Queue(q).AppendMessages(ctx, inputs); err != nil {
+		t.Fatal(err)
+	}
+	sc, err := nsSQLIdent(ns.Queue, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := testStore.pool.Query(ctx, "SELECT event_id FROM "+sc+".stream_events ORDER BY seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("stored order = %v, want %v", got, want)
+	}
+}
+
 func TestStreamSnapshotVisibilityAcrossCommitOrder(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-snapshot")

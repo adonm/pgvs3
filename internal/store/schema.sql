@@ -839,12 +839,21 @@ BEGIN
       PERFORM pg_advisory_xact_lock_shared(hashtextextended(%2$L, 0));
       SELECT c.current_segment INTO v_segment FROM %1$I.stream_config c;
       RETURN QUERY
-        WITH inserted AS (
-          INSERT INTO %1$I.stream_events (segment, event_id, type, payload, headers)
-          SELECT v_segment, i.id, i.type, i.payload::jsonb, i.headers::jsonb
+        WITH inputs AS (
+          SELECT i.id, i.type, i.payload, i.headers, i.ord
           FROM unnest(p_ids, p_types, p_payloads, p_headers)
             WITH ORDINALITY AS i(id, type, payload, headers, ord)
-          ORDER BY i.ord
+        ), allocated AS (
+          SELECT nextval('%1$I.stream_event_seq'::regclass) AS seq
+          FROM generate_series(1, cardinality(p_ids))
+        ), ranked AS (
+          SELECT a.seq, row_number() OVER (ORDER BY a.seq) AS pos
+          FROM allocated a
+        ), inserted AS (
+          INSERT INTO %1$I.stream_events (seq, segment, event_id, type, payload, headers)
+          SELECT r.seq, v_segment, i.id, i.type, i.payload::jsonb, i.headers::jsonb
+          FROM ranked r
+          JOIN inputs i ON i.ord = r.pos
           RETURNING *
         )
         SELECT * FROM inserted ORDER BY seq;
