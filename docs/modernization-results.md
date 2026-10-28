@@ -535,17 +535,68 @@ Gates on `39249fc`: gofmt, vet with and without `-tags=integration`,
 suite (16 s). The Docker CLI is unavailable here, so the contract ran against local
 PostgreSQL 18.6, as in the previous round.
 
-Known gaps, deliberately not handled in this round:
+### Catalog bucket rule, ephemeral rename, fault/interop trim and streaming-upload fix
 
-- A DELETE in a missing bucket returns 204 through a global origin, but 404
-  `NoSuchBucket` through the store-backed server. Global origins have no bucket rows,
-  so the fix needs an origin-level bucket rule.
-- The local origin paths were not benchmarked. Syscall counts changed: fewer per
-  ranged filesystem read, and more per overwrite and per `ephemeral` read.
-- `test/fault.sh` and `test/interop.sh` were neither run (they need Docker) nor
-  trimmed. They still contain fixed sleeps and SKIP branches that exit 0.
-- Stream function bodies are created per queue schema from a function stored in the
-  database, so a body change needs a fresh database, like any layout change.
+This round completes the three deferred items and fixes a gateway bug that the
+interop suite exposed.
+
+- **`inmem` is renamed to `ephemeral`** (`64ea56f`). The origin stores in a private
+  temporary directory that is removed on close, so the old name was misleading.
+  Persisted specs that use `inmem` no longer parse.
+- **Origin-served requests require a catalog bucket** (`721b742`). Every bucket-scoped
+  S3 request on an origin-served bucket checks the catalog first and returns 404
+  `NoSuchBucket` if the bucket has no row. A global origin serves only buckets created
+  with `PUT /{bucket}`, and `PUT` on an origin bucket creates the row. A DELETE on a
+  missing bucket now returns 404 instead of 204. Origin-only test servers keep the old
+  behaviour.
+- **`test/fault.sh` and `test/interop.sh` are fixed and trimmed** (`7267b34`, `4cda816`).
+  `fault.sh` was failing before this round because it wrote to a bucket it never
+  created. Fixed sleeps are replaced by deadline polls, SKIP branches are gone, and
+  missing tools fail.
+- **Streaming SigV4 uploads are sized by their decoded length** (`430ebf4`). restic
+  uploads small objects with `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, where the wire
+  `Content-Length` includes chunk headers and signatures. `putObject`, `prepareIngest`
+  and `uploadPart` fell back to the wire length, so the inline read hit EOF early and
+  returned 500. They now use `x-amz-decoded-content-length`, and a missing or invalid
+  decoded length returns `InvalidRequest`.
+
+| Whole-repo Go | Start of round (`39249fc`) | Now (`430ebf4`) |
+| --- | ---: | ---: |
+| Files | 48 | 48 |
+| Total lines | 34,817 | 35,048 |
+| Production lines | 20,770 | 20,825 |
+| Test lines | 14,047 | 14,223 |
+
+#### Paired checks, catalog bucket rule
+
+Old is `c15bbfb` and new is `430ebf4`. Origin rows used a global filesystem origin
+and a Warmed cache, so every measured request is a cache hit. Sessions alternated
+old, new, new, old. A separate three-way run compared `prev` (`c15bbfb`), `head`
+(`430ebf4`) and `nocheck` (`430ebf4` with the catalog check disabled) across three
+rotated rounds of 4,000 requests.
+
+| Workload | Old p50 | New p50 | Δ p50 | Δ throughput |
+| --- | ---: | ---: | ---: | ---: |
+| Origin-served 10 MiB GET, 1 worker | 10.37 ms | 10.49 ms | +1.1% | -0.2% |
+| Origin-served 10 MiB GET, 4 workers | 10.61 ms | 10.53 ms | -0.8% | +1.5% |
+| Native 10 MiB GET, 1 worker (control) | 10.50 ms | 10.45 ms | -0.5% | -1.4% |
+| Origin-served 4 KiB GET, 4 workers | 0.145 ms | 0.185 ms | +27.9% | -20.7% |
+| Same 4 KiB GET with check disabled | 0.145 ms | 0.145 ms | +0.5% | -0.6% |
+
+The 10 MiB target workload is unaffected. The 4 KiB origin-hit row crosses the 20%
+rule because the per-request `to_regclass` check adds about 40 µs, and the three-way
+run shows the check is the entire cost. This is an accepted exception: keeping the
+per-request check preserves immediate catalog authority across gateways when a bucket
+is dropped, without a layout bump or an in-process cache.
+
+Gates on `430ebf4`, with the host Docker CLI: gofmt, vet with and without
+`-tags=integration`, `go test -race ./...`, the integration suite on a fresh database
+(0 failing), s3t (36 of 36), `hk check --all --profile ci`, and `deploy/bench/stack.sh`
+in `contract`, `fault` and `interop` modes (all exit 0, with restic passing).
+
+Remaining note: native requests with an invalid bucket name return 500 instead of 400
+because `ns.ErrInvalidName` is not mapped on the native path. Origin-served requests
+map it to 404 `NoSuchBucket`. This predates the refactor and was left unchanged.
 
 The [live file map](../CONTRIBUTING.md#package-map) describes the final structure.
 Package/build-tag boundaries, the isolated SDK benchmark module, streaming
