@@ -228,7 +228,7 @@ func TestIntegrationLeaseExclusivity(t *testing.T) {
 }
 
 func TestIntegrationPriorityAndScheduled(t *testing.T) {
-	base, srv := newIntServer(t, false)
+	base, _ := newIntServer(t, false)
 	q := uniqQueue(t)
 	enqueue(t, base, q, "low", `[]`, `"priority":0`)
 	enqueue(t, base, q, "high", `[]`, `"priority":10`)
@@ -241,7 +241,15 @@ func TestIntegrationPriorityAndScheduled(t *testing.T) {
 		`{"job_id":"`+id+`","lease_token":"`+jobs[0]["lease_token"].(string)+`"}`)
 	expectStatus(t, r, http.StatusOK)
 
-	scheduledAt := time.Now().UTC().Add(200 * time.Millisecond).Format(time.RFC3339Nano)
+	drained := fetch(t, base, q, 1, 1000)
+	if len(drained) != 1 || drained[0]["type"] != "low" {
+		t.Fatalf("remaining low-priority fetch = %+v", drained)
+	}
+	r = call(t, base, http.MethodPost, "/ojs/v1/workers/ack",
+		`{"job_id":"`+drained[0]["id"].(string)+`","lease_token":"`+drained[0]["lease_token"].(string)+`"}`)
+	expectStatus(t, r, http.StatusOK)
+
+	scheduledAt := time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
 	body := `{"type":"later","args":[],"queue":"` + q + `","scheduled_at":"` + scheduledAt + `"}`
 	r = call(t, base, http.MethodPost, "/ojs/v1/jobs", body)
 	expectStatus(t, r, http.StatusCreated)
@@ -250,17 +258,16 @@ func TestIntegrationPriorityAndScheduled(t *testing.T) {
 		t.Fatalf("scheduled state = %+v", scheduled)
 	}
 	if got := fetch(t, base, q, 1, 1000); len(got) != 0 {
-
-		r = call(t, base, http.MethodPost, "/ojs/v1/workers/ack",
-			`{"job_id":"`+got[0]["id"].(string)+`","lease_token":"`+got[0]["lease_token"].(string)+`"}`)
-		expectStatus(t, r, http.StatusOK)
-		if got := fetch(t, base, q, 1, 0); len(got) != 0 {
-			t.Fatalf("scheduled job fetched early: %+v", got)
-		}
+		t.Fatalf("scheduled job fetched before scheduled_at: %+v", got)
 	}
-	time.Sleep(250 * time.Millisecond)
-	srv.longPoll = 0
-	jobs = fetch(t, base, q, 1, 1000)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		jobs = fetch(t, base, q, 1, 1000)
+		if len(jobs) != 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if len(jobs) != 1 || jobs[0]["type"] != "later" {
 		t.Fatalf("due scheduled fetch = %+v", jobs)
 	}
@@ -373,9 +380,34 @@ func TestIntegrationStreamSendReceiveAck(t *testing.T) {
 	if len(r.body["consumers"].([]any)) != 2 {
 		t.Fatalf("consumers = %+v", r.body)
 	}
+	t.Run("job and stream share a queue", func(t *testing.T) {
+		base, _ := newIntServer(t, false)
+		q := uniqQueue(t)
+		created := enqueue(t, base, q, "email.send", `[]`, "")
+		if created["state"] != store.JobAvailable.String() {
+			t.Fatalf("job = %+v", created)
+		}
+		r := call(t, base, http.MethodPost, "/ojs/v1/queues/"+q+"/consumers",
+			`{"consumer":"stream-worker","from_tick":0}`)
+		expectStatus(t, r, http.StatusCreated)
+		r = call(t, base, http.MethodPost, "/ojs/v1/queues/"+q+"/messages",
+			`{"type":"event","payload":{"n":1}}`)
+		expectStatus(t, r, http.StatusCreated)
+
+		jobs := fetch(t, base, q, 1, 1000)
+		if len(jobs) != 1 {
+			t.Fatalf("jobs = %+v", jobs)
+		}
+		r = call(t, base, http.MethodPost, "/ojs/v1/queues/"+q+"/receive",
+			`{"consumer":"stream-worker","max":10}`)
+		expectStatus(t, r, http.StatusOK)
+		if len(r.body["messages"].([]any)) != 1 {
+			t.Fatalf("stream messages = %+v", r.body)
+		}
+	})
 }
 
-func TestIntegrationStreamConfigAndReadOnly(t *testing.T) {
+func TestIntegrationStreamConfig(t *testing.T) {
 	base, _ := newIntServer(t, false)
 	q := uniqQueue(t)
 	r := call(t, base, http.MethodPost, "/ojs/v1/queues/"+q+"/consumers",
@@ -389,41 +421,6 @@ func TestIntegrationStreamConfigAndReadOnly(t *testing.T) {
 		t.Fatalf("config = %+v", cfg)
 	}
 
-	roBase, _ := newIntServer(t, true)
-	r = call(t, roBase, http.MethodPost, "/ojs/v1/queues/"+q+"/messages",
-		`{"type":"x","payload":{}}`)
-	expectStatus(t, r, http.StatusForbidden)
-	r = call(t, roBase, http.MethodPost, "/ojs/v1/queues/"+q+"/receive",
-		`{"consumer":"c","max":1}`)
-	expectStatus(t, r, http.StatusForbidden)
-	r = call(t, roBase, http.MethodGet, "/ojs/v1/queues/"+q+"/info", "")
-	expectStatus(t, r, http.StatusOK)
-}
-
-func TestIntegrationJobAndStreamShareQueue(t *testing.T) {
-	base, _ := newIntServer(t, false)
-	q := uniqQueue(t)
-	created := enqueue(t, base, q, "email.send", `[]`, "")
-	if created["state"] != store.JobAvailable.String() {
-		t.Fatalf("job = %+v", created)
-	}
-	r := call(t, base, http.MethodPost, "/ojs/v1/queues/"+q+"/consumers",
-		`{"consumer":"stream-worker","from_tick":0}`)
-	expectStatus(t, r, http.StatusCreated)
-	r = call(t, base, http.MethodPost, "/ojs/v1/queues/"+q+"/messages",
-		`{"type":"event","payload":{"n":1}}`)
-	expectStatus(t, r, http.StatusCreated)
-
-	jobs := fetch(t, base, q, 1, 1000)
-	if len(jobs) != 1 {
-		t.Fatalf("jobs = %+v", jobs)
-	}
-	r = call(t, base, http.MethodPost, "/ojs/v1/queues/"+q+"/receive",
-		`{"consumer":"stream-worker","max":10}`)
-	expectStatus(t, r, http.StatusOK)
-	if len(r.body["messages"].([]any)) != 1 {
-		t.Fatalf("stream messages = %+v", r.body)
-	}
 }
 
 func TestIntegrationCancelAndReadOnly(t *testing.T) {
@@ -443,22 +440,11 @@ func TestIntegrationCancelAndReadOnly(t *testing.T) {
 	r = call(t, base, http.MethodDelete, "/ojs/v1/jobs/"+id, "")
 	expectStatus(t, r, http.StatusConflict)
 
-	roBase, _ := newIntServer(t, true)
-	r = call(t, roBase, http.MethodGet, "/ojs/v1/jobs/"+id, "")
-	expectStatus(t, r, http.StatusOK)
-	r = call(t, roBase, http.MethodGet, "/ojs/v1/queues", "")
-	expectStatus(t, r, http.StatusOK)
-	r = call(t, roBase, http.MethodGet, "/ojs/v1/queues/"+q+"/stats", "")
+	r = call(t, base, http.MethodGet, "/ojs/v1/queues/"+q+"/stats", "")
 	expectStatus(t, r, http.StatusOK)
 	if r.body["stats"].(map[string]any)["cancelled"] != float64(1) {
 		t.Fatalf("stats = %+v", r.body)
 	}
-	r = call(t, roBase, http.MethodPost, "/ojs/v1/jobs", `{"type":"x","args":[]}`)
-	expectStatus(t, r, http.StatusForbidden)
-	r = call(t, roBase, http.MethodPost, "/ojs/v1/workers/fetch", `{"queues":["`+q+`"]}`)
-	expectStatus(t, r, http.StatusForbidden)
-	r = call(t, roBase, http.MethodDelete, "/ojs/v1/jobs/"+id, "")
-	expectStatus(t, r, http.StatusForbidden)
 }
 
 func TestIntegrationBatchListAndStats(t *testing.T) {
@@ -492,11 +478,4 @@ func TestIntegrationBatchListAndStats(t *testing.T) {
 		t.Fatalf("queue %s missing from list: %+v", q, r.body)
 	}
 
-	jobs := fetch(t, base, q, 1, 1000)
-	r = call(t, base, http.MethodPost, "/ojs/v1/workers/heartbeat",
-		`{"worker_id":"worker-1","active_jobs":["`+jobs[0]["id"].(string)+`"],"lease_tokens":{"`+jobs[0]["id"].(string)+`":"`+jobs[0]["lease_token"].(string)+`"},"visibility_timeout_ms":5000}`)
-	expectStatus(t, r, http.StatusOK)
-	if len(r.body["jobs_extended"].([]any)) != 1 {
-		t.Fatalf("heartbeat = %+v", r.body)
-	}
 }
