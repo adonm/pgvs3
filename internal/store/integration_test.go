@@ -47,6 +47,11 @@ func unique(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
+func dropOnCleanup(t *testing.T, kind ns.Kind, name string) {
+	t.Helper()
+	t.Cleanup(func() { _, _ = testStore.DropNamespace(testCtx, kind, name, true) })
+}
+
 func TestPendingOutboxLifecycle(t *testing.T) {
 	ctx := testCtx
 	cache := unique("origin")
@@ -128,10 +133,8 @@ func TestPendingOutboxLifecycle(t *testing.T) {
 		if err := testStore.SetNamespaceAttrs(ctx, ns.Cache, cache, map[string]any{"origin": map[string]any{"scope": "global"}}); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() {
-			_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
-			_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
-		})
+		dropOnCleanup(t, ns.WriteBack, cache)
+		dropOnCleanup(t, ns.Cache, cache)
 		if _, err := testStore.Pool().Exec(ctx, `INSERT INTO s3p.pending_uploads
 			(kind, namespace, key, token, size, attempts, next_attempt, base_missing)
 			VALUES ('cache', $1, 'bkt/key', 'pending:flush', 1, 0, now(), false)`, cache); err != nil {
@@ -401,7 +404,7 @@ func TestEnsureMaintenanceDetectsSchemaDrift(t *testing.T) {
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	defer testStore.DropBucket(ctx, bucket, true)
+	dropOnCleanup(t, ns.Bucket, bucket)
 	schema, err := nsSQLIdent(ns.Bucket, bucket)
 	if err != nil {
 		t.Fatal(err)
@@ -446,7 +449,7 @@ func TestQuotaAdmission(t *testing.T) {
 		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, &quota, nil); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true) })
+		dropOnCleanup(t, ns.Cache, cache)
 		_, err := testStore.StartPart(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: "bkt/part"}, "missing", 1, 2<<20)
 		if !errors.Is(err, ErrQuotaExceeded) {
 			t.Fatalf("oversized part error = %v, want ErrQuotaExceeded", err)
@@ -606,10 +609,8 @@ func TestWriteBackNamespaceIsLogged(t *testing.T) {
 	if err := testStore.EnsureNamespace(ctx, ns.WriteBack, cache, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
-		_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
-	})
+	dropOnCleanup(t, ns.WriteBack, cache)
+	dropOnCleanup(t, ns.Cache, cache)
 	for kind, want := range map[ns.Kind]string{ns.Cache: "p", ns.WriteBack: "p"} {
 		schema, err := kind.Schema(cache)
 		if err != nil {
@@ -633,7 +634,7 @@ func TestConcurrentConditionalCreate(t *testing.T) {
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Bucket, bucket, true) })
+	dropOnCleanup(t, ns.Bucket, bucket)
 	start := make(chan struct{})
 	type result struct {
 		ok  bool
@@ -672,7 +673,7 @@ func TestChunkLayoutRequiresReloptionsAndExternalStorage(t *testing.T) {
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropBucket(testCtx, bucket, true) })
+	dropOnCleanup(t, ns.Bucket, bucket)
 	schema, err := ns.Bucket.Schema(bucket)
 	if err != nil {
 		t.Fatal(err)
@@ -725,7 +726,7 @@ func TestMaintainHasSingleLeader(t *testing.T) {
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropBucket(testCtx, bucket, true) })
+	dropOnCleanup(t, ns.Bucket, bucket)
 	schema, err := ns.Bucket.Schema(bucket)
 	if err != nil {
 		t.Fatal(err)
@@ -805,7 +806,7 @@ func TestMetadataRoundTrip(t *testing.T) {
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Bucket, bucket, true) })
+	dropOnCleanup(t, ns.Bucket, bucket)
 	modified := time.Date(2025, 4, 3, 2, 1, 0, 0, time.UTC)
 	ref := ObjectRef{NS: ns.BucketRef(bucket), Key: "encoded"}
 	if _, err := testStore.PutInline(ctx, ref, []byte("body"), WriteOptions{
@@ -844,10 +845,8 @@ func TestMetadataRoundTrip(t *testing.T) {
 		if err := testStore.CreateBucket(ctx, src); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() {
-			_, _ = testStore.DropNamespace(ctx, ns.Bucket, src, true)
-			_, _ = testStore.DropNamespace(ctx, ns.Bucket, dst, true)
-		})
+		dropOnCleanup(t, ns.Bucket, dst)
+		dropOnCleanup(t, ns.Bucket, src)
 		modified := time.Date(2025, 6, 7, 8, 9, 10, 0, time.UTC)
 		srcRef := ObjectRef{NS: ns.BucketRef(src), Key: "obj"}
 		if _, err := testStore.PutInline(ctx, srcRef, []byte("body"), WriteOptions{
@@ -885,7 +884,7 @@ func TestMetadataRoundTrip(t *testing.T) {
 		if err := testStore.CreateBucket(testCtx, bucket); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _, _ = testStore.DropBucket(testCtx, bucket, true) })
+		dropOnCleanup(t, ns.Bucket, bucket)
 		for i, data := range [][]byte{nil, bytes.Repeat([]byte("compressible"), 2048)} {
 			src := ObjectRef{NS: ns.BucketRef(bucket), Key: fmt.Sprintf("source-%d", i)}
 			dst := ObjectRef{NS: src.NS, Key: fmt.Sprintf("copy-%d", i)}
@@ -971,7 +970,7 @@ func TestGetBodyFromMeta(t *testing.T) {
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropBucket(ctx, bucket, true) })
+	dropOnCleanup(t, ns.Bucket, bucket)
 
 	check := func(ref ObjectRef, m *Meta, want []byte, rng ByteRange) {
 		t.Helper()
@@ -1048,10 +1047,8 @@ func TestCopyAndCopyPart(t *testing.T) {
 	if err := testStore.CreateBucket(ctx, dstBucket); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = testStore.DropBucket(context.WithoutCancel(ctx), srcBucket, true)
-		_, _ = testStore.DropBucket(context.WithoutCancel(ctx), dstBucket, true)
-	})
+	dropOnCleanup(t, ns.Bucket, dstBucket)
+	dropOnCleanup(t, ns.Bucket, srcBucket)
 
 	data := bytes.Repeat([]byte("0123456789abcdef"), 8192)
 	srcRef := ObjectRef{NS: ns.BucketRef(srcBucket), Key: "source"}
@@ -1135,7 +1132,7 @@ func mutationCache(t *testing.T) string {
 	if err := testStore.EnsureNamespace(testCtx, ns.Cache, name, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(testCtx, ns.Cache, name, true) })
+	dropOnCleanup(t, ns.Cache, name)
 	return name
 }
 
@@ -1247,7 +1244,7 @@ func TestCacheAtomicMutations(t *testing.T) {
 		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true) })
+		dropOnCleanup(t, ns.Cache, cache)
 		if _, _, wrote, err := testStore.Cache(cache).Set(ctx, "k", []byte("a"), CacheSetOptions{}); err != nil || !wrote {
 			t.Fatalf("initial set wrote=%v err=%v", wrote, err)
 		}
@@ -1392,7 +1389,7 @@ func TestMetadataDistinguishesMissingKeyFromMissingBucket(t *testing.T) {
 	if err := testStore.CreateBucket(testCtx, name); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropBucket(testCtx, name, true) })
+	dropOnCleanup(t, ns.Bucket, name)
 	if _, err := testStore.StatNamespace(testCtx, ns.Bucket, name); err != nil {
 		t.Fatalf("namespace stats: %v", err)
 	}
@@ -1597,7 +1594,7 @@ func TestObjectModelAcrossWorkers(t *testing.T) {
 	if err := testStore.CreateBucket(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = testStore.DropBucket(context.WithoutCancel(ctx), bucket, true) })
+	dropOnCleanup(t, ns.Bucket, bucket)
 
 	other, err := Open(ctx, testStore.Pool().Config().ConnString(), 8,
 		testutil.DiscardLogger())
@@ -1753,7 +1750,7 @@ func TestMaintenanceExpiry(t *testing.T) {
 	t.Run("expired lease exhausts attempts", func(t *testing.T) {
 		ctx := testCtx
 		q := unique("ojs-expired")
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		dropOnCleanup(t, ns.Queue, q)
 
 		jobs, err := testStore.EnqueueJobs(ctx, []EnqueueInput{{
 			Type: "expired.test", Args: []byte("[]"), Queue: q, MaxAttempts: 1,
@@ -1792,7 +1789,7 @@ func TestHeartbeatJobsExtendsLeasesAcrossQueues(t *testing.T) {
 	queues := []string{unique("ojs-hb-a"), unique("ojs-hb-b")}
 	for _, q := range queues {
 		q := q
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		dropOnCleanup(t, ns.Queue, q)
 		_, err := testStore.EnqueueJobs(ctx, []EnqueueInput{{
 			Type: "heartbeat.test", Args: []byte("[]"), Queue: q,
 		}})
@@ -1862,7 +1859,7 @@ func TestHeartbeatJobsExtendsLeasesAcrossQueues(t *testing.T) {
 func TestMissingQueuesIgnored(t *testing.T) {
 	ctx := testCtx
 	q := unique("ojs-fetch-missing")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if _, err := testStore.EnqueueJobs(ctx, []EnqueueInput{{
 		Type: "missing.test", Args: []byte("[]"), Queue: q,
 	}}); err != nil {
@@ -1886,7 +1883,7 @@ func TestMissingQueuesIgnored(t *testing.T) {
 	t.Run("any queue exists", func(t *testing.T) {
 		ctx := testCtx
 		q := unique("ojs-any-exists")
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		dropOnCleanup(t, ns.Queue, q)
 		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -1992,7 +1989,7 @@ func TestClaimTransitions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			queue := unique("claim")
 			id := newJobID()
-			t.Cleanup(func() { _, _ = testStore.DropNamespace(testCtx, ns.Queue, queue, true) })
+			dropOnCleanup(t, ns.Queue, queue)
 			if _, err := testStore.EnqueueJobs(testCtx, []EnqueueInput{{ID: id, Queue: queue,
 				Type: "claim", Args: []byte("[]"), MaxAttempts: tc.job.MaxAttempts}}); err != nil {
 				t.Fatal(err)
@@ -2029,7 +2026,7 @@ func TestClaimTransitions(t *testing.T) {
 func TestStreamAppend(t *testing.T) {
 	ctx := testCtx
 	queue := unique("stream-append-rollback")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, queue, true) })
+	dropOnCleanup(t, ns.Queue, queue)
 	if _, err := testStore.Queue(queue).Subscribe(ctx, "reader", ptrInt64(0)); err != nil {
 		t.Fatal(err)
 	}
@@ -2054,7 +2051,7 @@ func TestStreamAppend(t *testing.T) {
 	t.Run("stored in input order", func(t *testing.T) {
 		ctx := testCtx
 		q := unique("stream-order")
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		dropOnCleanup(t, ns.Queue, q)
 		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -2096,7 +2093,7 @@ func TestStreamAppend(t *testing.T) {
 func TestStreamFanoutAndAck(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-fanout")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2154,7 +2151,7 @@ func TestStreamFanoutAndAck(t *testing.T) {
 	t.Run("receive ceiling", func(t *testing.T) {
 		ctx := testCtx
 		q := unique("stream-limit")
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		dropOnCleanup(t, ns.Queue, q)
 		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -2182,7 +2179,7 @@ func TestStreamFanoutAndAck(t *testing.T) {
 func TestStreamTicks(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-prune")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2210,7 +2207,7 @@ func TestStreamTicks(t *testing.T) {
 	t.Run("empty receive writes no tick", func(t *testing.T) {
 		ctx := testCtx
 		q := unique("stream-idle-ticks")
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		dropOnCleanup(t, ns.Queue, q)
 		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -2261,7 +2258,7 @@ func TestStreamTicks(t *testing.T) {
 func TestStreamErrorMappings(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-errors")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2337,7 +2334,7 @@ func TestStreamErrorMappings(t *testing.T) {
 func TestStreamSnapshotVisibilityAcrossCommitOrder(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-snapshot")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2391,7 +2388,7 @@ func TestStreamSnapshotVisibilityAcrossCommitOrder(t *testing.T) {
 func TestStreamCooperativeConsumers(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-coop")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2446,7 +2443,7 @@ func TestStreamCooperativeConsumers(t *testing.T) {
 func TestStreamNackRetryDLQAndReplay(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-dlq")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2514,7 +2511,7 @@ func TestStreamNackRetryDLQAndReplay(t *testing.T) {
 func TestStreamRotation(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-rotate")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2553,7 +2550,7 @@ func TestStreamRotation(t *testing.T) {
 	t.Run("pinned consumer", func(t *testing.T) {
 		ctx := testCtx
 		q := unique("stream-rotate-pin")
-		t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+		dropOnCleanup(t, ns.Queue, q)
 		if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -2601,7 +2598,7 @@ func TestStreamRotation(t *testing.T) {
 func TestStreamStatAndSizeIncludeSegments(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-stat")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2635,7 +2632,7 @@ func ptrInt64(v int64) *int64 { return &v }
 func TestDiagnoseNamesMissingStreamFunction(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-diagnose")
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	dropOnCleanup(t, ns.Queue, q)
 	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}

@@ -45,6 +45,11 @@ func TestMain(m *testing.M) {
 	}))
 }
 
+func dropOnCleanup(t *testing.T, kind ns.Kind, name string) {
+	t.Helper()
+	t.Cleanup(func() { _, _ = testStore.DropNamespace(testCtx, kind, name, true) })
+}
+
 type fixture struct {
 	tier *Tier
 	dir  string
@@ -59,12 +64,9 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = tier.Close()
-		for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
-			_, _ = testStore.DropNamespace(testCtx, kind, tier.namespace, true)
-		}
-	})
+	dropOnCleanup(t, ns.WriteBack, tier.namespace)
+	dropOnCleanup(t, ns.Cache, tier.namespace)
+	t.Cleanup(func() { _ = tier.Close() })
 	return &fixture{tier: tier, dir: dir}
 }
 
@@ -933,10 +935,8 @@ func TestReadOnlyTier(t *testing.T) {
 		if err := testStore.EnsureNamespace(ctx, ns.WriteBack, cache, nil, nil); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() {
-			_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
-			_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
-		})
+		dropOnCleanup(t, ns.WriteBack, cache)
+		dropOnCleanup(t, ns.Cache, cache)
 		if _, err := testStore.PutInline(ctx, store.ObjectRef{NS: ns.WriteBackRef(cache), Key: "bkt/warm"},
 			[]byte("durable"), store.WriteOptions{ContentType: "text/plain", OriginETag: "origin-v1"}); err != nil {
 			t.Fatal(err)
@@ -978,10 +978,8 @@ func TestReadOnlyTier(t *testing.T) {
 			t.Fatal(err)
 		}
 		cache := fmt.Sprintf("origin-shared-%d", time.Now().UnixNano())
-		t.Cleanup(func() {
-			_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
-			_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
-		})
+		dropOnCleanup(t, ns.WriteBack, cache)
+		dropOnCleanup(t, ns.Cache, cache)
 		cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
 		writer, err := New(testutil.DiscardLogger(), cfg, testStore, cache, time.Hour, time.Hour, 2)
 		if err != nil {
@@ -1283,7 +1281,7 @@ func TestTierModelAcrossWorkers(t *testing.T) {
 	}
 	first, second := newTier(), newTier()
 	t.Cleanup(func() { _ = first.Close(); _ = second.Close() })
-	t.Cleanup(func() { _, _ = testStore.DropNamespace(context.WithoutCancel(ctx), "cache", cache, true) })
+	dropOnCleanup(t, "cache", cache)
 	tiers := []*Tier{first, second}
 
 	model := map[string]string{}
