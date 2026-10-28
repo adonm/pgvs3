@@ -299,7 +299,6 @@ pc.copy_object(Bucket=gen, Key=f'{run}/shared-copy', CopySource={'Bucket':gen,'K
 pc.delete_objects(Bucket=gen, Delete={'Objects':[{'Key':f'{run}/shared-src'},{'Key':f'{run}/presigned'}]})
 subprocess.run(['.tmp/pgvs3/pgvs3', 'reap', '--url', os.environ['PGVS3_TEST_DB_URL'], '--grace', '0s'], check=True, stdout=subprocess.DEVNULL)
 assert pc.get_object(Bucket=gen, Key=f'{run}/shared-copy')['Body'].read()==b'shared'
-print('boto3 ok')
 PY
 
 # --- RESP (Redis/Valkey) + compressed block storage on the same port --------
@@ -429,7 +428,6 @@ s3c = boto3.client('s3', endpoint_url=ep_a,
 bkt = os.environ['E2E_BUCKET']; run = os.environ['E2E_RUN']
 s3c.put_object(Bucket=bkt, Key=f'{run}/from-s3', Body=b's3-payload-' * 1000)
 assert rb.get(f's3://{bkt}/{run}/from-s3') == b's3-payload-' * 1000
-print('resp ok')
 PY
 
 # --- OJS core job protocol: lifecycle on A, state visible on the read-only gateway
@@ -600,7 +598,6 @@ c.execute(f"ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 's3://{b}/{run}/lake/
 c.execute(f"CREATE TABLE lake.t_{run.replace('-','_')}(i INTEGER)")
 c.execute(f"INSERT INTO lake.t_{run.replace('-','_')} SELECT range FROM range(1000)")
 assert c.execute(f"SELECT count(*) FROM lake.t_{run.replace('-','_')}").fetchone()[0]==1000
-print("duckdb 2.0 ok")
 PY
 
 # --- duckdb-object-storage (1.5.6) on the same gateway ---------------------
@@ -625,7 +622,4 @@ assert c.execute("SELECT count(*), sum(i) FROM o.items").fetchone()==(3,6)
 c.execute("DETACH o")
 c.execute("ATTACH 'duckdb_objfs://contract.db' AS o (READ_ONLY)")
 assert c.execute("SELECT count(*) FROM o.items").fetchone()[0]==3
-print("duckdb_object_storage ok")
 PY
-
-echo "contract ok"
