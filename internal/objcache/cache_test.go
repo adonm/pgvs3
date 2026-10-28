@@ -291,31 +291,58 @@ func TestTempOriginRemovesDirectoryOnClose(t *testing.T) {
 	}
 }
 
-func TestLocalOriginOverwriteKeepsOpenReaders(t *testing.T) {
+func TestLocalOverwriteIsAtomic(t *testing.T) {
 	ctx := context.Background()
 	temp, err := newTempBucket(Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer temp.Close()
+	versions := []string{strings.Repeat("a", 4096), strings.Repeat("b", 8192)}
 	for _, o := range []*origin{newTestOrigin(t, ""), temp} {
-		if _, err := o.Upload(ctx, "bkt/k", strings.NewReader("old-version"), 11, originUpload{}); err != nil {
+		if _, err := o.Upload(ctx, "bkt/k", strings.NewReader(versions[0]), 4096, originUpload{}); err != nil {
 			t.Fatal(err)
 		}
 		rc, attrs, err := o.GetWithAttrs(ctx, "bkt/k")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := o.Upload(ctx, "bkt/k", strings.NewReader("new-version-longer"), 18, originUpload{}); err != nil {
+		if _, err := o.Upload(ctx, "bkt/k", strings.NewReader(versions[1]), 8192, originUpload{}); err != nil {
 			t.Fatal(err)
 		}
 		body, err := io.ReadAll(rc)
 		_ = rc.Close()
-		if err != nil || string(body) != "old-version" || attrs.Size != 11 {
-			t.Fatalf("open reader saw %q (size %d, err %v) after overwrite", body, attrs.Size, err)
+		if err != nil || string(body) != versions[0] || attrs.Size != 4096 {
+			t.Fatalf("open reader saw %d bytes (size %d, err %v) after overwrite", len(body), attrs.Size, err)
 		}
-		if got := conformanceGet(t, ctx, o, "bkt/k"); got != "new-version-longer" {
-			t.Fatalf("overwritten object = %q", got)
+		var readers sync.WaitGroup
+		failures := make(chan error, 4)
+		for range 4 {
+			readers.Go(func() {
+				for range 200 {
+					rc, _, err := o.GetWithAttrs(ctx, "bkt/k")
+					if err != nil {
+						failures <- err
+						return
+					}
+					body, err := io.ReadAll(rc)
+					_ = rc.Close()
+					if err != nil || (string(body) != versions[0] && string(body) != versions[1]) {
+						failures <- fmt.Errorf("read %d bytes, err %v", len(body), err)
+						return
+					}
+				}
+			})
+		}
+		for i := range 100 {
+			if _, err := o.Upload(ctx, "bkt/k", strings.NewReader(versions[i%2]), int64(len(versions[i%2])), originUpload{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		readers.Wait()
+		close(failures)
+		for err := range failures {
+			t.Fatal(err)
 		}
 	}
 }

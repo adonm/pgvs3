@@ -186,9 +186,11 @@ SELECT * FROM lake.events;
   S3-compatible (`s3`) and read-only HTTP(S); `filesystem` and `inmem` remain
   small local/test providers that share one on-disk implementation. `inmem`
   keeps its objects in a private temporary directory under `TMPDIR`, removed on
-  clean shutdown. User metadata is process-local for both. Keys that cannot be
-  stored as paths are rejected: empty, `.` or `..` segments, NUL bytes, segments
-  over 255 bytes, and keys that conflict with an existing object or prefix. PUT,
+  clean shutdown. Both keep in-flight writes in a `.pgvs3-tmp` directory at their
+  root; that directory is hidden from listings and its name cannot be a key. User
+  metadata is process-local for both. Keys that cannot be stored as paths are
+  rejected: empty, `.` or `..` segments, NUL bytes, segments over 255 bytes, and
+  keys that conflict with an existing object or prefix. PUT,
   COPY and multipart completion reject them with `400 InvalidRequest` before any
   body is acknowledged or committed, including write-back uploads. Reads return
   `404`, and `DELETE` is a no-op.

@@ -3,6 +3,7 @@ package objcache
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -876,7 +877,10 @@ type localMeta struct {
 	userMeta        []string
 }
 
-const localNameMax = 255
+const (
+	localNameMax = 255
+	localTempDir = ".pgvs3-tmp"
+)
 
 type localBucket struct {
 	root      *os.Root
@@ -920,47 +924,65 @@ func openLocalBucket(kind, prefix, dir string, temporary bool) (*origin, error) 
 	if err != nil {
 		return nil, err
 	}
+	if err := root.MkdirAll(localTempDir, 0o755); err != nil {
+		_ = root.Close()
+		return nil, err
+	}
 	b := &localBucket{root: root, meta: map[string]localMeta{}, temporary: temporary}
 	return &origin{kind: kind, caps: originCapabilitiesAll, prefix: p, driver: b}, nil
 }
 
 func (b *localBucket) Upload(_ context.Context, key string, r io.Reader, _ int64, in originUpload) (originAttrs, error) {
-	if err := b.checkKey(key); err != nil {
+	if !validLocalKey(key) {
+		return originAttrs{}, fmt.Errorf("%q: %w", key, ErrOriginKeyUnsupported)
+	}
+	tmp, err := b.writeTemp(r)
+	if err != nil {
 		return originAttrs{}, err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	current, exists, err := b.attrsLocked(key)
-	if err != nil {
-		return originAttrs{}, err
-	}
-	if !in.Precondition.Allows(exists, current.ETag) {
-		return originAttrs{}, errOriginPrecondition
-	}
-	if err := b.root.MkdirAll(path.Dir(key), 0o755); err != nil {
-		return originAttrs{}, localWriteError(key, err)
-	}
-	if exists {
-		if err := b.root.Remove(key); err != nil {
-			return originAttrs{}, err
-		}
-	}
-	f, err := b.root.Create(key)
-	if err != nil {
-		return originAttrs{}, localWriteError(key, err)
-	}
-	if _, err := io.Copy(f, r); err != nil {
-		_ = f.Close()
-		_ = b.root.Remove(key)
-		return originAttrs{}, err
-	}
-	if err := f.Close(); err != nil {
-		_ = b.root.Remove(key)
+	if err := b.publishLocked(tmp, key, in.Precondition); err != nil {
+		_ = b.root.Remove(tmp)
 		return originAttrs{}, err
 	}
 	b.meta[key] = localMeta{contentType: in.ContentType, contentEncoding: in.ContentEncoding, userMeta: clonePairs(in.UserMetadata)}
 	attrs, _, err := b.attrsLocked(key)
 	return attrs, err
+}
+
+func (b *localBucket) writeTemp(r io.Reader) (string, error) {
+	name := localTempDir + "/" + rand.Text()
+	f, err := b.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	if err != nil {
+		return "", err
+	}
+	_, err = io.Copy(f, r)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = b.root.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
+func (b *localBucket) publishLocked(tmp, key string, p store.Precondition) error {
+	current, exists, err := b.attrsLocked(key)
+	if err != nil {
+		return err
+	}
+	if !p.Allows(exists, current.ETag) {
+		return errOriginPrecondition
+	}
+	if err := b.root.MkdirAll(path.Dir(key), 0o755); err != nil {
+		return localWriteError(key, err)
+	}
+	if err := b.root.Rename(tmp, key); err != nil {
+		return localWriteError(key, err)
+	}
+	return nil
 }
 
 func (b *localBucket) Delete(_ context.Context, key string) error {
@@ -1077,6 +1099,9 @@ func (b *localBucket) walk(dir string, yield func(originObject, error) bool) boo
 	}
 	slices.SortFunc(entries, compareListing)
 	for _, entry := range entries {
+		if dir == "." && entry.Name() == localTempDir {
+			continue
+		}
 		name := entry.Name()
 		if dir != "." {
 			name = dir + "/" + name
@@ -1144,7 +1169,7 @@ func listingKey(e fs.DirEntry) string {
 }
 
 func validLocalKey(key string) bool {
-	if strings.IndexByte(key, 0) >= 0 {
+	if strings.IndexByte(key, 0) >= 0 || key == localTempDir || strings.HasPrefix(key, localTempDir+"/") {
 		return false
 	}
 	for part := range strings.SplitSeq(key, "/") {
