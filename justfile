@@ -174,8 +174,9 @@ ci:
     #!/usr/bin/env bash
     set -euo pipefail
     mise exec -- hk check --all --profile ci
+    mise exec go -- go vet -tags=integration ./...
     mise exec go -- go test -race ./...
-    just integration
+    GOFLAGS=-race just integration
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=5s ./internal/s3
     mise exec go -- go test -fuzz=FuzzChunkedBody -fuzztime=5s ./internal/s3
     mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=5s ./internal/store
@@ -183,3 +184,6 @@ ci:
     mise exec helm -- helm lint deploy/charts/pgvs3
     just helm-kind
     just contract
+    just fault
+    just interop
+    bash deploy/bench/stack.sh s3t

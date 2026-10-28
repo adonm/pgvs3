@@ -8,12 +8,14 @@ set -euo pipefail
 : "${PGVS3_ACCESS_KEY:?}"
 : "${PGVS3_SECRET_KEY:?}"
 : "${PGVS3_TEST_PG_PORT:?}"
+: "${PGVS3_TEST_BIN:?}"
+: "${PGVS3_TEST_RUN_DIR:?}"
 
 A=$PGVS3_TEST_ENDPOINT_A
 B=$PGVS3_TEST_ENDPOINT_B
 BUCKET=pgvs3-contract
 RUN="e2e-$(date +%s)-$$"
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "$PGVS3_TEST_RUN_DIR/e2e.XXXXXX")
 ro_pid=""
 cleanup() {
   if [ -n "$ro_pid" ]; then kill "$ro_pid" 2>/dev/null || true; fi
@@ -147,7 +149,7 @@ expect 200 -X PUT --data-binary 'copy me' "$ED/src"
 expect 200 -X PUT -H 'x-amz-copy-source: /src' "$ED/copy"
 [ "$(s3 "$ED/copy")" = 'copy me' ] || fail "copy bytes"
 expect 204 -X DELETE "$ED/src"
-.tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null || fail "reap with a shared file"
+"$PGVS3_TEST_BIN" reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null || fail "reap with a shared file"
 [ "$(s3 "$ED/copy")" = 'copy me' ] || fail "reaper removed a shared file"
 
 # --- indexed file_id reference checks and multi-pass reaping ----------------
@@ -168,7 +170,7 @@ docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -v ON_ERROR_STO
   SELECT 999999999, g, '\''x'\''::bytea FROM generate_series(0, 69999) AS g;
   INSERT INTO "s3b_pgvs3-contract".garbage (file_id, queued_at) VALUES (999999999, now());
 ' >/dev/null
-.tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s --all >/dev/null || fail "multi-pass reap"
+"$PGVS3_TEST_BIN" reap --url "$PGVS3_TEST_DB_URL" --grace 0s --all >/dev/null || fail "multi-pass reap"
 left_garbage=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c \
   'SELECT count(*) FROM "s3b_pgvs3-contract".garbage WHERE file_id = 999999999')
 [ "$left_garbage" = 0 ] || fail "multi-pass reap left $left_garbage garbage rows"
@@ -191,7 +193,7 @@ s3 "$B/$CLONE_HTTP/chunked.bin" -o "$TMP/cloned.bin"
 cmp "$TMP/one.bin" "$TMP/cloned.bin" || fail "cloned bucket chunked read"
 expect 409 -X PUT -H "x-amz-copy-source: /$SRC_B" "$A/$CLONE_HTTP"
 
-.tmp/pgvs3/pgvs3 clone --url "$PGVS3_TEST_DB_URL" "$SRC_B" "$CLONE_CLI" >/dev/null || fail "pgvs3 clone CLI"
+"$PGVS3_TEST_BIN" clone --url "$PGVS3_TEST_DB_URL" "$SRC_B" "$CLONE_CLI" >/dev/null || fail "pgvs3 clone CLI"
 [ "$(s3 "$A/$CLONE_CLI/inline.txt")" = 'inline-val' ] || fail "CLI cloned bucket read"
 
 # Cross-bucket CopyObject (chunked and inline).
@@ -205,7 +207,7 @@ expect 204 -X DELETE "$A/$CLONE_HTTP?force=true"
 
 # Single-bucket `pg_dump -n` snapshot and `pg_restore` after dropping the bucket.
 docker exec "$PGVS3_TEST_PG_CONTAINER" pg_dump -U postgres -Fc -n "\"s3b_$CLONE_CLI\"" pgvs3 > "$TMP/bucket.dump"
-.tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$CLONE_CLI" >/dev/null || fail "pgvs3 drop --force"
+"$PGVS3_TEST_BIN" drop --url "$PGVS3_TEST_DB_URL" --force "$CLONE_CLI" >/dev/null || fail "pgvs3 drop --force"
 docker exec -i "$PGVS3_TEST_PG_CONTAINER" pg_restore --single-transaction -U postgres -d pgvs3 < "$TMP/bucket.dump"
 # Restored schemas are immediately live (no manual adoption step required) and
 # carry their own metadata in <schema>.meta; reap/maintenance reconciles the
@@ -213,9 +215,9 @@ docker exec -i "$PGVS3_TEST_PG_CONTAINER" pg_restore --single-transaction -U pos
 [ "$(s3 "$B/$CLONE_CLI/inline.txt")" = 'inline-val' ] || fail "restored bucket inline read"
 s3 "$B/$CLONE_CLI/cross-copy.bin" -o "$TMP/restored.bin"
 cmp "$TMP/one.bin" "$TMP/restored.bin" || fail "restored bucket chunked read"
-.tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null
-.tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$SRC_B" >/dev/null
-.tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --force "$CLONE_CLI" >/dev/null
+"$PGVS3_TEST_BIN" reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null
+"$PGVS3_TEST_BIN" drop --url "$PGVS3_TEST_DB_URL" --force "$SRC_B" >/dev/null
+"$PGVS3_TEST_BIN" drop --url "$PGVS3_TEST_DB_URL" --force "$CLONE_CLI" >/dev/null
 
 # A catalog row whose schema vanished must not block layout checks, and
 # maintenance (`reap`) prunes it automatically.
@@ -223,10 +225,10 @@ MISSING="missing-$RUN"
 expect 200 -X PUT "$A/$MISSING"
 docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -q -c \
   "SET client_min_messages=warning; DROP SCHEMA \"s3b_$MISSING\" CASCADE"
-doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL" || true)
+doctor_out=$("$PGVS3_TEST_BIN" doctor --url "$PGVS3_TEST_DB_URL" || true)
 echo "$doctor_out" | grep -q "missing_schemas=1" || fail "missing schema not reported: $doctor_out"
-.tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null || fail "reap with a missing schema"
-doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
+"$PGVS3_TEST_BIN" reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null || fail "reap with a missing schema"
+doctor_out=$("$PGVS3_TEST_BIN" doctor --url "$PGVS3_TEST_DB_URL")
 echo "$doctor_out" | grep -q "missing_schemas=0" || fail "missing schema not pruned: $doctor_out"
 
 # CRC64NVME / FULL_OBJECT checksum on a single PUT.
@@ -297,7 +299,7 @@ assert attrs['ObjectParts']['Parts'][0]['ChecksumSHA256']==part['ChecksumSHA256'
 pc.put_object(Bucket=gen, Key=f'{run}/shared-src', Body=b'shared')
 pc.copy_object(Bucket=gen, Key=f'{run}/shared-copy', CopySource={'Bucket':gen,'Key':f'{run}/shared-src'})
 pc.delete_objects(Bucket=gen, Delete={'Objects':[{'Key':f'{run}/shared-src'},{'Key':f'{run}/presigned'}]})
-subprocess.run(['.tmp/pgvs3/pgvs3', 'reap', '--url', os.environ['PGVS3_TEST_DB_URL'], '--grace', '0s'], check=True, stdout=subprocess.DEVNULL)
+subprocess.run([os.environ['PGVS3_TEST_BIN'], 'reap', '--url', os.environ['PGVS3_TEST_DB_URL'], '--grace', '0s'], check=True, stdout=subprocess.DEVNULL)
 assert pc.get_object(Bucket=gen, Key=f'{run}/shared-copy')['Body'].read()==b'shared'
 PY
 
@@ -461,11 +463,11 @@ tok=$(printf '%s' "$fr" | jget job.lease_token)
 ack=$(ojs_post "$A" /ojs/v1/workers/ack "{\"job_id\":\"$jid\",\"lease_token\":\"$tok\",\"result\":{\"ok\":true}}")
 [ "$(printf '%s' "$ack" | jget state)" = completed ] || fail "OJS ack: $ack"
 ro_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-.tmp/pgvs3/pgvs3 serve --url "$PGVS3_TEST_DB_URL" --addr "127.0.0.1:$ro_port" \
-  --read-only --log-level error >"$TMP/ojs-ro.log" 2>&1 &
+"$PGVS3_TEST_BIN" serve --url "$PGVS3_TEST_DB_URL" --addr "127.0.0.1:$ro_port" \
+  --read-only --log-level error >"$PGVS3_TEST_RUN_DIR/ojs-ro.log" 2>&1 &
 ro_pid=$!
 ro_ready() { curl -fsS --max-time 1 "http://127.0.0.1:$ro_port/ojs/v1/health" >/dev/null 2>&1; }
-poll 30 ro_ready || { cat "$TMP/ojs-ro.log" >&2; fail "read-only OJS gateway did not start"; }
+poll 30 ro_ready || { cat "$PGVS3_TEST_RUN_DIR/ojs-ro.log" >&2; fail "read-only OJS gateway did not start"; }
 RO="http://127.0.0.1:$ro_port"
 [ "$(ojs_code GET "$RO" "/ojs/v1/jobs/$jid")" = 200 ] || fail "read-only OJS INFO"
 [ "$(jget job.state < "$TMP/ojs.json")" = completed ] || fail "read-only OJS did not see the ack"
@@ -478,7 +480,7 @@ plan=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c "
   EXPLAIN (COSTS OFF) UPDATE \"s3q_$OQ\".jobs SET state='active' WHERE id = '$id';
 ")
 echo "$plan" | grep -q "jobs_id_key" || fail "OJS lease update does not use jobs id index: $plan"
-.tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --kind queue --force "$OQ" >/dev/null
+"$PGVS3_TEST_BIN" drop --url "$PGVS3_TEST_DB_URL" --kind queue --force "$OQ" >/dev/null
 
 # --- S3 cache tier stored in PostgreSQL (no external gateway state) ---------
 ORIGIN_DIR="$TMP/origin"
@@ -486,7 +488,7 @@ mkdir -p "$ORIGIN_DIR"
 cat > "$TMP/origin.json" <<JSON
 {"type":"filesystem","config":{"directory":"$ORIGIN_DIR"}}
 JSON
-.tmp/pgvs3/pgvs3 origin --url "$PGVS3_TEST_DB_URL" --bucket edge \
+"$PGVS3_TEST_BIN" origin --url "$PGVS3_TEST_DB_URL" --bucket edge \
   --cache-namespace "ocache-$RUN" --cache-ttl 0s set "$TMP/origin.json" | grep -q "origin_set=edge" || fail "pgvs3 origin set"
 mkdir -p "$ORIGIN_DIR/edge/$RUN"
 printf probe > "$ORIGIN_DIR/edge/$RUN/probe.txt"
@@ -574,9 +576,9 @@ curl -fsS -H 'Range: bytes=1048576-1049599' "$OCACHE/edge/$RUN/big.bin" -o "$TMP
 [ "$(wc -c < "$TMP/range.part")" = 1024 ] || fail "cache range length"
 curl -fsS "$OCACHE/edge/$RUN/big.bin" -o /dev/null
 curl -fsSI -H 'Range: bytes=1048576-1049599' "$B/edge/$RUN/big.bin" | grep -qi 'x-cache: HIT' || fail "cached 16 MiB range did not hit cache"
-stat_out=$(.tmp/pgvs3/pgvs3 stat --url "$PGVS3_TEST_DB_URL" --kind cache --name "ocache-$RUN")
+stat_out=$("$PGVS3_TEST_BIN" stat --url "$PGVS3_TEST_DB_URL" --kind cache --name "ocache-$RUN")
 echo "$stat_out" | grep -Eq 'chunks=[1-9]' || fail "pgvs3 stat chunks: $stat_out"
-.tmp/pgvs3/pgvs3 origin --url "$PGVS3_TEST_DB_URL" --bucket edge clear | grep -q "origin_cleared=edge" || fail "pgvs3 origin clear"
+"$PGVS3_TEST_BIN" origin --url "$PGVS3_TEST_DB_URL" --bucket edge clear | grep -q "origin_cleared=edge" || fail "pgvs3 origin clear"
 
 # --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
 export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY \

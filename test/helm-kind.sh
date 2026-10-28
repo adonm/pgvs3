@@ -3,15 +3,20 @@
 # Security Standard, then checks the hardened pod spec, NetworkPolicy, probes,
 # and a same-namespace S3 round trip.
 set -euo pipefail
+# shellcheck source=test/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/harness.sh"
+test_run helm-kind
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-cluster=${KIND_CLUSTER_NAME:-pgvs3-helm-$$}
+ROOT=$test_root
+run_id=${PGVS3_TEST_RUN_DIR##*.}
+cluster=${KIND_CLUSTER_NAME:-pgvs3-helm-${run_id,,}}
 app_ns=pgvs3-helm
 db_ns=pgvs3-helm-db
 release=pgvs3
-tag=kind-test
+tag="kind-test-${PGVS3_TEST_RUN_DIR##*.}"
 image=""
-tmp=$(mktemp -d)
+created=false
+export KUBECONFIG="$PGVS3_TEST_RUN_DIR/kubeconfig"
 
 kind() { mise exec kind -- kind "$@"; }
 kubectl() { mise exec kubectl -- kubectl --context "kind-$cluster" "$@"; }
@@ -19,35 +24,38 @@ helm() { mise exec helm -- helm --kube-context "kind-$cluster" "$@"; }
 
 cleanup() {
   status=$?
-  if [ "$status" -ne 0 ] && kind get clusters 2>/dev/null | grep -qx "$cluster"; then
-    echo "::group::kind diagnostics"
-    kubectl get pods -A || true
-    kubectl -n "$db_ns" describe deploy/postgres || true
-    kubectl -n "$db_ns" logs deploy/postgres --tail=100 || true
-    kubectl -n "$app_ns" describe deploy/pgvs3 || true
-    kubectl -n "$app_ns" logs deploy/pgvs3 --tail=100 || true
-    echo "::endgroup::"
-  fi
-  if kind get clusters 2>/dev/null | grep -qx "$cluster"; then
+  if [ "$created" = true ]; then
+    if [ "$status" -ne 0 ] && [ -s "$KUBECONFIG" ]; then
+      {
+        kubectl get pods -A || true
+        kubectl -n "$db_ns" describe deploy/postgres || true
+        kubectl -n "$db_ns" logs deploy/postgres --tail=100 || true
+        kubectl -n "$app_ns" describe deploy/pgvs3 || true
+        kubectl -n "$app_ns" logs deploy/pgvs3 --tail=100 || true
+      } > "$PGVS3_TEST_RUN_DIR/diagnostics.log" 2>&1
+    fi
     kind delete cluster --name "$cluster" >/dev/null 2>&1 || true
   fi
-  rm -rf "$tmp"
-  exit "$status"
+  if [ -n "$image" ]; then docker image rm "$image" >/dev/null 2>&1 || true; fi
+  test_finish "$status"
 }
 
 trap cleanup EXIT
 
-echo "building gateway image"
+main() {
+if kind get clusters 2>/dev/null | grep -qx "$cluster"; then
+  echo "refusing to replace existing kind cluster $cluster" >&2
+  return 1
+fi
 image=$(cd "$ROOT" && KO_DOCKER_REPO=ko.local mise exec go ko -- ko build --local --tags "$tag" ./cmd/pgvs3 | tail -n1)
 repo=${image%%@*}
 repo=${repo%:*}
 image="$repo:$tag"
 
-echo "creating kind cluster $cluster"
+created=true
 kind create cluster --name "$cluster" --wait 180s
 kind load docker-image "$image" --name "$cluster"
 
-echo "starting PostgreSQL"
 kubectl create namespace "$db_ns"
 kubectl -n "$db_ns" apply -f - <<'YAML'
 apiVersion: apps/v1
@@ -93,7 +101,6 @@ spec:
 YAML
 kubectl -n "$db_ns" rollout status deploy/postgres --timeout=180s
 
-echo "installing the chart under restricted Pod Security"
 kubectl create namespace "$app_ns"
 kubectl label namespace "$app_ns" \
   pod-security.kubernetes.io/enforce=restricted \
@@ -109,7 +116,6 @@ helm install "$release" "$ROOT/deploy/charts/pgvs3" -n "$app_ns" \
   --wait --timeout 5m
 kubectl -n "$app_ns" rollout status deploy/pgvs3 --timeout=180s
 
-echo "checking the rendered pod security and network policy"
 test "$(kubectl -n "$app_ns" get deploy pgvs3 -o jsonpath='{.spec.template.spec.securityContext.runAsNonRoot}')" = true
 test "$(kubectl -n "$app_ns" get deploy pgvs3 -o jsonpath='{.spec.template.spec.securityContext.runAsUser}')" = 65532
 test "$(kubectl -n "$app_ns" get deploy pgvs3 -o jsonpath='{.spec.template.spec.securityContext.fsGroup}')" = 65532
@@ -122,11 +128,9 @@ test "$(kubectl -n "$app_ns" get deploy pgvs3 -o jsonpath='{.spec.template.spec.
 test "$(kubectl -n "$app_ns" get deploy pgvs3 -o jsonpath='{.spec.template.spec.containers[0].volumeMounts[0].mountPath}')" = /tmp
 test "$(kubectl -n "$app_ns" get networkpolicy pgvs3 -o jsonpath='{.spec.podSelector.matchLabels.app}')" = pgvs3
 
-echo "checking ServiceMonitor rendering"
 mise exec helm -- helm template "$release" "$ROOT/deploy/charts/pgvs3" \
   --set serviceMonitor.enabled=true | grep -q 'kind: ServiceMonitor'
 
-echo "checking a same-namespace S3 round trip"
 kubectl -n "$app_ns" apply -f - <<'YAML'
 apiVersion: v1
 kind: Pod
@@ -152,7 +156,10 @@ YAML
 kubectl -n "$app_ns" wait --for=condition=Ready pod/pgvs3-check --timeout=120s
 code=$(kubectl -n "$app_ns" exec pgvs3-check -- curl -sS -o /dev/null -w '%{http_code}' http://pgvs3:8014/readyz)
 test "$code" = 200
+kubectl -n "$app_ns" exec pgvs3-check -- curl -fsS -X PUT http://pgvs3:8014/kind-bucket
 kubectl -n "$app_ns" exec pgvs3-check -- curl -fsS -X PUT --data-binary 'kind' http://pgvs3:8014/kind-bucket/kind.txt
 body=$(kubectl -n "$app_ns" exec pgvs3-check -- curl -fsS http://pgvs3:8014/kind-bucket/kind.txt)
 test "$body" = kind
-echo "helm-kind: ok"
+}
+
+main > "$PGVS3_TEST_RUN_DIR/kind.log" 2>&1

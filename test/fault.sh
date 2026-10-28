@@ -12,7 +12,7 @@ A=$PGVS3_TEST_ENDPOINT_A
 B=$PGVS3_TEST_ENDPOINT_B
 BUCKET=pgvs3-fault
 RUN="fault-$(date +%s)-$$"
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "${PGVS3_TEST_RUN_DIR:?}/fault.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 s3() { curl -sS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" "$@"; }

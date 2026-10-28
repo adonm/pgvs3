@@ -10,7 +10,7 @@ set -euo pipefail
 A=$PGVS3_TEST_ENDPOINT_A
 BUCKET=pgvs3-contract
 RUN="interop-$(date +%s)-$$"
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "${PGVS3_TEST_RUN_DIR:?}/interop.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

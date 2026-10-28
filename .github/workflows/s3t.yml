@@ -16,40 +16,16 @@ jobs:
   s3t:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
       - run: mise install
-      - name: Build and start gateway
-        env:
-          PGVS3_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
-        run: |
-          set -euo pipefail
-          mise exec go -- go build -o /tmp/pgvs3 ./cmd/pgvs3
-          /tmp/pgvs3 serve --url "$PGVS3_URL" --addr 127.0.0.1:8014 >/tmp/pgvs3.log 2>&1 &
-          for i in $(seq 1 120); do
-            curl -fsS http://127.0.0.1:8014/readyz >/dev/null 2>&1 && exit 0
-            sleep 1
-          done
-          cat /tmp/pgvs3.log
-          exit 1
       - name: Run s3t allow-list
-        run: bash test/s3t.sh
+        run: mise exec -- bash deploy/bench/stack.sh s3t
       - name: Upload gateway log on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: pgvs3-s3t-log
-          path: /tmp/pgvs3.log
+          path: .tmp/verify/**/*.log
+          include-hidden-files: true
