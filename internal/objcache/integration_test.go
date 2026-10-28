@@ -1464,7 +1464,7 @@ func TestCacheResolutionLifecycle(t *testing.T) {
 					if state == "fresh" {
 						f.tier.ttl = time.Hour
 					}
-					res, err := f.tier.resolveCache(ctx, ck, key, true, false, false)
+					res, err := f.tier.resolveCache(ctx, ck, true, false, false)
 					if state == "deleted" || state == "missing-origin" {
 						if !errors.Is(err, store.ErrNotFound) {
 							t.Fatalf("error = %v, want not found", err)

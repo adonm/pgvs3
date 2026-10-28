@@ -285,7 +285,7 @@ type cacheResolution struct {
 	attrsValid bool
 }
 
-func (t *Tier) resolveCache(ctx context.Context, ck, key string, deleteStale, withInline, skipAttributesOnMiss bool) (cacheResolution, error) {
+func (t *Tier) resolveCache(ctx context.Context, ck string, deleteStale, withInline, skipAttributesOnMiss bool) (cacheResolution, error) {
 	res := cacheResolution{ref: t.cacheRef(ck), state: store.CacheLive}
 	m, ref, err := t.lookupCached(ctx, ck, withInline)
 	if err != nil {
@@ -371,7 +371,7 @@ func cachedInfo(ref store.ObjectRef, m *store.Meta) store.ObjectInfo {
 
 func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 	ck := t.key(bucket, key)
-	res, err := t.resolveCache(ctx, ck, key, false, false, false)
+	res, err := t.resolveCache(ctx, ck, false, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +386,7 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange
 	ck := t.key(bucket, key)
 
 	skipAttributes := !rng.Requested
-	res, err := t.resolveCache(ctx, ck, key, true, true, skipAttributes)
+	res, err := t.resolveCache(ctx, ck, true, true, skipAttributes)
 	if err != nil {
 		return nil, err
 	}
