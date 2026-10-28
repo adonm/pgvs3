@@ -394,16 +394,10 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	if err != nil {
 		return err
 	}
-	opts, in := ing.opts, ing.in
-	opts.ContentEncoding = r.Header.Get("Content-Encoding")
-	body := io.Reader(r.Body)
-	if len(in.h) > 0 {
-		body = &integrityReader{r: r.Body, in: in}
-	}
 	var checks []store.Checksum
-	etag, err := s.writeBackendFor(r.Context(), bucket).Put(r.Context(), bucket, key, body, ing.size, opts,
+	etag, err := s.writeBackendFor(r.Context(), bucket).Put(r.Context(), bucket, key, ing.body.reader, ing.body.size, ing.opts,
 		func() ([]store.Checksum, error) {
-			got, err := in.verify(r.Trailer)
+			got, err := ing.body.verify()
 			if err == nil {
 				checks = got
 			}
@@ -645,35 +639,21 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 	if err != nil || partNo < 1 || partNo > 10000 {
 		return errInvalidPart()
 	}
-	in, err := newIntegrity(r.Header)
+	body, err := prepareUploadBody(r)
 	if err != nil {
 		return err
 	}
-	expectedSize := r.ContentLength
-	if isStreaming(r) {
-		if expectedSize, err = decodedLength(r); err != nil {
-			return err
-		}
-	} else if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
-		if n, perr := strconv.ParseInt(v, 10, 64); perr == nil && n >= 0 {
-			expectedSize = n
-		}
-	}
-	writer, err := s.multipartBackendFor(r.Context(), bucket).StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo), expectedSize)
+	writer, err := s.multipartBackendFor(r.Context(), bucket).StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo), body.expectedSize)
 	if err != nil {
 		return err
-	}
-	body := io.ReadCloser(r.Body)
-	if len(in.h) > 0 {
-		body = &integrityReader{r: body, in: in}
 	}
 	buf := copyBuf()
 	defer putCopyBuf(buf)
-	if _, err := io.CopyBuffer(writer, body, buf); err != nil {
+	if _, err := io.CopyBuffer(writer, body.reader, buf); err != nil {
 		writer.Abort()
 		return bodyError(err)
 	}
-	checks, err := in.verify(r.Trailer)
+	checks, err := body.verify()
 	if err != nil {
 		writer.Abort()
 		return err

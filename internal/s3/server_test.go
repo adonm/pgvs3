@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/xml"
@@ -1562,6 +1563,68 @@ func TestChunkedUploadPartNeedsDecodedLength(t *testing.T) {
 	s.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest || backend.startedPart {
 		t.Fatalf("status=%d startedPart=%v body=%s", rec.Code, backend.startedPart, rec.Body.String())
+	}
+}
+
+func TestUploadBodyContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload, decoded, checksum string
+		streaming, unknown, rawHTTP      bool
+		size, expected                   int64
+		wantError                        string
+	}{
+		{name: "plain", payload: "hello", size: 5, expected: 5},
+		{name: "unknown length", payload: "hello", unknown: true, size: -1, expected: -1},
+		{name: "late HTTP trailer", rawHTTP: true, size: -1, expected: -1,
+			payload: "PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nx-amz-trailer: x-amz-checksum-crc32\r\n\r\n5\r\nhello\r\n0\r\nx-amz-checksum-crc32: NhCmhg==\r\n\r\n"},
+		{name: "plain multipart hint", payload: "hello", decoded: "7", size: 5, expected: 7},
+		{name: "streamed", payload: "5\r\nhello\r\n0\r\n\r\n", streaming: true, decoded: "5", size: 5, expected: 5},
+		{name: "empty stream", payload: "0\r\n\r\n", streaming: true, decoded: "0"},
+		{name: "missing length", payload: "0\r\n\r\n", streaming: true, wantError: "InvalidRequest"},
+		{name: "bad length", payload: "0\r\n\r\n", streaming: true, decoded: "-1", wantError: "InvalidRequest"},
+		{name: "short stream", payload: "5\r\nhe", streaming: true, decoded: "5", wantError: "IncompleteBody"},
+		{name: "bad checksum", payload: "hello", checksum: "invalid", size: 5, expected: 5, wantError: "BadDigest"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("PUT", "/bucket/key", strings.NewReader(tc.payload))
+			if tc.rawHTTP {
+				var err error
+				r, err = http.ReadRequest(bufio.NewReader(strings.NewReader(tc.payload)))
+				testutil.Must(t, err)
+			}
+			if tc.streaming {
+				r.Header.Set("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+			}
+			if tc.decoded != "" {
+				r.Header.Set("x-amz-decoded-content-length", tc.decoded)
+			}
+			if tc.checksum != "" {
+				r.Header.Set("Content-MD5", tc.checksum)
+			}
+			if tc.unknown {
+				r.ContentLength = -1
+			}
+			err := prepareBody(r)
+			r = r.WithContext(r.Context())
+			var body uploadBody
+			if err == nil {
+				body, err = prepareUploadBody(r)
+			}
+			if err == nil {
+				_, err = io.Copy(io.Discard, body.reader)
+				if err == nil {
+					_, err = body.verify()
+				}
+			}
+			if tc.wantError != "" {
+				var ae *APIError
+				if !errors.As(err, &ae) || ae.Code != tc.wantError {
+					t.Fatalf("error=%v want=%s", err, tc.wantError)
+				}
+			} else if err != nil || body.size != tc.size || body.expectedSize != tc.expected {
+				t.Fatalf("size=%d expected=%d err=%v", body.size, body.expectedSize, err)
+			}
+		})
 	}
 }
 

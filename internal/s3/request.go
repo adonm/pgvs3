@@ -421,9 +421,41 @@ var crc64NVMETables = func() [8][256]uint64 {
 
 type ingestInput struct {
 	opts store.WriteOptions
-	in   *integrity
-	size int64
+	body uploadBody
 }
+
+type uploadBody struct {
+	reader       io.Reader
+	size         int64
+	expectedSize int64
+	integrity    *integrity
+	trailers     http.Header
+}
+
+func prepareUploadBody(r *http.Request) (uploadBody, error) {
+	body := uploadBody{reader: r.Body, size: r.ContentLength, expectedSize: r.ContentLength, trailers: r.Trailer}
+	in, err := newIntegrity(r.Header)
+	if err != nil {
+		return body, err
+	}
+	if decoded, ok := r.Body.(*chunkedBody); ok {
+		if decoded.decodedLen < 0 {
+			return body, errInvalidRequest("invalid x-amz-decoded-content-length")
+		}
+		body.size, body.expectedSize = decoded.decodedLen, decoded.decodedLen
+	} else if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			body.expectedSize = n
+		}
+	}
+	body.integrity = in
+	if len(in.h) > 0 {
+		body.reader = &integrityReader{r: r.Body, in: in}
+	}
+	return body, nil
+}
+
+func (b uploadBody) verify() ([]store.Checksum, error) { return b.integrity.verify(b.trailers) }
 
 func prepareIngest(r *http.Request) (ingestInput, error) {
 	var in ingestInput
@@ -442,32 +474,19 @@ func prepareIngest(r *http.Request) (ingestInput, error) {
 	if err != nil {
 		return in, err
 	}
-	integrity, err := newIntegrity(r.Header)
+	body, err := prepareUploadBody(r)
 	if err != nil {
 		return in, err
 	}
 	in.opts = store.WriteOptions{
-		Precondition: precondition,
-		UserMetadata: meta,
-		ContentType:  ct,
+		Precondition:    precondition,
+		UserMetadata:    meta,
+		ContentType:     ct,
+		ContentEncoding: r.Header.Get("Content-Encoding"),
+		ExpectedSize:    max(body.expectedSize, 0),
 	}
-	in.size = r.ContentLength
-	if isStreaming(r) {
-		n, err := decodedLength(r)
-		if err != nil {
-			return in, err
-		}
-		in.size = n
-		in.opts.ExpectedSize = n
-	} else if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
-			in.opts.ExpectedSize = n
-		}
-	} else if r.ContentLength >= 0 {
-		in.opts.ExpectedSize = r.ContentLength
-	}
-	in.in = integrity
-	if c := integrity.expectedChecksum(); c != nil {
+	in.body = body
+	if c := body.integrity.expectedChecksum(); c != nil {
 		in.opts.Checksum = c
 		in.opts.ChecksumType = "FULL_OBJECT"
 	}
@@ -703,10 +722,6 @@ const (
 	maxTrailerBytes = 64 << 10
 )
 
-func isStreaming(r *http.Request) bool {
-	return strings.HasPrefix(r.Header.Get("x-amz-content-sha256"), "STREAMING-")
-}
-
 func decodedLength(r *http.Request) (int64, error) {
 	n, err := strconv.ParseInt(r.Header.Get("x-amz-decoded-content-length"), 10, 64)
 	if err != nil || n < 0 {
@@ -716,6 +731,9 @@ func decodedLength(r *http.Request) (int64, error) {
 }
 
 func prepareBody(r *http.Request) error {
+	if r.Trailer == nil && r.Header.Get("x-amz-trailer") != "" {
+		r.Trailer = make(http.Header)
+	}
 	payload := r.Header.Get("x-amz-content-sha256")
 	if !strings.HasPrefix(payload, "STREAMING-") {
 
@@ -727,9 +745,9 @@ func prepareBody(r *http.Request) error {
 	}
 	decoded := int64(-1)
 	if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || n < 0 {
-			return errInvalidRequest("invalid x-amz-decoded-content-length")
+		n, err := decodedLength(r)
+		if err != nil {
+			return err
 		}
 		decoded = n
 	}
