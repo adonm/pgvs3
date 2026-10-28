@@ -230,17 +230,21 @@ func serve(args []string) int {
 	if err != nil {
 		return 1
 	}
-	if !configureObjcache(cfg, log) {
+	runtime, err := cacheRuntime(cfg)
+	if err != nil {
+		log.Error("configuring origin cache", "err", err)
 		return 1
 	}
-	origin, err := openOrigin(st, cfg, log)
+	origin, err := openOrigin(st, runtime, cfg, log)
 	if err != nil {
 		return 1
 	}
 	if origin != nil {
 		defer origin.Close()
 	}
-	g := newGateway(ctx, st, cfg, origin, log)
+	origins := objcache.NewRegistry(st, log, runtime, objcache.TierOptions{ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack})
+	origins.SetDefault(origin)
+	g := newGateway(ctx, st, cfg, origins, log)
 	startPprof(cfg.pprofAddr, log)
 	return runGateway(ctx, g, cfg, log)
 }
@@ -307,22 +311,20 @@ func startMaintenance(ctx context.Context, st *store.Store, reapGrace time.Durat
 	}
 }
 
-func configureObjcache(cfg serveConfig, log *slog.Logger) bool {
-	objcache.ConfigureLimits(cfg.fillConcurrency, min(cfg.fillConcurrency, 8))
+func cacheRuntime(cfg serveConfig) (*objcache.Runtime, error) {
 	if cfg.spoolDir != "" {
 		info, err := os.Stat(cfg.spoolDir)
 		if err != nil || !info.IsDir() {
-			log.Error("invalid spool directory", "dir", cfg.spoolDir, "err", err)
-			return false
+			return nil, fmt.Errorf("invalid spool directory %q: %v", cfg.spoolDir, err)
 		}
 	}
-	objcache.ConfigureSpoolDir(cfg.spoolDir)
-	objcache.ConfigureSpoolBytes(cfg.spoolMaxBytes)
-	objcache.ConfigureWriteBack(cfg.cacheWriteBack)
-	return true
+	return objcache.NewRuntime(objcache.RuntimeOptions{
+		Fills: cfg.fillConcurrency, Pending: min(cfg.fillConcurrency, 8),
+		SpoolDir: cfg.spoolDir, SpoolBytes: cfg.spoolMaxBytes,
+	}), nil
 }
 
-func openOrigin(st *store.Store, cfg serveConfig, log *slog.Logger) (*objcache.Tier, error) {
+func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log *slog.Logger) (*objcache.Tier, error) {
 	if cfg.originConfig == "" {
 		return nil, nil
 	}
@@ -331,23 +333,21 @@ func openOrigin(st *store.Store, cfg serveConfig, log *slog.Logger) (*objcache.T
 		log.Error("reading origin config", "err", err)
 		return nil, err
 	}
-	var origin *objcache.Tier
-	if cfg.readOnly {
-		origin, err = objcache.NewReadOnly(log, raw, st, cfg.cacheNamespace, cfg.cacheTTL, cfg.cacheRetention, cfg.fillConcurrency)
-	} else {
-		origin, err = objcache.New(log, raw, st, cfg.cacheNamespace, cfg.cacheTTL, cfg.cacheRetention, cfg.fillConcurrency)
-	}
+	origin, err := objcache.New(log, raw, st, runtime, objcache.TierOptions{
+		Namespace: cfg.cacheNamespace, TTL: cfg.cacheTTL, Retention: cfg.cacheRetention,
+		MaxFills: cfg.fillConcurrency, RangeChunk: cfg.rangeCacheChunk,
+		ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack,
+	})
 	if err != nil {
 		log.Error("opening origin", "err", err)
 		return nil, err
 	}
-	origin.EnableRangeCache(cfg.rangeCacheChunk)
 	log.Info("origin cache enabled", "namespace", origin.Name(), "capabilities", origin.Capabilities())
 	return origin, nil
 }
 
-func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, origin *objcache.Tier, log *slog.Logger) *gateway.Gateway {
-	g := gateway.New(st, log, cfg.readOnly, origin, gateway.Limits{
+func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, origins *objcache.Registry, log *slog.Logger) *gateway.Gateway {
+	g := gateway.New(st, log, cfg.readOnly, origins, gateway.Limits{
 		S3: cfg.s3Concurrency, OJS: cfg.queueConcurrency, RESP: cfg.respConcurrency,
 	})
 	g.SetVersion(version)

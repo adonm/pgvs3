@@ -55,12 +55,16 @@ type fixture struct {
 	dir  string
 }
 
-func newFixture(t *testing.T) *fixture {
+func newFixture(t *testing.T, options ...TierOptions) *fixture {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
-	tier, err := New(testutil.DiscardLogger(), cfg, testStore,
-		fmt.Sprintf("origin-%d", time.Now().UnixNano()), 0, 24*time.Hour, 4)
+	var opts TierOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	opts.Namespace, opts.Retention, opts.MaxFills = fmt.Sprintf("origin-%d", time.Now().UnixNano()), 24*time.Hour, 4
+	tier, err := New(testutil.DiscardLogger(), cfg, testStore, NewRuntime(RuntimeOptions{}), opts)
 	testutil.Must(t, err)
 	dropOnCleanup(t, ns.WriteBack, tier.namespace)
 	dropOnCleanup(t, ns.Cache, tier.namespace)
@@ -291,8 +295,9 @@ func newS3Fixture(t *testing.T, prefix string) *s3Fixture {
 			"bucket_lookup_type":"path"
 		}
 	}`, prefix, bucket, cfg.Endpoint, cfg.AccessKey, cfg.SecretKey)
-	tier, err := New(testutil.DiscardLogger(), originCfg, testStore,
-		fmt.Sprintf("origin-s3-%d", time.Now().UnixNano()), 0, 24*time.Hour, 4)
+	tier, err := New(testutil.DiscardLogger(), originCfg, testStore, NewRuntime(RuntimeOptions{}), TierOptions{
+		Namespace: fmt.Sprintf("origin-s3-%d", time.Now().UnixNano()), Retention: 24 * time.Hour, MaxFills: 4,
+	})
 	testutil.Must(t, err)
 	t.Cleanup(func() { _ = tier.Close() })
 	return &s3Fixture{tier: tier, client: client}
@@ -401,8 +406,7 @@ func TestTierS3PrefixMetadataAndConditions(t *testing.T) {
 
 func TestUnsupportedKeysRejectedBeforeCommit(t *testing.T) {
 	ctx := testCtx
-	f := newFixture(t)
-	f.tier.EnableWriteBack(true)
+	f := newFixture(t, TierOptions{WriteBack: true})
 	if _, err := f.tier.Upload(ctx, "bkt", "source", strings.NewReader("source"), nil, "text/plain"); err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +531,7 @@ func TestFillCoalescing(t *testing.T) {
 	}
 	newTier := func() *Tier {
 		return &Tier{
-			origin: blocked, store: testStore, namespace: cache, ttl: 0, retention: time.Hour,
+			origin: blocked, store: testStore, runtime: NewRuntime(RuntimeOptions{}), namespace: cache, ttl: 0, retention: time.Hour,
 			fills: make(chan struct{}, 2), completes: make(chan struct{}, 2),
 			log: testutil.DiscardLogger(), workerID: randomID(),
 			cancel: func() {},
@@ -632,7 +636,7 @@ func TestStaleFillCannotOverwriteNewerCacheVersion(t *testing.T) {
 	}
 	newTier := func(origin originHandle) *Tier {
 		return &Tier{
-			origin: origin, store: testStore, namespace: cache, ttl: 0, retention: time.Hour,
+			origin: origin, store: testStore, runtime: NewRuntime(RuntimeOptions{}), namespace: cache, ttl: 0, retention: time.Hour,
 			fills: make(chan struct{}, 2), completes: make(chan struct{}, 2),
 			log: testutil.DiscardLogger(), workerID: randomID(),
 			cancel: func() {},
@@ -694,7 +698,7 @@ func TestDeleteDuringFillCannotResurrectCache(t *testing.T) {
 	}
 	newTier := func(origin originHandle) *Tier {
 		return &Tier{
-			origin: origin, store: testStore, namespace: cache, ttl: 0, retention: time.Hour,
+			origin: origin, store: testStore, runtime: NewRuntime(RuntimeOptions{}), namespace: cache, ttl: 0, retention: time.Hour,
 			fills: make(chan struct{}, 2), completes: make(chan struct{}, 2),
 			log: testutil.DiscardLogger(), workerID: randomID(),
 			cancel: func() {},
@@ -800,7 +804,8 @@ func TestReadOnlyTier(t *testing.T) {
 	testutil.Must(t, os.WriteFile(filepath.Join(dir, "bkt", "cold.txt"), []byte("cold"), 0o644))
 	cache := fmt.Sprintf("origin-ro-%d", time.Now().UnixNano())
 	cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
-	seed, err := New(testutil.DiscardLogger(), cfg, testStore, cache, 0, time.Hour, 2)
+	runtime := NewRuntime(RuntimeOptions{})
+	seed, err := New(testutil.DiscardLogger(), cfg, testStore, runtime, TierOptions{Namespace: cache, Retention: time.Hour, MaxFills: 2})
 	testutil.Must(t, err)
 	if _, err := seed.Upload(ctx, "bkt", "warm.txt", strings.NewReader("older"), nil, "text/plain"); err != nil {
 		t.Fatal(err)
@@ -808,7 +813,7 @@ func TestReadOnlyTier(t *testing.T) {
 	seed.Close()
 	testutil.Must(t, os.WriteFile(filepath.Join(dir, "bkt", "warm.txt"), []byte("newer"), 0o644))
 
-	tier, err := NewReadOnly(testutil.DiscardLogger(), cfg, testStore, cache, 0, time.Hour, 2)
+	tier, err := New(testutil.DiscardLogger(), cfg, testStore, runtime, TierOptions{Namespace: cache, Retention: time.Hour, MaxFills: 2, ReadOnly: true})
 	testutil.Must(t, err)
 	defer tier.Close()
 	head, err := tier.Head(ctx, "bkt", "cold.txt")
@@ -855,7 +860,7 @@ func TestReadOnlyTier(t *testing.T) {
 		}
 		origin := newTestOrigin(t, "")
 		tier := &Tier{
-			origin: origin, store: testStore, namespace: cache, ttl: time.Hour,
+			origin: origin, store: testStore, runtime: NewRuntime(RuntimeOptions{}), namespace: cache, ttl: time.Hour,
 			retention: time.Hour, readOnly: true, fills: make(chan struct{}, 2),
 			completes: make(chan struct{}, 2), log: testutil.DiscardLogger(),
 		}
@@ -883,7 +888,8 @@ func TestReadOnlyTier(t *testing.T) {
 		dropOnCleanup(t, ns.WriteBack, cache)
 		dropOnCleanup(t, ns.Cache, cache)
 		cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
-		writer, err := New(testutil.DiscardLogger(), cfg, testStore, cache, time.Hour, time.Hour, 2)
+		runtime := NewRuntime(RuntimeOptions{})
+		writer, err := New(testutil.DiscardLogger(), cfg, testStore, runtime, TierOptions{Namespace: cache, TTL: time.Hour, Retention: time.Hour, MaxFills: 2})
 		testutil.Must(t, err)
 		defer writer.Close()
 		obj, err := writer.Open(ctx, "bucket", "key", store.WholeObjectRange())
@@ -892,7 +898,7 @@ func TestReadOnlyTier(t *testing.T) {
 			t.Fatalf("writer open = %q", got)
 		}
 		testutil.Must(t, os.Remove(filepath.Join(dir, "bucket", "key")))
-		reader, err := NewReadOnly(testutil.DiscardLogger(), cfg, testStore, cache, time.Hour, time.Hour, 2)
+		reader, err := New(testutil.DiscardLogger(), cfg, testStore, runtime, TierOptions{Namespace: cache, TTL: time.Hour, Retention: time.Hour, MaxFills: 2, ReadOnly: true})
 		testutil.Must(t, err)
 		defer reader.Close()
 		obj, err = reader.Open(ctx, "bucket", "key", store.WholeObjectRange())
@@ -1053,8 +1059,7 @@ func TestWriteBackAcks(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := testCtx
-			f := newFixture(t)
-			f.tier.EnableWriteBack(true)
+			f := newFixture(t, TierOptions{WriteBack: true})
 			blocked := &blockingOrigin{
 				originHandle: f.tier.origin,
 				entered:      make(chan struct{}),
@@ -1102,11 +1107,10 @@ func TestWriteBackAcks(t *testing.T) {
 
 func TestListMergesPendingWriteBackObjects(t *testing.T) {
 	ctx := testCtx
-	f := newFixture(t)
+	f := newFixture(t, TierOptions{WriteBack: true})
 	if _, err := f.tier.origin.Upload(ctx, f.tier.key("bkt", "a"), strings.NewReader("a"), 1, originUpload{}); err != nil {
 		t.Fatal(err)
 	}
-	f.tier.EnableWriteBack(true)
 	blocked := &blockingOrigin{
 		originHandle: f.tier.origin,
 		entered:      make(chan struct{}),
@@ -1146,7 +1150,7 @@ func TestTierModelAcrossWorkers(t *testing.T) {
 	log := testutil.DiscardLogger()
 	newTier := func() *Tier {
 		return &Tier{
-			origin: mem, store: testStore, namespace: cache, ttl: 0, retention: time.Hour,
+			origin: mem, store: testStore, runtime: NewRuntime(RuntimeOptions{}), namespace: cache, ttl: 0, retention: time.Hour,
 			fills: make(chan struct{}, 2), completes: make(chan struct{}, 2),
 			log: log, workerID: randomID(), cancel: func() {},
 		}
@@ -1280,7 +1284,7 @@ func TestSpooledPublicationMetadata(t *testing.T) {
 	f.tier.cancel()
 	<-f.tier.done
 	data := bytes.Repeat([]byte("encoded"), 16<<10)
-	sp, cleanup, err := spoolStream(testCtx, bytes.NewReader(data), int64(len(data)))
+	sp, cleanup, err := f.tier.runtime.spoolStream(testCtx, bytes.NewReader(data), int64(len(data)))
 	testutil.Must(t, err)
 	defer cleanup()
 	sum := sha256.Sum256(data)
@@ -1314,9 +1318,7 @@ func TestSpooledPublicationMetadata(t *testing.T) {
 }
 
 func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
-	f := newFixture(t)
-	f.tier.ttl = time.Hour
-	f.tier.EnableRangeCache(64 << 10)
+	f := newFixture(t, TierOptions{TTL: time.Hour, RangeChunk: 64 << 10})
 	data := bytes.Repeat([]byte("parquet"), 2<<20)
 	ck := f.tier.key("bkt", "ranges")
 	if _, err := f.tier.origin.Upload(testCtx, ck, bytes.NewReader(data), int64(len(data)), originUpload{ContentType: "application/parquet", UserMetadata: []string{"owner", "test"}}); err != nil {
@@ -1342,10 +1344,11 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 		t.Fatalf("metadata became a body: %v", err)
 	}
 
-	ro, err := NewReadOnly(nil, []byte(`{"type":"ephemeral"}`), testStore, f.tier.namespace, time.Hour, time.Hour, 1)
+	ro, err := New(nil, []byte(`{"type":"ephemeral"}`), testStore, f.tier.runtime, TierOptions{
+		Namespace: f.tier.namespace, TTL: time.Hour, Retention: time.Hour, MaxFills: 1, ReadOnly: true, RangeChunk: 64 << 10,
+	})
 	testutil.Must(t, err)
 	defer ro.Close()
-	ro.EnableRangeCache(64 << 10)
 	obj, err := ro.Open(testCtx, "bkt", "ranges", rng)
 	testutil.Must(t, err)
 	if got := readObject(t, obj); got != string(data[100:200]) {

@@ -46,16 +46,19 @@ type Server struct {
 
 func (s *Server) SetMetricsHook(f func(io.Writer)) { s.metricsHook = f }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int) *Server {
+func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, origins *objcache.Registry) *Server {
 	if maxConc <= 0 {
 		maxConc = 32
 	}
 	if log == nil {
 		log = slog.Default()
 	}
+	if origins == nil {
+		origins = objcache.NewRegistry(st, log, objcache.NewRuntime(objcache.RuntimeOptions{}), objcache.TierOptions{ReadOnly: readOnly})
+	}
 	return &Server{
 		store: st, log: log, metrics: telemetry.NewRequestMetrics(), readOnly: readOnly,
-		origins: objcache.NewRegistry(st, log, readOnly),
+		origins: origins,
 		sem:     make(chan struct{}, maxConc),
 	}
 }
@@ -561,7 +564,7 @@ func (s *Server) writeMetrics(w http.ResponseWriter, st *store.Store) {
 	if st != nil {
 		st.WriteMetrics(w)
 	}
-	objcache.WriteSpoolMetrics(w)
+	s.origins.WriteMetrics(w)
 }
 
 type recWriter struct {

@@ -53,10 +53,10 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	dir := t.TempDir()
 	tier, err := objcache.New(testutil.DiscardLogger(),
 		fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir),
-		originTestStore, fmt.Sprintf("origin-http-%d", os.Getpid()), 0, time.Hour, 2)
+		originTestStore, objcache.NewRuntime(objcache.RuntimeOptions{}), objcache.TierOptions{Namespace: fmt.Sprintf("origin-http-%d", os.Getpid()), Retention: time.Hour, MaxFills: 2})
 	testutil.Must(t, err)
 	defer tier.Close()
-	srv := New(originTestStore, testutil.DiscardLogger(), false, 8)
+	srv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
 	srv.SetOrigin(tier)
 	httpSrv := httptest.NewServer(srv)
 	defer httpSrv.Close()
@@ -211,7 +211,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	}
 	t.Run("encoded headers and error statuses", func(t *testing.T) {
 		bucket := fmt.Sprintf("errbucket-%d", time.Now().UnixNano())
-		local := New(originTestStore, testutil.DiscardLogger(), false, 8)
+		local := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
 		localSrv := httptest.NewServer(local)
 		defer localSrv.Close()
 		client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
@@ -314,14 +314,14 @@ func TestOriginRequiresCatalogBucket(t *testing.T) {
 	originDir := t.TempDir()
 	globalTier, err := objcache.New(testutil.DiscardLogger(),
 		fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, originDir),
-		originTestStore, globalCache, 0, time.Hour, 2)
+		originTestStore, objcache.NewRuntime(objcache.RuntimeOptions{}), objcache.TierOptions{Namespace: globalCache, Retention: time.Hour, MaxFills: 2})
 	testutil.Must(t, err)
 	defer globalTier.Close()
 
-	nativeSrv := New(originTestStore, testutil.DiscardLogger(), false, 8)
+	nativeSrv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
 	nativeHTTP := httptest.NewServer(nativeSrv)
 	defer nativeHTTP.Close()
-	globalSrv := New(originTestStore, testutil.DiscardLogger(), false, 8)
+	globalSrv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
 	globalSrv.SetOrigin(globalTier)
 	globalHTTP := httptest.NewServer(globalSrv)
 	defer globalHTTP.Close()

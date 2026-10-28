@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"sync"
@@ -25,7 +26,7 @@ type Spec struct {
 	Config     string `json:"config,omitempty"`
 }
 
-func NewFromSpec(log *slog.Logger, st *store.Store, spec Spec, readOnly bool) (*Tier, error) {
+func NewFromSpec(log *slog.Logger, st *store.Store, runtime *Runtime, spec Spec, opts TierOptions) (*Tier, error) {
 	ttl := time.Minute
 	if spec.TTL != "" {
 		d, err := time.ParseDuration(spec.TTL)
@@ -42,12 +43,9 @@ func NewFromSpec(log *slog.Logger, st *store.Store, spec Spec, readOnly bool) (*
 		}
 		ret = d
 	}
-	t, err := newTier(log, []byte(spec.Config), st, spec.Namespace, ttl, ret, spec.MaxFills, readOnly)
-	if err != nil {
-		return nil, err
-	}
-	t.EnableRangeCache(spec.RangeChunk)
-	return t, nil
+	opts.Namespace, opts.TTL, opts.Retention = spec.Namespace, ttl, ret
+	opts.MaxFills, opts.RangeChunk = spec.MaxFills, spec.RangeChunk
+	return New(log, []byte(spec.Config), st, runtime, opts)
 }
 
 func ValidateConfig(config []byte) error {
@@ -152,7 +150,8 @@ type Registry struct {
 	mu          sync.RWMutex
 	refreshMu   sync.Mutex
 	defaultTier *Tier
-	readOnly    bool
+	runtime     *Runtime
+	options     TierOptions
 	checked     atomic.Int64
 	tiers       map[string]registeredTier
 }
@@ -162,14 +161,17 @@ type registeredTier struct {
 	tier *Tier
 }
 
-func NewRegistry(st *store.Store, log *slog.Logger, readOnly bool) *Registry {
+func NewRegistry(st *store.Store, log *slog.Logger, runtime *Runtime, opts TierOptions) *Registry {
 	return &Registry{
-		store:    st,
-		log:      log,
-		readOnly: readOnly,
-		tiers:    map[string]registeredTier{},
+		store:   st,
+		log:     log,
+		runtime: runtime,
+		options: opts,
+		tiers:   map[string]registeredTier{},
 	}
 }
+
+func (r *Registry) WriteMetrics(w io.Writer) { r.runtime.WriteMetrics(w) }
 
 func (r *Registry) SetDefault(t *Tier) {
 	r.mu.Lock()
@@ -240,7 +242,7 @@ func (r *Registry) replace(wanted map[string]Spec) {
 		if entry, ok := current[bucket]; ok && entry.spec == spec {
 			continue
 		}
-		tier, err := NewFromSpec(r.log, r.store, spec, r.readOnly)
+		tier, err := NewFromSpec(r.log, r.store, r.runtime, spec, r.options)
 		if err != nil {
 			if r.log != nil {
 				r.log.Error("opening persisted origin", "bucket", bucket, "cache_namespace", spec.Namespace, "err", err)

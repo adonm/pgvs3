@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/adonm/pgvs3/internal/store"
+	"github.com/adonm/pgvs3/internal/testutil"
 )
 
 func TestEtagForAttrs(t *testing.T) {
@@ -49,7 +50,7 @@ func TestOriginETag(t *testing.T) {
 }
 
 func TestRegistryReplacementAndFallback(t *testing.T) {
-	r := NewRegistry(nil, nil, true)
+	r := NewRegistry(nil, nil, NewRuntime(RuntimeOptions{}), TierOptions{ReadOnly: true})
 	global := Spec{Namespace: "global", Config: `{"type":"ephemeral"}`}
 	bucket := Spec{Namespace: "bucket", Config: `{"type":"ephemeral"}`}
 	wanted := map[string]Spec{"": global, "lake": bucket}
@@ -83,6 +84,39 @@ func TestRegistryReplacementAndFallback(t *testing.T) {
 	r.replace(nil)
 	if r.ForBucket(context.Background(), "lake") != g {
 		t.Fatal("missing global tier did not fall back to the default")
+	}
+}
+
+func TestCacheRuntimeIsolation(t *testing.T) {
+	runtime := NewRuntime(RuntimeOptions{Fills: 1, Pending: 2, SpoolBytes: memFillMax + 1, SpoolDir: t.TempDir()})
+	opts := TierOptions{ReadOnly: true, WriteBack: true, RangeChunk: 1}
+	r := NewRegistry(nil, nil, runtime, opts)
+	r.replace(map[string]Spec{
+		"":     {Namespace: "global", Config: `{"type":"ephemeral"}`, RangeChunk: 1},
+		"lake": {Namespace: "bucket", Config: `{"type":"ephemeral"}`},
+	})
+	defer r.replace(nil)
+	for _, entry := range r.tiers {
+		if entry.tier.runtime != runtime || !entry.tier.writeBack || !entry.tier.readOnly {
+			t.Fatal("registry tiers do not share the configured runtime and options")
+		}
+	}
+	if r.tiers[""].tier.rangeSize != 64<<10 || cap(runtime.fills) != 1 || cap(runtime.pending) != 2 {
+		t.Fatal("cache limits were not normalized before construction")
+	}
+	data := bytes.Repeat([]byte("x"), memFillMax+1)
+	_, cleanup, err := runtime.spoolStream(context.Background(), bytes.NewReader(data), int64(len(data)))
+	testutil.Must(t, err)
+	defer cleanup()
+	if _, _, err := r.tiers["lake"].tier.runtime.spoolStream(context.Background(), bytes.NewReader(data), int64(len(data))); !errors.Is(err, ErrSpoolBusy) {
+		t.Fatalf("shared spool budget: %v", err)
+	}
+	other := NewRuntime(RuntimeOptions{SpoolBytes: int64(len(data)), SpoolDir: t.TempDir()})
+	_, otherCleanup, err := other.spoolStream(context.Background(), bytes.NewReader(data), int64(len(data)))
+	testutil.Must(t, err)
+	defer otherCleanup()
+	if other.spool == runtime.spool || other.fills == runtime.fills || other.pending == runtime.pending {
+		t.Fatal("separate runtimes share mutable resources")
 	}
 }
 
@@ -176,7 +210,8 @@ func TestObjectContentLengthAndResolveRange(t *testing.T) {
 
 func TestSpoolStreamMemoryAndTempFile(t *testing.T) {
 	small := bytes.Repeat([]byte("a"), 1024)
-	sp, clean, err := spoolStream(context.Background(), bytes.NewReader(small), int64(len(small)))
+	runtime := NewRuntime(RuntimeOptions{SpoolDir: t.TempDir()})
+	sp, clean, err := runtime.spoolStream(context.Background(), bytes.NewReader(small), int64(len(small)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +221,7 @@ func TestSpoolStreamMemoryAndTempFile(t *testing.T) {
 	}
 
 	large := bytes.Repeat([]byte("b"), memFillMax+4096)
-	sp2, clean2, err := spoolStream(context.Background(), bytes.NewReader(large), int64(len(large)))
+	sp2, clean2, err := runtime.spoolStream(context.Background(), bytes.NewReader(large), int64(len(large)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +263,7 @@ func TestListSortsBeforeLimit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	tier := &Tier{origin: b, namespace: "origin", ttl: time.Minute, retention: time.Hour, fills: make(chan struct{}, 2)}
+	tier := &Tier{origin: b, runtime: NewRuntime(RuntimeOptions{}), namespace: "origin", ttl: time.Minute, retention: time.Hour, fills: make(chan struct{}, 2)}
 	rows, err := tier.List(ctx, "edge", "", "", 2)
 	if err != nil || len(rows) != 2 || rows[0].Key != "a" || rows[1].Key != "dir/b" {
 		t.Fatalf("rows=%+v err=%v", rows, err)
@@ -432,7 +467,7 @@ func TestListDirectUsesIteratorMetadata(t *testing.T) {
 		}
 	}
 	origin := &countingBucket{originHandle: mem}
-	tier := &Tier{origin: origin, namespace: "origin", ttl: time.Minute, retention: time.Hour}
+	tier := &Tier{origin: origin, runtime: NewRuntime(RuntimeOptions{}), namespace: "origin", ttl: time.Minute, retention: time.Hour}
 	rows, err := tier.List(ctx, "edge", "", "", 10)
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("rows=%+v err=%v", rows, err)
@@ -450,7 +485,7 @@ func TestSpoolBudgetSharedAndReleased(t *testing.T) {
 	t.Setenv("TMPDIR", dir)
 	data := bytes.Repeat([]byte("x"), memFillMax+4096)
 	for _, expected := range []int64{int64(len(data)), -1} {
-		budget := newSpoolBudget(int64(len(data)))
+		budget := newSpoolBudget(int64(len(data)), t.TempDir())
 		_, cleanup, err := spoolWithBudget(context.Background(), bytes.NewReader(data), expected, budget)
 		if err != nil {
 			t.Fatal(err)
@@ -477,7 +512,7 @@ func TestSpoolBudgetSharedAndReleased(t *testing.T) {
 func TestUnknownSpoolBudgetGrowthCannotDeadlock(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TMPDIR", dir)
-	budget := newSpoolBudget(memFillMax + 2)
+	budget := newSpoolBudget(memFillMax+2, t.TempDir())
 	data := bytes.Repeat([]byte("x"), memFillMax+4096)
 	_, _, err := spoolWithBudget(context.Background(), bytes.NewReader(data), -1, budget)
 	if !errors.Is(err, ErrSpoolBusy) || budget.used.Load() != 0 {

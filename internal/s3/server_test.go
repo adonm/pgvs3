@@ -55,7 +55,7 @@ func TestCRC64NVMEAgainstBitwise(t *testing.T) {
 
 func TestBackendSelectionSharesAllCapabilities(t *testing.T) {
 	ctx := context.Background()
-	s := New(nil, nil, false, 1)
+	s := New(nil, nil, false, 1, nil)
 	capabilities := func() []any {
 		return []any{s.backendFor(ctx, "lake"), s.writeBackendFor(ctx, "lake"), s.multipartBackendFor(ctx, "lake")}
 	}
@@ -64,7 +64,9 @@ func TestBackendSelectionSharesAllCapabilities(t *testing.T) {
 			t.Fatalf("native capability selected %T", backend)
 		}
 	}
-	tier, err := objcache.NewReadOnly(nil, []byte(`{"type":"ephemeral"}`), nil, "origin", time.Minute, time.Hour, 1)
+	tier, err := objcache.New(nil, []byte(`{"type":"ephemeral"}`), nil, objcache.NewRuntime(objcache.RuntimeOptions{}), objcache.TierOptions{
+		Namespace: "origin", TTL: time.Minute, Retention: time.Hour, MaxFills: 1, ReadOnly: true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +140,7 @@ func TestIngestErrorMapsUnrepresentableKeyToBadRequest(t *testing.T) {
 }
 
 func TestServerRequestSemaphore(t *testing.T) {
-	s := New(nil, testutil.DiscardLogger(), false, 1)
+	s := New(nil, testutil.DiscardLogger(), false, 1, nil)
 	release, ok := s.acquire()
 	if !ok {
 		t.Fatal("first acquisition failed")
@@ -1578,7 +1580,9 @@ func TestMetricsObserveAndWrite(t *testing.T) {
 	m.Observe("PUT", 403, 25*time.Millisecond, 0)
 
 	rr := httptest.NewRecorder()
-	(&Server{metrics: m}).writeMetrics(rr, nil)
+	s := New(nil, nil, false, 1, nil)
+	s.metrics = m
+	s.writeMetrics(rr, nil)
 
 	if got := rr.Header().Get("Content-Type"); got != "text/plain; version=0.0.4" {
 		t.Fatalf("Content-Type = %q", got)
@@ -1609,7 +1613,9 @@ func TestMetricsConcurrentObserve(t *testing.T) {
 	}
 	wg.Wait()
 	rr := httptest.NewRecorder()
-	(&Server{metrics: m}).writeMetrics(rr, nil)
+	s := New(nil, nil, false, 1, nil)
+	s.metrics = m
+	s.writeMetrics(rr, nil)
 	if !strings.Contains(rr.Body.String(), `pgvs3_requests_total{method="GET",code="200"} 100`) {
 		t.Fatalf("unexpected request series:\n%s", rr.Body.String())
 	}

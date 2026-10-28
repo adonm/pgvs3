@@ -26,6 +26,7 @@ import (
 type Tier struct {
 	origin         originHandle
 	store          *store.Store
+	runtime        *Runtime
 	namespace      string
 	ttl            time.Duration
 	retention      time.Duration
@@ -45,6 +46,7 @@ type Tier struct {
 	done           chan struct{}
 	workerStarted  bool
 	closeOnce      sync.Once
+	closeErr       error
 	fillTTL        time.Duration
 }
 
@@ -59,30 +61,49 @@ const (
 )
 
 var (
-	processFills     = make(chan struct{}, 64)
-	processPending   = make(chan struct{}, 64)
-	spoolDirectory   string
-	writeBackEnabled bool
-
 	errPendingOrigin = errors.New("cache object is pending origin upload")
 	errFillBusy      = errors.New("origin fill owned by another worker")
 	ErrReadOnly      = errors.New("cache tier is read-only")
 )
 
-func ConfigureLimits(fills, pending int) {
-	if fills <= 0 {
-		fills = 64
-	}
-	if pending <= 0 {
-		pending = fills
-	}
-	processFills = make(chan struct{}, fills)
-	processPending = make(chan struct{}, pending)
+type RuntimeOptions struct {
+	Fills      int
+	Pending    int
+	SpoolDir   string
+	SpoolBytes int64
 }
 
-func ConfigureSpoolDir(dir string) { spoolDirectory = dir }
+type Runtime struct {
+	fills   chan struct{}
+	pending chan struct{}
+	spool   *spoolBudget
+}
 
-func ConfigureWriteBack(enabled bool) { writeBackEnabled = enabled }
+func NewRuntime(opts RuntimeOptions) *Runtime {
+	if opts.Fills <= 0 {
+		opts.Fills = 64
+	}
+	if opts.Pending <= 0 {
+		opts.Pending = opts.Fills
+	}
+	if opts.SpoolBytes <= 0 {
+		opts.SpoolBytes = 8 << 30
+	}
+	return &Runtime{
+		fills: make(chan struct{}, opts.Fills), pending: make(chan struct{}, opts.Pending),
+		spool: newSpoolBudget(opts.SpoolBytes, opts.SpoolDir),
+	}
+}
+
+type TierOptions struct {
+	Namespace  string
+	TTL        time.Duration
+	Retention  time.Duration
+	MaxFills   int
+	RangeChunk int64
+	ReadOnly   bool
+	WriteBack  bool
+}
 
 func acquireProcess(sem chan struct{}, ctx context.Context) bool {
 	select {
@@ -93,15 +114,13 @@ func acquireProcess(sem chan struct{}, ctx context.Context) bool {
 	}
 }
 
-func New(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl, retention time.Duration, maxFills int) (*Tier, error) {
-	return newTier(log, config, st, namespace, ttl, retention, maxFills, false)
-}
-
-func NewReadOnly(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl, retention time.Duration, maxFills int) (*Tier, error) {
-	return newTier(log, config, st, namespace, ttl, retention, maxFills, true)
-}
-
-func newTier(log *slog.Logger, config []byte, st *store.Store, namespace string, ttl, retention time.Duration, maxFills int, readOnly bool) (*Tier, error) {
+func New(log *slog.Logger, config []byte, st *store.Store, runtime *Runtime, opts TierOptions) (*Tier, error) {
+	if runtime == nil {
+		return nil, errors.New("cache runtime is required")
+	}
+	if !opts.ReadOnly && st == nil {
+		return nil, errors.New("writable cache tier requires a store")
+	}
 	if log == nil {
 		log = slog.Default()
 	}
@@ -113,35 +132,38 @@ func newTier(log *slog.Logger, config []byte, st *store.Store, namespace string,
 	if err != nil {
 		return nil, err
 	}
-	if namespace == "" {
-		namespace = "origin"
+	if opts.Namespace == "" {
+		opts.Namespace = "origin"
 	}
-	if !ns.ValidName(namespace) {
+	if !ns.ValidName(opts.Namespace) {
 		_ = b.Close()
-		return nil, fmt.Errorf("invalid cache namespace %q", namespace)
+		return nil, fmt.Errorf("invalid cache namespace %q", opts.Namespace)
 	}
-	if ttl < 0 {
-		ttl = time.Minute
+	if opts.TTL < 0 {
+		opts.TTL = time.Minute
 	}
-	if retention <= 0 {
-		retention = 24 * time.Hour
+	if opts.Retention <= 0 {
+		opts.Retention = 24 * time.Hour
 	}
-	if maxFills <= 0 {
-		maxFills = 8
+	if opts.MaxFills <= 0 {
+		opts.MaxFills = 8
+	}
+	if opts.RangeChunk > 0 {
+		opts.RangeChunk = min(max(opts.RangeChunk, 64<<10), maxRangeCacheSpan)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Tier{
-		origin: b, store: st, namespace: namespace, ttl: ttl, retention: retention,
-		fills: make(chan struct{}, maxFills), completes: make(chan struct{}, maxFills),
-		log: log, readOnly: readOnly, writeBack: writeBackEnabled,
-		workerID: randomID(), pendingWorkers: min(maxFills, 8),
+		origin: b, store: st, runtime: runtime, namespace: opts.Namespace, ttl: opts.TTL, retention: opts.Retention,
+		fills: make(chan struct{}, opts.MaxFills), completes: make(chan struct{}, opts.MaxFills),
+		log: log, readOnly: opts.ReadOnly, writeBack: opts.WriteBack, rangeSize: max(opts.RangeChunk, 0),
+		workerID: randomID(), pendingWorkers: min(opts.MaxFills, 8),
 		pendingWake: make(chan struct{}, 1),
 		ctx:         ctx, cancel: cancel, done: make(chan struct{}),
 	}
-	if !readOnly {
+	if !opts.ReadOnly {
 
 		for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
-			if err := st.EnsureNamespace(ctx, kind, namespace, nil, nil); err != nil {
+			if err := st.EnsureNamespace(ctx, kind, opts.Namespace, nil, nil); err != nil {
 				cancel()
 				_ = b.Close()
 				return nil, fmt.Errorf("ensure %s namespace: %w", kind, err)
@@ -165,15 +187,6 @@ func (t *Tier) Name() string { return t.namespace }
 
 func (t *Tier) Capabilities() string { return t.origin.Capabilities().String() }
 
-func (t *Tier) EnableRangeCache(chunk int64) {
-	if chunk > 0 {
-		chunk = min(max(chunk, 64<<10), 8<<20)
-	}
-	t.rangeSize = max(chunk, 0)
-}
-
-func (t *Tier) EnableWriteBack(enabled bool) { t.writeBack = enabled }
-
 func (t *Tier) wakePending() {
 	select {
 	case t.pendingWake <- struct{}{}:
@@ -189,8 +202,9 @@ func (t *Tier) Close() error {
 		if t.workerStarted {
 			<-t.done
 		}
+		t.closeErr = t.origin.Close()
 	})
-	return t.origin.Close()
+	return t.closeErr
 }
 
 func (t *Tier) baseContext() context.Context {
@@ -653,7 +667,7 @@ func (t *Tier) rangeChunk(ctx context.Context, ck, key string, v readView, off i
 			}
 			return nil, err
 		}
-		sp, cleanup, err := spoolStream(fillCtx, io.LimitReader(rc, length), length)
+		sp, cleanup, err := t.runtime.spoolStream(fillCtx, io.LimitReader(rc, length), length)
 		_ = rc.Close()
 		if err != nil {
 			return nil, err
@@ -871,10 +885,10 @@ func (t *Tier) coalesceFill(ctx context.Context, ck string, timeout time.Duratio
 		defer unlock()
 		fillCtx, cancel := context.WithTimeout(t.baseContext(), timeout)
 		defer cancel()
-		if !acquireProcess(processFills, fillCtx) {
+		if !acquireProcess(t.runtime.fills, fillCtx) {
 			return nil, fillCtx.Err()
 		}
-		defer func() { <-processFills }()
+		defer func() { <-t.runtime.fills }()
 		if !acquireProcess(t.fills, fillCtx) {
 			return nil, fillCtx.Err()
 		}
@@ -992,7 +1006,7 @@ func (t *Tier) fill(ctx context.Context, ck, key string) (*store.Meta, error) {
 			}
 			return nil, err
 		}
-		sp, cleanup, err := spoolStream(fillCtx, rc, attrs.Size)
+		sp, cleanup, err := t.runtime.spoolStream(fillCtx, rc, attrs.Size)
 		_ = rc.Close()
 		if err != nil {
 			if t.origin.IsObjNotFoundErr(err) {
@@ -1033,25 +1047,22 @@ var ErrSpoolBusy = errors.New("cache spool byte budget exhausted")
 type spoolBudget struct {
 	sem      *semaphore.Weighted
 	limit    int64
+	dir      string
 	used     atomic.Int64
 	rejected atomic.Uint64
 }
 
-func newSpoolBudget(limit int64) *spoolBudget {
-	return &spoolBudget{sem: semaphore.NewWeighted(limit), limit: limit}
+func newSpoolBudget(limit int64, dir string) *spoolBudget {
+	return &spoolBudget{sem: semaphore.NewWeighted(limit), limit: limit, dir: dir}
 }
 
-var processSpool = newSpoolBudget(8 << 30)
-
-func ConfigureSpoolBytes(limit int64) { processSpool = newSpoolBudget(limit) }
-
-func WriteSpoolMetrics(w io.Writer) {
+func (r *Runtime) WriteMetrics(w io.Writer) {
 	fmt.Fprintf(w, "pgvs3_spool_bytes %d\npgvs3_spool_limit_bytes %d\npgvs3_spool_rejections_total %d\n",
-		processSpool.used.Load(), processSpool.limit, processSpool.rejected.Load())
+		r.spool.used.Load(), r.spool.limit, r.spool.rejected.Load())
 }
 
-func spoolStream(ctx context.Context, r io.Reader, expected int64) (spooled, func(), error) {
-	return spoolWithBudget(ctx, r, expected, processSpool)
+func (r *Runtime) spoolStream(ctx context.Context, body io.Reader, expected int64) (spooled, func(), error) {
+	return spoolWithBudget(ctx, body, expected, r.spool)
 }
 
 func spoolWithBudget(ctx context.Context, r io.Reader, expected int64, budget *spoolBudget) (spooled, func(), error) {
@@ -1089,7 +1100,7 @@ func spoolWithBudget(ctx context.Context, r io.Reader, expected int64, budget *s
 	if err := reserve(max(expected, int64(len(head)))); err != nil {
 		return spooled{}, nil, err
 	}
-	tmp, err := os.CreateTemp(spoolDirectory, "pgvs3-fill-*")
+	tmp, err := os.CreateTemp(budget.dir, "pgvs3-fill-*")
 	if err != nil {
 		budget.sem.Release(reserved)
 		budget.used.Add(-reserved)
@@ -1299,7 +1310,7 @@ func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body i
 	if expected <= 0 {
 		expected = -1
 	}
-	sp, cleanup, err := spoolStream(ctx, body, expected)
+	sp, cleanup, err := t.runtime.spoolStream(ctx, body, expected)
 	if err != nil {
 		switch {
 		case errors.Is(err, errOriginPrecondition):
@@ -1423,10 +1434,10 @@ func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string,
 		done.Bucket, done.Key = bucket, key
 		return done, nil
 	}
-	if !acquireProcess(processPending, ctx) {
+	if !acquireProcess(t.runtime.pending, ctx) {
 		return nil, ctx.Err()
 	}
-	defer func() { <-processPending }()
+	defer func() { <-t.runtime.pending }()
 	if !acquireProcess(t.completes, ctx) {
 		return nil, ctx.Err()
 	}
@@ -1572,7 +1583,7 @@ func (t *Tier) flushOneNoLock(ctx context.Context, p store.PendingUpload, owner 
 		_ = t.store.Cache(t.namespace).ClearPendingUploadToken(context.WithoutCancel(ctx), p.Key, p.Token)
 		return "", nil
 	}
-	sp, cleanup, err := spoolStream(ctx, body, sm.Size)
+	sp, cleanup, err := t.runtime.spoolStream(ctx, body, sm.Size)
 	_ = body.Close()
 	if err != nil {
 		_ = t.store.Cache(t.namespace).FailPendingUpload(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
@@ -1631,12 +1642,12 @@ func (t *Tier) runPending(ctx context.Context) {
 
 func (t *Tier) runPendingWorker(ctx context.Context, owner string) {
 	for ctx.Err() == nil {
-		if !acquireProcess(processPending, ctx) {
+		if !acquireProcess(t.runtime.pending, ctx) {
 			return
 		}
 		pending, err := t.store.Cache(t.namespace).ClaimPendingUploads(ctx, owner, 1, 5*time.Minute)
 		if err != nil || len(pending) == 0 {
-			<-processPending
+			<-t.runtime.pending
 			if err != nil && ctx.Err() == nil {
 				t.log.Warn("claiming pending origin uploads", "owner", owner, "err", err)
 			}
@@ -1649,7 +1660,7 @@ func (t *Tier) runPendingWorker(ctx context.Context, owner string) {
 		flushCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		_, err = t.flushOne(flushCtx, p, p.LeaseOwner)
 		cancel()
-		<-processPending
+		<-t.runtime.pending
 		if err != nil && ctx.Err() == nil {
 			t.log.Warn("pending origin upload failed", "key", p.Key, "attempt", p.Attempts+1, "err", err)
 		}

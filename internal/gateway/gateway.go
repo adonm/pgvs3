@@ -33,14 +33,11 @@ type Limits struct {
 	RESP int
 }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool, origin *objcache.Tier, lim Limits) *Gateway {
+func New(st *store.Store, log *slog.Logger, readOnly bool, origins *objcache.Registry, lim Limits) *Gateway {
 	g := &Gateway{
-		s3:   s3.New(st, log, readOnly, lim.S3),
+		s3:   s3.New(st, log, readOnly, lim.S3, origins),
 		ojs:  ojs.New(st, log, readOnly, lim.OJS, "dev"),
 		resp: resp.New(st, readOnly, lim.RESP),
-	}
-	if origin != nil {
-		g.s3.SetOrigin(origin)
 	}
 	g.s3.SetMetricsHook(func(w io.Writer) {
 		g.resp.Metrics(w)
