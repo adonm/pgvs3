@@ -143,7 +143,7 @@ func TestPlanCacheRead(t *testing.T) {
 			if tc.name == "no range cache" {
 				rs = 0
 			}
-			got := planCacheRead(tc.res, rs, tc.readOnly, tc.start, tc.end, tc.size, tc.ranged)
+			got := planCacheRead(tc.res, rs, tc.readOnly, readView{Size: tc.size, start: tc.start, end: tc.end, ranged: tc.ranged})
 			if got.action != tc.want {
 				t.Fatalf("action = %v, want %v", got.action, tc.want)
 			}

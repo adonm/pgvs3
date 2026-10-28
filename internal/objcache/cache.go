@@ -237,19 +237,17 @@ const (
 
 type cachePlan struct {
 	action cacheAction
-	start  int64
-	end    int64
 	length int64
-	ranged bool
 }
 
-func planCacheRead(res cacheResolution, rangeSize int64, readOnly bool, start, end, size int64, ranged bool) cachePlan {
-	plan := cachePlan{start: start, end: end, ranged: ranged}
+func planCacheRead(res cacheResolution, rangeSize int64, readOnly bool, v readView) cachePlan {
+	size := v.Size
+	var plan cachePlan
 	if size == 0 {
 		plan.action = cacheActionZero
 		return plan
 	}
-	plan.length = end - start + 1
+	plan.length = v.end - v.start + 1
 	switch {
 	case readOnly && !res.valid && !res.attrsValid:
 		plan.action = cacheActionPassThrough
@@ -265,6 +263,17 @@ func planCacheRead(res cacheResolution, rangeSize int64, readOnly bool, start, e
 }
 
 type Object = store.ReadResult
+
+type readView struct {
+	store.ObjectInfo
+	start, end int64
+	ranged     bool
+	hit        bool
+}
+
+func newObject(v readView, body io.ReadCloser) *Object {
+	return &Object{ObjectInfo: v.ObjectInfo, Body: body, Start: v.start, End: v.end, Ranged: v.ranged, Hit: v.hit}
+}
 
 type cacheResolution struct {
 	meta       *store.Meta
@@ -370,11 +379,7 @@ func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 	if info.ContentType == "" {
 		info.ContentType = contentTypeFor(key)
 	}
-	return &Object{
-		ObjectInfo: info,
-		End:        max(info.Size-1, 0),
-		Hit:        res.valid || res.attrsValid,
-	}, nil
+	return newObject(readView{ObjectInfo: info, end: max(info.Size-1, 0), hit: res.valid || res.attrsValid}, nil), nil
 }
 
 func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange) (*Object, error) {
@@ -410,7 +415,7 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange
 		if spanErr != nil {
 			return nil, spanErr
 		}
-		return t.openCached(ctx, ck, key, readRef, m, span.Start, span.End, rng, span.Ranged, false)
+		return t.openCached(ctx, readRef, m, readView{start: span.Start, end: span.End, ranged: span.Ranged})
 	}
 	size, version, lastMod, ct := res.info.Size, res.info.OriginETag, res.info.CreatedAt, res.info.ContentType
 	if ct == "" {
@@ -421,15 +426,16 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange
 	if err != nil {
 		return nil, err
 	}
-	start, end, ranged := span.Start, span.End, span.Ranged
-	plan := planCacheRead(res, t.rangeSize, t.readOnly, start, end, size, ranged)
+	view := readView{Size: size, ContentType: ct, CreatedAt: lastMod, start: span.Start, end: span.End, ranged: span.Ranged}
+	plan := planCacheRead(res, t.rangeSize, t.readOnly, view)
 	switch plan.action {
 	case cacheActionZero:
 		return t.openZero(ctx, ck, key, res, rng)
 	case cacheActionPassThrough:
-		return t.passThrough(ctx, ck, passThroughSpan{start: plan.start, length: plan.length, size: size, end: plan.end, ranged: plan.ranged}, res.attrs, ct, lastMod)
+		return t.passThrough(ctx, ck, view, res.attrs)
 	case cacheActionRange:
-		obj, err := t.openRange(ctx, ck, key, plan.start, plan.end, size, version, ct, res.info.ContentEncoding, res.attrs.UserMetadata, lastMod, plan.ranged)
+		view.ETag, view.ContentEncoding, view.UserMetadata = version, res.info.ContentEncoding, res.attrs.UserMetadata
+		obj, err := t.openRange(ctx, ck, key, view)
 		if errors.Is(err, store.ErrStaleCache) || errors.Is(err, errFillBusy) {
 			return t.openPending(ctx, ck, key, rng)
 		}
@@ -437,12 +443,12 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange
 	default:
 		readMeta, readRef := res.meta, res.ref
 		if !res.valid && t.readOnly {
-			return t.passThrough(ctx, ck, passThroughSpan{start: plan.start, length: plan.length, size: size, end: plan.end, ranged: plan.ranged}, res.attrs, ct, lastMod)
+			return t.passThrough(ctx, ck, view, res.attrs)
 		}
 		if !res.valid {
 			fm, err := t.fill(ctx, ck, key)
 			if errors.Is(err, errPendingOrigin) || errors.Is(err, errFillBusy) {
-				return t.passThrough(ctx, ck, passThroughSpan{start: plan.start, length: plan.length, size: size, end: plan.end, ranged: plan.ranged}, res.attrs, ct, lastMod)
+				return t.passThrough(ctx, ck, view, res.attrs)
 			} else if errors.Is(err, store.ErrStaleCache) {
 				return t.openPending(ctx, ck, key, rng)
 			} else if err != nil {
@@ -459,7 +465,8 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange
 				readMeta, readRef = wm, t.writeRef(ck)
 			}
 		}
-		return t.openCached(ctx, ck, key, readRef, readMeta, plan.start, plan.end, rng, plan.ranged, res.valid)
+		view.hit = res.valid
+		return t.openCached(ctx, readRef, readMeta, view)
 	}
 }
 
@@ -470,7 +477,7 @@ func (t *Tier) openZero(ctx context.Context, ck, key string, res cacheResolution
 	}
 	originZero := func() *Object {
 		info.Size = 0
-		return &Object{ObjectInfo: info, Body: io.NopCloser(bytes.NewReader(nil)), Ranged: rng.Requested}
+		return newObject(readView{ObjectInfo: info, ranged: rng.Requested}, io.NopCloser(bytes.NewReader(nil)))
 	}
 	if t.readOnly && !res.valid {
 		return originZero(), nil
@@ -493,23 +500,22 @@ func (t *Tier) openZero(ctx context.Context, ck, key string, res cacheResolution
 		info = m.ObjectInfo
 		info.ETag, info.OriginETag = responseETag(m), originETag(m)
 	}
-	return &Object{
-		ObjectInfo: info, Body: io.NopCloser(bytes.NewReader(nil)), Hit: res.valid,
-	}, nil
+	return newObject(readView{ObjectInfo: info, hit: res.valid}, io.NopCloser(bytes.NewReader(nil))), nil
 }
 
-func (t *Tier) openCached(ctx context.Context, ck, key string, ref store.ObjectRef, m *store.Meta, start, end int64, rng store.ByteRange, ranged, hit bool) (*Object, error) {
+func (t *Tier) openCached(ctx context.Context, ref store.ObjectRef, m *store.Meta, v readView) (*Object, error) {
+	start, end := v.start, v.end
 	sm, body, err := t.store.GetBodyFromMeta(ctx, ref, m, store.Range(start, end, -1))
 	if err != nil {
 		return nil, err
 	}
-	return &Object{
+	info := store.ObjectInfo{
 		Size: sm.Size, ETag: responseETagSliceFor(ref, sm), ContentType: sm.ContentType,
 		ContentEncoding: sm.ContentEncoding, ChecksumName: sm.ChecksumName,
 		ChecksumValue: sm.ChecksumValue, ChecksumType: sm.ChecksumType,
 		UserMetadata: sm.UserMetadata, CreatedAt: sm.CreatedAt, OriginModified: sm.OriginModified,
-		Body: body, Start: sm.Start, End: sm.End, Ranged: ranged, Hit: hit,
-	}, nil
+	}
+	return newObject(readView{ObjectInfo: info, start: sm.Start, end: sm.End, ranged: v.ranged, hit: v.hit}, body), nil
 }
 
 func (t *Tier) openPending(ctx context.Context, ck, key string, rng store.ByteRange) (*Object, error) {
@@ -530,14 +536,15 @@ func (t *Tier) openPending(ctx context.Context, ck, key string, rng store.ByteRa
 		return nil, err
 	}
 	if size == 0 {
-		return &Object{
+		info := store.ObjectInfo{
 			Size: 0, ETag: etagForAttrs(a), ContentType: ct,
 			ContentEncoding: a.ContentEncoding,
 			UserMetadata:    a.UserMetadata, CreatedAt: a.LastModified,
-			Body: io.NopCloser(bytes.NewReader(nil)), Ranged: rng.Requested,
-		}, nil
+		}
+		return newObject(readView{ObjectInfo: info, ranged: rng.Requested}, io.NopCloser(bytes.NewReader(nil))), nil
 	}
-	return t.passThrough(ctx, ck, passThroughSpan{start: span.Start, length: span.End - span.Start + 1, size: size, end: span.End, ranged: span.Ranged}, a, ct, a.LastModified)
+	view := readView{Size: size, ContentType: ct, CreatedAt: a.LastModified, start: span.Start, end: span.End, ranged: span.Ranged}
+	return t.passThrough(ctx, ck, view, a)
 }
 
 func (t *Tier) passThroughWhole(ctx context.Context, ck, key string, rng store.ByteRange) (*Object, error) {
@@ -557,54 +564,39 @@ func (t *Tier) passThroughWhole(ctx context.Context, ck, key string, rng store.B
 		_ = rc.Close()
 		return nil, err
 	}
-	return &Object{
+	info := store.ObjectInfo{
 		Size: attrs.Size, ETag: etagForAttrs(attrs), ContentType: ct,
 		ContentEncoding: attrs.ContentEncoding,
 		UserMetadata:    attrs.UserMetadata, CreatedAt: attrs.LastModified,
-		Body: rc, Start: span.Start, End: span.End, Ranged: span.Ranged,
-	}, nil
+	}
+	return newObject(readView{ObjectInfo: info, start: span.Start, end: span.End, ranged: span.Ranged}, rc), nil
 }
 
-type passThroughSpan struct {
-	start  int64
-	length int64
-	size   int64
-	end    int64
-	ranged bool
-}
-
-func (t *Tier) passThrough(ctx context.Context, ck string, span passThroughSpan, a originAttrs, ct string, lastMod time.Time) (*Object, error) {
-	rc, err := t.origin.GetRange(ctx, ck, span.start, span.length, "")
+func (t *Tier) passThrough(ctx context.Context, ck string, v readView, a originAttrs) (*Object, error) {
+	rc, err := t.origin.GetRange(ctx, ck, v.start, v.end-v.start+1, "")
 	if err != nil {
 		if t.origin.IsObjNotFoundErr(err) {
 			return nil, store.ErrNotFound
 		}
 		return nil, err
 	}
-	return &Object{
-		Size: span.size, ETag: etagForAttrs(a), ContentType: ct,
-		ContentEncoding: a.ContentEncoding,
-		UserMetadata:    a.UserMetadata, CreatedAt: lastMod,
-		Body: rc, Start: span.start, End: span.end, Ranged: span.ranged,
-	}, nil
+	v.ETag, v.ContentEncoding, v.UserMetadata = etagForAttrs(a), a.ContentEncoding, a.UserMetadata
+	return newObject(v, rc), nil
 }
 
 func rangeChunkKey(ck string, offset int64, version string) string {
 	return fmt.Sprintf("%s.__range__.%016x.%s", ck, offset, version)
 }
 
-func (t *Tier) openRange(ctx context.Context, ck, key string, start, end, size int64, version, ct, contentEncoding string, userMeta []string, lastMod time.Time, ranged bool) (*Object, error) {
+func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Object, error) {
+	start, end := v.start, v.end
 	length := end - start + 1
 	body := make([]byte, 0, length)
 	hit := true
 	first := start - start%t.rangeSize
 	last := first + ((end-first)/t.rangeSize)*t.rangeSize
 	for off := first; off <= end; off += t.rangeSize {
-		want := t.rangeSize
-		if off+want > size {
-			want = size - off
-		}
-		chunk, cached, err := t.rangeChunk(ctx, ck, key, off, want, version, ct, lastMod)
+		chunk, cached, err := t.rangeChunk(ctx, ck, key, v, off)
 		if err != nil {
 			return nil, err
 		}
@@ -624,15 +616,16 @@ func (t *Tier) openRange(ctx context.Context, ck, key string, start, end, size i
 	if int64(len(body)) != length {
 		return nil, fmt.Errorf("range cache assembled %d bytes, wanted %d", len(body), length)
 	}
-	return &Object{
-		Size: size, ETag: version, ContentType: ct,
-		ContentEncoding: contentEncoding,
-		UserMetadata:    userMeta, CreatedAt: lastMod,
-		Body: io.NopCloser(bytes.NewReader(body)), Start: start, End: end, Ranged: ranged, Hit: hit,
-	}, nil
+	v.hit = hit
+	return newObject(v, io.NopCloser(bytes.NewReader(body))), nil
 }
 
-func (t *Tier) rangeChunk(ctx context.Context, ck, key string, off, length int64, version, ct string, lastModified time.Time) ([]byte, bool, error) {
+func (t *Tier) rangeChunk(ctx context.Context, ck, key string, v readView, off int64) ([]byte, bool, error) {
+	length := t.rangeSize
+	if off+length > v.Size {
+		length = v.Size - off
+	}
+	version, ct, lastModified := v.ETag, v.ContentType, v.CreatedAt
 	chunkKey := rangeChunkKey(ck, off, version)
 	if m, err := t.store.MetaHeader(ctx, t.cacheRef(chunkKey)); err == nil && m.OriginETag == version && m.Size == length {
 		_, body, err := t.store.GetBody(ctx, t.cacheRef(chunkKey), store.WholeObjectRange(), nil)
