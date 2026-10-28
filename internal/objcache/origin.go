@@ -1099,9 +1099,6 @@ func (b *localBucket) walk(dir string, yield func(originObject, error) bool) boo
 	}
 	slices.SortFunc(entries, compareListing)
 	for _, entry := range entries {
-		if dir == "." && entry.Name() == localTempDir {
-			continue
-		}
 		name := entry.Name()
 		if dir != "." {
 			name = dir + "/" + name

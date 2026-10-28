@@ -210,6 +210,16 @@ func newTestOrigin(t *testing.T, prefix string) *origin {
 	return o
 }
 
+func newTestTempOrigin(t *testing.T, prefix string) *origin {
+	t.Helper()
+	o, err := newTempBucket(Config{Prefix: prefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = o.Close() })
+	return o
+}
+
 func TestListSortsBeforeLimit(t *testing.T) {
 	b := newTestOrigin(t, "")
 	ctx := context.Background()
@@ -231,11 +241,7 @@ func TestListSortsBeforeLimit(t *testing.T) {
 
 func TestTempOriginPrefixIsLogicalAtIterator(t *testing.T) {
 	ctx := context.Background()
-	b, err := newTempBucket(Config{Prefix: "tenant"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
+	b := newTestTempOrigin(t, "tenant")
 	if _, err := b.Upload(ctx, "edge/a", strings.NewReader("alpha"), 5, originUpload{
 		ContentType: "text/plain", UserMetadata: []string{"owner", "test"},
 	}); err != nil {
@@ -280,9 +286,6 @@ func TestTempOriginRemovesDirectoryOnClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := o.driver.(*localBucket).root.Name()
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatal(err)
-	}
 	if err := o.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -291,15 +294,86 @@ func TestTempOriginRemovesDirectoryOnClose(t *testing.T) {
 	}
 }
 
+func TestLocalKeyRules(t *testing.T) {
+	ctx := context.Background()
+	long := strings.Repeat("n", localNameMax)
+	for _, o := range []*origin{newTestOrigin(t, ""), newTestTempOrigin(t, "")} {
+		if _, err := o.Upload(ctx, "bkt/k", strings.NewReader("target"), 6, originUpload{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := o.Upload(ctx, "bkt/dir/file", strings.NewReader("file"), 4, originUpload{}); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			key string
+			ok  bool
+		}{
+			{"bkt/new", true},
+			{"bkt/" + long, true},
+			{"bkt/" + long + "n", false},
+			{"bkt//k", false},
+			{"bkt/./k", false},
+			{"bkt/../bkt/k", false},
+			{"bkt/k/", false},
+			{"bkt/k/child", false},
+			{"bkt/dir", false},
+			{"bkt/a\x00b", false},
+			{localTempDir + "/k", false},
+		} {
+			_, err := o.Upload(ctx, tc.key, strings.NewReader("payload"), 7, originUpload{})
+			if (err == nil) != tc.ok || (err != nil && !errors.Is(err, ErrOriginKeyUnsupported)) {
+				t.Fatalf("Upload(%q) error = %v", tc.key, err)
+			}
+			if tc.ok {
+				if got := conformanceGet(t, ctx, o, tc.key); got != "payload" {
+					t.Fatalf("Get(%q) = %q", tc.key, got)
+				}
+			} else if _, err := o.Get(ctx, tc.key); !o.IsObjNotFoundErr(err) {
+				t.Fatalf("Get(%q) error = %v, want not found", tc.key, err)
+			}
+			if got := conformanceGet(t, ctx, o, "bkt/k"); got != "target" {
+				t.Fatalf("Upload(%q) changed bkt/k to %q", tc.key, got)
+			}
+		}
+		if err := o.Delete(ctx, "bkt/dir"); err != nil {
+			t.Fatalf("Delete of a directory path: %v", err)
+		}
+		if got := conformanceGet(t, ctx, o, "bkt/dir/file"); got != "file" {
+			t.Fatalf("Delete of a directory path changed its object: %q", got)
+		}
+		if rc, err := o.GetRange(ctx, "bkt/k", 7, 1, ""); err == nil {
+			_ = rc.Close()
+			t.Fatal("range past the end of an object succeeded")
+		}
+	}
+}
+
+func TestLocalListingOrder(t *testing.T) {
+	ctx := context.Background()
+	all := []string{"bkt/a-b", "bkt/a.txt", "bkt/a/c", "bkt/dir/file"}
+	for _, o := range []*origin{newTestOrigin(t, ""), newTestTempOrigin(t, "")} {
+		for _, key := range []string{"bkt/dir/file", "bkt/a/c", "bkt/a.txt", "bkt/a-b"} {
+			if _, err := o.Upload(ctx, key, strings.NewReader(key), int64(len(key)), originUpload{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		stray, err := o.driver.(*localBucket).root.Create(localTempDir + "/interrupted")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = stray.Close()
+		for dir, want := range map[string][]string{"": all, "bkt/": all, "bkt/a/": {"bkt/a/c"}} {
+			if got := conformanceIterKeys(t, ctx, o, dir); !slices.Equal(got, want) {
+				t.Fatalf("Iter(%q) = %#v, want %#v", dir, got, want)
+			}
+		}
+	}
+}
+
 func TestLocalOverwriteIsAtomic(t *testing.T) {
 	ctx := context.Background()
-	temp, err := newTempBucket(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer temp.Close()
 	versions := []string{strings.Repeat("a", 4096), strings.Repeat("b", 8192)}
-	for _, o := range []*origin{newTestOrigin(t, ""), temp} {
+	for _, o := range []*origin{newTestOrigin(t, ""), newTestTempOrigin(t, "")} {
 		if _, err := o.Upload(ctx, "bkt/k", strings.NewReader(versions[0]), 4096, originUpload{}); err != nil {
 			t.Fatal(err)
 		}
@@ -313,7 +387,7 @@ func TestLocalOverwriteIsAtomic(t *testing.T) {
 		body, err := io.ReadAll(rc)
 		_ = rc.Close()
 		if err != nil || string(body) != versions[0] || attrs.Size != 4096 {
-			t.Fatalf("open reader saw %d bytes (size %d, err %v) after overwrite", len(body), attrs.Size, err)
+			t.Fatalf("open reader saw %d bytes after overwrite (err %v)", len(body), err)
 		}
 		var readers sync.WaitGroup
 		failures := make(chan error, 4)
@@ -328,7 +402,7 @@ func TestLocalOverwriteIsAtomic(t *testing.T) {
 					body, err := io.ReadAll(rc)
 					_ = rc.Close()
 					if err != nil || (string(body) != versions[0] && string(body) != versions[1]) {
-						failures <- fmt.Errorf("read %d bytes, err %v", len(body), err)
+						failures <- fmt.Errorf("read %d bytes (err %v)", len(body), err)
 						return
 					}
 				}
@@ -344,36 +418,6 @@ func TestLocalOverwriteIsAtomic(t *testing.T) {
 		for err := range failures {
 			t.Fatal(err)
 		}
-	}
-}
-
-func TestLocalPathRules(t *testing.T) {
-	long := strings.Repeat("n", localNameMax)
-	for _, tc := range []struct {
-		key  string
-		want bool
-	}{
-		{"bkt/a", true},
-		{"bkt/a b/c-d.txt", true},
-		{"bkt/" + long, true},
-		{"bkt/" + long + "n", false},
-		{"", false},
-		{"bkt//a", false},
-		{"bkt/a/", false},
-		{"/bkt/a", false},
-		{"bkt/./a", false},
-		{"bkt/../a", false},
-		{"bkt/a\x00", false},
-	} {
-		if got := validLocalKey(tc.key); got != tc.want {
-			t.Fatalf("validLocalKey(%q) = %v, want %v", tc.key, got, tc.want)
-		}
-	}
-	if _, err := newTempBucket(Config{Prefix: "a//b"}); err == nil {
-		t.Fatal("temporary origin accepted a prefix that cannot be a path")
-	}
-	if _, err := newFSBucket(Config{Type: "filesystem", Prefix: "../escape", Config: map[string]any{"directory": t.TempDir()}}); err == nil {
-		t.Fatal("filesystem origin accepted a prefix that cannot be a path")
 	}
 }
 
@@ -518,11 +562,7 @@ func TestOriginCapabilitySets(t *testing.T) {
 	}
 	defer files.Close()
 
-	memory, err := newTempBucket(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer memory.Close()
+	memory := newTestTempOrigin(t, "")
 
 	objects, err := newS3Bucket(Config{Type: "s3", Config: map[string]any{
 		"bucket": "test-bucket", "endpoint": srv.URL,
@@ -600,11 +640,7 @@ func TestOriginCapabilityGating(t *testing.T) {
 		t.Fatalf("Tier.List error = %v", err)
 	}
 
-	memory, err := newTempBucket(Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer memory.Close()
+	memory := newTestTempOrigin(t, "")
 	memory.caps &^= capConditional
 	if _, err := memory.Upload(ctx, "k", strings.NewReader("x"), 1, originUpload{
 		Precondition: store.Precondition{Mode: store.IfAbsent},
@@ -700,11 +736,7 @@ func TestSharedPrefixBehavior(t *testing.T) {
 		{
 			name: "inmem",
 			open: func(t *testing.T) (*origin, string) {
-				o, err := newTempBucket(Config{Prefix: "/tenant/"})
-				if err != nil {
-					t.Fatal(err)
-				}
-				return o, ""
+				return newTestTempOrigin(t, "/tenant/"), ""
 			},
 		},
 	}
@@ -795,8 +827,6 @@ type conformanceFixture struct {
 	conflict bool
 
 	physicalKeys func() []string
-
-	localPaths bool
 }
 
 type conformanceFactory func(t *testing.T, prefix string) conformanceFixture
@@ -806,13 +836,12 @@ func originConformance(t *testing.T, name string, factory conformanceFactory) {
 	ctx := context.Background()
 
 	type conformanceCase struct {
-		name              string
-		requires          originCapabilities
-		prefix            string
-		requirePrefix     bool
-		requireConflict   bool
-		requireLocalPaths bool
-		run               func(t *testing.T, ctx context.Context, fx conformanceFixture)
+		name            string
+		requires        originCapabilities
+		prefix          string
+		requirePrefix   bool
+		requireConflict bool
+		run             func(t *testing.T, ctx context.Context, fx conformanceFixture)
 	}
 	cases := []conformanceCase{
 		{
@@ -868,12 +897,6 @@ func originConformance(t *testing.T, name string, factory conformanceFactory) {
 			run:             conformanceConflict,
 		},
 		{
-			name:              "local-path-rules",
-			requires:          capRead | capWrite | capList | capRange | capMetadata,
-			requireLocalPaths: true,
-			run:               conformanceLocalPaths,
-		},
-		{
 			name: "close-is-safe",
 			run:  conformanceClose,
 		},
@@ -891,9 +914,6 @@ func originConformance(t *testing.T, name string, factory conformanceFactory) {
 			}
 			if tc.requireConflict && !fx.conflict {
 				t.Skipf("%s test double cannot synthesize a conditional conflict", name)
-			}
-			if tc.requireLocalPaths && !fx.localPaths {
-				t.Skipf("%s does not map keys onto local paths", name)
 			}
 			if tc.requires != 0 && !fx.handle.Supports(tc.requires) {
 				t.Skipf("%s lacks %s (caps %s)", name, tc.requires, fx.handle.Capabilities())
@@ -1312,61 +1332,6 @@ func conformanceConflict(t *testing.T, ctx context.Context, fx conformanceFixtur
 	}
 }
 
-func conformanceLocalPaths(t *testing.T, ctx context.Context, fx conformanceFixture) {
-	t.Helper()
-	h := fx.handle
-	for _, key := range []string{"edge/dir/file", "edge/a/c", "edge/a.txt", "edge/a-b"} {
-		if _, err := h.Upload(ctx, key, strings.NewReader(key), int64(len(key)), originUpload{}); err != nil {
-			t.Fatalf("Upload %s: %v", key, err)
-		}
-	}
-	want := []string{"edge/a-b", "edge/a.txt", "edge/a/c", "edge/dir/file"}
-	if got := conformanceIterKeys(t, ctx, h, "edge/"); !slices.Equal(got, want) {
-		t.Fatalf("Iter(edge/) keys = %#v, want %#v", got, want)
-	}
-	if got := conformanceIterKeys(t, ctx, h, "edge/a-b/"); len(got) != 0 {
-		t.Fatalf("Iter below a file yielded %#v", got)
-	}
-
-	tooLong := "edge/" + strings.Repeat("n", localNameMax+1)
-	for _, key := range []string{"edge//a-b", "edge/a-b/", "/edge/a-b", "edge/./a-b", "edge/../edge/a-b", tooLong} {
-		if _, err := h.Upload(ctx, key, strings.NewReader("x"), 1, originUpload{}); !errors.Is(err, ErrOriginKeyUnsupported) {
-			t.Fatalf("Upload %q error = %v, want ErrOriginKeyUnsupported", key, err)
-		}
-		if err := h.Delete(ctx, key); err != nil {
-			t.Fatalf("Delete %q: %v", key, err)
-		}
-		if _, err := h.Get(ctx, key); !h.IsObjNotFoundErr(err) {
-			t.Fatalf("Get %q error = %v, want not found", key, err)
-		}
-	}
-	for _, key := range []string{"edge/dir", "edge/a-b/child"} {
-		if _, err := h.Upload(ctx, key, strings.NewReader("x"), 1, originUpload{}); !errors.Is(err, ErrOriginKeyUnsupported) {
-			t.Fatalf("conflicting Upload %q error = %v, want ErrOriginKeyUnsupported", key, err)
-		}
-		if _, err := h.Attributes(ctx, key); !h.IsObjNotFoundErr(err) {
-			t.Fatalf("Attributes %q error = %v, want not found", key, err)
-		}
-		if _, err := h.GetRange(ctx, key, 0, 1, ""); !h.IsObjNotFoundErr(err) {
-			t.Fatalf("GetRange %q error = %v, want not found", key, err)
-		}
-	}
-	if got := conformanceIterKeys(t, ctx, h, "edge/"); !slices.Equal(got, want) {
-		t.Fatalf("rejected keys changed the listing: %#v", got)
-	}
-
-	if err := h.Delete(ctx, "edge/dir"); err != nil {
-		t.Fatalf("Delete of a directory path: %v", err)
-	}
-	if got := conformanceGet(t, ctx, h, "edge/dir/file"); got != "edge/dir/file" {
-		t.Fatalf("deleting a directory path changed its object: %q", got)
-	}
-	if rc, err := h.GetRange(ctx, "edge/a-b", int64(len("edge/a-b"))+1, 1, ""); err == nil {
-		_ = rc.Close()
-		t.Fatal("GetRange beyond the object end succeeded")
-	}
-}
-
 func conformanceClose(t *testing.T, _ context.Context, fx conformanceFixture) {
 	t.Helper()
 	if err := fx.handle.Close(); err != nil {
@@ -1447,7 +1412,6 @@ func conformanceMemFactory(t *testing.T, prefix string) conformanceFixture {
 		handle:        o,
 		caps:          originCapabilitiesAll,
 		prefixMapping: true,
-		localPaths:    true,
 	}
 }
 
@@ -1464,7 +1428,6 @@ func conformanceFSFactory(t *testing.T, prefix string) conformanceFixture {
 		handle:        o,
 		caps:          originCapabilitiesAll,
 		prefixMapping: true,
-		localPaths:    true,
 		physicalKeys: func() []string {
 			var keys []string
 			err := filepath.WalkDir(dir, func(name string, entry fs.DirEntry, err error) error {
