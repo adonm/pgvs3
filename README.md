@@ -184,7 +184,14 @@ SELECT * FROM lake.events;
    `503 SlowDown` before acknowledging a write. Write-back uploads retain a
    session key lock to preserve remote ordering. The production origins are
   S3-compatible (`s3`) and read-only HTTP(S); `filesystem` and `inmem` remain
-  small local/test providers (filesystem user metadata is process-local).
+  small local/test providers that share one on-disk implementation. `inmem`
+  keeps its objects in a private temporary directory under `TMPDIR`, removed on
+  clean shutdown. User metadata is process-local for both. Keys that cannot be
+  stored as paths are rejected: empty, `.` or `..` segments, NUL bytes, segments
+  over 255 bytes, and keys that conflict with an existing object or prefix. Writes
+  return `400 InvalidRequest`, except large write-back uploads, which are
+  acknowledged first and then dead-lettered. Reads return `404`, and `DELETE` is
+  a no-op.
 - **Cache safety across workers.** Read-through fills are fenced by the
   expected origin version, so a fill that started before a newer write-through
   write cannot overwrite the newer cache row. Write-through deletes leave a

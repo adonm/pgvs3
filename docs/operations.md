@@ -655,9 +655,12 @@ FROM s3p.pending_uploads;
 
 The production origin types are `s3` (SigV4 and object operations via the
 Apache-2.0 `internal/s3client` fork of `kelindar/s3`) and read-only
-`http`/`https`; `filesystem` and `inmem` are local/test providers, and
-filesystem user metadata is process-local. HTTP origins are read-only by
-default and map the cache bucket path onto a base URL:
+`http`/`https`; `filesystem` and `inmem` are local/test providers. They share one
+on-disk implementation, and `inmem` uses a private temporary directory under
+`TMPDIR` that is removed on clean shutdown, so it needs a writable temporary
+directory. User metadata is process-local for both, and keys that cannot be
+stored as paths are rejected as described in the README. HTTP origins are
+read-only by default and map the cache bucket path onto a base URL:
 
 ```json
 {

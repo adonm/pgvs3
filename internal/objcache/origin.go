@@ -13,10 +13,12 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/s3client"
@@ -60,6 +62,8 @@ var ErrOriginConflict = errors.New("origin conditional request conflict")
 var ErrOriginUnsupported = errors.New("origin operation unsupported")
 
 var ErrOriginListingUnsupported = errors.New("origin does not support listing")
+
+var ErrOriginKeyUnsupported = fmt.Errorf("%w: key cannot be stored", ErrOriginUnsupported)
 
 type originUpload struct {
 	UserMetadata    []string
@@ -308,7 +312,7 @@ func newOrigin(c Config) (*origin, error) {
 	case "filesystem":
 		return newFSBucket(c)
 	case "inmem":
-		return newMemBucket(c), nil
+		return newTempBucket(c)
 	default:
 		return nil, fmt.Errorf("unsupported origin type %q (s3, http, filesystem or inmem)", c.Type)
 	}
@@ -853,16 +857,19 @@ type fsConfig struct {
 	Directory string `json:"directory"`
 }
 
-type fsBucket struct {
-	root *os.Root
-	mu   sync.Mutex
-	meta map[string]storedMeta
-}
-
-type storedMeta struct {
+type localMeta struct {
 	contentType     string
 	contentEncoding string
 	userMeta        []string
+}
+
+const localNameMax = 255
+
+type localBucket struct {
+	root      *os.Root
+	mu        sync.Mutex
+	meta      map[string]localMeta
+	temporary bool
 }
 
 func newFSBucket(c Config) (*origin, error) {
@@ -876,20 +883,40 @@ func newFSBucket(c Config) (*origin, error) {
 	if err := os.MkdirAll(fc.Directory, 0o755); err != nil {
 		return nil, err
 	}
-	root, err := os.OpenRoot(fc.Directory)
+	return openLocalBucket("filesystem", c.Prefix, fc.Directory, false)
+}
+
+func newTempBucket(c Config) (*origin, error) {
+	dir, err := os.MkdirTemp("", "pgvs3-inmem-")
 	if err != nil {
 		return nil, err
 	}
-	b := &fsBucket{root: root, meta: map[string]storedMeta{}}
-	return &origin{kind: "filesystem", caps: originCapabilitiesAll, prefix: newOriginPrefix(c.Prefix), driver: b}, nil
+	o, err := openLocalBucket("inmem", c.Prefix, dir, true)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+	}
+	return o, err
 }
 
-func (b *fsBucket) Upload(_ context.Context, key string, r io.Reader, _ int64, in originUpload) (originAttrs, error) {
+func openLocalBucket(kind, prefix, dir string, temporary bool) (*origin, error) {
+	p := newOriginPrefix(prefix)
+	if p != "" && !validLocalKey(string(p)) {
+		return nil, fmt.Errorf("%s origin prefix %q cannot be stored as a path", kind, prefix)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	b := &localBucket{root: root, meta: map[string]localMeta{}, temporary: temporary}
+	return &origin{kind: kind, caps: originCapabilitiesAll, prefix: p, driver: b}, nil
+}
+
+func (b *localBucket) Upload(_ context.Context, key string, r io.Reader, _ int64, in originUpload) (originAttrs, error) {
+	if !validLocalKey(key) {
+		return originAttrs{}, fmt.Errorf("%q: %w", key, ErrOriginKeyUnsupported)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if err := b.root.MkdirAll(path.Dir(key), 0o755); err != nil {
-		return originAttrs{}, err
-	}
 	current, exists, err := b.attrsLocked(key)
 	if err != nil {
 		return originAttrs{}, err
@@ -897,9 +924,17 @@ func (b *fsBucket) Upload(_ context.Context, key string, r io.Reader, _ int64, i
 	if !in.Precondition.Allows(exists, current.ETag) {
 		return originAttrs{}, errOriginPrecondition
 	}
+	if err := b.root.MkdirAll(path.Dir(key), 0o755); err != nil {
+		return originAttrs{}, localWriteError(key, err)
+	}
+	if exists {
+		if err := b.root.Remove(key); err != nil {
+			return originAttrs{}, err
+		}
+	}
 	f, err := b.root.Create(key)
 	if err != nil {
-		return originAttrs{}, err
+		return originAttrs{}, localWriteError(key, err)
 	}
 	if _, err := io.Copy(f, r); err != nil {
 		_ = f.Close()
@@ -910,70 +945,70 @@ func (b *fsBucket) Upload(_ context.Context, key string, r io.Reader, _ int64, i
 		_ = b.root.Remove(key)
 		return originAttrs{}, err
 	}
-	ct := in.ContentType
-	if ct == "" {
-		ct = contentTypeFor(key)
-	}
-	b.meta[key] = storedMeta{contentType: ct, contentEncoding: in.ContentEncoding, userMeta: clonePairs(in.UserMetadata)}
+	b.meta[key] = localMeta{contentType: in.ContentType, contentEncoding: in.ContentEncoding, userMeta: clonePairs(in.UserMetadata)}
 	attrs, _, err := b.attrsLocked(key)
 	return attrs, err
 }
 
-func (b *fsBucket) Delete(_ context.Context, key string) error {
+func (b *localBucket) Delete(_ context.Context, key string) error {
+	if !validLocalKey(key) {
+		return nil
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	err := b.root.Remove(key)
 	delete(b.meta, key)
-	if errors.Is(err, fs.ErrNotExist) {
+	err := b.root.Remove(key)
+	if err == nil || isMissingPath(err) {
+		return nil
+	}
+	if fi, statErr := b.root.Stat(key); statErr == nil && fi.IsDir() {
 		return nil
 	}
 	return err
 }
 
-func (b *fsBucket) GetWithAttrs(_ context.Context, key string) (io.ReadCloser, originAttrs, error) {
+func (b *localBucket) GetWithAttrs(_ context.Context, key string) (io.ReadCloser, originAttrs, error) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	attrs, ok, err := b.attrsLocked(key)
 	if err != nil {
-		b.mu.Unlock()
 		return nil, originAttrs{}, err
 	}
 	if !ok {
-		b.mu.Unlock()
 		return nil, originAttrs{}, fs.ErrNotExist
 	}
 	f, err := b.root.Open(key)
-	b.mu.Unlock()
 	if err != nil {
 		return nil, originAttrs{}, err
 	}
 	return f, attrs, nil
 }
 
-func (b *fsBucket) GetRange(_ context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
+func (b *localBucket) GetRange(_ context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
 	cond := store.ReadCondition{IfMatch: ifMatch}
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	attrs, exists, err := b.attrsLocked(key)
 	if err != nil {
-		b.mu.Unlock()
 		return nil, err
 	}
 	if !cond.Allows(exists, attrs.ETag) {
-		b.mu.Unlock()
 		return nil, errOriginPrecondition
 	}
+	if !exists {
+		return nil, fs.ErrNotExist
+	}
+	if offset < 0 || offset > attrs.Size {
+		return nil, fs.ErrInvalid
+	}
 	f, err := b.root.Open(key)
-	b.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return &rangeReadCloser{r: io.LimitReader(f, length), c: f}, nil
+	return &rangeReadCloser{r: io.NewSectionReader(f, offset, length), c: f}, nil
 }
 
-func (b *fsBucket) Attributes(_ context.Context, key string) (originAttrs, error) {
+func (b *localBucket) Attributes(_ context.Context, key string) (originAttrs, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	attrs, ok, err := b.attrsLocked(key)
@@ -986,55 +1021,124 @@ func (b *fsBucket) Attributes(_ context.Context, key string) (originAttrs, error
 	return attrs, nil
 }
 
-func (b *fsBucket) attrsLocked(name string) (originAttrs, bool, error) {
-	fi, err := b.root.Stat(name)
-	if errors.Is(err, fs.ErrNotExist) {
+func (b *localBucket) attrsLocked(key string) (originAttrs, bool, error) {
+	if !validLocalKey(key) {
 		return originAttrs{}, false, nil
 	}
+	fi, err := b.root.Stat(key)
 	if err != nil {
+		if isMissingPath(err) {
+			return originAttrs{}, false, nil
+		}
 		return originAttrs{}, false, err
 	}
-	sm := b.meta[name]
-	return originAttrsFor(name, fi.Size(), fmt.Sprintf("%d-%d", fi.Size(), fi.ModTime().UnixNano()),
-		fi.ModTime(), sm.contentType, sm.contentEncoding, sm.userMeta), true, nil
+	if fi.IsDir() {
+		return originAttrs{}, false, nil
+	}
+	m := b.meta[key]
+	size := fi.Size()
+	return originAttrsFor(key, size, fmt.Sprintf("%d-%d", size, fi.ModTime().UnixNano()),
+		fi.ModTime(), m.contentType, m.contentEncoding, m.userMeta), true, nil
 }
 
-func (b *fsBucket) Iter(_ context.Context, dir string) iter.Seq2[originObject, error] {
+func (b *localBucket) Iter(_ context.Context, dir string) iter.Seq2[originObject, error] {
 	return func(yield func(originObject, error) bool) {
-		physical := strings.TrimSuffix(dir, "/")
-		if physical == "" {
-			physical = "."
+		name := strings.TrimSuffix(dir, "/")
+		if name == "" {
+			name = "."
+		} else if !validLocalKey(name) {
+			return
 		}
-		err := fs.WalkDir(b.root.FS(), physical, func(name string, d fs.DirEntry, err error) error {
-			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					return nil
-				}
-				yield(originObject{}, err)
-				return fs.SkipAll
-			}
-			if d.IsDir() {
-				return nil
-			}
-			b.mu.Lock()
-			attrs, ok, err := b.attrsLocked(name)
-			b.mu.Unlock()
-			if err != nil {
-				yield(originObject{}, err)
-				return fs.SkipAll
-			}
-			if !ok || yield(originObject{Key: name, Attrs: attrs}, nil) {
-				return nil
-			}
-			return fs.SkipAll
-		})
-		if err != nil && !errors.Is(err, fs.SkipAll) && !errors.Is(err, fs.ErrNotExist) {
-			yield(originObject{}, err)
-		}
+		b.walk(name, yield)
 	}
 }
 
-func (b *fsBucket) Close() error { return b.root.Close() }
+func (b *localBucket) walk(dir string, yield func(originObject, error) bool) bool {
+	entries, err := b.readDir(dir)
+	if err != nil {
+		if isMissingPath(err) {
+			return true
+		}
+		yield(originObject{}, err)
+		return false
+	}
+	slices.SortFunc(entries, compareListing)
+	for _, entry := range entries {
+		name := entry.Name()
+		if dir != "." {
+			name = dir + "/" + name
+		}
+		if entry.IsDir() {
+			if !b.walk(name, yield) {
+				return false
+			}
+			continue
+		}
+		b.mu.Lock()
+		attrs, ok, err := b.attrsLocked(name)
+		b.mu.Unlock()
+		if err != nil {
+			yield(originObject{}, err)
+			return false
+		}
+		if ok && !yield(originObject{Key: name, Attrs: attrs}, nil) {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *localBucket) readDir(dir string) ([]fs.DirEntry, error) {
+	f, err := b.root.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.ReadDir(-1)
+}
+
+func (b *localBucket) Close() error {
+	name := b.root.Name()
+	err := b.root.Close()
+	if b.temporary {
+		err = errors.Join(err, os.RemoveAll(name))
+	}
+	return err
+}
+
+func compareListing(a, b fs.DirEntry) int {
+	return strings.Compare(listingKey(a), listingKey(b))
+}
+
+func listingKey(e fs.DirEntry) string {
+	if e.IsDir() {
+		return e.Name() + "/"
+	}
+	return e.Name()
+}
+
+func validLocalKey(key string) bool {
+	if strings.IndexByte(key, 0) >= 0 {
+		return false
+	}
+	for part := range strings.SplitSeq(key, "/") {
+		if part == "" || part == "." || part == ".." || len(part) > localNameMax {
+			return false
+		}
+	}
+	return true
+}
+
+func isMissingPath(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
+func localWriteError(key string, err error) error {
+	if errors.Is(err, syscall.EEXIST) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) {
+		return fmt.Errorf("%q conflicts with an existing object or prefix: %w", key, ErrOriginKeyUnsupported)
+	}
+	return err
+}
 
 type rangeReadCloser struct {
 	r io.Reader
@@ -1044,128 +1148,3 @@ type rangeReadCloser struct {
 func (r *rangeReadCloser) Read(p []byte) (int, error) { return r.r.Read(p) }
 
 func (r *rangeReadCloser) Close() error { return r.c.Close() }
-
-type memObject struct {
-	data []byte
-	mod  time.Time
-	ct   string
-	ce   string
-	meta []string
-}
-
-type memBucket struct {
-	mu   sync.Mutex
-	data map[string]memObject
-}
-
-func newMemBucket(c Config) *origin {
-	b := &memBucket{data: map[string]memObject{}}
-	return &origin{kind: "inmem", caps: originCapabilitiesAll, prefix: newOriginPrefix(c.Prefix), driver: b}
-}
-
-func (b *memBucket) Upload(_ context.Context, key string, r io.Reader, _ int64, in originUpload) (originAttrs, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return originAttrs{}, err
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	current, exists := b.attrsLocked(key)
-	if !in.Precondition.Allows(exists, current.ETag) {
-		return originAttrs{}, errOriginPrecondition
-	}
-	ct := in.ContentType
-	if ct == "" {
-		ct = contentTypeFor(key)
-	}
-	b.data[key] = memObject{data: cloneBytes(data), mod: time.Now().UTC(), ct: ct, meta: clonePairs(in.UserMetadata)}
-	attrs, _ := b.attrsLocked(key)
-	return attrs, nil
-}
-
-func (b *memBucket) Delete(_ context.Context, key string) error {
-	b.mu.Lock()
-	delete(b.data, key)
-	b.mu.Unlock()
-	return nil
-}
-
-func (b *memBucket) GetWithAttrs(_ context.Context, key string) (io.ReadCloser, originAttrs, error) {
-	b.mu.Lock()
-	attrs, ok := b.attrsLocked(key)
-	if !ok {
-		b.mu.Unlock()
-		return nil, originAttrs{}, fs.ErrNotExist
-	}
-	data := b.data[key].data
-	b.mu.Unlock()
-	return io.NopCloser(bytes.NewReader(data)), attrs, nil
-}
-
-func (b *memBucket) GetRange(_ context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
-	cond := store.ReadCondition{IfMatch: ifMatch}
-	b.mu.Lock()
-	attrs, exists := b.attrsLocked(key)
-	if !cond.Allows(exists, attrs.ETag) {
-		b.mu.Unlock()
-		return nil, errOriginPrecondition
-	}
-	o, ok := b.data[key]
-	b.mu.Unlock()
-	if !ok {
-		return nil, fs.ErrNotExist
-	}
-	if offset < 0 || offset > int64(len(o.data)) {
-		return nil, fs.ErrInvalid
-	}
-	end := min(offset+length, int64(len(o.data)))
-	return io.NopCloser(bytes.NewReader(o.data[offset:end])), nil
-}
-
-func (b *memBucket) Attributes(_ context.Context, key string) (originAttrs, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	attrs, ok := b.attrsLocked(key)
-	if !ok {
-		return originAttrs{}, fs.ErrNotExist
-	}
-	return attrs, nil
-}
-
-func (b *memBucket) attrsLocked(key string) (originAttrs, bool) {
-	o, ok := b.data[key]
-	if !ok {
-		return originAttrs{}, false
-	}
-	return originAttrsFor(key, int64(len(o.data)),
-		fmt.Sprintf("%d-%d", len(o.data), o.mod.UnixNano()), o.mod, o.ct, o.ce, o.meta), true
-}
-
-func (b *memBucket) Iter(_ context.Context, dir string) iter.Seq2[originObject, error] {
-	return func(yield func(originObject, error) bool) {
-		b.mu.Lock()
-		objects := make([]originObject, 0, len(b.data))
-		for key := range b.data {
-			if strings.HasPrefix(key, dir) {
-				attrs, _ := b.attrsLocked(key)
-				objects = append(objects, originObject{Key: key, Attrs: attrs})
-			}
-		}
-		b.mu.Unlock()
-		sort.Slice(objects, func(i, j int) bool { return objects[i].Key < objects[j].Key })
-		for _, object := range objects {
-			if !yield(object, nil) {
-				return
-			}
-		}
-	}
-}
-
-func (b *memBucket) Close() error { return nil }
-
-func cloneBytes(data []byte) []byte {
-	if data == nil {
-		return nil
-	}
-	return append([]byte(nil), data...)
-}

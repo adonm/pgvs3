@@ -298,6 +298,8 @@ func (s *Server) apiError(err error) error {
 		return errAccessDenied("gateway is read-only")
 	case errors.Is(err, objcache.ErrOriginConflict):
 		return apiErr("OperationAborted", "A conflicting conditional operation is in progress. Retry the request.", http.StatusConflict)
+	case errors.Is(err, objcache.ErrOriginKeyUnsupported):
+		return errInvalidRequest("the object key cannot be stored by the configured origin")
 	case errors.Is(err, objcache.ErrOriginUnsupported), errors.Is(err, objcache.ErrOriginListingUnsupported):
 		return apiErr("NotImplemented", "The configured origin does not support this operation.", http.StatusNotImplemented)
 	case errors.Is(err, store.ErrPrecondition):

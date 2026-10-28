@@ -578,7 +578,7 @@ func (b *blockingGetOrigin) GetWithAttrs(ctx context.Context, key string) (io.Re
 
 func TestFillLeaseCoalescesAcrossTiers(t *testing.T) {
 	ctx := testCtx
-	mem := newMemBucket(Config{})
+	mem := newTestOrigin(t, "")
 	if _, err := mem.Upload(ctx, "bkt/shared", strings.NewReader("shared-fill"), 11, originUpload{ContentType: "text/plain"}); err != nil {
 		t.Fatal(err)
 	}
@@ -655,7 +655,7 @@ func TestFillLeaseCoalescesAcrossTiers(t *testing.T) {
 
 func TestStaleFillCannotOverwriteNewerCacheVersion(t *testing.T) {
 	ctx := testCtx
-	mem := newMemBucket(Config{})
+	mem := newTestOrigin(t, "")
 	if _, err := mem.Upload(ctx, "bkt/race", strings.NewReader("old-version"), 11, originUpload{
 		ContentType: "text/plain",
 	}); err != nil {
@@ -719,7 +719,7 @@ func TestStaleFillCannotOverwriteNewerCacheVersion(t *testing.T) {
 
 func TestDeleteDuringFillCannotResurrectCache(t *testing.T) {
 	ctx := testCtx
-	mem := newMemBucket(Config{})
+	mem := newTestOrigin(t, "")
 	if _, err := mem.Upload(ctx, "bkt/delete-race", strings.NewReader("delete-me"), 9, originUpload{
 		ContentType: "text/plain",
 	}); err != nil {
@@ -1278,7 +1278,7 @@ func TestReadOnlyTierUsesDurableWriteCache(t *testing.T) {
 	if _, err := testStore.DropNamespace(ctx, ns.Cache, cache, true); err != nil {
 		t.Fatal(err)
 	}
-	origin := newMemBucket(Config{})
+	origin := newTestOrigin(t, "")
 	tier := &Tier{
 		origin: origin, store: testStore, namespace: cache, ttl: time.Hour,
 		retention: time.Hour, readOnly: true, fills: make(chan struct{}, 2),
@@ -1355,7 +1355,10 @@ func TestSharedReadCacheSurvivesOriginRemoval(t *testing.T) {
 
 func TestTierModelAcrossWorkers(t *testing.T) {
 	ctx := testCtx
-	mem := newMemBucket(Config{})
+	mem, err := newTempBucket(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	cache := fmt.Sprintf("origin-model-%d", time.Now().UnixNano())
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	newTier := func() *Tier {

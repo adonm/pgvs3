@@ -200,8 +200,18 @@ func TestSpoolStreamMemoryAndTempFile(t *testing.T) {
 	}
 }
 
+func newTestOrigin(t *testing.T, prefix string) *origin {
+	t.Helper()
+	o, err := newFSBucket(Config{Type: "filesystem", Prefix: prefix, Config: map[string]any{"directory": t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = o.Close() })
+	return o
+}
+
 func TestListSortsBeforeLimit(t *testing.T) {
-	b := newMemBucket(Config{})
+	b := newTestOrigin(t, "")
 	ctx := context.Background()
 	for _, k := range []string{"edge/dir/c", "edge/a", "edge/dir/b"} {
 		if _, err := b.Upload(ctx, k, strings.NewReader(k), int64(len(k)), originUpload{}); err != nil {
@@ -219,9 +229,13 @@ func TestListSortsBeforeLimit(t *testing.T) {
 	}
 }
 
-func TestMemBucketPrefixIsLogicalAtIterator(t *testing.T) {
+func TestTempOriginPrefixIsLogicalAtIterator(t *testing.T) {
 	ctx := context.Background()
-	b := newMemBucket(Config{Prefix: "tenant"})
+	b, err := newTempBucket(Config{Prefix: "tenant"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
 	if _, err := b.Upload(ctx, "edge/a", strings.NewReader("alpha"), 5, originUpload{
 		ContentType: "text/plain", UserMetadata: []string{"owner", "test"},
 	}); err != nil {
@@ -260,9 +274,85 @@ func (b *countingBucket) Attributes(ctx context.Context, key string) (originAttr
 	return b.originHandle.Attributes(ctx, key)
 }
 
+func TestTempOriginRemovesDirectoryOnClose(t *testing.T) {
+	o, err := newTempBucket(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := o.driver.(*localBucket).root.Name()
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("temporary origin directory survived Close: %v", err)
+	}
+}
+
+func TestLocalOriginOverwriteKeepsOpenReaders(t *testing.T) {
+	ctx := context.Background()
+	temp, err := newTempBucket(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer temp.Close()
+	for _, o := range []*origin{newTestOrigin(t, ""), temp} {
+		if _, err := o.Upload(ctx, "bkt/k", strings.NewReader("old-version"), 11, originUpload{}); err != nil {
+			t.Fatal(err)
+		}
+		rc, attrs, err := o.GetWithAttrs(ctx, "bkt/k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := o.Upload(ctx, "bkt/k", strings.NewReader("new-version-longer"), 18, originUpload{}); err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil || string(body) != "old-version" || attrs.Size != 11 {
+			t.Fatalf("open reader saw %q (size %d, err %v) after overwrite", body, attrs.Size, err)
+		}
+		if got := conformanceGet(t, ctx, o, "bkt/k"); got != "new-version-longer" {
+			t.Fatalf("overwritten object = %q", got)
+		}
+	}
+}
+
+func TestLocalPathRules(t *testing.T) {
+	long := strings.Repeat("n", localNameMax)
+	for _, tc := range []struct {
+		key  string
+		want bool
+	}{
+		{"bkt/a", true},
+		{"bkt/a b/c-d.txt", true},
+		{"bkt/" + long, true},
+		{"bkt/" + long + "n", false},
+		{"", false},
+		{"bkt//a", false},
+		{"bkt/a/", false},
+		{"/bkt/a", false},
+		{"bkt/./a", false},
+		{"bkt/../a", false},
+		{"bkt/a\x00", false},
+	} {
+		if got := validLocalKey(tc.key); got != tc.want {
+			t.Fatalf("validLocalKey(%q) = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+	if _, err := newTempBucket(Config{Prefix: "a//b"}); err == nil {
+		t.Fatal("temporary origin accepted a prefix that cannot be a path")
+	}
+	if _, err := newFSBucket(Config{Type: "filesystem", Prefix: "../escape", Config: map[string]any{"directory": t.TempDir()}}); err == nil {
+		t.Fatal("filesystem origin accepted a prefix that cannot be a path")
+	}
+}
+
 func TestListDirectUsesIteratorMetadata(t *testing.T) {
 	ctx := context.Background()
-	mem := newMemBucket(Config{})
+	mem := newTestOrigin(t, "")
 	for _, key := range []string{"edge/a", "edge/b"} {
 		if _, err := mem.Upload(ctx, key, strings.NewReader(key), int64(len(key)), originUpload{
 			ContentType: "text/plain",
@@ -401,7 +491,10 @@ func TestOriginCapabilitySets(t *testing.T) {
 	}
 	defer files.Close()
 
-	memory := newMemBucket(Config{})
+	memory, err := newTempBucket(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer memory.Close()
 
 	objects, err := newS3Bucket(Config{Type: "s3", Config: map[string]any{
@@ -480,7 +573,10 @@ func TestOriginCapabilityGating(t *testing.T) {
 		t.Fatalf("Tier.List error = %v", err)
 	}
 
-	memory := newMemBucket(Config{})
+	memory, err := newTempBucket(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer memory.Close()
 	memory.caps &^= capConditional
 	if _, err := memory.Upload(ctx, "k", strings.NewReader("x"), 1, originUpload{
@@ -577,7 +673,11 @@ func TestSharedPrefixBehavior(t *testing.T) {
 		{
 			name: "inmem",
 			open: func(t *testing.T) (*origin, string) {
-				return newMemBucket(Config{Prefix: "/tenant/"}), ""
+				o, err := newTempBucket(Config{Prefix: "/tenant/"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return o, ""
 			},
 		},
 	}
@@ -668,6 +768,8 @@ type conformanceFixture struct {
 	conflict bool
 
 	physicalKeys func() []string
+
+	localPaths bool
 }
 
 type conformanceFactory func(t *testing.T, prefix string) conformanceFixture
@@ -677,12 +779,13 @@ func originConformance(t *testing.T, name string, factory conformanceFactory) {
 	ctx := context.Background()
 
 	type conformanceCase struct {
-		name            string
-		requires        originCapabilities
-		prefix          string
-		requirePrefix   bool
-		requireConflict bool
-		run             func(t *testing.T, ctx context.Context, fx conformanceFixture)
+		name              string
+		requires          originCapabilities
+		prefix            string
+		requirePrefix     bool
+		requireConflict   bool
+		requireLocalPaths bool
+		run               func(t *testing.T, ctx context.Context, fx conformanceFixture)
 	}
 	cases := []conformanceCase{
 		{
@@ -738,6 +841,12 @@ func originConformance(t *testing.T, name string, factory conformanceFactory) {
 			run:             conformanceConflict,
 		},
 		{
+			name:              "local-path-rules",
+			requires:          capRead | capWrite | capList | capRange | capMetadata,
+			requireLocalPaths: true,
+			run:               conformanceLocalPaths,
+		},
+		{
 			name: "close-is-safe",
 			run:  conformanceClose,
 		},
@@ -755,6 +864,9 @@ func originConformance(t *testing.T, name string, factory conformanceFactory) {
 			}
 			if tc.requireConflict && !fx.conflict {
 				t.Skipf("%s test double cannot synthesize a conditional conflict", name)
+			}
+			if tc.requireLocalPaths && !fx.localPaths {
+				t.Skipf("%s does not map keys onto local paths", name)
 			}
 			if tc.requires != 0 && !fx.handle.Supports(tc.requires) {
 				t.Skipf("%s lacks %s (caps %s)", name, tc.requires, fx.handle.Capabilities())
@@ -1173,6 +1285,61 @@ func conformanceConflict(t *testing.T, ctx context.Context, fx conformanceFixtur
 	}
 }
 
+func conformanceLocalPaths(t *testing.T, ctx context.Context, fx conformanceFixture) {
+	t.Helper()
+	h := fx.handle
+	for _, key := range []string{"edge/dir/file", "edge/a/c", "edge/a.txt", "edge/a-b"} {
+		if _, err := h.Upload(ctx, key, strings.NewReader(key), int64(len(key)), originUpload{}); err != nil {
+			t.Fatalf("Upload %s: %v", key, err)
+		}
+	}
+	want := []string{"edge/a-b", "edge/a.txt", "edge/a/c", "edge/dir/file"}
+	if got := conformanceIterKeys(t, ctx, h, "edge/"); !slices.Equal(got, want) {
+		t.Fatalf("Iter(edge/) keys = %#v, want %#v", got, want)
+	}
+	if got := conformanceIterKeys(t, ctx, h, "edge/a-b/"); len(got) != 0 {
+		t.Fatalf("Iter below a file yielded %#v", got)
+	}
+
+	tooLong := "edge/" + strings.Repeat("n", localNameMax+1)
+	for _, key := range []string{"edge//a-b", "edge/a-b/", "/edge/a-b", "edge/./a-b", "edge/../edge/a-b", tooLong} {
+		if _, err := h.Upload(ctx, key, strings.NewReader("x"), 1, originUpload{}); !errors.Is(err, ErrOriginKeyUnsupported) {
+			t.Fatalf("Upload %q error = %v, want ErrOriginKeyUnsupported", key, err)
+		}
+		if err := h.Delete(ctx, key); err != nil {
+			t.Fatalf("Delete %q: %v", key, err)
+		}
+		if _, err := h.Get(ctx, key); !h.IsObjNotFoundErr(err) {
+			t.Fatalf("Get %q error = %v, want not found", key, err)
+		}
+	}
+	for _, key := range []string{"edge/dir", "edge/a-b/child"} {
+		if _, err := h.Upload(ctx, key, strings.NewReader("x"), 1, originUpload{}); !errors.Is(err, ErrOriginKeyUnsupported) {
+			t.Fatalf("conflicting Upload %q error = %v, want ErrOriginKeyUnsupported", key, err)
+		}
+		if _, err := h.Attributes(ctx, key); !h.IsObjNotFoundErr(err) {
+			t.Fatalf("Attributes %q error = %v, want not found", key, err)
+		}
+		if _, err := h.GetRange(ctx, key, 0, 1, ""); !h.IsObjNotFoundErr(err) {
+			t.Fatalf("GetRange %q error = %v, want not found", key, err)
+		}
+	}
+	if got := conformanceIterKeys(t, ctx, h, "edge/"); !slices.Equal(got, want) {
+		t.Fatalf("rejected keys changed the listing: %#v", got)
+	}
+
+	if err := h.Delete(ctx, "edge/dir"); err != nil {
+		t.Fatalf("Delete of a directory path: %v", err)
+	}
+	if got := conformanceGet(t, ctx, h, "edge/dir/file"); got != "edge/dir/file" {
+		t.Fatalf("deleting a directory path changed its object: %q", got)
+	}
+	if rc, err := h.GetRange(ctx, "edge/a-b", int64(len("edge/a-b"))+1, 1, ""); err == nil {
+		_ = rc.Close()
+		t.Fatal("GetRange beyond the object end succeeded")
+	}
+}
+
 func conformanceClose(t *testing.T, _ context.Context, fx conformanceFixture) {
 	t.Helper()
 	if err := fx.handle.Close(); err != nil {
@@ -1253,6 +1420,7 @@ func conformanceMemFactory(t *testing.T, prefix string) conformanceFixture {
 		handle:        o,
 		caps:          originCapabilitiesAll,
 		prefixMapping: true,
+		localPaths:    true,
 	}
 }
 
@@ -1269,6 +1437,7 @@ func conformanceFSFactory(t *testing.T, prefix string) conformanceFixture {
 		handle:        o,
 		caps:          originCapabilitiesAll,
 		prefixMapping: true,
+		localPaths:    true,
 		physicalKeys: func() []string {
 			var keys []string
 			err := filepath.WalkDir(dir, func(name string, entry fs.DirEntry, err error) error {

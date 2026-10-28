@@ -128,6 +128,15 @@ func TestIngestErrorMapsOriginUnsupported(t *testing.T) {
 	}
 }
 
+func TestIngestErrorMapsUnrepresentableKeyToBadRequest(t *testing.T) {
+	s := &Server{}
+	err := fmt.Errorf("upload: %w", objcache.ErrOriginKeyUnsupported)
+	ae, ok := s.apiError(err).(*APIError)
+	if !ok || ae.Status != http.StatusBadRequest || ae.Code != "InvalidRequest" {
+		t.Fatalf("unrepresentable key mapped to %+v", ae)
+	}
+}
+
 func TestServerRequestSemaphore(t *testing.T) {
 	s := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), false, 1)
 	release, ok := s.acquire()
