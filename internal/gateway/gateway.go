@@ -56,6 +56,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) SetDraining(v bool) { g.s3.SetDraining(v) }
 
+func (g *Gateway) Close() { g.s3.Close() }
+
 func (g *Gateway) SetVersion(v string) {
 	g.resp.SetVersion(v)
 	g.ojs.SetVersion(v)

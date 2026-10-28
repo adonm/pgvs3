@@ -57,6 +57,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	testutil.Must(t, err)
 	defer tier.Close()
 	srv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
+	defer srv.Close()
 	srv.SetOrigin(tier)
 	httpSrv := httptest.NewServer(srv)
 	defer httpSrv.Close()
@@ -212,6 +213,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	t.Run("encoded headers and error statuses", func(t *testing.T) {
 		bucket := fmt.Sprintf("errbucket-%d", time.Now().UnixNano())
 		local := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
+		defer local.Close()
 		localSrv := httptest.NewServer(local)
 		defer localSrv.Close()
 		client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
@@ -319,9 +321,11 @@ func TestOriginRequiresCatalogBucket(t *testing.T) {
 	defer globalTier.Close()
 
 	nativeSrv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
+	defer nativeSrv.Close()
 	nativeHTTP := httptest.NewServer(nativeSrv)
 	defer nativeHTTP.Close()
 	globalSrv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
+	defer globalSrv.Close()
 	globalSrv.SetOrigin(globalTier)
 	globalHTTP := httptest.NewServer(globalSrv)
 	defer globalHTTP.Close()

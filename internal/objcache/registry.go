@@ -149,16 +149,19 @@ type Registry struct {
 	log         *slog.Logger
 	mu          sync.RWMutex
 	refreshMu   sync.Mutex
-	defaultTier *Tier
+	defaultTier *registeredTier
 	runtime     *Runtime
 	options     TierOptions
 	checked     atomic.Int64
-	tiers       map[string]registeredTier
+	tiers       map[string]*registeredTier
+	closed      bool
 }
 
 type registeredTier struct {
-	spec Spec
-	tier *Tier
+	spec    Spec
+	tier    *Tier
+	users   int
+	retired bool
 }
 
 func NewRegistry(st *store.Store, log *slog.Logger, runtime *Runtime, opts TierOptions) *Registry {
@@ -167,7 +170,7 @@ func NewRegistry(st *store.Store, log *slog.Logger, runtime *Runtime, opts TierO
 		log:     log,
 		runtime: runtime,
 		options: opts,
-		tiers:   map[string]registeredTier{},
+		tiers:   map[string]*registeredTier{},
 	}
 }
 
@@ -175,26 +178,84 @@ func (r *Registry) WriteMetrics(w io.Writer) { r.runtime.WriteMetrics(w) }
 
 func (r *Registry) SetDefault(t *Tier) {
 	r.mu.Lock()
-	r.defaultTier = t
+	old := r.defaultTier
+	if old != nil && old.tier == t {
+		r.mu.Unlock()
+		return
+	}
+	if r.closed {
+		r.mu.Unlock()
+		if t != nil {
+			_ = t.Close()
+		}
+		return
+	}
+	r.defaultTier = nil
+	if t != nil {
+		r.defaultTier = &registeredTier{tier: t}
+	}
 	r.mu.Unlock()
+	r.retire(old)
 }
 
-func (r *Registry) ForBucket(ctx context.Context, bucket string) *Tier {
+func (r *Registry) Acquire(ctx context.Context, bucket string) (*Tier, func()) {
 	if r == nil {
-		return nil
+		return nil, nil
 	}
 	r.refreshIfStale(ctx)
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if bucket != "" {
-		if entry, ok := r.tiers[bucket]; ok {
-			return entry.tier
-		}
+	r.mu.Lock()
+	entry := r.tiers[bucket]
+	if entry == nil {
+		entry = r.tiers[""]
 	}
-	if entry, ok := r.tiers[""]; ok {
-		return entry.tier
+	if entry == nil {
+		entry = r.defaultTier
 	}
-	return r.defaultTier
+	if entry == nil || r.closed {
+		r.mu.Unlock()
+		return nil, nil
+	}
+	entry.users++
+	r.mu.Unlock()
+	var once sync.Once
+	return entry.tier, func() {
+		once.Do(func() {
+			r.mu.Lock()
+			entry.users--
+			closeTier := entry.retired && entry.users == 0
+			r.mu.Unlock()
+			if closeTier {
+				_ = entry.tier.Close()
+			}
+		})
+	}
+}
+
+func (r *Registry) retire(entry *registeredTier) {
+	if entry == nil {
+		return
+	}
+	r.mu.Lock()
+	entry.retired = true
+	closeTier := entry.users == 0
+	r.mu.Unlock()
+	if closeTier {
+		_ = entry.tier.Close()
+	}
+}
+
+func (r *Registry) Close() {
+	r.mu.Lock()
+	r.closed = true
+	retired := []*registeredTier{r.defaultTier}
+	for _, entry := range r.tiers {
+		retired = append(retired, entry)
+	}
+	r.defaultTier, r.tiers = nil, nil
+	r.mu.Unlock()
+	for _, entry := range retired {
+		r.retire(entry)
+	}
 }
 
 func (r *Registry) refreshIfStale(ctx context.Context) {
@@ -227,17 +288,21 @@ func (r *Registry) refreshIfStale(ctx context.Context) {
 
 func (r *Registry) replace(wanted map[string]Spec) {
 	r.mu.RLock()
-	current := make(map[string]registeredTier, len(r.tiers))
+	if r.closed {
+		r.mu.RUnlock()
+		return
+	}
+	current := make(map[string]*registeredTier, len(r.tiers))
 	maps.Copy(current, r.tiers)
 	r.mu.RUnlock()
 
-	var retired []*Tier
+	var retired []*registeredTier
 	for bucket, entry := range current {
 		if _, ok := wanted[bucket]; !ok {
-			retired = append(retired, entry.tier)
+			retired = append(retired, entry)
 		}
 	}
-	opened := make(map[string]registeredTier, len(wanted))
+	opened := make(map[string]*registeredTier, len(wanted))
 	for bucket, spec := range wanted {
 		if entry, ok := current[bucket]; ok && entry.spec == spec {
 			continue
@@ -249,13 +314,20 @@ func (r *Registry) replace(wanted map[string]Spec) {
 			}
 			continue
 		}
-		opened[bucket] = registeredTier{spec: spec, tier: tier}
+		opened[bucket] = &registeredTier{spec: spec, tier: tier}
 		if entry, ok := current[bucket]; ok {
-			retired = append(retired, entry.tier)
+			retired = append(retired, entry)
 		}
 	}
 
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		for _, entry := range opened {
+			_ = entry.tier.Close()
+		}
+		return
+	}
 	for bucket := range r.tiers {
 		if _, ok := wanted[bucket]; !ok {
 			delete(r.tiers, bucket)
@@ -264,7 +336,7 @@ func (r *Registry) replace(wanted map[string]Spec) {
 	maps.Copy(r.tiers, opened)
 	r.mu.Unlock()
 
-	for _, tier := range retired {
-		_ = tier.Close()
+	for _, entry := range retired {
+		r.retire(entry)
 	}
 }

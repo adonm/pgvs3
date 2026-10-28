@@ -55,8 +55,11 @@ func TestRegistryReplacementAndFallback(t *testing.T) {
 	bucket := Spec{Namespace: "bucket", Config: `{"type":"ephemeral"}`}
 	wanted := map[string]Spec{"": global, "lake": bucket}
 	r.replace(wanted)
-	defer r.replace(nil)
-	g, b := r.ForBucket(context.Background(), "other"), r.ForBucket(context.Background(), "lake")
+	defer r.Close()
+	g, releaseGlobal := r.Acquire(context.Background(), "other")
+	b, releaseBucket := r.Acquire(context.Background(), "lake")
+	defer releaseGlobal()
+	defer releaseBucket()
 	if g == nil || b == nil || g == b || g.Name() != "global" || b.Name() != "bucket" {
 		t.Fatalf("unexpected global/bucket resolution: %v %v", g, b)
 	}
@@ -73,17 +76,68 @@ func TestRegistryReplacementAndFallback(t *testing.T) {
 		t.Fatal("failed replacements discarded working tiers")
 	}
 	global.TTL = "2m"
+	releaseGlobal()
+	releaseBucket()
 	r.replace(map[string]Spec{"": global})
 	if r.tiers[""].tier == g || g.ctx.Err() == nil || b.ctx.Err() == nil {
 		t.Fatal("replacement/removal did not close the old tiers")
 	}
-	if r.ForBucket(context.Background(), "lake") != r.tiers[""].tier {
+	fallback, release := r.Acquire(context.Background(), "lake")
+	if fallback != r.tiers[""].tier {
 		t.Fatal("removed bucket did not fall back to the global tier")
 	}
-	r.SetDefault(g)
+	release()
+	defaultTier, err := New(nil, []byte(`{"type":"ephemeral"}`), nil, r.runtime, TierOptions{ReadOnly: true})
+	testutil.Must(t, err)
+	r.SetDefault(defaultTier)
 	r.replace(nil)
-	if r.ForBucket(context.Background(), "lake") != g {
+	fallback, release = r.Acquire(context.Background(), "lake")
+	defer release()
+	if fallback != defaultTier {
 		t.Fatal("missing global tier did not fall back to the default")
+	}
+}
+
+func TestRegistryRetiresAfterLastBorrower(t *testing.T) {
+	for _, action := range []string{"replace", "remove", "default", "close"} {
+		t.Run(action, func(t *testing.T) {
+			r := NewRegistry(nil, nil, NewRuntime(RuntimeOptions{}), TierOptions{ReadOnly: true})
+			defer r.Close()
+			spec := Spec{Namespace: "origin", Config: `{"type":"ephemeral"}`}
+			if action == "default" {
+				tier, err := NewFromSpec(nil, nil, r.runtime, spec, r.options)
+				testutil.Must(t, err)
+				r.SetDefault(tier)
+			} else {
+				r.replace(map[string]Spec{"": spec})
+			}
+			old, first := r.Acquire(context.Background(), "bucket")
+			_, last := r.Acquire(context.Background(), "bucket")
+			defer first()
+			defer last()
+			switch action {
+			case "replace":
+				spec.TTL = "2m"
+				r.replace(map[string]Spec{"": spec})
+			case "remove":
+				r.replace(nil)
+			case "default":
+				r.SetDefault(nil)
+			case "close":
+				r.Close()
+			}
+			first()
+			first()
+			if old.ctx.Err() != nil {
+				t.Fatal("retired tier closed with an active borrower")
+			}
+			_, err := old.origin.Upload(context.Background(), "object", strings.NewReader("body"), 4, originUpload{})
+			testutil.Must(t, err)
+			last()
+			if old.ctx.Err() == nil {
+				t.Fatal("retired tier stayed open after its last borrower")
+			}
+		})
 	}
 }
 

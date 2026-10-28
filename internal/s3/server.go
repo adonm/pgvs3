@@ -137,6 +137,8 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 
 func (s *Server) SetDraining(v bool) { s.draining.Store(v) }
 
+func (s *Server) Close() { s.origins.Close() }
+
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
 	if err := prepareBody(r); err != nil {
 		return err
@@ -151,6 +153,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
 	if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return errAccessDenied("gateway is read-only")
 	}
+	r, release := s.bindBackends(r)
+	defer release()
 	q := r.URL.Query()
 	switch {
 	case bucket == "":

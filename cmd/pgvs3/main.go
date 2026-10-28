@@ -239,12 +239,10 @@ func serve(args []string) int {
 	if err != nil {
 		return 1
 	}
-	if origin != nil {
-		defer origin.Close()
-	}
 	origins := objcache.NewRegistry(st, log, runtime, objcache.TierOptions{ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack})
 	origins.SetDefault(origin)
 	g := newGateway(ctx, st, cfg, origins, log)
+	defer g.Close()
 	startPprof(cfg.pprofAddr, log)
 	return runGateway(ctx, g, cfg, log)
 }

@@ -55,12 +55,14 @@ func TestCRC64NVMEAgainstBitwise(t *testing.T) {
 }
 
 func TestBackendSelectionSharesAllCapabilities(t *testing.T) {
-	ctx := context.Background()
 	s := New(nil, nil, false, 1, nil)
-	capabilities := func() []any {
+	defer s.Close()
+	capabilities := func(ctx context.Context) []any {
 		return []any{s.backendFor(ctx, "lake"), s.writeBackendFor(ctx, "lake"), s.multipartBackendFor(ctx, "lake")}
 	}
-	for _, backend := range capabilities() {
+	native, releaseNative := s.bindBackends(httptest.NewRequest("GET", "/lake/key", nil))
+	defer releaseNative()
+	for _, backend := range capabilities(native.Context()) {
 		if _, ok := backend.(localBackend); !ok {
 			t.Fatalf("native capability selected %T", backend)
 		}
@@ -71,13 +73,23 @@ func TestBackendSelectionSharesAllCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tier.Close()
 	s.SetOrigin(tier)
-	for _, backend := range capabilities() {
+	originRequest, releaseOrigin := s.bindBackends(httptest.NewRequest("GET", "/lake/key", nil))
+	defer releaseOrigin()
+	for _, backend := range capabilities(originRequest.Context()) {
 		origin, ok := backend.(originBackend)
 		if !ok || origin.Tier != tier {
 			t.Fatalf("origin capability selected %T", backend)
 		}
+	}
+	s.SetOrigin(nil)
+	for _, backend := range capabilities(originRequest.Context()) {
+		if origin, ok := backend.(originBackend); !ok || origin.Tier != tier {
+			t.Fatal("request changed backends during origin replacement")
+		}
+	}
+	if _, ok := s.objectBackendFor(native.Context(), "lake").(localBackend); !ok {
+		t.Fatal("native request switched to a newly configured origin")
 	}
 }
 

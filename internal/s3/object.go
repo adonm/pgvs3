@@ -36,6 +36,51 @@ type objectBackend interface {
 	multipartBackend
 }
 
+type requestBackendsKey struct{}
+
+type bucketBackend struct {
+	bucket  string
+	origin  *objcache.Tier
+	backend objectBackend
+	release func()
+}
+
+type requestBackends struct {
+	context context.Context
+	entries []bucketBackend
+}
+
+func (s *Server) bindBackends(r *http.Request) (*http.Request, func()) {
+	backends := &requestBackends{context: r.Context()}
+	r = r.WithContext(context.WithValue(r.Context(), requestBackendsKey{}, backends))
+	return r, func() {
+		for _, entry := range backends.entries {
+			if entry.release != nil {
+				entry.release()
+			}
+		}
+	}
+}
+
+func (s *Server) selectedBackend(ctx context.Context, bucket string) bucketBackend {
+	backends, ok := ctx.Value(requestBackendsKey{}).(*requestBackends)
+	if !ok {
+		return bucketBackend{bucket: bucket, backend: localBackend{store: s.store}}
+	}
+	for _, entry := range backends.entries {
+		if entry.bucket == bucket {
+			return entry
+		}
+	}
+	tier, release := s.origins.Acquire(backends.context, bucket)
+	entry := bucketBackend{bucket: bucket, origin: tier, backend: localBackend{store: s.store}, release: release}
+	if tier != nil {
+		entry.backend = originBackend{Tier: tier}
+	}
+	backends.entries = append(backends.entries, entry)
+	return entry
+}
+
 type readBackend interface {
 	Head(ctx context.Context, bucket, key string) (readHead, error)
 	Open(ctx context.Context, bucket, key string, rng store.ByteRange) (*store.ReadResult, error)
@@ -50,10 +95,7 @@ func (s *Server) backendFor(ctx context.Context, bucket string) readBackend {
 }
 
 func (s *Server) objectBackendFor(ctx context.Context, bucket string) objectBackend {
-	if origin := s.originFor(ctx, bucket); origin != nil {
-		return originBackend{Tier: origin}
-	}
-	return localBackend{store: s.store}
+	return s.selectedBackend(ctx, bucket).backend
 }
 
 type localBackend struct {
@@ -101,10 +143,7 @@ func (b originBackend) Head(ctx context.Context, bucket, key string) (readHead, 
 func (s *Server) SetOrigin(t *objcache.Tier) { s.origins.SetDefault(t) }
 
 func (s *Server) originFor(ctx context.Context, bucket string) *objcache.Tier {
-	if s.origins == nil {
-		return nil
-	}
-	return s.origins.ForBucket(ctx, bucket)
+	return s.selectedBackend(ctx, bucket).origin
 }
 
 func (s *Server) serveOriginBucket(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) error {
