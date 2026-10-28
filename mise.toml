@@ -4,12 +4,19 @@
 just = "1.59.0"
 go = "1.27.3"
 ko = "0.19.1"
-uv = "0.13.4"
+uv = "0.13.5"
 python = "3.12.15"
 helm = "4.3.1"
+kind = "0.33.0"
+kubectl = "1.37.1"
 rclone = "1.75.2"
 restic = "0.19.1"
-rust = "1.99.1"
+
+# Git hooks and Go quality tools. `mise install` provisions them for hk.
+hk = "2.8.1"
+"go:golang.org/x/tools/cmd/goimports" = "0.52.0"
+"go:honnef.co/go/tools/cmd/staticcheck" = "0.8.2"
+"go:golang.org/x/vuln/cmd/govulncheck" = "1.9.0"
 
 # DuckDB for `just contract`, `just ducklake` and `just bench`.
 [env]

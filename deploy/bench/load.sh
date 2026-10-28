@@ -75,26 +75,24 @@ for op in resp-set resp-get; do
   run -op "$op" -size 4096 -workers 64 -pipeline 1 -duration 5s -count 2000
   run -op "$op" -size 4096 -workers 64 -pipeline 16 -duration 5s -count 2000
 done
-# SQS queue protocol: send and receive+delete on the same listener.
+# OJS queue protocol: enqueue and fetch+ack on the same listener.
 for w in 1 64; do
-  run -op sqs-send -size 4096 -workers "$w" -pipeline 1 -duration 5s -queue benchq
-  run -op sqs-send -size 4096 -workers 64 -pipeline 16 -duration 5s -queue benchq
+  run -op ojs-enqueue -size 4096 -workers "$w" -pipeline 1 -duration 5s -queue benchq
+  run -op ojs-enqueue -size 4096 -workers 64 -pipeline 16 -duration 5s -queue benchq
 done
 for w in 1 32; do
-  run -op sqs-recv -size 4096 -workers "$w" -pipeline 1 -duration 5s -queue benchq
+  run -op ojs-fetch -size 4096 -workers "$w" -pipeline 1 -duration 5s -queue benchq
 done
 
-# S3 cache tier in front of a filesystem origin (thanos objstore).
+# S3 cache tier in front of a filesystem origin.
 origin_dir="$PWD/.tmp/pgvs3/origin"
 rm -rf "$origin_dir"; mkdir -p "$origin_dir"
-cat > .tmp/pgvs3/origin.yaml <<YAML
-type: filesystem
-config:
-  directory: $origin_dir
-YAML
+cat > .tmp/pgvs3/origin.json <<JSON
+{"type":"filesystem","config":{"directory":"$origin_dir"}}
+JSON
 read -r cport < <(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 PGVS3_URL="$url" PGVS3_POOL_MAX=64 PGVS3_LOG_LEVEL=warn \
-  .tmp/pgvs3/pgvs3 serve --addr "127.0.0.1:$cport" --origin-config .tmp/pgvs3/origin.yaml \
+  .tmp/pgvs3/pgvs3 serve --addr "127.0.0.1:$cport" --origin-config .tmp/pgvs3/origin.json \
   --cache-namespace loadcache --cache-ttl 5m > .tmp/pgvs3/load-origin.log 2>&1 &
 cpid=$!
 for i in $(seq 1 120); do

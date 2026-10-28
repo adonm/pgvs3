@@ -5,29 +5,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"gopkg.in/yaml.v2"
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
-// Spec is an origin cache configuration persisted inside PostgreSQL in
-// `s3p.namespaces.attrs["origin"]` (and mirrored in `<schema>.meta.attrs`).
 type Spec struct {
-	Scope      string `json:"scope"` // "global" or "bucket"
+	Scope      string `json:"scope"`
 	Bucket     string `json:"bucket,omitempty"`
 	Namespace  string `json:"namespace"`
 	TTL        string `json:"ttl,omitempty"`
 	Retention  string `json:"retention,omitempty"`
 	MaxFills   int    `json:"max_fills,omitempty"`
-	ConfigYAML string `json:"config_yaml"`
+	RangeChunk int64  `json:"range_chunk,omitempty"`
+	Config     string `json:"config,omitempty"`
 }
 
-// NewFromSpec builds a Tier from a database-stored Spec.
-func NewFromSpec(log *slog.Logger, st *store.Store, spec Spec) (*Tier, error) {
+func NewFromSpec(log *slog.Logger, st *store.Store, spec Spec, readOnly bool) (*Tier, error) {
 	ttl := time.Minute
 	if spec.TTL != "" {
 		d, err := time.ParseDuration(spec.TTL)
@@ -44,17 +42,29 @@ func NewFromSpec(log *slog.Logger, st *store.Store, spec Spec) (*Tier, error) {
 		}
 		ret = d
 	}
-	return New(log, []byte(spec.ConfigYAML), st, spec.Namespace, ttl, ret, spec.MaxFills)
+	t, err := newTier(log, []byte(spec.Config), st, spec.Namespace, ttl, ret, spec.MaxFills, readOnly)
+	if err != nil {
+		return nil, err
+	}
+	t.EnableRangeCache(spec.RangeChunk)
+	return t, nil
 }
 
-// SaveSpec validates and persists an origin configuration in PostgreSQL so any
-// gateway connected to the database automatically serves the cache tier without
-// external config files. When bucket is empty, the origin applies globally
-// across all buckets; otherwise it applies only to the named bucket.
+func ValidateConfig(config []byte) error {
+	c, err := parseConfig(config)
+	if err != nil {
+		return err
+	}
+	o, err := newOrigin(c)
+	if err != nil {
+		return err
+	}
+	return o.Close()
+}
+
 func SaveSpec(ctx context.Context, st *store.Store, bucket string, spec Spec) error {
-	var c Config
-	if err := yaml.UnmarshalStrict([]byte(spec.ConfigYAML), &c); err != nil {
-		return fmt.Errorf("parse origin config: %w", err)
+	if err := ValidateConfig([]byte(spec.Config)); err != nil {
+		return fmt.Errorf("invalid origin config: %w", err)
 	}
 	if spec.Namespace == "" {
 		if bucket != "" {
@@ -65,6 +75,17 @@ func SaveSpec(ctx context.Context, st *store.Store, bucket string, spec Spec) er
 	}
 	if !ns.ValidName(spec.Namespace) {
 		return fmt.Errorf("invalid cache namespace %q", spec.Namespace)
+	}
+	if bucket == "" {
+		specs, err := ListSpecs(ctx, st)
+		if err != nil {
+			return err
+		}
+		for _, existing := range specs {
+			if (existing.Scope == "global" || existing.Bucket == "") && existing.Namespace != spec.Namespace {
+				return fmt.Errorf("a global origin already exists in cache namespace %q", existing.Namespace)
+			}
+		}
 	}
 	if err := st.EnsureNamespace(ctx, ns.Cache, spec.Namespace, nil, nil); err != nil {
 		return err
@@ -88,7 +109,6 @@ func SaveSpec(ctx context.Context, st *store.Store, bucket string, spec Spec) er
 	return st.SetNamespaceAttrs(ctx, targetKind, targetName, map[string]any{"origin": spec})
 }
 
-// ClearSpec removes a persisted origin configuration from PostgreSQL.
 func ClearSpec(ctx context.Context, st *store.Store, bucket, cacheNS string) error {
 	kind := ns.Cache
 	name := cacheNS
@@ -99,67 +119,55 @@ func ClearSpec(ctx context.Context, st *store.Store, bucket, cacheNS string) err
 		kind = ns.Bucket
 		name = bucket
 	}
-	sc, err := kind.Schema(name)
-	if err != nil {
-		return err
-	}
-	if _, err := st.Pool().Exec(ctx,
-		"UPDATE s3p.namespaces SET attrs = attrs - 'origin' WHERE kind = $1 AND name = $2",
-		string(kind), name); err != nil {
-		return err
-	}
-	_, _ = st.Pool().Exec(ctx, fmt.Sprintf("UPDATE %q.meta SET attrs = attrs - 'origin'", sc))
-	return nil
+	return st.RemoveNamespaceAttr(ctx, kind, name, "origin")
 }
 
-// ListSpecs returns every origin Spec currently stored in PostgreSQL.
 func ListSpecs(ctx context.Context, st *store.Store) ([]Spec, error) {
-	rows, err := st.Pool().Query(ctx, `SELECT kind, name, attrs->'origin'
-		FROM s3p.namespaces WHERE attrs ? 'origin' ORDER BY kind, name`)
+	namespaces, err := st.NamespacesWithAttr(ctx, "origin")
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []Spec
-	for rows.Next() {
-		var kind, name string
-		var raw []byte
-		if err := rows.Scan(&kind, &name, &raw); err != nil {
-			return nil, err
-		}
-		var sp Spec
-		if json.Unmarshal(raw, &sp) != nil || sp.ConfigYAML == "" {
+	out := make([]Spec, 0, len(namespaces))
+	for _, n := range namespaces {
+		raw, err := json.Marshal(n.Attrs["origin"])
+		if err != nil {
 			continue
 		}
-		if kind == string(ns.Bucket) && sp.Bucket == "" {
-			sp.Bucket = name
+		var sp Spec
+		if json.Unmarshal(raw, &sp) != nil || sp.Config == "" {
+			continue
+		}
+		if n.Kind == ns.Bucket && sp.Bucket == "" {
+			sp.Bucket = n.Name
 			sp.Scope = "bucket"
 		}
 		out = append(out, sp)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
-// Registry resolves global and per-bucket origin Tiers from PostgreSQL, caching
-// open Tiers in memory and refreshing the catalog at most once per second.
 type Registry struct {
 	store       *store.Store
 	log         *slog.Logger
-	mu          sync.Mutex
+	mu          sync.RWMutex
+	refreshMu   sync.Mutex
 	defaultTier *Tier
-	checked     time.Time
-	global      *Tier
-	globalKey   string
-	buckets     map[string]*Tier
-	bucketKeys  map[string]string
+	readOnly    bool
+	checked     atomic.Int64
+	tiers       map[string]registeredTier
 }
 
-func NewRegistry(st *store.Store, log *slog.Logger) *Registry {
+type registeredTier struct {
+	spec Spec
+	tier *Tier
+}
+
+func NewRegistry(st *store.Store, log *slog.Logger, readOnly bool) *Registry {
 	return &Registry{
-		store:      st,
-		log:        log,
-		buckets:    map[string]*Tier{},
-		bucketKeys: map[string]string{},
+		store:    st,
+		log:      log,
+		readOnly: readOnly,
+		tiers:    map[string]registeredTier{},
 	}
 }
 
@@ -170,76 +178,91 @@ func (r *Registry) SetDefault(t *Tier) {
 }
 
 func (r *Registry) ForBucket(ctx context.Context, bucket string) *Tier {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.store != nil && (r.checked.IsZero() || time.Since(r.checked) > time.Second) {
-		r.refreshLocked(ctx)
+	if r == nil {
+		return nil
 	}
+	r.refreshIfStale(ctx)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if bucket != "" {
-		if t, ok := r.buckets[bucket]; ok {
-			return t
+		if entry, ok := r.tiers[bucket]; ok {
+			return entry.tier
 		}
 	}
-	if r.global != nil {
-		return r.global
+	if entry, ok := r.tiers[""]; ok {
+		return entry.tier
 	}
 	return r.defaultTier
 }
 
-func (r *Registry) refreshLocked(ctx context.Context) {
-	r.checked = time.Now()
+func (r *Registry) refreshIfStale(ctx context.Context) {
+	if r.store == nil {
+		return
+	}
+	if last := r.checked.Load(); last != 0 && time.Since(time.Unix(0, last)) < time.Second {
+		return
+	}
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	if last := r.checked.Load(); last != 0 && time.Since(time.Unix(0, last)) < time.Second {
+		return
+	}
+	r.checked.Store(time.Now().UnixNano())
 	specs, err := ListSpecs(ctx, r.store)
 	if err != nil {
 		return
 	}
-	var wantGlobal *Spec
-	wantBuckets := map[string]Spec{}
-	for i := range specs {
-		sp := specs[i]
+	wanted := make(map[string]Spec, len(specs))
+	for _, sp := range specs {
 		if sp.Scope == "bucket" || sp.Bucket != "" {
-			wantBuckets[sp.Bucket] = sp
-		} else if wantGlobal == nil {
-			wantGlobal = &sp
+			wanted[sp.Bucket] = sp
+		} else if _, exists := wanted[""]; !exists {
+			wanted[""] = sp
 		}
 	}
-	if wantGlobal == nil {
-		if r.global != nil {
-			_ = r.global.Close()
-			r.global = nil
-			r.globalKey = ""
-		}
-	} else {
-		raw, _ := json.Marshal(wantGlobal)
-		key := string(raw)
-		if key != r.globalKey {
-			if t, err := NewFromSpec(r.log, r.store, *wantGlobal); err == nil {
-				if r.global != nil {
-					_ = r.global.Close()
-				}
-				r.global = t
-				r.globalKey = key
-			}
+	r.replace(wanted)
+}
+
+func (r *Registry) replace(wanted map[string]Spec) {
+	r.mu.RLock()
+	current := make(map[string]registeredTier, len(r.tiers))
+	maps.Copy(current, r.tiers)
+	r.mu.RUnlock()
+
+	var retired []*Tier
+	for bucket, entry := range current {
+		if _, ok := wanted[bucket]; !ok {
+			retired = append(retired, entry.tier)
 		}
 	}
-	for b, old := range r.buckets {
-		if _, ok := wantBuckets[b]; !ok {
-			_ = old.Close()
-			delete(r.buckets, b)
-			delete(r.bucketKeys, b)
-		}
-	}
-	for b, sp := range wantBuckets {
-		raw, _ := json.Marshal(sp)
-		key := string(raw)
-		if r.bucketKeys[b] == key {
+	opened := make(map[string]registeredTier, len(wanted))
+	for bucket, spec := range wanted {
+		if entry, ok := current[bucket]; ok && entry.spec == spec {
 			continue
 		}
-		if t, err := NewFromSpec(r.log, r.store, sp); err == nil {
-			if old, ok := r.buckets[b]; ok {
-				_ = old.Close()
+		tier, err := NewFromSpec(r.log, r.store, spec, r.readOnly)
+		if err != nil {
+			if r.log != nil {
+				r.log.Error("opening persisted origin", "bucket", bucket, "cache_namespace", spec.Namespace, "err", err)
 			}
-			r.buckets[b] = t
-			r.bucketKeys[b] = key
+			continue
 		}
+		opened[bucket] = registeredTier{spec: spec, tier: tier}
+		if entry, ok := current[bucket]; ok {
+			retired = append(retired, entry.tier)
+		}
+	}
+
+	r.mu.Lock()
+	for bucket := range r.tiers {
+		if _, ok := wanted[bucket]; !ok {
+			delete(r.tiers, bucket)
+		}
+	}
+	maps.Copy(r.tiers, opened)
+	r.mu.Unlock()
+
+	for _, tier := range retired {
+		_ = tier.Close()
 	}
 }

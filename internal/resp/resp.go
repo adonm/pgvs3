@@ -3,16 +3,19 @@ package resp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"path"
+	"strconv"
 	"strings"
-
-	"github.com/tidwall/redcon"
+	"time"
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
+	"github.com/adonm/pgvs3/internal/telemetry"
+	"github.com/tidwall/redcon"
 )
 
-// DefaultCache is the cache namespace used when a client has not run SELECT.
 const DefaultCache = "cache"
 
 var (
@@ -20,17 +23,15 @@ var (
 	errNotInt         = errors.New("value is not an integer or out of range")
 )
 
-// Server terminates RESP2 on a connection.
 type Server struct {
 	store    *store.Store
 	readOnly bool
-	metrics  *metrics
+	metrics  *telemetry.CommandMetrics
 	sem      chan struct{}
 	ctx      context.Context
 	version  string
 }
 
-// New returns a RESP server over the shared store.
 func New(st *store.Store, readOnly bool, maxConc int) *Server {
 	if maxConc <= 0 {
 		maxConc = 32
@@ -38,20 +39,17 @@ func New(st *store.Store, readOnly bool, maxConc int) *Server {
 	return &Server{
 		store:    st,
 		readOnly: readOnly,
-		metrics:  newMetrics(),
+		metrics:  telemetry.NewCommandMetrics(),
 		sem:      make(chan struct{}, maxConc),
 		ctx:      context.Background(),
 		version:  "dev",
 	}
 }
 
-// Metrics writes this server's Prometheus counters.
-func (s *Server) Metrics(w io.Writer) { s.metrics.write(w) }
+func (s *Server) Metrics(w io.Writer) { s.metrics.Write(w, "pgvs3_resp") }
 
-// SetContext supplies the cancellation context for store work.
 func (s *Server) SetContext(ctx context.Context) { s.ctx = ctx }
 
-// SetVersion sets the version reported by HELLO and INFO.
 func (s *Server) SetVersion(v string) { s.version = v }
 
 type respCmd struct {
@@ -69,9 +67,6 @@ func fromRedcon(cmd redcon.Command) respCmd {
 	return respCmd{name: strings.ToUpper(string(cmd.Args[0])), args: cmd.Args[1:]}
 }
 
-// ServeRESP implements redcon's command handler. Any remaining commands in the
-// current pipeline are consumed here so consecutive GETs and SETs can still be
-// coalesced into CacheMGet/CacheMSet.
 func (s *Server) ServeRESP(conn redcon.Conn, first redcon.Command) {
 	sess, _ := conn.Context().(*respSession)
 	if sess == nil {
@@ -199,11 +194,13 @@ func (s *Server) tryCoalesceSet(ctx context.Context, conn redcon.Conn, currentCa
 	return j
 }
 
-// resolveTarget parses an optional "s3://<bucket>/<key>" prefix. Without that
-// prefix, the key addresses the session's active cache namespace.
+func targetRef(kind ns.Kind, namespace, key string) store.ObjectRef {
+	return store.ObjectRef{NS: ns.Ref{Kind: kind, Name: namespace}, Key: key}
+}
+
 func resolveTarget(currentCache, rawKey string) (ns.Kind, string, string) {
-	if strings.HasPrefix(rawKey, "s3://") {
-		rest := strings.TrimPrefix(rawKey, "s3://")
+	if after, ok := strings.CutPrefix(rawKey, "s3://"); ok {
+		rest := after
 		if b, k, ok := strings.Cut(rest, "/"); ok && b != "" && k != "" {
 			return ns.Bucket, b, k
 		}
@@ -211,8 +208,6 @@ func resolveTarget(currentCache, rawKey string) (ns.Kind, string, string) {
 	return ns.Cache, currentCache, rawKey
 }
 
-// writeTarget resolves a key for a mutating command, rejecting cross-namespace
-// and s3:// writes.
 func writeTarget(currentCache string, rawKey []byte) (string, string, error) {
 	raw := string(rawKey)
 	if strings.HasPrefix(raw, "s3://") {
@@ -229,7 +224,7 @@ type cmdHandler func(s *Server, ctx context.Context, conn redcon.Conn, sess *res
 
 type cmdSpec struct {
 	minArgs int
-	maxArgs int // -1 for variadic
+	maxArgs int
 	write   bool
 	fn      cmdHandler
 }
@@ -290,7 +285,7 @@ var commands = map[string]cmdSpec{
 func (s *Server) execRESPCommand(ctx context.Context, conn redcon.Conn, sess *respSession, cmd respCmd) bool {
 	sess.status = 200
 	defer func() {
-		s.metrics.observe("RESP_"+cmd.name, sess.status)
+		s.metrics.Observe("RESP_"+cmd.name, sess.status)
 	}()
 
 	spec, ok := commands[cmd.name]
@@ -322,7 +317,6 @@ func (s *Server) execRESPCommand(ctx context.Context, conn redcon.Conn, sess *re
 	return sess.quit
 }
 
-// writeBulk distinguishes a nil value (RESP null) from an empty value.
 func writeBulk(conn redcon.Conn, b []byte) {
 	if b == nil {
 		conn.WriteNull()
@@ -355,4 +349,647 @@ func writeBoolInt(conn redcon.Conn, ok bool, err error) error {
 		conn.WriteInt64(0)
 	}
 	return nil
+}
+
+func cmdTxUnsupported(_ *Server, _ context.Context, _ redcon.Conn, _ *respSession, _ string, _ [][]byte) error {
+	return errors.New("MULTI/EXEC/WATCH are not supported; use a pipeline (redis-py: transaction=False)")
+}
+
+func cmdPing(_ *Server, _ context.Context, conn redcon.Conn, _ *respSession, _ string, args [][]byte) error {
+	if len(args) == 0 {
+		conn.WriteString("PONG")
+	} else {
+		writeBulk(conn, args[0])
+	}
+	return nil
+}
+
+func cmdEcho(_ *Server, _ context.Context, conn redcon.Conn, _ *respSession, _ string, args [][]byte) error {
+	writeBulk(conn, args[0])
+	return nil
+}
+
+func cmdOK(_ *Server, _ context.Context, conn redcon.Conn, _ *respSession, _ string, _ [][]byte) error {
+	conn.WriteString("OK")
+	return nil
+}
+
+func cmdQuit(_ *Server, _ context.Context, conn redcon.Conn, sess *respSession, _ string, _ [][]byte) error {
+	sess.quit = true
+	conn.WriteString("OK")
+	return nil
+}
+
+func cmdReset(_ *Server, _ context.Context, conn redcon.Conn, sess *respSession, _ string, _ [][]byte) error {
+	sess.bucket = DefaultCache
+	conn.WriteString("RESET")
+	return nil
+}
+
+func cmdHello(s *Server, _ context.Context, conn redcon.Conn, _ *respSession, _ string, args [][]byte) error {
+	if len(args) >= 1 {
+		ver, err := strconv.Atoi(string(args[0]))
+		if err != nil {
+			return errors.New("protocol version is not an integer or out of range")
+		}
+		if ver != 2 {
+			return errors.New("NOPROTO sorry this protocol version is not supported")
+		}
+	}
+	conn.WriteArray(14)
+	conn.WriteBulkString("server")
+	conn.WriteBulkString("pgvs3")
+	conn.WriteBulkString("version")
+	conn.WriteBulkString(s.version)
+	conn.WriteBulkString("proto")
+	conn.WriteInt64(2)
+	conn.WriteBulkString("id")
+	conn.WriteInt64(1)
+	conn.WriteBulkString("mode")
+	conn.WriteBulkString("standalone")
+	conn.WriteBulkString("role")
+	conn.WriteBulkString("master")
+	conn.WriteBulkString("modules")
+	conn.WriteArray(0)
+	return nil
+}
+
+func cmdCommand(_ *Server, _ context.Context, conn redcon.Conn, _ *respSession, _ string, _ [][]byte) error {
+	conn.WriteArray(0)
+	return nil
+}
+
+func cmdConfig(_ *Server, _ context.Context, conn redcon.Conn, _ *respSession, _ string, args [][]byte) error {
+	if len(args) >= 2 && strings.EqualFold(string(args[0]), "GET") {
+		switch strings.ToLower(string(args[1])) {
+		case "save":
+			conn.WriteArray(2)
+			conn.WriteBulkString("save")
+			conn.WriteBulkString("")
+		case "appendonly":
+			conn.WriteArray(2)
+			conn.WriteBulkString("appendonly")
+			conn.WriteBulkString("no")
+		default:
+			conn.WriteArray(0)
+		}
+		return nil
+	}
+	conn.WriteString("OK")
+	return nil
+}
+
+func cmdSelect(_ *Server, _ context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	target := string(args[0])
+	if n, err := strconv.Atoi(target); err == nil {
+		if n < 0 || n > 15 {
+			return errors.New("DB index is out of range")
+		}
+		if n == 0 {
+			target = DefaultCache
+		} else {
+			target = fmt.Sprintf("%s-%d", DefaultCache, n)
+		}
+	}
+	if !ns.ValidName(target) {
+		return errors.New("invalid namespace name")
+	}
+	sess.bucket = target
+	conn.WriteString("OK")
+	return nil
+}
+
+func cmdInfo(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, _ [][]byte) error {
+	st, _ := s.store.StatNamespace(ctx, ns.Cache, sess.bucket)
+	info := fmt.Sprintf("# Server\r\nredis_version:6.2.0\r\npgvs3_version:%s\r\nredis_mode:standalone\r\n# Keyspace\r\ndb0:keys=%d,logical_bytes=%d,physical_bytes=%d\r\n",
+		s.version, st.Objects, st.LogicalBytes, st.PhysicalBytes)
+	conn.WriteBulkString(info)
+	return nil
+}
+
+func cmdDBSize(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, _ [][]byte) error {
+	n, err := s.store.CacheDBSize(ctx, sess.bucket)
+	return writeInt(conn, n, err)
+}
+
+func cmdFlush(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, name string, _ [][]byte) error {
+	if strings.EqualFold(name, "FLUSHALL") {
+		_, err := s.store.CacheFlushAll(ctx)
+		return writeOK(conn, err)
+	}
+	return writeOK(conn, s.store.CacheFlush(ctx, sess.bucket))
+}
+
+func cmdGet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	val, err := s.readValue(ctx, sess.bucket, args[0])
+	if err != nil {
+		sess.status = 500
+		return err
+	}
+	if val == nil {
+		sess.status = 404
+	}
+	writeBulk(conn, val)
+	return nil
+}
+
+func (s *Server) readValue(ctx context.Context, current string, key []byte) ([]byte, error) {
+	kind, name, k := resolveTarget(current, string(key))
+	if kind == ns.Cache {
+		value, _, err := s.store.CacheGet(ctx, name, k)
+		return value, err
+	}
+	value, err := s.store.Get(ctx, targetRef(kind, name, k), store.WholeObjectRange())
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return value.Bytes, nil
+}
+
+func cmdMGet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	cacheKeys := make([]string, len(args))
+	allCache := true
+	for i, a := range args {
+		kind, _, key := resolveTarget(sess.bucket, string(a))
+		if kind != ns.Cache {
+			allCache = false
+			break
+		}
+		cacheKeys[i] = key
+	}
+	if allCache {
+		vals, err := s.store.CacheMGet(ctx, sess.bucket, cacheKeys)
+		if err != nil {
+			sess.status = 500
+			return err
+		}
+		conn.WriteArray(len(vals))
+		for _, v := range vals {
+			writeBulk(conn, v)
+		}
+		return nil
+	}
+	conn.WriteArray(len(args))
+	for _, a := range args {
+		val, err := s.readValue(ctx, sess.bucket, a)
+		if err != nil {
+			sess.status = 500
+			return err
+		}
+		writeBulk(conn, val)
+	}
+	return nil
+}
+
+func cmdSet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	opts, err := parseRESPSetOptions(args[2:])
+	if err != nil {
+		return err
+	}
+	oldVal, _, wrote, err := s.store.CacheSet(ctx, b, k, args[1], opts)
+	if err != nil {
+		sess.status = 500
+		return err
+	}
+	if opts.ReturnOld {
+		writeBulk(conn, oldVal)
+		return nil
+	}
+	if !wrote {
+		conn.WriteNull()
+		return nil
+	}
+	conn.WriteString("OK")
+	return nil
+}
+
+func cmdSetNX(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	_, _, wrote, err := s.store.CacheSet(ctx, b, k, args[1], store.CacheSetOptions{Precondition: store.Precondition{Mode: store.IfAbsent}})
+	return writeBoolInt(conn, wrote, err)
+}
+
+func cmdSetEX(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, name string, args [][]byte) error {
+	n, err := strconv.ParseInt(string(args[1]), 10, 64)
+	if err != nil || n <= 0 {
+		return fmt.Errorf("invalid expire time in '%s' command", strings.ToLower(name))
+	}
+	exp := respExpiration(name, n, time.Now())
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	_, _, _, err = s.store.CacheSet(ctx, b, k, args[2], store.CacheSetOptions{ExpiresAt: &exp})
+	return writeOK(conn, err)
+}
+
+func cmdGetSet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	oldVal, _, _, err := s.store.CacheGetSet(ctx, b, k, args[1], store.CacheSetOptions{ReturnOld: true})
+	if err != nil {
+		return err
+	}
+	writeBulk(conn, oldVal)
+	return nil
+}
+
+func cmdGetDel(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	val, _, err := s.store.CacheGetDel(ctx, b, k)
+	if err != nil {
+		return err
+	}
+	writeBulk(conn, val)
+	return nil
+}
+
+func cmdMSet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	if len(args)%2 != 0 {
+		return errors.New("wrong number of arguments for 'mset' command")
+	}
+	n := len(args) / 2
+	keys := make([]string, n)
+	vals := make([][]byte, n)
+	for i := range n {
+		_, k, err := writeTarget(sess.bucket, args[2*i])
+		if err != nil {
+			return err
+		}
+		keys[i], vals[i] = k, args[2*i+1]
+	}
+	return writeOK(conn, s.store.CacheMSet(ctx, sess.bucket, keys, vals))
+}
+
+func cmdAppend(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	n, err := s.store.CacheAppend(ctx, b, k, args[1])
+	return writeInt(conn, n, err)
+}
+
+func cmdSetRange(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	off, err := strconv.ParseInt(string(args[1]), 10, 64)
+	if err != nil || off < 0 {
+		return errors.New("offset is out of range")
+	}
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	n, err := s.store.CacheSetRange(ctx, b, k, off, args[2])
+	return writeInt(conn, n, err)
+}
+
+func cmdGetRange(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	startIdx, err1 := strconv.ParseInt(string(args[1]), 10, 64)
+	endIdx, err2 := strconv.ParseInt(string(args[2]), 10, 64)
+	if err1 != nil || err2 != nil {
+		return errNotInt
+	}
+	kind, b, k := resolveTarget(sess.bucket, string(args[0]))
+	m, err := s.store.MetaHeader(ctx, targetRef(kind, b, k))
+	if errors.Is(err, store.ErrNotFound) || (err == nil && m.Size == 0) {
+		writeBulk(conn, []byte{})
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if startIdx < 0 {
+		startIdx = max(m.Size+startIdx, 0)
+	}
+	if endIdx < 0 {
+		endIdx = m.Size + endIdx
+	}
+	if startIdx > endIdx || startIdx >= m.Size || endIdx < 0 {
+		writeBulk(conn, []byte{})
+		return nil
+	}
+	sl, err := s.store.Get(ctx, targetRef(kind, b, k), store.Range(startIdx, min(endIdx, m.Size-1), -1))
+	if err != nil {
+		return err
+	}
+	writeBulk(conn, sl.Bytes)
+	return nil
+}
+
+func cmdStrLen(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	kind, b, k := resolveTarget(sess.bucket, string(args[0]))
+	m, err := s.store.MetaHeader(ctx, targetRef(kind, b, k))
+	if errors.Is(err, store.ErrNotFound) {
+		conn.WriteInt64(0)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	conn.WriteInt64(m.Size)
+	return nil
+}
+
+func cmdIncr(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, name string, args [][]byte) error {
+	var delta int64 = 1
+	switch name {
+	case "DECR":
+		delta = -1
+	case "INCRBY", "DECRBY":
+		v, err := strconv.ParseInt(string(args[1]), 10, 64)
+		if err != nil {
+			return errNotInt
+		}
+		if name == "DECRBY" {
+			delta = -v
+		} else {
+			delta = v
+		}
+	}
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	next, err := s.store.CacheIncrBy(ctx, b, k, delta)
+	if errors.Is(err, store.ErrNotInteger) {
+		return errNotInt
+	}
+	return writeInt(conn, next, err)
+}
+
+func cmdType(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	kind, b, k := resolveTarget(sess.bucket, string(args[0]))
+	_, err := s.store.MetaHeader(ctx, targetRef(kind, b, k))
+	if errors.Is(err, store.ErrNotFound) {
+		conn.WriteString("none")
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	conn.WriteString("string")
+	return nil
+}
+
+func cmdDel(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	keys := make([]string, len(args))
+	for i, a := range args {
+		_, k, err := writeTarget(sess.bucket, a)
+		if err != nil {
+			return err
+		}
+		keys[i] = k
+	}
+	n, err := s.store.CacheDel(ctx, sess.bucket, keys)
+	return writeInt(conn, n, err)
+}
+
+func cmdExists(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	var n int64
+	cacheKeys := make([]string, 0, len(args))
+	for _, a := range args {
+		kind, b, k := resolveTarget(sess.bucket, string(a))
+		if kind == ns.Bucket {
+			if _, err := s.store.MetaHeader(ctx, targetRef(kind, b, k)); err == nil {
+				n++
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			continue
+		}
+		cacheKeys = append(cacheKeys, k)
+	}
+	if len(cacheKeys) > 0 {
+		count, err := s.store.CacheExists(ctx, sess.bucket, cacheKeys)
+		if err != nil {
+			return err
+		}
+		n += count
+	}
+	return writeInt(conn, n, nil)
+}
+
+func cmdExpire(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, name string, args [][]byte) error {
+	n, err := strconv.ParseInt(string(args[1]), 10, 64)
+	if err != nil {
+		return errNotInt
+	}
+	exp := respExpiration(name, n, time.Now())
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	opts := make([]string, len(args)-2)
+	for i, opt := range args[2:] {
+		opts[i] = string(opt)
+	}
+	ok, err := s.store.CacheExpire(ctx, b, k, &exp, opts...)
+	return writeBoolInt(conn, ok, err)
+}
+
+func cmdPersist(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	b, k, err := writeTarget(sess.bucket, args[0])
+	if err != nil {
+		return err
+	}
+	ok, err := s.store.CacheExpire(ctx, b, k, nil)
+	return writeBoolInt(conn, ok, err)
+}
+
+func cmdTTL(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, name string, args [][]byte) error {
+	kind, b, k := resolveTarget(sess.bucket, string(args[0]))
+	if kind == ns.Bucket {
+		if _, err := s.store.MetaHeader(ctx, targetRef(kind, b, k)); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				conn.WriteInt64(-2)
+				return nil
+			}
+			return err
+		}
+		conn.WriteInt64(-1)
+		return nil
+	}
+	d, hasTTL, exists, err := s.store.CacheTTL(ctx, b, k)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		conn.WriteInt64(-2)
+		return nil
+	}
+	if !hasTTL {
+		conn.WriteInt64(-1)
+		return nil
+	}
+	if name == "PTTL" {
+		conn.WriteInt64(max(d.Milliseconds(), 1))
+	} else {
+		conn.WriteInt64(max(int64(d.Seconds()+0.5), 1))
+	}
+	return nil
+}
+
+func cmdKeys(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	_, keys, err := s.scanCache(ctx, sess.bucket, string(args[0]), "", 0)
+	if err != nil {
+		return err
+	}
+	conn.WriteArray(len(keys))
+	for _, k := range keys {
+		conn.WriteBulkString(k)
+	}
+	return nil
+}
+
+func cmdScan(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
+	cursor := string(args[0])
+	count := 10
+	match := "*"
+	for i := 1; i+1 < len(args); i += 2 {
+		switch strings.ToUpper(string(args[i])) {
+		case "MATCH":
+			match = string(args[i+1])
+		case "COUNT":
+			if n, err := strconv.Atoi(string(args[i+1])); err == nil && n > 0 {
+				count = n
+			}
+		case "TYPE":
+			if !strings.EqualFold(string(args[i+1]), "string") {
+				conn.WriteArray(2)
+				conn.WriteBulkString("0")
+				conn.WriteArray(0)
+				return nil
+			}
+		}
+	}
+	after := ""
+	if cursor != "0" {
+		after = cursor
+	}
+	next, keys, err := s.scanCache(ctx, sess.bucket, match, after, count)
+	if err != nil {
+		return err
+	}
+	conn.WriteArray(2)
+	conn.WriteBulkString(next)
+	conn.WriteArray(len(keys))
+	for _, k := range keys {
+		conn.WriteBulkString(k)
+	}
+	return nil
+}
+
+func parseRESPSetOptions(args [][]byte) (store.CacheSetOptions, error) {
+	var opts store.CacheSetOptions
+	for i := 0; i < len(args); i++ {
+		flag := strings.ToUpper(string(args[i]))
+		switch flag {
+		case "NX":
+			if opts.Precondition.Mode == store.IfPresent {
+				return opts, errors.New("syntax error")
+			}
+			opts.Precondition.Mode = store.IfAbsent
+		case "XX":
+			if opts.Precondition.Mode == store.IfAbsent {
+				return opts, errors.New("syntax error")
+			}
+			opts.Precondition.Mode = store.IfPresent
+		case "GET":
+			opts.ReturnOld = true
+		case "KEEPTTL":
+			opts.KeepTTL = true
+		case "EX", "PX", "EXAT", "PXAT":
+			if i+1 >= len(args) {
+				return opts, errors.New("syntax error")
+			}
+			i++
+			n, err := strconv.ParseInt(string(args[i]), 10, 64)
+			if err != nil || n <= 0 {
+				return opts, errors.New("invalid expire time in 'set' command")
+			}
+			t := respExpiration(flag, n, time.Now())
+			opts.ExpiresAt = &t
+		default:
+			return opts, errors.New("syntax error")
+		}
+	}
+	return opts, nil
+}
+
+func respExpiration(name string, n int64, now time.Time) time.Time {
+	switch name {
+	case "EX", "SETEX", "EXPIRE":
+		return now.Add(time.Duration(n) * time.Second)
+	case "PX", "PSETEX", "PEXPIRE":
+		return now.Add(time.Duration(n) * time.Millisecond)
+	case "EXAT", "EXPIREAT":
+		return time.Unix(n, 0)
+	case "PXAT", "PEXPIREAT":
+		return time.UnixMilli(n)
+	default:
+		return time.Time{}
+	}
+}
+
+func literalPrefix(pat string) string {
+	for i := 0; i < len(pat); i++ {
+		switch pat[i] {
+		case '*', '?', '[', '\\':
+			return pat[:i]
+		}
+	}
+	return pat
+}
+
+func prefixUpper(prefix string) string { return prefix + "\U0010FFFF" }
+
+func (s *Server) scanCache(ctx context.Context, name, pattern, after string, count int) (string, []string, error) {
+	if count <= 0 {
+		count = int(^uint(0) >> 1)
+	}
+	prefix := literalPrefix(pattern)
+	page := 1024
+	if count < page {
+		page = max(count*4, 64)
+	}
+	keys := make([]string, 0, min(count, page))
+	for len(keys) < count {
+		rows, err := s.store.List(ctx, ns.CacheRef(name), prefix, prefixUpper(prefix), after, page)
+		if err != nil {
+			return "0", nil, err
+		}
+		if len(rows) == 0 {
+			return "0", keys, nil
+		}
+		for _, row := range rows {
+			after = row.Key
+			if pattern == "*" {
+				keys = append(keys, row.Key)
+			} else if ok, _ := path.Match(pattern, row.Key); ok {
+				keys = append(keys, row.Key)
+			}
+			if len(keys) >= count {
+				return after, keys, nil
+			}
+		}
+		if len(rows) < page {
+			return "0", keys, nil
+		}
+	}
+	return after, keys, nil
 }

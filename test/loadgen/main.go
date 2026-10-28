@@ -1,14 +1,9 @@
-// Command loadgen is a small SigV4 S3 load generator used by `just load`.
-// It is a benchmark tool, not part of the gateway image.
 package main
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,12 +13,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adonm/pgvs3/internal/s3client"
 )
 
 type result struct {
@@ -45,7 +42,8 @@ type result struct {
 }
 
 type signer struct {
-	access, secret, region string
+	client   *s3client.Signer
+	unsigned bool
 }
 
 func must(err error) {
@@ -60,7 +58,7 @@ func main() {
 	bucket := flag.String("bucket", "bench", "bucket")
 	access := flag.String("access", "testkey", "access key")
 	secret := flag.String("secret", "testsecret", "secret key")
-	op := flag.String("op", "get", "put, get, head, range, list, resp-set, resp-get, sqs-send or sqs-recv")
+	op := flag.String("op", "get", "put, get, head, range, list, resp-set, resp-get, ojs-enqueue, ojs-fetch, ojs-cycle, ojs-stream-send, ojs-stream-receive or ojs-stream-cycle")
 	size := flag.Int64("size", 4096, "object size for put/get")
 	rangeSize := flag.Int64("range-size", 8192, "range length for -op range")
 	workers := flag.Int("workers", 16, "concurrent workers")
@@ -68,14 +66,34 @@ func main() {
 	duration := flag.Duration("duration", 5*time.Second, "measurement duration")
 	count := flag.Int("count", 2000, "objects to prefill/read")
 	warmup := flag.Bool("warmup", false, "read every key once before measuring")
+	prefillObjects := flag.Bool("prefill", true, "create objects before get/range/head/list benchmarks")
+	requests := flag.Int64("requests", 0, "fixed measured request count (0 uses duration)")
+	unsigned := flag.Bool("unsigned", false, "omit signing for trusted-network gateway comparisons")
+	payloadFile := flag.String("payload-file", "", "use file bytes for PUT/prefill instead of random data")
+	rangeOffset := flag.Int64("range-offset", 0, "starting byte for -op range")
 	prefix := flag.String("prefix", "", "key prefix (a unique one is generated if empty)")
-	queue := flag.String("queue", "benchq", "SQS queue name for sqs-send/sqs-recv")
+	queue := flag.String("queue", "benchq", "OJS queue name for ojs-enqueue/ojs-fetch")
 	flag.Parse()
+	if *requests < 0 || *count <= 0 || *workers <= 0 || *size < 0 || *rangeOffset < 0 || *rangeSize <= 0 {
+		fmt.Fprintln(os.Stderr, "request count, object count, workers, size and range must be valid")
+		os.Exit(2)
+	}
+	var filePayload []byte
+	if *payloadFile != "" {
+		var err error
+		filePayload, err = os.ReadFile(*payloadFile)
+		must(err)
+		*size = int64(len(filePayload))
+	}
 	if *prefix == "" {
 		*prefix = fmt.Sprintf("bench-%d", time.Now().UnixNano())
 	}
-	if strings.HasPrefix(*op, "sqs-") {
-		runSQS(*endpoint, *queue, *op, *size, *workers, max(*pipeline, 1), *duration)
+	if strings.HasPrefix(*op, "ojs-stream-") {
+		runStream(*endpoint, *queue, *op, *size, *workers, *duration)
+		return
+	}
+	if strings.HasPrefix(*op, "ojs-") {
+		runOJS(*endpoint, *queue, *op, *size, *workers, max(*pipeline, 1), *duration)
 		return
 	}
 	if strings.HasPrefix(*op, "resp-") {
@@ -92,19 +110,32 @@ func main() {
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
-	s := &signer{access: *access, secret: *secret, region: "us-east-1"}
+	s := &signer{unsigned: *unsigned}
+	if !*unsigned {
+		s.client = s3client.NewSigner("us-east-1", *access, *secret, "")
+	}
 	base := strings.TrimRight(*endpoint, "/")
-	must(s.do(c, base+"/"+*bucket, http.MethodPut, nil))
+
+	if err := s.do(c, base+"/"+*bucket, http.MethodPut, nil); err != nil && !strings.Contains(err.Error(), "HTTP 409") {
+		must(err)
+	}
 
 	switch *op {
 	case "put":
 	case "get", "range", "head":
-		payload := make([]byte, *size)
-		_, _ = rand.Read(payload)
-		prefill(c, s, base, *bucket, *prefix, *count, payload, 16)
+		if *prefillObjects {
+			payload := filePayload
+			if payload == nil {
+				payload = make([]byte, *size)
+				_, _ = rand.Read(payload)
+			}
+			prefill(c, s, base, *bucket, *prefix, *count, payload, 16)
+		}
 	case "list":
-		payload := []byte("x")
-		prefill(c, s, base, *bucket, *prefix, *count, payload, 16)
+		if *prefillObjects {
+			payload := []byte("x")
+			prefill(c, s, base, *bucket, *prefix, *count, payload, 16)
+		}
 	default:
 		fmt.Fprintln(os.Stderr, "unknown -op")
 		os.Exit(2)
@@ -114,7 +145,7 @@ func main() {
 			u := fmt.Sprintf("%s/%s/%s/obj-%06d", base, *bucket, *prefix, i)
 			req, _ := http.NewRequest(http.MethodGet, u, nil)
 			if *op == "range" {
-				req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", *rangeSize-1))
+				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", *rangeOffset, *rangeOffset+*rangeSize-1))
 			}
 			if err := s.sign(req, nil); err != nil {
 				must(err)
@@ -129,6 +160,16 @@ func main() {
 	}
 	time.Sleep(300 * time.Millisecond)
 
+	var putBody []byte
+	if *op == "put" {
+		if filePayload != nil {
+			putBody = filePayload
+		} else {
+			putBody = make([]byte, *size)
+			_, _ = rand.Read(putBody)
+		}
+	}
+
 	var (
 		reqs, errs, bytesRead int64
 		firstErr              atomic.Value
@@ -137,14 +178,19 @@ func main() {
 		wg                    sync.WaitGroup
 		latMu                 sync.Mutex
 		latencies             []time.Duration
+		issued                atomic.Int64
 	)
 	for w := 0; w < *workers; w++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			local := make([]time.Duration, 0, 4096)
+			buf := make([]byte, 32<<10)
 			var seq int64
-			for time.Now().Before(deadline) {
+			for *requests > 0 || time.Now().Before(deadline) {
+				if *requests > 0 && issued.Add(1) > *requests {
+					break
+				}
 				seq++
 				var (
 					method = http.MethodGet
@@ -159,11 +205,10 @@ func main() {
 				case "put":
 					method = http.MethodPut
 					urlStr = fmt.Sprintf("%s/%s/%s/w%d-%d", base, *bucket, *prefix, id, seq)
-					body = make([]byte, *size)
-					_, _ = rand.Read(body)
+					body = putBody
 					want = http.StatusOK
 				case "range":
-					header = http.Header{"Range": []string{fmt.Sprintf("bytes=0-%d", *rangeSize-1)}}
+					header = http.Header{"Range": []string{fmt.Sprintf("bytes=%d-%d", *rangeOffset, *rangeOffset+*rangeSize-1)}}
 					want = http.StatusPartialContent
 				case "list":
 					urlStr = fmt.Sprintf("%s/%s?list-type=2&prefix=%s&max-keys=1000", base, *bucket, url.QueryEscape(*prefix))
@@ -171,7 +216,7 @@ func main() {
 				t0 := time.Now()
 				req, err := http.NewRequest(method, urlStr, bytes.NewReader(body))
 				if err != nil {
-					errs++
+					atomic.AddInt64(&errs, 1)
 					continue
 				}
 				if header != nil {
@@ -188,17 +233,14 @@ func main() {
 					firstErr.CompareAndSwap(nil, err.Error())
 					continue
 				}
-				// Drain so the connection is reusable.
-				buf := make([]byte, 32<<10)
-				var got int64
-				for {
-					m, e := resp.Body.Read(buf)
-					got += int64(m)
-					if e != nil {
-						break
-					}
-				}
+
+				got, readErr := io.CopyBuffer(io.Discard, resp.Body, buf)
 				_ = resp.Body.Close()
+				if readErr != nil {
+					atomic.AddInt64(&errs, 1)
+					firstErr.CompareAndSwap(nil, readErr.Error())
+					continue
+				}
 				if resp.StatusCode != want {
 					atomic.AddInt64(&errs, 1)
 					firstErr.CompareAndSwap(nil, fmt.Sprintf("HTTP %d", resp.StatusCode))
@@ -219,7 +261,7 @@ func main() {
 	}
 	wg.Wait()
 	elapsed := time.Since(start).Seconds()
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.Sort(latencies)
 	pick := func(q float64) float64 {
 		if len(latencies) == 0 {
 			return 0
@@ -245,7 +287,7 @@ func main() {
 func prefill(c *http.Client, s *signer, base, bucket, prefix string, count int, payload []byte, workers int) {
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
-	for i := 0; i < count; i++ {
+	for i := range count {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int) {
@@ -295,106 +337,10 @@ func (s *signer) do(c *http.Client, u string, method string, body []byte) error 
 }
 
 func (s *signer) sign(req *http.Request, body []byte) error {
-	now := time.Now().UTC()
-	amzDate := now.Format("20060102T150405Z")
-	date := now.Format("20060102")
-	payloadHash := "UNSIGNED-PAYLOAD"
-	req.Header.Set("x-amz-content-sha256", payloadHash)
-	req.Header.Set("x-amz-date", amzDate)
-	host := req.Host
-	if host == "" {
-		host = req.URL.Host
+	if s.unsigned {
+		return nil
 	}
-	headers := "host:" + host + "\n" +
-		"x-amz-content-sha256:" + payloadHash + "\n" +
-		"x-amz-date:" + amzDate + "\n"
-	_ = body
-	uri := req.URL.EscapedPath()
-	if uri == "" {
-		uri = "/"
-	}
-	canonical := strings.Join([]string{
-		req.Method, uri, canonicalQuery(req.URL.RawQuery), headers,
-		"host;x-amz-content-sha256;x-amz-date", payloadHash,
-	}, "\n")
-	scope := date + "/" + s.region + "/s3/aws4_request"
-	toSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hexSHA256([]byte(canonical))
-	key := signingKey(s.secret, date, s.region, "s3")
-	m := hmac.New(sha256.New, key)
-	m.Write([]byte(toSign))
-	sig := hex.EncodeToString(m.Sum(nil))
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+s.access+"/"+scope+
-		", SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="+sig)
-	return nil
-}
-
-func signingKey(secret, date, region, service string) []byte {
-	kDate := hmacSHA256([]byte("AWS4"+secret), []byte(date))
-	kRegion := hmacSHA256(kDate, []byte(region))
-	kService := hmacSHA256(kRegion, []byte(service))
-	return hmacSHA256(kService, []byte("aws4_request"))
-}
-
-func hmacSHA256(key, data []byte) []byte {
-	m := hmac.New(sha256.New, key)
-	m.Write(data)
-	return m.Sum(nil)
-}
-
-func hexSHA256(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
-}
-
-func canonicalQuery(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	type pair struct{ k, v string }
-	var pairs []pair
-	for _, part := range strings.Split(raw, "&") {
-		if part == "" {
-			continue
-		}
-		k, v, _ := strings.Cut(part, "=")
-		dk, _ := url.QueryUnescape(k)
-		dv, _ := url.QueryUnescape(v)
-		pairs = append(pairs, pair{awsEncode(dk), awsEncode(dv)})
-	}
-	sort.Slice(pairs, func(i, j int) bool {
-		if pairs[i].k != pairs[j].k {
-			return pairs[i].k < pairs[j].k
-		}
-		return pairs[i].v < pairs[j].v
-	})
-	var b strings.Builder
-	for i, p := range pairs {
-		if i > 0 {
-			b.WriteByte('&')
-		}
-		b.WriteString(p.k)
-		b.WriteByte('=')
-		b.WriteString(p.v)
-	}
-	return b.String()
-}
-
-func awsEncode(s string) string {
-	const h = "0123456789ABCDEF"
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
-			c == '-', c == '.', c == '_', c == '~':
-			b.WriteByte(c)
-		default:
-			b.WriteByte('%')
-			b.WriteByte(h[c>>4])
-			b.WriteByte(h[c&15])
-		}
-	}
-	return b.String()
+	return s.client.Sign(req, body)
 }
 
 func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, duration time.Duration, count int, prefix string) {
@@ -471,7 +417,7 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 		latMu                 sync.Mutex
 		latencies             []time.Duration
 	)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -492,7 +438,7 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 			var seq int64
 			for time.Now().Before(deadline) {
 				t0 := time.Now()
-				for p := 0; p < pipeline; p++ {
+				for range pipeline {
 					seq++
 					if op == "resp-set" {
 						k := fmt.Sprintf("%s/w%d-%d", prefix, id, seq)
@@ -509,7 +455,7 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 				}
 				var batchBytes int64
 				failed := false
-				for p := 0; p < pipeline; p++ {
+				for range pipeline {
 					n, err := readReply(br)
 					if err != nil {
 						atomic.AddInt64(&errs, 1)
@@ -538,7 +484,7 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 	}
 	wg.Wait()
 	elapsed := time.Since(start).Seconds()
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.Sort(latencies)
 	pick := func(q float64) float64 {
 		if len(latencies) == 0 {
 			return 0
@@ -553,6 +499,249 @@ func runRESP(endpoint, bucket, op string, size int64, workers, pipeline int, dur
 		P50:   pick(.50), P90: pick(.90), P99: pick(.99), Max: pick(1),
 		Errors: errs,
 	}
+	if v := firstErr.Load(); v != nil {
+		out.FirstErr = v.(string)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
+}
+
+type ojsJob struct {
+	ID         string `json:"id"`
+	State      string `json:"state"`
+	LeaseToken string `json:"lease_token"`
+	Args       []any  `json:"args"`
+}
+
+type ojsReply struct {
+	Jobs []ojsJob `json:"jobs"`
+}
+
+func ojsCall(c *http.Client, endpoint, path string, payload any, out any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/openjobspec+json")
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("%s: HTTP %d: %s", path, resp.StatusCode, data)
+	}
+	if out != nil {
+		return json.Unmarshal(data, out)
+	}
+	return nil
+}
+
+func runOJS(endpoint, queue, op string, size int64, workers, pipeline int, duration time.Duration) {
+	c := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        4096,
+			MaxIdleConnsPerHost: 4096,
+			MaxConnsPerHost:     workers,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+	payload := bytes.Repeat([]byte("q"), int(size))
+
+	var (
+		msgs, errs, bytesXfer int64
+		firstErr              atomic.Value
+		start                 = time.Now()
+		deadline              = start.Add(duration)
+		wg                    sync.WaitGroup
+		latMu                 sync.Mutex
+		latencies             []time.Duration
+	)
+	for w := range workers {
+		wg.Go(func() {
+			local := make([]time.Duration, 0, 4096)
+			workerID := fmt.Sprintf("loadgen-%d", w)
+			for time.Now().Before(deadline) {
+				t0 := time.Now()
+				if op == "ojs-enqueue" {
+					for range pipeline {
+						if err := ojsCall(c, endpoint, "/ojs/v1/jobs", map[string]any{
+							"type": "bench", "args": []any{string(payload)},
+							"options": map[string]any{"queue": queue},
+						}, nil); err != nil {
+							atomic.AddInt64(&errs, 1)
+							firstErr.CompareAndSwap(nil, err.Error())
+							return
+						}
+						atomic.AddInt64(&msgs, 1)
+						atomic.AddInt64(&bytesXfer, size)
+					}
+				} else {
+					count := 10
+					if op == "ojs-cycle" {
+						count = 1
+						if err := ojsCall(c, endpoint, "/ojs/v1/jobs", map[string]any{
+							"type": "bench", "args": []any{string(payload)}, "queue": queue,
+						}, nil); err != nil {
+							atomic.AddInt64(&errs, 1)
+							firstErr.CompareAndSwap(nil, err.Error())
+							return
+						}
+					}
+					var reply ojsReply
+					if err := ojsCall(c, endpoint, "/ojs/v1/workers/fetch", map[string]any{
+						"queues": []string{queue}, "count": count, "worker_id": workerID,
+						"visibility_timeout_ms": 30000,
+					}, &reply); err != nil {
+						atomic.AddInt64(&errs, 1)
+						firstErr.CompareAndSwap(nil, err.Error())
+						return
+					}
+					for _, job := range reply.Jobs {
+						if err := ojsCall(c, endpoint, "/ojs/v1/workers/ack", map[string]any{
+							"job_id": job.ID, "lease_token": job.LeaseToken,
+						}, nil); err != nil {
+							atomic.AddInt64(&errs, 1)
+							firstErr.CompareAndSwap(nil, err.Error())
+							return
+						}
+						atomic.AddInt64(&msgs, 1)
+						for _, arg := range job.Args {
+							if s, ok := arg.(string); ok {
+								atomic.AddInt64(&bytesXfer, int64(len(s)))
+							}
+						}
+					}
+				}
+				local = append(local, time.Since(t0)/time.Duration(max(pipeline, 1)))
+			}
+			latMu.Lock()
+			latencies = append(latencies, local...)
+			latMu.Unlock()
+		})
+	}
+	wg.Wait()
+	elapsed := time.Since(start).Seconds()
+	slices.Sort(latencies)
+	pick := func(q float64) float64 {
+		if len(latencies) == 0 {
+			return 0
+		}
+		i := int(q * float64(len(latencies)-1))
+		return float64(latencies[i].Microseconds()) / 1000
+	}
+	out := result{
+		Op: op, Workers: workers, Pipeline: pipeline, Size: size,
+		Requests: msgs, Seconds: elapsed, RPS: float64(msgs) / elapsed,
+		MiBps: float64(bytesXfer) / elapsed / (1 << 20),
+		P50:   pick(.50), P90: pick(.90), P99: pick(.99), Max: pick(1),
+		Errors: errs,
+	}
+	if v := firstErr.Load(); v != nil {
+		out.FirstErr = v.(string)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
+}
+
+type streamReply struct {
+	BatchID  int64             `json:"batch_id"`
+	Messages []json.RawMessage `json:"messages"`
+}
+
+func runStream(endpoint, queue, op string, size int64, workers int, duration time.Duration) {
+	c := &http.Client{Timeout: 10 * time.Second}
+	payload := bytes.Repeat([]byte("s"), int(size))
+	if op == "ojs-stream-receive" || op == "ojs-stream-cycle" {
+		if err := ojsCall(c, endpoint, "/ojs/v1/queues/"+queue+"/consumers",
+			map[string]any{"consumer": "loadgen", "from_tick": 0}, nil); err != nil {
+			fmt.Fprintln(os.Stderr, "subscribe:", err)
+		}
+	}
+	var (
+		msgs, errs, bytesXfer int64
+		firstErr              atomic.Value
+		start                 = time.Now()
+		deadline              = start.Add(duration)
+		wg                    sync.WaitGroup
+		latMu                 sync.Mutex
+		latencies             []time.Duration
+	)
+	for worker := range workers {
+		wg.Go(func() {
+			local := make([]time.Duration, 0, 4096)
+			for time.Now().Before(deadline) {
+				t0 := time.Now()
+				if op == "ojs-stream-send" {
+					if err := ojsCall(c, endpoint, "/ojs/v1/queues/"+queue+"/messages",
+						map[string]any{"type": "bench", "payload": map[string]any{"data": string(payload)}}, nil); err != nil {
+						atomic.AddInt64(&errs, 1)
+						firstErr.CompareAndSwap(nil, err.Error())
+						return
+					}
+					atomic.AddInt64(&msgs, 1)
+					atomic.AddInt64(&bytesXfer, size)
+				} else {
+					request := map[string]any{"consumer": "loadgen", "max": 100000, "wait_ms": 100}
+					if op == "ojs-stream-cycle" {
+						request["wait_ms"] = 0
+						if workers > 1 {
+							request["member"] = fmt.Sprintf("member-%d", worker)
+						}
+						if err := ojsCall(c, endpoint, "/ojs/v1/queues/"+queue+"/messages",
+							map[string]any{"type": "bench", "payload": map[string]any{"data": string(payload)}}, nil); err != nil {
+							atomic.AddInt64(&errs, 1)
+							firstErr.CompareAndSwap(nil, err.Error())
+							return
+						}
+					}
+					var reply streamReply
+					if err := ojsCall(c, endpoint, "/ojs/v1/queues/"+queue+"/receive",
+						request, &reply); err != nil {
+						atomic.AddInt64(&errs, 1)
+						firstErr.CompareAndSwap(nil, err.Error())
+						return
+					}
+					if reply.BatchID > 0 {
+						if err := ojsCall(c, endpoint, "/ojs/v1/streams/ack",
+							map[string]any{"queue": queue, "batch_id": reply.BatchID}, nil); err != nil {
+							atomic.AddInt64(&errs, 1)
+							firstErr.CompareAndSwap(nil, err.Error())
+							return
+						}
+					}
+					atomic.AddInt64(&msgs, int64(len(reply.Messages)))
+					for range reply.Messages {
+						atomic.AddInt64(&bytesXfer, size)
+					}
+				}
+				local = append(local, time.Since(t0))
+			}
+			latMu.Lock()
+			latencies = append(latencies, local...)
+			latMu.Unlock()
+		})
+	}
+	wg.Wait()
+	elapsed := time.Since(start).Seconds()
+	slices.Sort(latencies)
+	pick := func(q float64) float64 {
+		if len(latencies) == 0 {
+			return 0
+		}
+		return float64(latencies[int(q*float64(len(latencies)-1))].Microseconds()) / 1000
+	}
+	out := result{Op: op, Workers: workers, Size: size, Requests: msgs, Seconds: elapsed,
+		RPS: float64(msgs) / elapsed, MiBps: float64(bytesXfer) / elapsed / (1 << 20),
+		P50: pick(.50), P90: pick(.90), P99: pick(.99), Max: pick(1), Errors: errs}
 	if v := firstErr.Load(); v != nil {
 		out.FirstErr = v.(string)
 	}

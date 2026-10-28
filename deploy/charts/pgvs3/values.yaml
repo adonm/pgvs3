@@ -1,20 +1,66 @@
 replicas: 3
 image: ghcr.io/adonm/pgvs3:latest
+imagePullPolicy: IfNotPresent
 # Secret with a `url` key (standard libpq/pgx URL; sslmode controls DB TLS).
 urlSecretName: pgvs3-db
 # Keep below the container memory limit; Go uses it as a soft heap ceiling.
-gomemlimit: "3Gi"
+gomemlimit: "3GiB"
 # A per-replica ceiling. Size PostgreSQL max_connections for the whole fleet,
 # including rollout headroom and other clients.
 poolMax: 64
+# Leave 2 GiB between the spool payload budget and the emptyDir limit.
+spoolMaxBytes: 8589934592
 # Spread stateless gateway replicas across zones.
 topologySpread:
   enabled: true
   maxSkew: 1
   whenUnsatisfiable: DoNotSchedule
 resources:
-  requests: { cpu: 250m, memory: 256Mi }
-  limits: { memory: 4Gi }
+  requests: { cpu: 250m, memory: 256Mi, ephemeral-storage: 10Gi }
+  limits: { memory: 4Gi, ephemeral-storage: 12Gi }
+# Let in-flight transfers finish after the 5s drain window.
+terminationGracePeriodSeconds: 60
+automountServiceAccountToken: false
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  # distroless/static:nonroot runs as 65532; fsGroup makes the /tmp emptyDir
+  # writable for cache spooling under a read-only root filesystem.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+# Cache fills and origin uploads spool to /tmp; it must be writable even with
+# a read-only root filesystem. Raise sizeLimit if origin objects exceed it.
+tmpDir:
+  sizeLimit: 10Gi
+# Ingress is default-deny. The default allows clients in the release namespace;
+# add namespaceSelector/podSelector entries for other namespaces. Some CNIs
+# evaluate kubelet HTTP probes against this policy; add the node CIDR to
+# ingress.from if readiness/liveness probes fail.
+networkPolicy:
+  enabled: true
+  ingress:
+    from:
+      - podSelector: {}
+  egress:
+    # Keep true unless PostgreSQL and DNS are covered by explicit rules below.
+    allowAll: true
+    rules: []
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  relabelings: []
+  metricRelabelings: []
 podDisruptionBudget:
   enabled: true
   minAvailable: 1

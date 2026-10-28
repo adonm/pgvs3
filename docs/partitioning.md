@@ -1,4 +1,4 @@
-# Why `s3p.chunks` Is Unpartitioned
+# Why Each Bucket's `chunks` Table Is Unpartitioned
 
 Every chunk read in pgvs3 is a range scan on one file:
 
@@ -40,6 +40,7 @@ Partitioning adds planner and catalog overhead on every query, hurting small
 reads by 15–32% and writes by ~10%, while DuckLake's single-writer model has no
 insert contention to spread across tables.
 
-`s3p.chunks` therefore remains a single unpartitioned table (up to PostgreSQL's
-32 TiB single-relation limit), while ≤64 KiB objects live inline in
-`s3p.objects` and large reads scale via 8 MiB parallel snapshot queries.
+Each bucket's `chunks` table therefore remains a single unpartitioned relation
+(up to PostgreSQL's 32 TiB single-relation limit), while ≤64 KiB objects live
+inline in that schema's `objects` table and large reads scale via 8 MiB parallel
+snapshot queries.

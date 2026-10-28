@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end S3 contract against two live gateways sharing one PostgreSQL.
+# End-to-end S3 + OJS contract against two live gateways sharing one PostgreSQL.
 # Requires: curl, python3, uv (DuckDB 2.0), docker (DuckDB 1.5.6 extension).
 set -euo pipefail
 : "${PGVS3_TEST_DB_URL:?}"
@@ -14,7 +14,12 @@ B=$PGVS3_TEST_ENDPOINT_B
 BUCKET=pgvs3-contract
 RUN="e2e-$(date +%s)-$$"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+ro_pid=""
+cleanup() {
+  if [ -n "$ro_pid" ]; then kill "$ro_pid" 2>/dev/null || true; fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 s3() { curl -sS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$PGVS3_ACCESS_KEY:$PGVS3_SECRET_KEY" "$@"; }
 code() { s3 -o /dev/null -w '%{http_code}' "$@"; }
@@ -22,6 +27,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() { local want=$1; shift; local got; got=$(code "$@"); [ "$got" = "$want" ] || fail "expected HTTP $want, got $got: $*"; }
 
 WEB=$A
+
+# Buckets are explicit resources: object writes never create or resurrect one.
+expect 200 -X PUT "$A/$BUCKET"
 
 # --- basic object, cross-gateway read, HEAD, ranges -------------------------
 head -c 1048576 /dev/urandom > "$TMP/one.bin"
@@ -33,6 +41,11 @@ s3 -H 'Range: bytes=100-199' "$B/$BUCKET/$RUN/one.bin" -o "$TMP/range.out"
 dd if="$TMP/one.bin" of="$TMP/range.want" bs=1 skip=100 count=100 status=none
 cmp "$TMP/range.want" "$TMP/range.out" || fail "range bytes"
 [ "$(s3 -H 'Range: bytes=-100' "$A/$BUCKET/$RUN/one.bin" | wc -c)" = 100 ] || fail "suffix range"
+[ "$(s3 -H 'Range: bytes=0-0' "$A/$BUCKET/$RUN/one.bin" | wc -c)" = 1 ] || fail "single-byte range"
+[ "$(s3 -H 'Range: bytes=0-' "$A/$BUCKET/$RUN/one.bin" | wc -c)" = 1048576 ] || fail "open-ended range"
+s3 -H 'Range: bytes=-1' "$A/$BUCKET/$RUN/one.bin" -o "$TMP/last.out"
+tail -c 1 "$TMP/one.bin" > "$TMP/last.want"
+cmp "$TMP/last.want" "$TMP/last.out" || fail "last-byte range"
 expect 416 -H 'Range: bytes=99999999-' "$A/$BUCKET/$RUN/one.bin"
 
 # --- plain HTTP static web and unsigned S3 ----------------------------------
@@ -46,6 +59,9 @@ curl -fsSI "$WEB/$BUCKET/$RUN/web/" | grep -qi 'content-type: text/html' || fail
 [ "$(curl -fsS "$B/$BUCKET/$RUN/one.bin" | wc -c)" = 1048576 ] || fail "unsigned GET"
 curl -fsS -X PUT --data-binary 'unsigned' "$B/$BUCKET/$RUN/noauth" >/dev/null || fail "unsigned PUT"
 [ "$(s3 "$A/$BUCKET/$RUN/noauth")" = unsigned ] || fail "unsigned PUT body"
+# Presigned URLs are rejected: auth is a network concern, not a gateway one.
+expect 400 "$A/$BUCKET/$RUN/one.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ak&X-Amz-Signature=abc"
+expect 400 "$A/$BUCKET/$RUN/one.bin?AWSAccessKeyId=ak&Signature=abc&Expires=1"
 expect 200 -X PUT --data-binary '' "$A/$BUCKET/$RUN/empty"
 [ "$(s3 "$B/$BUCKET/$RUN/empty" | wc -c)" = 0 ] || fail "empty object body"
 [ "$(s3 -I "$A/$BUCKET/$RUN/empty" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')" = 0 ] || fail "empty object HEAD"
@@ -73,6 +89,13 @@ cat "$TMP"/race.* > "$TMP/race.codes"
 [ "$(grep -c '^200$' "$TMP/race.codes")" = 1 ] || fail "exactly one conditional create must win"
 [ "$(grep -c '^412$' "$TMP/race.codes")" = 7 ] || fail "other conditional creates must be 412"
 s3 "$B/$BUCKET/$RUN/race.txt" | grep -Eq '^race-[0-9]+$' || fail "torn race object"
+
+# --- unsupported feature policy --------------------------------------------
+expect 501 -X PUT -H 'x-amz-server-side-encryption: aws:kms' --data-binary 'x' "$A/$BUCKET/$RUN/sse-kms"
+expect 200 -X PUT -H 'x-amz-server-side-encryption: AES256' --data-binary 'x' "$A/$BUCKET/$RUN/sse-aes"
+expect 501 -X PUT -H 'x-amz-object-lock-mode: COMPLIANCE' --data-binary 'x' "$A/$BUCKET/$RUN/lock"
+expect 501 -X PUT -H 'x-amz-tagging: a=b' --data-binary 'x' "$A/$BUCKET/$RUN/tag"
+expect 501 -X PUT -H 'x-amz-acl: public-read' --data-binary 'x' "$A/$BUCKET/$RUN/public"
 
 # --- listing, pagination and encoding --------------------------------------
 for i in 0 1 2 3 4; do
@@ -106,9 +129,12 @@ PY
 
 # --- batch delete ----------------------------------------------------------
 cat > "$TMP/delete.xml" <<XML
-<Delete><Object><Key>$RUN/page/0</Key></Object><Object><Key>$RUN/page/1</Key></Object><Object><Key>$RUN/page/2</Key></Object></Delete>
+<Delete><Object><Key>$RUN/page/0</Key></Object><Object><Key>$RUN/page/1</Key></Object><Object><Key>$RUN/page/2</Key></Object><Object><Key>$RUN/page/missing</Key></Object></Delete>
 XML
-expect 200 -X POST --data-binary @"$TMP/delete.xml" "$A/$BUCKET?delete"
+delete_resp=$(s3 -X POST --data-binary @"$TMP/delete.xml" "$A/$BUCKET?delete")
+for key in "$RUN/page/0" "$RUN/page/1" "$RUN/page/2" "$RUN/page/missing"; do
+  grep -q "<Deleted><Key>$key</Key></Deleted>" <<<"$delete_resp" || fail "DeleteObjects missing Deleted entry for $key"
+done
 expect 404 "$B/$BUCKET/$RUN/page/0"
 expect 404 "$B/$BUCKET/$RUN/page/1"
 
@@ -144,6 +170,9 @@ ED="$A/$BUCKET"
 expect 200 -X PUT --data-binary 'copy me' "$ED/src"
 expect 200 -X PUT -H 'x-amz-copy-source: /src' "$ED/copy"
 [ "$(s3 "$ED/copy")" = 'copy me' ] || fail "copy bytes"
+expect 200 -X PUT --data-binary 'encoded copy' "$ED/copy%20src%2Bplus"
+expect 200 -X PUT -H "x-amz-copy-source: /$BUCKET/copy%20src%2Bplus" "$ED/encoded-copy"
+[ "$(s3 "$ED/encoded-copy")" = 'encoded copy' ] || fail "URL-encoded copy source"
 expect 204 -X DELETE "$ED/src"
 sleep 2
 [ "$(s3 "$ED/copy")" = 'copy me' ] || fail "reaper removed a shared file"
@@ -178,6 +207,7 @@ left_chunks=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -
 SRC_B="src-$RUN"
 CLONE_HTTP="clone-http-$RUN"
 CLONE_CLI="clone-cli-$RUN"
+expect 200 -X PUT "$A/$SRC_B"
 expect 200 -X PUT --data-binary 'inline-val' "$A/$SRC_B/inline.txt"
 expect 200 -X PUT --data-binary @"$TMP/one.bin" "$A/$SRC_B/chunked.bin"
 
@@ -223,7 +253,7 @@ MISSING="missing-$RUN"
 expect 200 -X PUT "$A/$MISSING"
 docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -q -c \
   "SET client_min_messages=warning; DROP SCHEMA \"s3b_$MISSING\" CASCADE"
-doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
+doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL" || true)
 echo "$doctor_out" | grep -q "missing_schemas=1" || fail "missing schema not reported: $doctor_out"
 .tmp/pgvs3/pgvs3 reap --url "$PGVS3_TEST_DB_URL" --grace 0s >/dev/null || fail "reap with a missing schema"
 doctor_out=$(.tmp/pgvs3/pgvs3 doctor --url "$PGVS3_TEST_DB_URL")
@@ -258,7 +288,7 @@ cmp "$TMP/partcopy" "$TMP/partcopy.out" || fail "upload part copy bytes"
 # The standard S3 surface through an SDK.
 E2E_RUN="$RUN" E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
-import os, time, urllib.request, boto3
+import os, time, urllib.error, urllib.request, boto3
 from botocore.config import Config
 pc=boto3.client('s3', endpoint_url=os.environ['E2E_ENDPOINT'],
     aws_access_key_id=os.environ['E2E_KEY'], aws_secret_access_key=os.environ['E2E_SECRET'],
@@ -269,10 +299,21 @@ assert pc.get_object(Bucket=gen, Key=f'{run}/sdk')['Body'].read()==b'sdk'
 pc.copy_object(Bucket=gen, Key=f'{run}/sdk-copy', CopySource={'Bucket':gen,'Key':f'{run}/sdk'})
 assert pc.get_object(Bucket=gen, Key=f'{run}/sdk-copy')['Body'].read()==b'sdk'
 pc.put_object(Bucket=gen, Key=f'{run}/presigned', Body=b'presigned')
+# Presigned URLs are deliberately rejected: access control is the network's job.
 u=pc.generate_presigned_url('get_object', Params={'Bucket':gen,'Key':f'{run}/presigned'}, ExpiresIn=60)
-assert urllib.request.urlopen(u).read()==b'presigned'
+try:
+    urllib.request.urlopen(u)
+except urllib.error.HTTPError as e:
+    assert e.code == 400, e.code
+else:
+    raise AssertionError("presigned GET must be rejected")
 u=pc.generate_presigned_url('put_object', Params={'Bucket':gen,'Key':f'{run}/presigned-put'}, ExpiresIn=60)
-assert urllib.request.urlopen(urllib.request.Request(u,data=b'put',method='PUT')).status==200
+try:
+    urllib.request.urlopen(urllib.request.Request(u,data=b'put',method='PUT'))
+except urllib.error.HTTPError as e:
+    assert e.code == 400, e.code
+else:
+    raise AssertionError("presigned PUT must be rejected")
 pc.put_object(Bucket=gen, Key=f'{run}/over-inline', Body=b'old')
 up=pc.create_multipart_upload(Bucket=gen, Key=f'{run}/over-inline')
 part=pc.upload_part(Bucket=gen, Key=f'{run}/over-inline', UploadId=up['UploadId'], PartNumber=1, Body=b'n'*1048576)
@@ -435,210 +476,182 @@ comp_bytes=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -A
   'SELECT sum(octet_length(c.data)) FROM "s3c_cache".chunks c JOIN "s3c_cache".objects o ON o.file_id = c.file_id WHERE o.key = '\''big-blob'\''')
 [ "$comp_bytes" -lt 4096 ] || fail "expected 256 KiB compressible chunks < 4096 B, got $comp_bytes"
 
-# --- SQS queue protocol ----------------------------------------------------
-E2E_ENDPOINT="$A" E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" E2E_RUN="$RUN" \
-mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
-import json, os, time, boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
-ep = os.environ['E2E_ENDPOINT']
-sqs = boto3.client('sqs', endpoint_url=ep, aws_access_key_id=os.environ['E2E_KEY'],
-    aws_secret_access_key=os.environ['E2E_SECRET'], region_name='us-east-1',
-    config=Config(retries={'max_attempts': 0}))
-name = 'q-' + os.environ['E2E_RUN'].lower().replace('_', '-')
-url = sqs.create_queue(QueueName=name, Attributes={'VisibilityTimeout': '2'})['QueueUrl']
-assert sqs.get_queue_url(QueueName=name)['QueueUrl'] == url
-assert any(u.endswith('/' + name) for u in sqs.list_queues(QueueNamePrefix='q-').get('QueueUrls', []))
-assert sqs.send_message(QueueUrl=url, MessageBody='hello-sqs')['MD5OfMessageBody']
-batch = sqs.send_message_batch(QueueUrl=url, Entries=[
-    {'Id': 'a', 'MessageBody': 'one'}, {'Id': 'b', 'MessageBody': 'two'}])
-assert len(batch['Successful']) == 2, batch
-msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=2)['Messages']
-bodies = sorted(m['Body'] for m in msgs)
-assert bodies == ['hello-sqs', 'one', 'two'], bodies
-time.sleep(2.5)
-again = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)['Messages']
-assert again, 'messages did not become visible again'
-for m in again:
-    sqs.delete_message(QueueUrl=url, ReceiptHandle=m['ReceiptHandle'])
-attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=['All'])['Attributes']
-assert int(attrs['ApproximateNumberOfMessages']) == 0, attrs
+# --- OJS core job protocol -------------------------------------------------
+OQ="ojs-${RUN//_/-}"
+ojs_post() {
+  local base=$1 path=$2 body=$3
+  curl -fsS -X POST -H 'Content-Type: application/openjobspec+json' -d "$body" "$base$path"
+}
+ojs_get() { curl -fsS "$A$1"; }
+jget() {
+  python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    d=d[int(k)] if k.isdigit() else d[k]
+print(d)' "$1"
+}
+ojs_code() {
+  local method=$1 base=$2 path=$3 body=${4:-}
+  if [ -n "$body" ]; then
+    curl -sS -o "$TMP/ojs.json" -w '%{http_code}' -X "$method" \
+      -H 'Content-Type: application/openjobspec+json' -d "$body" "$base$path"
+  else
+    curl -sS -o "$TMP/ojs.json" -w '%{http_code}' -X "$method" "$base$path"
+  fi
+}
 
-# A superseded receipt is rejected instead of silently acknowledging someone
-# else's delivery; repeating the winning delete stays idempotent.
-stale_name = 'stale-' + os.environ['E2E_RUN'].lower().replace('_', '-')
-stale_url = sqs.create_queue(QueueName=stale_name, Attributes={'VisibilityTimeout': '1'})['QueueUrl']
-sqs.send_message(QueueUrl=stale_url, MessageBody='stale-ack')
-h1 = sqs.receive_message(QueueUrl=stale_url, MaxNumberOfMessages=1)['Messages'][0]['ReceiptHandle']
-time.sleep(1.2)
-h2 = sqs.receive_message(QueueUrl=stale_url, MaxNumberOfMessages=1)['Messages'][0]['ReceiptHandle']
-assert h1 != h2, (h1, h2)
-try:
-    sqs.delete_message(QueueUrl=stale_url, ReceiptHandle=h1)
-except ClientError as e:
-    assert e.response['Error']['Code'] == 'ReceiptHandleIsInvalid', e.response
-else:
-    raise AssertionError('stale receipt was accepted')
-dbatch = sqs.delete_message_batch(QueueUrl=stale_url, Entries=[
-    {'Id': 'stale', 'ReceiptHandle': h1},
-    {'Id': 'live', 'ReceiptHandle': h2},
-])
-assert [e['Id'] for e in dbatch.get('Successful', [])] == ['live'], dbatch
-assert len(dbatch.get('Failed', [])) == 1 and dbatch['Failed'][0]['Id'] == 'stale', dbatch
-assert dbatch['Failed'][0]['Code'] == 'ReceiptHandleIsInvalid', dbatch
-sqs.delete_message(QueueUrl=stale_url, ReceiptHandle=h2)
-sqs.delete_queue(QueueUrl=stale_url)
+manifest=$(ojs_get /ojs/manifest)
+printf '%s' "$manifest" | grep -q '"ojs_version":"1.0"' || fail "OJS manifest version"
+printf '%s' "$manifest" | grep -q '"conformance_level":0' || fail "OJS manifest conformance claim"
+printf '%s' "$manifest" | grep -q '"batch_enqueue":true' || fail "OJS manifest capabilities"
+health=$(ojs_get /ojs/v1/health)
+printf '%s' "$health" | grep -q '"status":"ok"' || fail "OJS health"
 
-# RedrivePolicy moves a message to the dead-letter queue on the receive that
-# exceeds maxReceiveCount, and that receive skips past it to any live message.
-run = os.environ['E2E_RUN'].lower().replace('_', '-')
-dl_name = 'dl-' + run
-dl_url = sqs.create_queue(QueueName=dl_name)['QueueUrl']
-src_name = 'src-' + run
-redrive = json.dumps({'deadLetterTargetArn': 'arn:aws:sqs:us-east-1:000000000000:' + dl_name,
-                      'maxReceiveCount': '1'})
-src_url = sqs.create_queue(QueueName=src_name,
-    Attributes={'VisibilityTimeout': '0', 'RedrivePolicy': redrive})['QueueUrl']
-sqs.send_message(QueueUrl=src_url, MessageBody='doomed')
-first = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=1).get('Messages', [])
-assert first and first[0]['Body'] == 'doomed', first
-sqs.send_message(QueueUrl=src_url, MessageBody='survivor')
-second = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=1).get('Messages', [])
-assert len(second) == 1 and second[0]['Body'] == 'survivor', second
-sqs.delete_message(QueueUrl=src_url, ReceiptHandle=second[0]['ReceiptHandle'])
-dead = sqs.receive_message(QueueUrl=dl_url, MaxNumberOfMessages=1).get('Messages', [])
-assert dead and dead[0]['Body'] == 'doomed', dead
-sqs.delete_message(QueueUrl=dl_url, ReceiptHandle=dead[0]['ReceiptHandle'])
-sqs.delete_queue(QueueUrl=src_url)
-sqs.delete_queue(QueueUrl=dl_url)
-sqs.purge_queue(QueueUrl=url)
-sqs.delete_queue(QueueUrl=url)
-try:
-    sqs.get_queue_url(QueueName=name)
-    raise AssertionError('queue still exists')
-except sqs.exceptions.QueueDoesNotExist:
-    pass
-print('sqs ok')
-PY
+enq=$(ojs_post "$A" /ojs/v1/jobs "{\"type\":\"e2e.job\",\"args\":[\"one\",{\"n\":1}],\"options\":{\"queue\":\"$OQ\",\"priority\":7}}")
+id=$(printf '%s' "$enq" | jget job.id)
+printf '%s' "$enq" | grep -q '"state":"available"' || fail "OJS enqueue state"
+[ "$(ojs_get "/ojs/v1/jobs/$id" | jget job.state)" = available ] || fail "OJS INFO available"
 
-# Acks must use the receipt index, never a sequential scan.
-QIDX="qidx-$RUN"
-curl -fsS -X POST -H 'Content-Type: application/x-amz-json-1.0' \
-  -H 'X-Amz-Target: AmazonSQS.CreateQueue' \
-  -d "{\"QueueName\":\"$QIDX\"}" "$A/" >/dev/null
+fr=$(ojs_post "$A" /ojs/v1/workers/fetch "{\"queues\":[\"$OQ\"],\"count\":1,\"worker_id\":\"e2e-worker\",\"visibility_timeout_ms\":2000}")
+jid=$(printf '%s' "$fr" | jget job.id)
+tok=$(printf '%s' "$fr" | jget job.lease_token)
+[ "$jid" = "$id" ] || fail "OJS fetch returned $jid, want $id"
+[ "$(printf '%s' "$fr" | jget job.state)" = active ] || fail "OJS fetch state"
+[ "$(printf '%s' "$fr" | jget job.attempt)" = 1 ] || fail "OJS fetch attempt"
+[ -n "$tok" ] || fail "OJS fetch lease token"
+
+hb=$(ojs_post "$A" /ojs/v1/workers/heartbeat \
+  "{\"worker_id\":\"e2e-worker\",\"active_jobs\":[\"$jid\"],\"lease_tokens\":{\"$jid\":\"$tok\"},\"visibility_timeout_ms\":5000}")
+[ "$(printf '%s' "$hb" | jget jobs_extended.0)" = "$jid" ] || fail "OJS heartbeat extension: $hb"
+
+ack=$(ojs_post "$A" /ojs/v1/workers/ack "{\"job_id\":\"$jid\",\"lease_token\":\"$tok\",\"result\":{\"ok\":true}}")
+[ "$(printf '%s' "$ack" | jget state)" = completed ] || fail "OJS ack: $ack"
+[ "$(ojs_get "/ojs/v1/jobs/$jid" | jget job.state)" = completed ] || fail "OJS INFO completed"
+[ "$(ojs_get "/ojs/v1/jobs/$jid" | jget job.result.ok)" = True ] || fail "OJS ack result"
+
+# A superseded lease is rejected with 409 instead of completing someone else's job.
+SQ="$OQ-stale"
+enq=$(ojs_post "$A" /ojs/v1/jobs "{\"type\":\"e2e.stale\",\"args\":[],\"queue\":\"$SQ\"}")
+sid=$(printf '%s' "$enq" | jget job.id)
+fr=$(ojs_post "$A" /ojs/v1/workers/fetch "{\"queues\":[\"$SQ\"],\"count\":1,\"worker_id\":\"e2e-old\",\"visibility_timeout_ms\":100}")
+old=$(printf '%s' "$fr" | jget job.lease_token)
+sleep 0.2
+fr=$(ojs_post "$A" /ojs/v1/workers/fetch "{\"queues\":[\"$SQ\"],\"count\":1,\"worker_id\":\"e2e-new\",\"visibility_timeout_ms\":2000}")
+new=$(printf '%s' "$fr" | jget job.lease_token)
+[ "$old" != "$new" ] || fail "OJS lease token was reused"
+code=$(ojs_code POST "$A" /ojs/v1/workers/ack "{\"job_id\":\"$sid\",\"lease_token\":\"$old\"}")
+[ "$code" = 409 ] || fail "stale OJS ack returned $code"
+grep -q 'stale_lease' "$TMP/ojs.json" || fail "stale OJS ack error body"
+ojs_post "$A" /ojs/v1/workers/ack "{\"job_id\":\"$sid\",\"lease_token\":\"$new\"}" >/dev/null || fail "fresh OJS ack"
+ojs_post "$A" /ojs/v1/workers/ack "{\"job_id\":\"$sid\",\"lease_token\":\"$new\"}" >/dev/null 2>&1 && fail "duplicate OJS ack accepted"
+
+# Retry with backoff, then discard when max_attempts is exhausted.
+RQ="$OQ-retry"
+enq=$(ojs_post "$A" /ojs/v1/jobs \
+  "{\"type\":\"e2e.retry\",\"args\":[],\"max_attempts\":2,\"queue\":\"$RQ\",\"retry\":{\"max_attempts\":2,\"initial_interval_ms\":25,\"backoff_coefficient\":2}}")
+rid=$(printf '%s' "$enq" | jget job.id)
+fr=$(ojs_post "$A" /ojs/v1/workers/fetch "{\"queues\":[\"$RQ\"],\"count\":1,\"worker_id\":\"e2e-retry\"}")
+rtok=$(printf '%s' "$fr" | jget job.lease_token)
+nack=$(ojs_post "$A" /ojs/v1/workers/nack \
+  "{\"job_id\":\"$rid\",\"lease_token\":\"$rtok\",\"error\":{\"retryable\":true,\"code\":\"E_TEMP\",\"message\":\"try again\"}}")
+[ "$(printf '%s' "$nack" | jget state)" = retryable ] || fail "OJS retry nack: $nack"
+[ "$(printf '%s' "$nack" | jget attempt)" = 2 ] || fail "OJS retry attempt: $nack"
+[ -n "$(printf '%s' "$nack" | jget next_attempt_at)" ] || fail "OJS retry schedule"
+sleep 0.15
+fr=$(ojs_post "$A" /ojs/v1/workers/fetch "{\"queues\":[\"$RQ\"],\"count\":1,\"worker_id\":\"e2e-retry2\",\"visibility_timeout_ms\":2000}")
+[ "$(printf '%s' "$fr" | jget job.attempt)" = 2 ] || fail "OJS retry attempt not preserved"
+rtok=$(printf '%s' "$fr" | jget job.lease_token)
+nack=$(ojs_post "$A" /ojs/v1/workers/nack \
+  "{\"job_id\":\"$rid\",\"lease_token\":\"$rtok\",\"error\":{\"retryable\":true,\"message\":\"still failing\"}}")
+[ "$(printf '%s' "$nack" | jget state)" = discarded ] || fail "OJS discard: $nack"
+[ -n "$(printf '%s' "$nack" | jget discarded_at)" ] || fail "OJS discarded_at"
+
+# A non-retryable error discards immediately.
+FQ="$OQ-fatal"
+enq=$(ojs_post "$A" /ojs/v1/jobs "{\"type\":\"e2e.fatal\",\"args\":[],\"max_attempts\":5,\"queue\":\"$FQ\"}")
+fid=$(printf '%s' "$enq" | jget job.id)
+fr=$(ojs_post "$A" /ojs/v1/workers/fetch "{\"queues\":[\"$FQ\"],\"count\":1,\"worker_id\":\"e2e-fatal\"}")
+ftok=$(printf '%s' "$fr" | jget job.lease_token)
+nack=$(ojs_post "$A" /ojs/v1/workers/nack \
+  "{\"job_id\":\"$fid\",\"lease_token\":\"$ftok\",\"error\":{\"retryable\":false,\"message\":\"fatal\"}}")
+[ "$(printf '%s' "$nack" | jget state)" = discarded ] || fail "OJS non-retryable discard: $nack"
+
+# Scheduled jobs stay out of the available set until scheduled_at.
+DQ="$OQ-sched"
+when=$(date -u -d '+1 second' +%Y-%m-%dT%H:%M:%SZ)
+enq=$(ojs_post "$A" /ojs/v1/jobs "{\"type\":\"e2e.later\",\"args\":[],\"queue\":\"$DQ\",\"scheduled_at\":\"$when\"}")
+did=$(printf '%s' "$enq" | jget job.id)
+[ "$(ojs_get "/ojs/v1/jobs/$did" | jget job.state)" = scheduled ] || fail "OJS scheduled state"
+sleep 1.3
+fr=$(ojs_post "$A" /ojs/v1/workers/fetch "{\"queues\":[\"$DQ\"],\"count\":1,\"worker_id\":\"e2e-sched\"}")
+[ "$(printf '%s' "$fr" | jget job.id)" = "$did" ] || fail "OJS scheduled job did not become available"
+
+# Atomic batch enqueue and queue metadata.
+BQ="$OQ-batch"
+batch=$(ojs_post "$A" /ojs/v1/jobs/batch "{\"jobs\":[
+  {\"type\":\"e2e.batch\",\"args\":[1],\"queue\":\"$BQ\"},
+  {\"type\":\"e2e.batch\",\"args\":[2],\"queue\":\"$BQ\"}]}")
+[ "$(printf '%s' "$batch" | jget count)" = 2 ] || fail "OJS batch count"
+stats=$(ojs_get "/ojs/v1/queues/$BQ/stats")
+[ "$(printf '%s' "$stats" | jget stats.available)" = 2 ] || fail "OJS queue stats: $stats"
+[ "$(printf '%s' "$stats" | jget queue.name)" = "$BQ" ] || fail "OJS queue stats name"
+ojs_get /ojs/v1/queues | grep -q "\"name\":\"$BQ\"" || fail "OJS queue list"
+ojs_post "$A" /ojs/v1/jobs/batch '{"jobs":[{"type":"e2e.batch","args":[]},{"type":"bad","args":{}}]}' >/dev/null 2>&1 \
+  && fail "invalid OJS batch accepted"
+
+# Read-only gateway: reads/metadata work, mutating lifecycle calls are rejected.
+ro_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+.tmp/pgvs3/pgvs3 serve --url "$PGVS3_TEST_DB_URL" --addr "127.0.0.1:$ro_port" \
+  --read-only --log-level error >"$TMP/ojs-ro.log" 2>&1 &
+ro_pid=$!
+for i in $(seq 1 120); do
+  curl -fsS --max-time 1 "http://127.0.0.1:$ro_port/ojs/v1/health" >/dev/null 2>&1 && break
+  [ "$i" = 120 ] && { cat "$TMP/ojs-ro.log" >&2; fail "read-only OJS gateway did not start"; }
+  sleep 0.25
+done
+RO="http://127.0.0.1:$ro_port"
+curl -fsS "$RO/ojs/v1/queues/$OQ/stats" | grep -q "\"name\":\"$OQ\"" || fail "read-only OJS stats"
+[ "$(ojs_code GET "$RO" "/ojs/v1/jobs/$id")" = 200 ] || fail "read-only OJS INFO"
+[ "$(ojs_code POST "$RO" /ojs/v1/jobs '{"type":"e2e.ro","args":[]}')" = 403 ] || fail "read-only OJS enqueue"
+[ "$(ojs_code POST "$RO" /ojs/v1/workers/fetch '{"queues":["'"$OQ"'"]}')" = 403 ] || fail "read-only OJS fetch"
+[ "$(ojs_code POST "$RO" /ojs/v1/workers/ack '{"job_id":"'"$id"'","lease_token":"x"}')" = 403 ] || fail "read-only OJS ack"
+[ "$(ojs_code POST "$RO" /ojs/v1/workers/nack '{"job_id":"'"$id"'","lease_token":"x","error":{"retryable":true}}')" = 403 ] || fail "read-only OJS nack"
+[ "$(ojs_code POST "$RO" /ojs/v1/workers/heartbeat '{"worker_id":"x","job_id":"'"$id"'","lease_token":"x"}')" = 403 ] || fail "read-only OJS heartbeat"
+[ "$(ojs_code DELETE "$RO" "/ojs/v1/jobs/$id")" = 403 ] || fail "read-only OJS cancel"
+kill "$ro_pid" 2>/dev/null || true
+wait "$ro_pid" 2>/dev/null || true
+ro_pid=""
+
+stat_out=$(.tmp/pgvs3/pgvs3 stat --url "$PGVS3_TEST_DB_URL" --kind queue --name "$OQ")
+echo "$stat_out" | grep -Eq 'objects=[1-9]' || fail "pgvs3 stat queue: $stat_out"
+# OJS INFO and lease updates must use the per-queue jobs primary key/unique index.
 plan=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d pgvs3 -At -c "
   SET enable_seqscan = off;
-  EXPLAIN (COSTS OFF) DELETE FROM \"s3q_$QIDX\".messages WHERE receipt = 'x';
+  EXPLAIN (COSTS OFF) UPDATE \"s3q_$OQ\".jobs SET state='active' WHERE id = '$id';
 ")
-echo "$plan" | grep -q "messages_receipt" || fail "SQS ack does not use messages_receipt: $plan"
-# Legacy Query/XML protocol (form-encoded POST body).
-curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data "Action=SendMessage&QueueUrl=$A/$QIDX&MessageBody=query-xml" "$A/" | grep -q '<SendMessageResponse' || fail "SQS Query SendMessage XML"
-curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data "Action=ReceiveMessage&QueueUrl=$A/$QIDX&MaxNumberOfMessages=1" "$A/" | grep -q '<Body>query-xml</Body>' || fail "SQS Query ReceiveMessage XML"
-curl -fsS -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data "Action=PurgeQueue&QueueUrl=$A/$QIDX" "$A/" | grep -q '<PurgeQueueResponse' || fail "SQS Query PurgeQueue XML"
-.tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --kind queue --force "$QIDX" >/dev/null
+echo "$plan" | grep -q "jobs_id_key" || fail "OJS lease update does not use jobs id index: $plan"
 
-# --- layout v10 -> v11 in-place migration -----------------------------------
-V10_DB="pgvs3_v10_${RUN//-/_}"
-V10_URL="${PGVS3_TEST_DB_URL%/*}/$V10_DB"
-docker exec "$PGVS3_TEST_PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d postgres \
-  -c "DROP DATABASE IF EXISTS \"$V10_DB\"" -c "CREATE DATABASE \"$V10_DB\"" >/dev/null
-docker exec -i "$PGVS3_TEST_PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d "$V10_DB" >/dev/null <<'SQL'
-CREATE SCHEMA s3p;
-CREATE TABLE s3p.layout (version int4 NOT NULL);
-INSERT INTO s3p.layout VALUES (10);
-CREATE SEQUENCE s3p.file_ids CACHE 64;
-CREATE TABLE s3p.buckets (
-  name        text COLLATE "C" PRIMARY KEY,
-  schema_name text COLLATE "C" NOT NULL UNIQUE,
-  created_at  timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT bucket_name_shape CHECK (name ~ '^[a-z0-9._-]{1,58}$'));
-CREATE SCHEMA "s3b_legacy";
-CREATE TABLE "s3b_legacy".objects (
-  key           text COLLATE "C" PRIMARY KEY,
-  file_id       bigint,
-  size          int8 NOT NULL,
-  sha256        bytea NOT NULL,
-  etag          text NOT NULL,
-  user_metadata text[] NOT NULL DEFAULT '{}'::text[],
-  content_type  text NOT NULL DEFAULT 'application/octet-stream',
-  created_at    timestamptz NOT NULL DEFAULT now(),
-  expires_at    timestamptz,
-  parts         int8[],
-  part_ends     int8[],
-  inline_data   bytea STORAGE EXTERNAL);
-CREATE TABLE "s3b_legacy".chunks (
-  file_id int8 NOT NULL, no int4 NOT NULL, data bytea STORAGE EXTERNAL NOT NULL,
-  PRIMARY KEY (file_id, no));
-CREATE TABLE "s3b_legacy".uploads (
-  upload_id          text PRIMARY KEY,
-  key                text COLLATE "C" NOT NULL,
-  checksum_algorithm text,
-  user_metadata      text[] NOT NULL DEFAULT '{}'::text[],
-  content_type       text NOT NULL DEFAULT 'application/octet-stream',
-  created_at         timestamptz NOT NULL DEFAULT now());
-CREATE TABLE "s3b_legacy".upload_parts (
-  upload_id text NOT NULL REFERENCES "s3b_legacy".uploads ON DELETE CASCADE,
-  part_no   int4 NOT NULL, file_id int8 NOT NULL, size int8 NOT NULL,
-  sha256 bytea NOT NULL, md5 bytea NOT NULL, checksum text,
-  PRIMARY KEY (upload_id, part_no));
-CREATE TABLE "s3b_legacy".object_part_checksums (
-  key text COLLATE "C" NOT NULL, part_no int4 NOT NULL, file_id int8 NOT NULL,
-  algorithm text NOT NULL, value text NOT NULL, PRIMARY KEY (key, part_no),
-  FOREIGN KEY (key) REFERENCES "s3b_legacy".objects (key)
-    ON UPDATE CASCADE ON DELETE CASCADE);
-CREATE TABLE "s3b_legacy".garbage (
-  file_id int8 PRIMARY KEY, queued_at timestamptz NOT NULL DEFAULT now());
-INSERT INTO s3p.buckets (name, schema_name) VALUES ('legacy', 's3b_legacy');
-INSERT INTO "s3b_legacy".objects (key, size, sha256, etag, inline_data)
-  VALUES ('inline.txt', 5, decode(repeat('00', 32), 'hex'),
-          '0123456789abcdef0123456789abcdef', 'hello');
-INSERT INTO "s3b_legacy".objects (key, file_id, size, sha256, etag)
-  VALUES ('chunked.bin', 42, 5, decode(repeat('11', 32), 'hex'),
-          'fedcba9876543210fedcba9876543210');
-INSERT INTO "s3b_legacy".chunks VALUES (42, 0, 'chunk');
-SELECT setval('s3p.file_ids', 42);
-SQL
-migrate_out=$(.tmp/pgvs3/pgvs3 migrate --url "$V10_URL")
-echo "$migrate_out" | grep -q "migrated_buckets=1 layout=11" || fail "migrate: $migrate_out"
-.tmp/pgvs3/pgvs3 migrate --url "$V10_URL" | grep -q "migrated_buckets=0 layout=11" || fail "migrate is not idempotent"
-v10_state=$(docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d "$V10_DB" -At -c "
-  SELECT (SELECT version FROM s3p.layout) || '|' ||
-         (SELECT count(*) FROM s3p.namespaces WHERE kind = 'bucket' AND name = 'legacy') || '|' ||
-         (SELECT count(*) FROM \"s3b_legacy\".chunks) || '|' ||
-         (SELECT count(*) FROM information_schema.columns WHERE table_schema = 's3b_legacy'
-            AND table_name = 'objects' AND column_name = 'origin_etag') || '|' ||
-         (to_regclass('s3p.v10_buckets') IS NOT NULL) || '|' ||
-         (SELECT string_agg(key || ':' || coalesce(encode(inline_data, 'escape'), '-') || ':' ||
-                            coalesce(file_id::text, '-'), ',' ORDER BY key)
-            FROM \"s3b_legacy\".objects);")
-[ "$v10_state" = '11|1|1|1|true|chunked.bin:-:42,inline.txt:hello:-' ] || fail "v10 migration state: $v10_state"
-doctor10=$(.tmp/pgvs3/pgvs3 doctor --url "$V10_URL")
-echo "$doctor10" | grep -q "layout=11" || fail "migrated layout: $doctor10"
-echo "$doctor10" | grep -q "buckets=1" || fail "migrated bucket count: $doctor10"
-docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -d postgres -c "DROP DATABASE \"$V10_DB\"" >/dev/null
+for q in "$OQ" "$SQ" "$RQ" "$FQ" "$DQ" "$BQ"; do
+  .tmp/pgvs3/pgvs3 drop --url "$PGVS3_TEST_DB_URL" --kind queue --force "$q" >/dev/null
+done
 
 # --- S3 cache tier stored in PostgreSQL (no external gateway state) ---------
 ORIGIN_DIR="$TMP/origin"
 mkdir -p "$ORIGIN_DIR"
-cat > "$TMP/origin.yaml" <<YAML
-type: filesystem
-config:
-  directory: $ORIGIN_DIR
-YAML
+cat > "$TMP/origin.json" <<JSON
+{"type":"filesystem","config":{"directory":"$ORIGIN_DIR"}}
+JSON
 # Persist the origin config for bucket `edge` inside PostgreSQL; both running
 # gateways ($A and $B, started without --origin-config) discover it from PG.
 .tmp/pgvs3/pgvs3 origin --url "$PGVS3_TEST_DB_URL" --bucket edge \
-  --cache-namespace "ocache-$RUN" --cache-ttl 0s set "$TMP/origin.yaml" | grep -q "origin_set=edge" || fail "pgvs3 origin set"
+  --cache-namespace "ocache-$RUN" --cache-ttl 0s set "$TMP/origin.json" | grep -q "origin_set=edge" || fail "pgvs3 origin set"
 .tmp/pgvs3/pgvs3 origin --url "$PGVS3_TEST_DB_URL" list | grep -q "origin=edge" || fail "pgvs3 origin list"
 sleep 1.2
 OCACHE="$A"
 OCACHE_ENDPOINT_A="$A" OCACHE_ENDPOINT_B="$B" OCACHE_DIR="$ORIGIN_DIR" OCACHE_RUN="$RUN" \
 E2E_KEY="$PGVS3_ACCESS_KEY" E2E_SECRET="$PGVS3_SECRET_KEY" \
 mise exec uv -- uv run --quiet --no-project --with boto3 python - <<'PY'
-import os, boto3
+import os, time, boto3
 from botocore.config import Config
 cfg = Config(signature_version='s3v4', s3={'addressing_style': 'path'})
 ca = boto3.client('s3', endpoint_url=os.environ['OCACHE_ENDPOINT_A'],
@@ -675,7 +688,8 @@ copy_get = cb.get_object(Bucket=b, Key=copy_k)
 assert copy_get['Body'].read() == body
 assert copy_get['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', copy_get['ResponseMetadata']['HTTPHeaders']
 assert os.path.exists(os.path.join(os.environ['OCACHE_DIR'], b, copy_k))
-# Multipart upload through the cache tier writes through to the origin and is immediately a cache HIT on B.
+# Unconditional multipart write-back is immediately readable on B; origin
+# persistence happens asynchronously, including for small multipart bodies.
 mp_k = os.environ['OCACHE_RUN'] + '/mp.bin'
 mp_body = b'part-payload-' * 1000
 up = ca.create_multipart_upload(Bucket=b, Key=mp_k)
@@ -685,7 +699,11 @@ ca.complete_multipart_upload(Bucket=b, Key=mp_k, UploadId=up['UploadId'],
 mp_get = cb.get_object(Bucket=b, Key=mp_k)
 assert mp_get['Body'].read() == mp_body
 assert mp_get['ResponseMetadata']['HTTPHeaders'].get('x-cache') == 'HIT', mp_get['ResponseMetadata']['HTTPHeaders']
-assert os.path.exists(os.path.join(os.environ['OCACHE_DIR'], b, mp_k))
+mp_path = os.path.join(os.environ['OCACHE_DIR'], b, mp_k)
+deadline = time.monotonic() + 15
+while not os.path.exists(mp_path):
+    assert time.monotonic() < deadline, 'multipart outbox did not reach the origin'
+    time.sleep(0.05)
 # 0-byte object through the cache tier must report Content-Length: 0.
 empty_k = os.environ['OCACHE_RUN'] + '/empty.bin'
 ca.put_object(Bucket=b, Key=empty_k, Body=b'')

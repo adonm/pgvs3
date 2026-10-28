@@ -1,0 +1,66 @@
+amends "package://github.com/jdx/hk/releases/download/v2.8.1/hk@2.8.1#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.8.1/hk@2.8.1#/Builtins.pkl"
+
+// Git hooks and project checks: https://hk.jdx.dev
+// Install once per clone with `hk install --mise` (or use the global launcher
+// on Git 2.54+). Run `just hooks` to install through mise.
+min_hk_version = "2.8.1"
+fail_fast = false
+exclude = List(".tmp/**")
+
+// File-level formatters first, then module-wide analysis. The dependency chain
+// makes the modernizer run before import formatting, and analysis after all
+// writes have landed.
+local goSteps = new Mapping<String, Step> {
+  ["trailing-whitespace"] = (Builtins.trailing_whitespace)
+  ["newlines"] = (Builtins.newlines)
+  ["go-fix"] = Builtins.go_fix
+  ["go-imports"] = (Builtins.go_imports) {
+    depends = List("go-fix")
+  }
+  ["go-fmt"] = (Builtins.go_fmt) {
+    depends = List("go-imports")
+  }
+  ["gomod-tidy"] = (Builtins.gomod_tidy) {
+    depends = List("go-fmt")
+  }
+  ["go-vet"] = (Builtins.go_vet) {
+    depends = List("go-fmt", "gomod-tidy")
+  }
+  ["staticcheck"] = (Builtins.staticcheck) {
+    depends = List("go-fmt", "gomod-tidy")
+  }
+  ["govulncheck"] = (Builtins.go_vuln_check) {
+    depends = List("gomod-tidy")
+    profiles = List("ci")
+  }
+}
+
+hooks {
+  ["check"] {
+    steps = goSteps
+  }
+  ["fix"] {
+    fix = true
+    steps = goSteps
+  }
+  ["pre-commit"] {
+    fix = true
+    stage = true
+    stash = "git"
+    steps = goSteps
+  }
+  // Keep pushes cheap but meaningful: run tests and the official Go
+  // vulnerability scanner for every Go module touched by the push.
+  ["pre-push"] {
+    steps {
+      ["go-test"] {
+        glob = List("**/*.go", "**/go.mod", "**/go.sum")
+        workspace_indicator = "go.mod"
+        dir = "{{workspace}}"
+        check = "go test ./..."
+      }
+      ["govulncheck"] = Builtins.go_vuln_check
+    }
+  }
+}

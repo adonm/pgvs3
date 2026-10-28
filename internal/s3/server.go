@@ -1,27 +1,22 @@
 package s3
 
 import (
-	"crypto/md5"
-	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
-	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/jackc/pgx/v5/pgconn"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/objcache"
+	"github.com/adonm/pgvs3/internal/reqguard"
 	"github.com/adonm/pgvs3/internal/store"
+	"github.com/adonm/pgvs3/internal/telemetry"
 )
 
 const ioChunk = 256 << 10
@@ -31,28 +26,49 @@ var copyBufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
-func copyBuf() []byte     { return *(copyBufPool.Get().(*[]byte)) }
+func copyBuf() []byte { return *(copyBufPool.Get().(*[]byte)) }
+
 func putCopyBuf(b []byte) { copyBufPool.Put(&b) }
 
-// Server is the S3 HTTP front end. It is stateless over PostgreSQL, so any
-// gateway instance can serve any request of any multipart upload.
 type Server struct {
-	store       *store.Store
-	log         *slog.Logger
-	metrics     *metrics
-	readOnly    bool
-	draining    atomic.Bool
-	origins     *objcache.Registry
-	metricsHook func(io.Writer)
+	store             *store.Store
+	log               *slog.Logger
+	metrics           *telemetry.RequestMetrics
+	readOnly          bool
+	draining          atomic.Bool
+	origins           *objcache.Registry
+	readOverride      readBackend
+	writeOverride     writeBackend
+	multipartOverride multipartBackend
+	metricsHook       func(io.Writer)
+	sem               chan struct{}
 }
 
-// SetMetricsHook appends another protocol's counters to /metrics.
 func (s *Server) SetMetricsHook(f func(io.Writer)) { s.metricsHook = f }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool) *Server {
+func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int) *Server {
+	if maxConc <= 0 {
+		maxConc = 32
+	}
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Server{
-		store: st, log: log, metrics: newMetrics(), readOnly: readOnly,
-		origins: objcache.NewRegistry(st, log),
+		store: st, log: log, metrics: telemetry.NewRequestMetrics(), readOnly: readOnly,
+		origins: objcache.NewRegistry(st, log, readOnly),
+		sem:     make(chan struct{}, maxConc),
+	}
+}
+
+func (s *Server) acquire() (func(), bool) {
+	if s.sem == nil {
+		return func() {}, true
+	}
+	select {
+	case s.sem <- struct{}{}:
+		return func() { <-s.sem }, true
+	default:
+		return nil, false
 	}
 }
 
@@ -71,7 +87,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.store.Ready(r.Context()); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			if s.log != nil {
+				s.log.Error("s3 readiness check failed", "err", err)
+			}
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -79,234 +98,169 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/metrics" {
-		s.metrics.write(w, s.store)
+		s.writeMetrics(w, s.store)
 		if s.metricsHook != nil {
 			s.metricsHook(w)
 		}
 		return
 	}
-	defer func() { s.metrics.observe(r.Method, rw.status, time.Since(start), rw.n) }()
-	w.Header().Set("x-amz-request-id", requestIDHeader())
+	defer func() { s.metrics.Observe(r.Method, rw.status, time.Since(start), rw.n) }()
+	ensureRequestID(w)
+	release, ok := s.acquire()
+	if !ok {
+		w.Header().Set("Retry-After", "1")
+		writeError(rw, r, apiErr("SlowDown", "Too many concurrent S3 requests; retry shortly.", http.StatusServiceUnavailable), s.log)
+		return
+	}
+	defer release()
+	if reqguard.Presigned(r.URL.Query()) {
+		writeError(rw, r, apiErr("InvalidRequest", reqguard.PresignRejection, http.StatusBadRequest), s.log)
+		return
+	}
 	s.log.Debug("request", "method", r.Method, "host", r.Host, "path", r.URL.Path, "query", r.URL.RawQuery)
-	s.serve(rw, r)
+	if err := s.serve(rw, r); err != nil {
+		s.fail(rw, r, err)
+	}
+}
+
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	err = s.apiError(err)
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Code == "SlowDown" {
+		w.Header().Set("Retry-After", "1")
+	}
+	writeError(w, r, err, s.log)
 }
 
 func (s *Server) SetDraining(v bool) { s.draining.Store(v) }
 
-func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	prepareBody(r)
+func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
+	if err := prepareBody(r); err != nil {
+		return err
+	}
 	if strings.HasPrefix(r.URL.EscapedPath(), CachePrefix) {
-		s.serveCacheHTTP(w, r)
-		return
+		return s.serveCacheHTTP(w, r)
 	}
 	bucket, key, err := splitPath(r)
 	if err != nil {
-		writeError(w, r, errInvalidRequest("invalid object path"), s.log)
-		return
+		return errInvalidRequest("invalid object path")
 	}
 	if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeError(w, r, errAccessDenied("gateway is read-only"), s.log)
-		return
+		return errAccessDenied("gateway is read-only")
 	}
 	q := r.URL.Query()
 	switch {
 	case bucket == "":
 		if r.Method == http.MethodGet {
-			s.listBuckets(w, r)
-			return
+			return s.listBuckets(w, r)
 		}
-		s.methodNotAllowed(w, r)
+		return errMethodNotAllowed()
 	case key == "":
 		if s.originFor(r.Context(), bucket) != nil {
-			s.serveOriginBucket(w, r, bucket, q)
-			return
+			return s.serveOriginBucket(w, r, bucket, q)
 		}
-		s.bucketRequest(w, r, bucket, q)
+		return s.bucketRequest(w, r, bucket, q)
 	default:
-		s.objectRequest(w, r, bucket, key, q)
+		return s.objectRequest(w, r, bucket, key, q)
 	}
 }
 
-func (s *Server) bucketRequest(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
-	switch r.Method {
-	case http.MethodPut:
-		s.createBucket(w, r, bucket)
-	case http.MethodDelete:
-		s.deleteBucket(w, r, bucket)
-	case http.MethodHead:
-		s.headBucket(w, r, bucket)
-	case http.MethodGet:
-		switch {
-		case q.Has("location"):
-			s.getBucketLocation(w, r, bucket)
-		case q.Has("uploads"):
-			s.listMultipartUploads(w, r, bucket, q)
-		case r.URL.RawQuery == "" && r.Header.Get("Authorization") == "" && r.Header.Get("x-amz-date") == "":
-			if _, err := s.store.MetaHeader(r.Context(), bucket, "index.html"); err == nil {
-				s.getObject(w, r, bucket, "index.html")
-				return
-			}
-			s.listObjectsV2(w, r, bucket, q)
-		default:
-			s.listObjectsV2(w, r, bucket, q)
-		}
-	case http.MethodPost:
-		if q.Has("delete") {
-			s.deleteObjects(w, r, bucket)
-			return
-		}
-		s.methodNotAllowed(w, r)
-	default:
-		s.methodNotAllowed(w, r)
+func (s *Server) bucketRequest(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) error {
+	c := routeContext{s: s, w: w, r: r, bucket: bucket, q: q}
+	found, err := c.dispatch(bucketRoutes)
+	if !found {
+		return errMethodNotAllowed()
 	}
+	return err
 }
 
-func (s *Server) objectRequest(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+func (s *Server) objectRequest(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) error {
 	if len(key) > 1024 {
-		writeError(w, r, errInvalidRequest("object key exceeds 1024 bytes"), s.log)
-		return
+		return errInvalidRequest("object key exceeds 1024 bytes")
 	}
 	if q.Has("renameObject") || r.Header.Get("x-amz-rename-source") != "" ||
 		r.Header.Get("x-amz-write-offset-bytes") != "" {
-		writeError(w, r, errNotImplemented(), s.log)
-		return
+		return errNotImplemented()
 	}
-	switch r.Method {
-	case http.MethodHead:
-		s.headObject(w, r, bucket, key)
-	case http.MethodGet:
-		if q.Has("attributes") {
-			s.getObjectAttributes(w, r, bucket, key)
-			return
-		}
-		if q.Has("uploadId") {
-			s.listParts(w, r, bucket, key, q)
-			return
-		}
-		s.getObject(w, r, bucket, key)
-	case http.MethodPut:
-		if q.Has("partNumber") && q.Has("uploadId") {
-			if r.Header.Get("x-amz-copy-source") != "" {
-				s.uploadPartCopy(w, r, bucket, key, q)
-				return
-			}
-			s.uploadPart(w, r, bucket, key, q)
-			return
-		}
-		if r.Header.Get("x-amz-copy-source") != "" {
-			s.copyObject(w, r, bucket, key)
-			return
-		}
-		s.putObject(w, r, bucket, key)
-	case http.MethodPost:
-		if q.Has("uploads") {
-			s.createMultipartUpload(w, r, bucket, key)
-			return
-		}
-		if q.Has("uploadId") {
-			s.completeMultipartUpload(w, r, bucket, key, q)
-			return
-		}
-		s.methodNotAllowed(w, r)
-	case http.MethodDelete:
-		if q.Has("uploadId") {
-			s.abortMultipartUpload(w, r, bucket, key, q)
-			return
-		}
-		s.deleteObject(w, r, bucket, key)
-	default:
-		s.methodNotAllowed(w, r)
+	c := routeContext{s: s, w: w, r: r, bucket: bucket, key: key, q: q}
+	found, err := c.dispatch(objectRoutes)
+	if !found {
+		return errMethodNotAllowed()
 	}
+	return err
 }
 
-func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
-	writeError(w, r, apiErr("MethodNotAllowed", "The specified method is not allowed against this resource.", http.StatusMethodNotAllowed), s.log)
+func errMethodNotAllowed() *APIError {
+	return apiErr("MethodNotAllowed", "The specified method is not allowed against this resource.", http.StatusMethodNotAllowed)
 }
 
-func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
 	ok, err := s.store.BucketExists(r.Context(), bucket)
 	if err != nil {
-		if errors.Is(err, store.ErrInvalidBucket) {
-			writeError(w, r, errInvalidBucketName(), s.log)
-			return
-		}
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
+		return err
 	}
 	if !ok {
-		writeError(w, r, errNoSuchBucket(), s.log)
-		return
+		return errNoSuchBucket()
 	}
 	w.Header().Set("x-amz-bucket-region", "us-east-1")
 	w.WriteHeader(http.StatusOK)
+	return nil
 }
 
-func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("x-amz-bucket-object-lock-enabled")), "true") {
+		return errNotImplemented()
+	}
+	if err := validateWriteHeaders(r); err != nil {
+		return err
+	}
 	src := strings.TrimPrefix(strings.TrimSpace(r.Header.Get("x-amz-copy-source")), "/")
 	if src == "" {
 		src = strings.TrimPrefix(strings.TrimSpace(r.URL.Query().Get("clone")), "/")
 	}
 	if src != "" {
+		if s.originFor(r.Context(), src) != nil {
+			return errNotImplemented()
+		}
 		if err := s.store.CloneBucket(r.Context(), src, bucket); err != nil {
-			switch {
-			case errors.Is(err, store.ErrInvalidBucket):
-				writeError(w, r, errInvalidBucketName(), s.log)
-			case errors.Is(err, store.ErrNoBucket):
-				writeError(w, r, errNoSuchBucket(), s.log)
-			case errors.Is(err, store.ErrBucketNotEmpty):
-				writeError(w, r, apiErr("BucketNotEmpty", "The destination bucket is not empty.", http.StatusConflict), s.log)
-			default:
-				writeError(w, r, errInternal(err, s.log), s.log)
-			}
-			return
+			return err
 		}
 		w.Header().Set("Location", "/"+bucket)
 		w.WriteHeader(http.StatusOK)
-		return
+		return nil
 	}
 	s.log.Debug("create bucket", "bucket", bucket, "content_length", r.ContentLength)
 	if err := s.store.CreateBucket(r.Context(), bucket); err != nil {
-		s.log.Debug("create bucket failed", "bucket", bucket, "err", err)
-		if errors.Is(err, store.ErrInvalidBucket) {
-			writeError(w, r, errInvalidBucketName(), s.log)
-			return
-		}
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
+		return err
 	}
-	s.log.Debug("created bucket", "bucket", bucket)
 	w.Header().Set("Location", "/"+bucket)
 	w.WriteHeader(http.StatusOK)
+	return nil
 }
 
-func (s *Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+func (s *Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
 	q := r.URL.Query()
 	force := q.Get("force") == "true" || q.Get("force") == "1" ||
 		strings.EqualFold(r.Header.Get("x-amz-force-delete"), "true")
 	res, err := s.store.DropBucket(r.Context(), bucket, force)
 	if err != nil {
-		if errors.Is(err, store.ErrInvalidBucket) {
-			writeError(w, r, errInvalidBucketName(), s.log)
-			return
-		}
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
+		return err
 	}
 	switch res {
 	case store.BucketDeleted:
 		w.WriteHeader(http.StatusNoContent)
+		return nil
 	case store.BucketNotEmpty:
-		writeError(w, r, apiErr("BucketNotEmpty", "The bucket you tried to delete is not empty.", http.StatusConflict), s.log)
+		return apiErr("BucketNotEmpty", "The bucket you tried to delete is not empty.", http.StatusConflict)
 	default:
-		writeError(w, r, errNoSuchBucket(), s.log)
+		return errNoSuchBucket()
 	}
 }
 
-func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) {
+func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) error {
 	buckets, err := s.store.Buckets(r.Context())
 	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
+		return err
 	}
 	out := listAllMyBucketsResult{
 		Xmlns: s3Namespace,
@@ -316,725 +270,311 @@ func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 		out.Buckets = append(out.Buckets, bucketXML{Name: b.Name, CreationDate: isoTime(b.Created)})
 	}
 	writeXML(w, http.StatusOK, out)
+	return nil
 }
 
-func (s *Server) getBucketLocation(w http.ResponseWriter, _ *http.Request, _ string) {
+func (s *Server) getBucketLocation(w http.ResponseWriter, _ *http.Request, _ string) error {
 	writeXML(w, http.StatusOK, locationConstraint{Xmlns: s3Namespace, Value: "us-east-1"})
+	return nil
 }
 
-func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		s.headOriginObject(w, r, origin, bucket, key)
-		return
-	}
-	m, err := s.store.MetaHeader(r.Context(), bucket, key)
-	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
-		key += "index.html"
-		m, err = s.store.MetaHeader(r.Context(), bucket, key)
-	}
-	if err != nil {
-		s.metaError(w, r, bucket, err)
-		return
-	}
-	part, hasPart, err := parsePartNumber(r.URL.Query())
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	length := m.Size
-	if hasPart {
-		start, end, ok := partBounds(m, part)
-		if !ok {
-			writeError(w, r, errInvalidRange(), s.log)
-			return
-		}
-		length = end - start + 1
-		if length < 0 {
-			length = 0
-		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, m.Size))
-	}
-	setPartsCount(w, m)
-	if err := readCondition(r, m.ETag); err != nil {
-		if errors.Is(err, errNotModifiedSentinel) {
-			w.Header().Set("ETag", quoteETag(m.ETag))
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		writeError(w, r, err, s.log)
-		return
-	}
-	setObjectHeaders(w, m, key)
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	w.WriteHeader(http.StatusOK)
+type routeContext struct {
+	s      *Server
+	w      http.ResponseWriter
+	r      *http.Request
+	bucket string
+	key    string
+	q      url.Values
 }
 
-func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		s.getOriginObject(w, r, origin, bucket, key)
-		return
-	}
-	part, hasPart, err := parsePartNumber(r.URL.Query())
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	first, last, suffix, ranged, err := parseRange(r.Header.Get("Range"))
-	if err != nil {
-		writeError(w, r, errInvalidRange(), s.log)
-		return
-	}
-	var partCount int
-	if hasPart {
-		if ranged {
-			writeError(w, r, errInvalidRequest("partNumber and Range are mutually exclusive"), s.log)
-			return
-		}
-		m, err := s.store.MetaHeader(r.Context(), bucket, key)
-		if err != nil {
-			s.metaError(w, r, bucket, err)
-			return
-		}
-		start, end, ok := partBounds(m, part)
-		if !ok {
-			writeError(w, r, errInvalidRange(), s.log)
-			return
-		}
-		first, last, suffix, ranged = start, end, -1, true
-		partCount = partsCount(m)
-	}
-	cond := &store.ReadCondition{IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match")}
-	sm, body, err := s.store.GetBody(r.Context(), bucket, key, first, last, suffix, cond)
-	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
-		key += "index.html"
-		sm, body, err = s.store.GetBody(r.Context(), bucket, key, first, last, suffix, cond)
-	}
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			s.metaError(w, r, bucket, err)
-		case errors.Is(err, store.ErrPrecondition):
-			writeError(w, r, errPreconditionFailed(), s.log)
-		case errors.Is(err, store.ErrNotModified):
-			w.Header().Set("ETag", quoteETag(metaETagFromCondition(cond, r)))
-			w.WriteHeader(http.StatusNotModified)
-		case errors.Is(err, store.ErrInvalidRange):
-			w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(smSize(sm), 10))
-			writeError(w, r, errInvalidRange(), s.log)
-		default:
-			writeError(w, r, errInternal(err, s.log), s.log)
-		}
-		return
-	}
-	defer body.Close()
-	if ranged && sm.Len() == 0 && sm.Size > 0 {
-		w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(sm.Size, 10))
-		writeError(w, r, errInvalidRange(), s.log)
-		return
-	}
-	setObjectHeaders(w, &store.Meta{
-		Size: sm.Size, ETag: sm.ETag, UserMetadata: sm.UserMetadata,
-		ContentType: sm.ContentType, CreatedAt: sm.CreatedAt,
-		FileID: sm.FileID, Parts: sm.Parts, PartEnds: sm.PartEnds,
-	}, key)
-	if partCount > 0 {
-		w.Header().Set("x-amz-mp-parts-count", strconv.Itoa(partCount))
-	}
-	w.Header().Set("Content-Length", strconv.FormatInt(sm.Len(), 10))
-	if ranged {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", sm.Start, sm.End, sm.Size))
-		w.WriteHeader(http.StatusPartialContent)
-	} else {
-		w.WriteHeader(http.StatusOK)
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	buf := copyBuf()
-	defer putCopyBuf(buf)
-	if _, err := io.CopyBuffer(w, body, buf); err != nil {
-		s.log.Debug("GET body interrupted", "bucket", bucket, "key", key, "err", err)
-	}
+type route struct {
+	name   string
+	method string
+	query  string
+	query2 string
+	header string
+	run    func(*routeContext) error
 }
 
-func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		s.putOriginObject(w, r, origin, bucket, key)
-		return
+func (rt *route) matches(r *http.Request, q url.Values) bool {
+	if rt.method != "" && rt.method != r.Method {
+		return false
 	}
-	if r.Header.Get("Content-Encoding") != "" {
-		writeError(w, r, errNotImplemented(), s.log)
-		return
+	if rt.query != "" && !q.Has(rt.query) {
+		return false
 	}
-	if err := validateSSE(r); err != nil {
-		writeError(w, r, err, s.log)
-		return
+	if rt.query2 != "" && !q.Has(rt.query2) {
+		return false
 	}
-	meta, err := parseMetadata(r.Header)
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
+	if rt.header != "" && r.Header.Get(rt.header) == "" {
+		return false
 	}
-	ct, err := contentType(r.Header.Get("Content-Type"))
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	cond, ifMatch, err := putCondition(r)
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	in, err := newIntegrity(r.Header)
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	if maxInline := int64(store.MaxInlineBytes); r.ContentLength >= 0 && r.ContentLength <= maxInline {
-		body := io.ReadCloser(r.Body)
-		if len(in.h) > 0 {
-			body = &integrityReader{r: body, in: in}
-		}
-		data, err := io.ReadAll(io.LimitReader(body, maxInline+1))
-		if err != nil {
-			writeError(w, r, bodyError(err), s.log)
-			return
-		}
-		if int64(len(data)) > maxInline {
-			writeError(w, r, errInvalidRequest("inline object exceeds 64 KiB"), s.log)
-			return
-		}
-		checks, err := in.verify(r.Trailer)
-		if err != nil {
-			writeError(w, r, err, s.log)
-			return
-		}
-		obj, err := s.store.PutInline(r.Context(), bucket, key, data, cond, ifMatch, meta, ct)
-		if err != nil {
-			switch {
-			case errors.Is(err, store.ErrNoBucket):
-				writeError(w, r, errNoSuchBucket(), s.log)
-			case errors.Is(err, store.ErrPrecondition):
-				writeError(w, r, errPreconditionFailed(), s.log)
-			default:
-				writeError(w, r, s.ingestError(err), s.log)
-			}
-			return
-		}
-		w.Header().Set("ETag", quoteETag(obj.ETag))
-		setChecksumHeaders(w, checks)
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	writer, err := s.store.StartObject(r.Context(), bucket, key, cond, ifMatch, meta, ct)
-	if err != nil {
-		s.metaError(w, r, bucket, err)
-		return
-	}
-	body := io.ReadCloser(r.Body)
-	if len(in.h) > 0 {
-		body = &integrityReader{r: body, in: in}
-	}
-	buf := copyBuf()
-	defer putCopyBuf(buf)
-	if _, err := io.CopyBuffer(writer, body, buf); err != nil {
-		writer.Abort()
-		writeError(w, r, bodyError(err), s.log)
-		return
-	}
-	checks, err := in.verify(r.Trailer)
-	if err != nil {
-		writer.Abort()
-		writeError(w, r, err, s.log)
-		return
-	}
-	pub, err := writer.Finish(checks)
-	if err != nil {
-		writeError(w, r, s.ingestError(err), s.log)
-		return
-	}
-	w.Header().Set("ETag", quoteETag(pub.ETag))
-	setChecksumHeaders(w, checks)
-	w.WriteHeader(http.StatusOK)
+	return true
 }
 
-func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if r.URL.Query().Has("versionId") || r.Header.Get("If-Match") != "" ||
-		r.Header.Get("x-amz-if-match-size") != "" || r.Header.Get("x-amz-if-match-last-modified-time") != "" {
-		writeError(w, r, errNotImplemented(), s.log)
-		return
-	}
-	var err error
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		err = origin.Delete(r.Context(), bucket, key)
-	} else {
-		_, err = s.store.Delete(r.Context(), bucket, key)
-	}
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
-	if err != nil {
-		writeError(w, r, bodyError(err), s.log)
-		return
-	}
-	if want := r.Header.Get("Content-MD5"); want != "" {
-		sum := md5.Sum(body)
-		if base64.StdEncoding.EncodeToString(sum[:]) != want {
-			writeError(w, r, apiErr("BadDigest", "The Content-MD5 you specified did not match the request body.", http.StatusBadRequest), s.log)
-			return
+func selectRoute(table []route, r *http.Request, q url.Values) *route {
+	for i := range table {
+		if table[i].matches(r, q) {
+			return &table[i]
 		}
-	}
-	var req deleteRequest
-	if err := xml.Unmarshal(body, &req); err != nil {
-		writeError(w, r, errInvalidRequest("malformed Delete XML"), s.log)
-		return
-	}
-	if len(req.Objects) == 0 || len(req.Objects) > 1000 {
-		writeError(w, r, errInvalidRequest("Delete must contain between 1 and 1000 objects"), s.log)
-		return
-	}
-	keys := make([]string, 0, len(req.Objects))
-	for _, o := range req.Objects {
-		if o.Key == "" || len(o.Key) > 1024 {
-			writeError(w, r, errInvalidRequest("invalid object key"), s.log)
-			return
-		}
-		keys = append(keys, o.Key)
-	}
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		err = origin.DeleteMany(r.Context(), bucket, keys)
-	} else {
-		err = s.store.DeleteMany(r.Context(), bucket, keys)
-	}
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	out := deleteResult{Xmlns: s3Namespace}
-	if !req.Quiet {
-		for _, k := range keys {
-			out.Deleted = append(out.Deleted, deletedXML{Key: k})
-		}
-	}
-	writeXML(w, http.StatusOK, out)
-}
-
-func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if r.Header.Get("Content-Encoding") != "" {
-		writeError(w, r, errNotImplemented(), s.log)
-		return
-	}
-	if err := validateSSE(r); err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	algorithm := r.Header.Get("x-amz-checksum-algorithm")
-	if algorithm != "" && !checksumAlgorithms[algorithm] {
-		writeError(w, r, errNotImplemented(), s.log)
-		return
-	}
-	if typ := r.Header.Get("x-amz-checksum-type"); typ != "" && (algorithm == "" || typ != "COMPOSITE") {
-		writeError(w, r, errNotImplemented(), s.log)
-		return
-	}
-	meta, err := parseMetadata(r.Header)
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	ct, err := contentType(r.Header.Get("Content-Type"))
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	var alg *string
-	if algorithm != "" {
-		alg = &algorithm
-	}
-	var id string
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		id, err = origin.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
-	} else {
-		id, err = s.store.CreateUpload(r.Context(), bucket, key, meta, ct, alg)
-	}
-	if err != nil {
-		if errors.Is(err, store.ErrNoBucket) {
-			writeError(w, r, errNoSuchBucket(), s.log)
-			return
-		}
-		writeError(w, r, s.ingestError(err), s.log)
-		return
-	}
-	writeXML(w, http.StatusOK, initiateMultipartUploadResult{
-		Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: id,
-	})
-}
-
-func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
-	partNo, err := strconv.ParseInt(q.Get("partNumber"), 10, 32)
-	if err != nil || partNo < 1 || partNo > 10000 {
-		writeError(w, r, errInvalidPart(), s.log)
-		return
-	}
-	in, err := newIntegrity(r.Header)
-	if err != nil {
-		writeError(w, r, err, s.log)
-		return
-	}
-	var writer *store.ChunkWriter
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		writer, err = origin.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
-	} else {
-		writer, err = s.store.StartPart(r.Context(), q.Get("uploadId"), bucket, key, int32(partNo))
-	}
-	if err != nil {
-		if errors.Is(err, store.ErrNoUpload) {
-			writeError(w, r, errNoSuchUpload(), s.log)
-			return
-		}
-		writeError(w, r, s.ingestError(err), s.log)
-		return
-	}
-	body := io.ReadCloser(r.Body)
-	if len(in.h) > 0 {
-		body = &integrityReader{r: body, in: in}
-	}
-	buf := copyBuf()
-	defer putCopyBuf(buf)
-	if _, err := io.CopyBuffer(writer, body, buf); err != nil {
-		writer.Abort()
-		writeError(w, r, bodyError(err), s.log)
-		return
-	}
-	checks, err := in.verify(r.Trailer)
-	if err != nil {
-		writer.Abort()
-		writeError(w, r, err, s.log)
-		return
-	}
-	pub, err := writer.Finish(checks)
-	if err != nil {
-		writeError(w, r, s.ingestError(err), s.log)
-		return
-	}
-	w.Header().Set("ETag", quoteETag(pub.ETag))
-	if pub.Checksum != nil {
-		w.Header().Set(pub.Checksum.Name, pub.Checksum.Value)
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
-	if err != nil {
-		writeError(w, r, bodyError(err), s.log)
-		return
-	}
-	var req completeMultipartUploadRequest
-	if err := xml.Unmarshal(body, &req); err != nil {
-		writeError(w, r, errInvalidRequest("malformed CompleteMultipartUpload XML"), s.log)
-		return
-	}
-	listed := make([]store.ListedPart, 0, len(req.Parts))
-	for _, p := range req.Parts {
-		if p.PartNumber < 1 || p.PartNumber > 10000 || p.ETag == "" {
-			writeError(w, r, errInvalidPart(), s.log)
-			return
-		}
-		var checks []store.Checksum
-		for name, value := range map[string]string{
-			"CRC32": p.ChecksumCRC32, "CRC32C": p.ChecksumCRC32C, "CRC64NVME": p.ChecksumCRC64NVME,
-			"SHA1": p.ChecksumSHA1, "SHA256": p.ChecksumSHA256,
-		} {
-			if value != "" {
-				checks = append(checks, store.Checksum{Name: name, Value: value})
-			}
-		}
-		if len(checks) > 1 {
-			writeError(w, r, errInvalidRequest("a part may carry only one checksum"), s.log)
-			return
-		}
-		var cs *store.Checksum
-		if len(checks) == 1 {
-			cs = &checks[0]
-		}
-		listed = append(listed, store.ListedPart{PartNo: int32(p.PartNumber), ETag: stripETag(p.ETag), Checksum: cs})
-	}
-	var done *store.Completed
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		done, err = origin.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
-	} else {
-		done, err = s.store.CompleteUpload(r.Context(), q.Get("uploadId"), bucket, key, listed)
-	}
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrNoUpload):
-			writeError(w, r, errNoSuchUpload(), s.log)
-		case errors.Is(err, store.ErrInvalidPart):
-			writeError(w, r, errInvalidPart(), s.log)
-		default:
-			writeError(w, r, s.ingestError(err), s.log)
-		}
-		return
-	}
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	writeXML(w, http.StatusOK, completeMultipartUploadResult{
-		Xmlns: s3Namespace, Location: fmt.Sprintf("%s://%s/%s/%s", scheme, r.Host, done.Bucket, done.Key),
-		Bucket: done.Bucket, Key: done.Key, ETag: quoteETag(done.ETag),
-	})
-}
-
-func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
-	var (
-		ok  bool
-		err error
-	)
-	if origin := s.originFor(r.Context(), bucket); origin != nil {
-		ok, err = origin.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
-	} else {
-		ok, err = s.store.AbortUpload(r.Context(), q.Get("uploadId"), bucket, key)
-	}
-	if err != nil {
-		writeError(w, r, errInternal(err, s.log), s.log)
-		return
-	}
-	if !ok {
-		writeError(w, r, errNoSuchUpload(), s.log)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
-	prefix := q.Get("prefix")
-	delimiter := q.Get("delimiter")
-	maxKeys := 1000
-	if v := q.Get("max-keys"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeError(w, r, errInvalidRequest("invalid max-keys"), s.log)
-			return
-		}
-		maxKeys = min(n, 1000)
-	}
-	startAfter := q.Get("start-after")
-	after := q.Get("continuation-token")
-	if after == "" {
-		after = startAfter
-	}
-	encode := q.Get("encoding-type") == "url"
-	if q.Get("encoding-type") != "" && !encode {
-		writeError(w, r, errInvalidRequest("unsupported encoding-type"), s.log)
-		return
-	}
-	bound := prefixEnd(prefix)
-	var contents []objectXML
-	var common []commonPrefixXML
-	seen := map[string]bool{}
-	if delimiter != "" {
-		if rest := strings.TrimPrefix(after, prefix); rest != after {
-			if idx := strings.Index(rest, delimiter); idx >= 0 {
-				seen[prefix+rest[:idx+len(delimiter)]] = true
-			}
-		}
-	}
-	truncated := false
-	if maxKeys > 0 {
-	outer:
-		for {
-			var (
-				rows []store.Listed
-				err  error
-			)
-			if origin := s.originFor(r.Context(), bucket); origin != nil {
-				rows, err = origin.List(r.Context(), bucket, prefix, after, 1024)
-			} else {
-				rows, err = s.store.List(r.Context(), bucket, prefix, bound, after, 1024)
-			}
-			if err != nil {
-				writeError(w, r, errInternal(err, s.log), s.log)
-				return
-			}
-			if len(rows) == 0 {
-				break
-			}
-			for _, row := range rows {
-				rest := strings.TrimPrefix(row.Key, prefix)
-				if delimiter != "" {
-					if idx := strings.Index(rest, delimiter); idx >= 0 {
-						cp := prefix + rest[:idx+len(delimiter)]
-						if !seen[cp] {
-							if len(contents)+len(common) >= maxKeys {
-								truncated = true
-								break outer
-							}
-							seen[cp] = true
-							display := cp
-							if encode {
-								display = awsEncode(cp, true)
-							}
-							common = append(common, commonPrefixXML{Prefix: display})
-						}
-						after = row.Key
-						continue
-					}
-				}
-				if len(contents)+len(common) >= maxKeys {
-					truncated = true
-					break outer
-				}
-				display := row.Key
-				if encode {
-					display = awsEncode(row.Key, true)
-				}
-				storageClass := "STANDARD"
-				contents = append(contents, objectXML{
-					Key: display, LastModified: isoTime(row.CreatedAt),
-					ETag: quoteETag(row.ETag), Size: row.Size, StorageClass: storageClass,
-				})
-				after = row.Key
-			}
-			if len(rows) < 1024 {
-				break
-			}
-		}
-	}
-	displayPrefix, displayDelim, displayStart := prefix, delimiter, startAfter
-	if encode {
-		displayPrefix, displayDelim, displayStart = awsEncode(prefix, true), awsEncode(delimiter, true), awsEncode(startAfter, true)
-	}
-	out := listBucketResult{
-		Xmlns: s3Namespace, Name: bucket, Prefix: displayPrefix, KeyCount: len(contents) + len(common),
-		MaxKeys: maxKeys, IsTruncated: truncated, Contents: contents, CommonPrefixes: common,
-		ContinuationToken: q.Get("continuation-token"), StartAfter: displayStart,
-	}
-	if delimiter != "" {
-		out.Delimiter = displayDelim
-	}
-	if encode {
-		out.EncodingType = "url"
-	}
-	if truncated {
-		out.NextContinuationToken = after
-	}
-	writeXML(w, http.StatusOK, out)
-}
-
-func (s *Server) metaError(w http.ResponseWriter, r *http.Request, _ string, err error) {
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		writeError(w, r, errNoSuchKey(), s.log)
-	case errors.Is(err, store.ErrInvalidBucket):
-		writeError(w, r, errInvalidBucketName(), s.log)
-	default:
-		writeError(w, r, errInternal(err, s.log), s.log)
-	}
-}
-
-func (s *Server) ingestError(err error) error {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "objects_bucket_fkey" {
-		return errNoSuchBucket()
-	}
-	switch {
-	case errors.Is(err, store.ErrPrecondition):
-		return errPreconditionFailed()
-	case errors.Is(err, store.ErrNoBucket):
-		return errNoSuchBucket()
-	case errors.Is(err, store.ErrInvalidBucket):
-		return errInvalidBucketName()
-	case errors.Is(err, store.ErrNoUpload):
-		return errNoSuchUpload()
-	case errors.Is(err, store.ErrMissingChecksum):
-		return errInvalidRequest("part lacks the upload's checksum")
-	default:
-		return errInternal(err, s.log)
-	}
-}
-
-func bodyError(err error) error {
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		return apiErr("IncompleteBody", "The request body terminated unexpectedly.", http.StatusBadRequest)
-	}
-	return apiErr("InvalidRequest", "Could not read the request body.", http.StatusBadRequest)
-}
-
-func putCondition(r *http.Request) (store.Condition, string, error) {
-	ifMatch := r.Header.Get("If-Match")
-	ifNone := r.Header.Get("If-None-Match")
-	switch {
-	case ifMatch == "" && ifNone == "":
-		return store.Unconditional, "", nil
-	case ifMatch == "" && strings.TrimSpace(ifNone) == "*":
-		return store.IfAbsent, "", nil
-	case ifMatch != "" && ifNone == "" && validETag(ifMatch):
-		return store.IfMatch, stripETag(ifMatch), nil
-	default:
-		return 0, "", errInvalidRequest("unsupported conditional PUT")
-	}
-}
-
-func readCondition(r *http.Request, etag string) error {
-	if v := r.Header.Get("If-Match"); v != "" && !store.ETagMatches(v, etag) {
-		return errPreconditionFailed()
-	}
-	if v := r.Header.Get("If-None-Match"); v != "" && store.ETagMatches(v, etag) {
-		return errNotModifiedSentinel
 	}
 	return nil
 }
 
-var errNotModifiedSentinel = errors.New("not modified")
+func (c *routeContext) dispatch(table []route) (bool, error) {
+	rt := selectRoute(table, c.r, c.q)
+	if rt == nil {
+		return false, nil
+	}
+	return true, rt.run(c)
+}
 
-func setObjectHeaders(w http.ResponseWriter, m *store.Meta, key string) {
-	ct := m.ContentType
-	if ct == "" || ct == "application/octet-stream" || ct == "application/x-www-form-urlencoded" {
-		if inferred := mime.TypeByExtension(path.Ext(key)); inferred != "" {
-			ct = inferred
+var bucketRoutes = []route{
+	{name: "bucket-put", method: http.MethodPut, run: func(c *routeContext) error {
+		return c.s.createBucket(c.w, c.r, c.bucket)
+	}},
+	{name: "bucket-delete", method: http.MethodDelete, run: func(c *routeContext) error {
+		return c.s.deleteBucket(c.w, c.r, c.bucket)
+	}},
+	{name: "bucket-head", method: http.MethodHead, run: func(c *routeContext) error {
+		return c.s.headBucket(c.w, c.r, c.bucket)
+	}},
+	{name: "bucket-location", method: http.MethodGet, query: "location", run: func(c *routeContext) error {
+		return c.s.getBucketLocation(c.w, c.r, c.bucket)
+	}},
+	{name: "bucket-versions", method: http.MethodGet, query: "versions", run: func(c *routeContext) error {
+		return c.s.listObjectVersions(c.w, c.r, c.bucket, c.q)
+	}},
+	{name: "bucket-uploads", method: http.MethodGet, query: "uploads", run: func(c *routeContext) error {
+		return c.s.listMultipartUploads(c.w, c.r, c.bucket, c.q)
+	}},
+	{name: "bucket-delete-objects", method: http.MethodPost, query: "delete", run: func(c *routeContext) error {
+		return c.s.deleteObjects(c.w, c.r, c.bucket)
+	}},
+	{name: "bucket-get", method: http.MethodGet, run: func(c *routeContext) error {
+		return c.s.getOrListBucket(c.w, c.r, c.bucket, c.q)
+	}},
+}
+
+func (s *Server) getOrListBucket(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) error {
+	if r.URL.RawQuery == "" && r.Header.Get("Authorization") == "" && r.Header.Get("x-amz-date") == "" {
+		if _, err := s.backendFor(r.Context(), bucket).Head(r.Context(), bucket, "index.html"); err == nil {
+			return s.getObject(w, r, bucket, "index.html")
 		}
 	}
-	if ct == "" {
-		ct = "application/octet-stream"
+	return s.listObjectsV2(w, r, bucket, q)
+}
+
+var objectRoutes = []route{
+	{name: "object-head", method: http.MethodHead, run: func(c *routeContext) error {
+		return c.s.headObject(c.w, c.r, c.bucket, c.key)
+	}},
+	{name: "object-attributes", method: http.MethodGet, query: "attributes", run: func(c *routeContext) error {
+		return c.s.getObjectAttributes(c.w, c.r, c.bucket, c.key)
+	}},
+	{name: "object-list-parts", method: http.MethodGet, query: "uploadId", run: func(c *routeContext) error {
+		return c.s.listParts(c.w, c.r, c.bucket, c.key, c.q)
+	}},
+	{name: "object-get", method: http.MethodGet, run: func(c *routeContext) error {
+		return c.s.getObject(c.w, c.r, c.bucket, c.key)
+	}},
+	{name: "object-upload-part-copy", method: http.MethodPut, query: "partNumber", query2: "uploadId",
+		header: "x-amz-copy-source", run: func(c *routeContext) error {
+			return c.s.uploadPartCopy(c.w, c.r, c.bucket, c.key, c.q)
+		}},
+	{name: "object-upload-part", method: http.MethodPut, query: "partNumber", query2: "uploadId", run: func(c *routeContext) error {
+		return c.s.uploadPart(c.w, c.r, c.bucket, c.key, c.q)
+	}},
+	{name: "object-copy", method: http.MethodPut, header: "x-amz-copy-source", run: func(c *routeContext) error {
+		return c.s.copyObject(c.w, c.r, c.bucket, c.key)
+	}},
+	{name: "object-put", method: http.MethodPut, run: func(c *routeContext) error {
+		return c.s.putObject(c.w, c.r, c.bucket, c.key)
+	}},
+	{name: "object-create-multipart", method: http.MethodPost, query: "uploads", run: func(c *routeContext) error {
+		return c.s.createMultipartUpload(c.w, c.r, c.bucket, c.key)
+	}},
+	{name: "object-complete-multipart", method: http.MethodPost, query: "uploadId", run: func(c *routeContext) error {
+		return c.s.completeMultipartUpload(c.w, c.r, c.bucket, c.key, c.q)
+	}},
+	{name: "object-abort-multipart", method: http.MethodDelete, query: "uploadId", run: func(c *routeContext) error {
+		return c.s.abortMultipartUpload(c.w, c.r, c.bucket, c.key, c.q)
+	}},
+	{name: "object-delete", method: http.MethodDelete, run: func(c *routeContext) error {
+		return c.s.deleteObject(c.w, c.r, c.bucket, c.key)
+	}},
+}
+
+var originBucketRoutes = []route{
+	{name: "origin-bucket-head", method: http.MethodHead, run: routeStatusOK},
+	{name: "origin-bucket-location", method: http.MethodGet, query: "location", run: func(c *routeContext) error {
+		c.s.getBucketLocation(c.w, c.r, c.bucket)
+		return nil
+	}},
+	{name: "origin-bucket-versions", method: http.MethodGet, query: "versions", run: func(c *routeContext) error {
+		return c.s.listOriginObjectVersions(c.w, c.r, c.bucket, c.q)
+	}},
+	{name: "origin-bucket-uploads", method: http.MethodGet, query: "uploads", run: func(c *routeContext) error {
+		return c.s.listMultipartUploads(c.w, c.r, c.bucket, c.q)
+	}},
+	{name: "origin-bucket-list", method: http.MethodGet, run: func(c *routeContext) error {
+		return c.s.listObjectsV2(c.w, c.r, c.bucket, c.q)
+	}},
+	{name: "origin-bucket-copy", method: http.MethodPut, header: "x-amz-copy-source", run: routeNotImplemented},
+	{name: "origin-bucket-put", method: http.MethodPut, run: routeStatusOK},
+	{name: "origin-bucket-delete", method: http.MethodDelete, run: routeNotImplemented},
+	{name: "origin-bucket-delete-objects", method: http.MethodPost, query: "delete", run: func(c *routeContext) error {
+		return c.s.deleteObjects(c.w, c.r, c.bucket)
+	}},
+}
+
+func routeStatusOK(c *routeContext) error {
+	c.w.WriteHeader(http.StatusOK)
+	return nil
+}
+
+func routeNotImplemented(c *routeContext) error { return errNotImplemented() }
+
+type APIError struct {
+	Code    string
+	Message string
+	Status  int
+}
+
+func (e *APIError) Error() string { return e.Code + ": " + e.Message }
+
+func apiErr(code, message string, status int) *APIError {
+	return &APIError{Code: code, Message: message, Status: status}
+}
+
+func errAccessDenied(msg string) *APIError {
+	return apiErr("AccessDenied", msg, http.StatusForbidden)
+}
+
+func errNoSuchKey() *APIError {
+	return apiErr("NoSuchKey", "The specified key does not exist.", http.StatusNotFound)
+}
+
+func errNoSuchBucket() *APIError {
+	return apiErr("NoSuchBucket", "The specified bucket does not exist.", http.StatusNotFound)
+}
+
+func errInvalidBucketName() *APIError {
+	return apiErr("InvalidBucketName", "The specified bucket is not valid.", http.StatusBadRequest)
+}
+
+func errNoSuchUpload() *APIError {
+	return apiErr("NoSuchUpload", "The specified multipart upload does not exist.", http.StatusNotFound)
+}
+
+func errPreconditionFailed() *APIError {
+	return apiErr("PreconditionFailed", "At least one of the preconditions you specified did not hold.", http.StatusPreconditionFailed)
+}
+
+func errInvalidRange() *APIError {
+	return apiErr("InvalidRange", "The requested range is not satisfiable.", http.StatusRequestedRangeNotSatisfiable)
+}
+
+func errInvalidPart() *APIError {
+	return apiErr("InvalidPart", "One or more of the specified parts could not be found or did not match the supplied ETag.", http.StatusBadRequest)
+}
+
+func errInvalidPartNumber() *APIError {
+	return apiErr("InvalidPartNumber", "The requested part number is not satisfiable.", http.StatusRequestedRangeNotSatisfiable)
+}
+
+func errInvalidRequest(msg string) *APIError {
+	return apiErr("InvalidRequest", msg, http.StatusBadRequest)
+}
+
+func errNotImplemented() *APIError {
+	return apiErr("NotImplemented", "A header or operation you provided implies functionality that is not implemented.", http.StatusNotImplemented)
+}
+
+func errInternal(err error, log *slog.Logger) *APIError {
+	if log != nil {
+		log.Error("internal error", "err", err)
 	}
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("ETag", quoteETag(m.ETag))
-	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Last-Modified", m.CreatedAt.UTC().Format(http.TimeFormat))
-	for k, vs := range metadataHeader(m.UserMetadata) {
-		for _, v := range vs {
-			w.Header().Set(k, v)
-		}
+	return apiErr("InternalError", "We encountered an internal error. Please try again.", http.StatusInternalServerError)
+}
+
+type errorResponse struct {
+	XMLName   xml.Name `xml:"Error"`
+	Code      string   `xml:"Code"`
+	Message   string   `xml:"Message"`
+	Resource  string   `xml:"Resource,omitempty"`
+	RequestID string   `xml:"RequestId"`
+}
+
+func writeError(w http.ResponseWriter, r *http.Request, err error, log *slog.Logger) {
+	var ae *APIError
+	if !errors.As(err, &ae) {
+		ae = errInternal(err, log)
+	}
+	id := ensureRequestID(w)
+	if r.Method == http.MethodHead {
+		w.WriteHeader(ae.Status)
+		return
+	}
+	body, _ := xml.Marshal(errorResponse{
+		Code: ae.Code, Message: ae.Message, Resource: r.URL.Path, RequestID: id,
+	})
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(ae.Status)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(body)
+}
+
+var reqSeq atomic.Uint64
+
+func requestID() string {
+	return fmt.Sprintf("%016x", reqSeq.Add(1))
+}
+
+func ensureRequestID(w http.ResponseWriter) string {
+	id := w.Header().Get("x-amz-request-id")
+	if id == "" {
+		id = requestID()
+		w.Header().Set("x-amz-request-id", id)
+	}
+	return id
+}
+
+func (s *Server) writeMetrics(w http.ResponseWriter, st *store.Store) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	s.metrics.Write(w, "pgvs3")
+	if st != nil {
+		st.WriteMetrics(w)
+	}
+	objcache.WriteSpoolMetrics(w)
+}
+
+type recWriter struct {
+	http.ResponseWriter
+	status int
+	n      int64
+}
+
+func (w *recWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *recWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+func (w *recWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 
-func setChecksumHeaders(w http.ResponseWriter, checks []store.Checksum) {
-	for _, c := range checks {
-		if c.Name == "content-md5" {
-			continue
-		}
-		w.Header().Set(c.Name, c.Value)
-	}
-}
-
-func metaETagFromCondition(cond *store.ReadCondition, r *http.Request) string {
-	if cond != nil {
-		return stripETag(cond.IfNoneMatch)
-	}
-	return ""
-}
-
-func smSize(sm *store.SliceMeta) int64 {
-	if sm == nil {
-		return 0
-	}
-	return sm.Size
-}
+func (w *recWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

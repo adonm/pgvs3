@@ -2,7 +2,7 @@
 # Disposable PostgreSQL + two local gateways, then one mode:
 #   contract  end-to-end S3, DuckDB 2.0 and DuckLake contract through both gateways
 #   fault     gateway/PostgreSQL failure and churn checks
-#   interop   rclone/restic/boto3/DuckLake/SlateDB compatibility
+#   interop   rclone/restic/boto3/DuckLake compatibility
 #   bench     DuckDB benchmark (parts: s3,compat,tuning)
 set -euo pipefail
 cd "$(dirname "$0")/../.."

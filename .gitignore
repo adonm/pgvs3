@@ -6,5 +6,4 @@
 *.pem
 __pycache__/
 duckdb_temp_*
-
-test/slatedb/target/
+hk.local.pkl

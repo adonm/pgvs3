@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interoperability suite: rclone, restic, boto3, DuckLake and SlateDB.
+# Interoperability suite: rclone, restic, boto3 and DuckLake.
 # Requires the environment exported by deploy/bench/stack.sh.
 set -euo pipefail
 : "${PGVS3_TEST_ENDPOINT_A:?}"
@@ -13,6 +13,9 @@ BUCKET=pgvs3-contract
 RUN="interop-$(date +%s)-$$"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+
+# rclone/restic do not tolerate a missing bucket; create it once up front.
+curl -fsS -X PUT "$A/$BUCKET" >/dev/null
 
 RCLONE_BIN=$(mise which rclone 2>/dev/null || command -v rclone || true)
 RESTIC_BIN=$(mise which restic 2>/dev/null || command -v restic || true)
@@ -109,13 +112,5 @@ assert c.execute(f"SELECT count(*), sum(i) FROM il.{table}").fetchone()==(2,3)
 print('ducklake ok')
 PY
 
-if mise exec rust -- cargo --version >/dev/null 2>&1; then
-  S3_ENDPOINT="$A" S3_BUCKET="$BUCKET" S3_ACCESS_KEY="$PGVS3_ACCESS_KEY" \
-  S3_SECRET_KEY="$PGVS3_SECRET_KEY" SLATEDB_PATH="$RUN/slatedb" \
-  mise exec rust -- cargo run --quiet --manifest-path test/slatedb/Cargo.toml
-  echo "slatedb ok"
-else
-  echo "SKIP slatedb: cargo not installed" >&2
-fi
 
 echo "interop ok"

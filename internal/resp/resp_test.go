@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tidwall/redcon"
 
@@ -52,7 +53,7 @@ func TestResolveAndWriteTarget(t *testing.T) {
 	if kind != ns.Bucket || b != "lake" || k != "dir/obj" {
 		t.Fatalf("got (%v, %q, %q)", kind, b, k)
 	}
-	// s3:// writes must be rejected even if the bucket name matches currentCache.
+
 	if _, _, err := writeTarget("cache", []byte("s3://cache/key")); err == nil {
 		t.Fatal("expected s3:// write to be rejected")
 	}
@@ -67,7 +68,7 @@ func TestResolveAndWriteTarget(t *testing.T) {
 
 func TestParseSetOptions(t *testing.T) {
 	opts, err := parseRESPSetOptions([][]byte{[]byte("nx"), []byte("ex"), []byte("10"), []byte("get")})
-	if err != nil || opts.Condition != store.IfAbsent || !opts.ReturnOld || opts.ExpiresAt == nil {
+	if err != nil || opts.Precondition.Mode != store.IfAbsent || !opts.ReturnOld || opts.ExpiresAt == nil {
 		t.Fatalf("unexpected opts: %+v err=%v", opts, err)
 	}
 	if _, err := parseRESPSetOptions([][]byte{[]byte("nx"), []byte("xx")}); err == nil {
@@ -75,6 +76,25 @@ func TestParseSetOptions(t *testing.T) {
 	}
 	if _, err := parseRESPSetOptions([][]byte{[]byte("ex"), []byte("0")}); err == nil {
 		t.Fatal("expected non-positive EX error")
+	}
+}
+
+func TestExpirationSpellings(t *testing.T) {
+	now := time.Unix(100, 0)
+	for _, tc := range []struct {
+		names []string
+		want  time.Time
+	}{
+		{[]string{"EX", "SETEX", "EXPIRE"}, now.Add(2 * time.Second)},
+		{[]string{"PX", "PSETEX", "PEXPIRE"}, now.Add(2 * time.Millisecond)},
+		{[]string{"EXAT", "EXPIREAT"}, time.Unix(2, 0)},
+		{[]string{"PXAT", "PEXPIREAT"}, time.UnixMilli(2)},
+	} {
+		for _, name := range tc.names {
+			if got := respExpiration(name, 2, now); !got.Equal(tc.want) {
+				t.Fatalf("%s expiry=%v, want %v", name, got, tc.want)
+			}
+		}
 	}
 }
 
