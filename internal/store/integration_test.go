@@ -2049,6 +2049,84 @@ func TestStreamFanoutAndAck(t *testing.T) {
 	}
 }
 
+func TestStreamPruneTicksRemovesOldUnreferencedTicks(t *testing.T) {
+	ctx := testCtx
+	q := unique("stream-prune")
+	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	sc, err := nsSQLIdent(ns.Queue, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.pool.Exec(ctx, `INSERT INTO `+sc+`.stream_ticks (max_seq, created_at)
+		SELECT 0, now() - interval '1 hour' FROM generate_series(1, 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.Queue(q).SetConfig(ctx, -1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := testStore.queue(q).PruneTicks(ctx, 2); err != nil || n != 2 {
+		t.Fatalf("first prune = %d, %v; want 2", n, err)
+	}
+	if n, err := testStore.queue(q).PruneTicks(ctx, ExpireBatch); err != nil || n != 1 {
+		t.Fatalf("second prune = %d, %v; want 1", n, err)
+	}
+	var left int
+	if err := testStore.pool.QueryRow(ctx, `SELECT count(*) FROM `+sc+`.stream_ticks`).Scan(&left); err != nil || left != 1 {
+		t.Fatalf("ticks left = %d, %v; want the minimum tick only", left, err)
+	}
+}
+
+func TestStreamErrorMappings(t *testing.T) {
+	ctx := testCtx
+	q := unique("stream-errors")
+	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{{ID: "evt-1", Payload: []byte(`{}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
+	if err != nil || len(batch.Messages) != 1 {
+		t.Fatalf("receive = %+v, %v", batch, err)
+	}
+	ackTwice := func() error {
+		if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
+			return err
+		}
+		_, err := testStore.Queue(q).AckBatch(ctx, batch.ID)
+		return err
+	}
+	tests := []struct {
+		name string
+		run  func() error
+		want error
+	}{
+		{"unknown nack", func() error {
+			_, err := testStore.Queue(q).NackMessage(ctx, batch.ID, "missing", time.Second, "x")
+			return err
+		}, ErrStreamMessageNotFound},
+		{"double ack", ackTwice, ErrStreamBatchNotFound},
+		{"missing subscribe tick", func() error {
+			_, err := testStore.Queue(q).Subscribe(ctx, "late", ptrInt64(999999))
+			return err
+		}, ErrStreamTickNotFound},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestStreamAppendStoresInInputOrder(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-order")
