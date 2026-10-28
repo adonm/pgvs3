@@ -194,7 +194,7 @@ block encoding, streaming reads and COPY loops, not inside them.
 | `internal/store/write.go` | Inline/COPY publication, multipart lifecycle and server-side copies |
 | `internal/store/cache.go` | Cache mutations, origin metadata, fill fences and durable outbox persistence |
 | `internal/store/ojs.go` | Job persistence, claims and state transitions |
-| `internal/store/stream.go` | Stream cursors, batches, retries and retention |
+| `internal/store/stream.go` | Stream Go wrappers over the layout-v25 `stream_*` functions in `schema.sql`: validation, sentinel mapping and result types |
 | `internal/objcache/cache.go` | Tier lifecycle, cache resolution, fills, bounded spooling and ordered mutations/outbox drain |
 | `internal/objcache/origin.go` | Origin contract, capabilities and production/local adapters |
 | `internal/objcache/registry.go` | Persisted configuration and one global/per-bucket replacement policy |

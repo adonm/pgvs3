@@ -404,7 +404,7 @@ Separate matrices measured HEAD and 8 KiB footer ranges within 3%. The earlier
 
 ### Handles, splits, read views and loadgen
 
-This round keeps layout v24 and the S3, OJS and RESP behaviour. The **Now**
+That round kept layout v24 and the S3, OJS and RESP behaviour. The **Now**
 column above counts the tree at `2857200`.
 
 - Namespaces are bound once. `Store.Cache(name)` and `Store.Queue(name)` validate
@@ -466,6 +466,86 @@ s3t (36 of 36), `hk check --all --profile ci`, and `test/e2e.sh` with two gatewa
 The Docker CLI was unavailable in the working environment, so the contract run
 followed `deploy/bench/stack.sh contract` step for step against local PostgreSQL
 18.6 instead of the container.
+
+### Layout v25, local origins and test trim
+
+This round moves to layout v25 and simplifies two more areas. Layout v25 needs
+fresh databases; there is no migration from v24.
+
+- **Stream operations are layout-v25 SQL functions.** Each queue schema gets
+  `stream_*` functions for append, subscribe, receive (plain and cooperative),
+  batch read, ack, nack, retry processing, prune, rotate and replay. Each call is
+  one statement, so a request is one round trip instead of five to thirteen.
+  `stream.go` lost about 800 lines and `schema.sql` gained about 430. Go keeps
+  validation, namespace creation and sentinel mapping. A missing queue or batch
+  still returns the same not-found result. Partial schemas (an undefined table or
+  function) propagate as storage errors instead of reading as empty, and doctor
+  lists queue namespaces that lack stream functions.
+- **Local origins collapse into one implementation.** `filesystem` and `inmem`
+  share one `os.Root`-based implementation. `inmem` keeps its name because
+  `origin set` accepts it, but it now stores in a private temporary directory that
+  is removed on close. Keys the local origin cannot represent are rejected with 400
+  before any body is acknowledged. Overwrites write a temporary file under
+  `.pgvs3-tmp` and rename it under the lock, so concurrent readers never see
+  partial bytes.
+- **The test surface is trimmed.** Integration test functions went from 100 to 70
+  (excluding `TestMain`), integration-tagged test lines from 5,317 to 4,646, and
+  e2e checks from 239 to 159. e2e has no fixed sleeps. Four compact tests cover
+  invariants that had none: layout refusal, a single maintenance leader, chunk
+  storage settings, and split pools. Shared `TestMain`, discard-logger, deadline
+  poll and namespace-cleanup helpers live in `internal/testutil`. The 4,400-line
+  target was not met; the largest tests need table rewrites.
+
+| Whole-repo Go | Start of round (`b170638`) | Now (`39249fc`) |
+| --- | ---: | ---: |
+| Files | 48 | 48 |
+| Total lines | 35,440 | 34,817 |
+| Production lines | 21,142 | 20,770 |
+| Test lines | 14,298 | 14,047 |
+
+#### Paired checks, layout v25
+
+Layout v24 and v25 binaries cannot share a database, so each side ran against its
+own fresh PostgreSQL 18.6 database, prefilled by its own gateway. Old is the
+`b170638` build and new is the `0142d1d` build, which has the same product code as
+`39249fc`. Sessions alternated old, new, new, old on the same host as the earlier
+checks. S3 rows used fixed request counts. OJS and RESP rows used 5-second runs with
+4 workers.
+
+| Workload | Old p50 | New p50 | Δ p50 | Δ throughput |
+| --- | ---: | ---: | ---: | ---: |
+| 10 MiB GET, 1 worker | 10.69 ms | 10.65 ms | -0.4% | -10.2% |
+| 10 MiB GET, 4 workers | 10.57 ms | 10.56 ms | 0.0% | -0.9% |
+| 10 MiB range (1 MiB), 4 workers | 1.19 ms | 1.19 ms | -0.3% | -0.6% |
+| 1 GiB GET, 1 worker | 965 ms | 957 ms | -0.9% | +1.1% |
+| OJS enqueue | 2.32 ms | 2.33 ms | +0.4% | -4.7% |
+| OJS fetch | 28.82 ms | 28.75 ms | -0.3% | +2.7% |
+| OJS stream send | 2.38 ms | 2.34 ms | -1.5% | +1.9% |
+| OJS stream cycle | 11.54 ms | 10.74 ms | -7.0% | +15.1% |
+| RESP SET, pipeline 4 | 1.75 ms | 1.75 ms | +0.3% | -3.0% |
+| RESP GET, pipeline 4 | 0.033 ms | 0.033 ms | 0.0% | 0.0% |
+
+Every row is inside the 20% budget. The stream cycle improvement fits the round-trip
+reduction. The -10.2% single-worker 10 MiB throughput has a flat p50 and is within
+run-to-run noise at 100 requests; the previous round measured +11.6% on the same path.
+
+Gates on `39249fc`: gofmt, vet with and without `-tags=integration`,
+`go test -race ./...`, the integration suite under `-race` on a fresh database
+(45 s, 0 failing), s3t (36 of 36), `hk check --all --profile ci`, and the contract
+suite (16 s). The Docker CLI is unavailable here, so the contract ran against local
+PostgreSQL 18.6, as in the previous round.
+
+Known gaps, deliberately not handled in this round:
+
+- A DELETE in a missing bucket returns 204 through a global origin, but 404
+  `NoSuchBucket` through the store-backed server. Global origins have no bucket rows,
+  so the fix needs an origin-level bucket rule.
+- The local origin paths were not benchmarked. Syscall counts changed: fewer per
+  ranged filesystem read, and more per overwrite and per `inmem` read.
+- `test/fault.sh` and `test/interop.sh` were neither run (they need Docker) nor
+  trimmed. They still contain fixed sleeps and SKIP branches that exit 0.
+- Stream function bodies are created per queue schema from a function stored in the
+  database, so a body change needs a fresh database, like any layout change.
 
 The [live file map](../CONTRIBUTING.md#package-map) describes the final structure.
 Package/build-tag boundaries, the isolated SDK benchmark module, streaming
