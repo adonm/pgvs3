@@ -604,22 +604,28 @@ func TestReadBackendRangeOnEmptyObject(t *testing.T) {
 
 type fakeWriteBackend struct {
 	putETag  string
+	stored   []byte
 	copied   *store.Meta
 	copyOpts store.CopyOptions
 	deleted  []string
 	err      error
 }
 
-func (f *fakeWriteBackend) Put(_ context.Context, _, _ string, body io.Reader, _ int64, _ store.WriteOptions, validate func() ([]store.Checksum, error)) (string, error) {
+func (f *fakeWriteBackend) Put(_ context.Context, _, _ string, body io.Reader, size int64, _ store.WriteOptions, validate func() ([]store.Checksum, error)) (string, error) {
 	if f.err != nil {
 		return "", f.err
 	}
+	inline, err := readInlineBody(size, body, store.MaxInlineBytes)
+	if err != nil {
+		return "", err
+	}
+	defer inline.release()
 	if validate != nil {
 		if _, err := validate(); err != nil {
 			return "", err
 		}
 	}
-	_, _ = io.Copy(io.Discard, body)
+	f.stored = bytes.Clone(inline.data)
 	return f.putETag, nil
 }
 
@@ -648,6 +654,7 @@ func (f *fakeWriteBackend) DeleteMany(_ context.Context, _ string, keys []string
 func testWriteServer(backend *fakeWriteBackend) *Server {
 	return &Server{
 		log:           testutil.DiscardLogger(),
+		metrics:       telemetry.NewRequestMetrics(),
 		writeOverride: backend,
 	}
 }
@@ -751,6 +758,7 @@ type fakeMultipartBackend struct {
 	parts         []store.UploadPartInfo
 	uploads       []store.UploadInfo
 	aborted       bool
+	startedPart   bool
 }
 
 func (f *fakeMultipartBackend) CreateUpload(context.Context, string, string, []string, string, string, *string) (string, error) {
@@ -758,7 +766,8 @@ func (f *fakeMultipartBackend) CreateUpload(context.Context, string, string, []s
 }
 
 func (f *fakeMultipartBackend) StartPart(context.Context, string, string, string, int32, int64) (*store.ChunkWriter, error) {
-	return nil, nil
+	f.startedPart = true
+	return nil, errors.New("unexpected StartPart")
 }
 
 func (f *fakeMultipartBackend) ListParts(context.Context, string, string, string, int, int32) ([]store.UploadPartInfo, bool, int32, error) {
@@ -782,6 +791,7 @@ func (f *fakeMultipartBackend) ListUploads(context.Context, string, string, stri
 func testMultipartServer(backend *fakeMultipartBackend) *Server {
 	return &Server{
 		log:               testutil.DiscardLogger(),
+		metrics:           telemetry.NewRequestMetrics(),
 		multipartOverride: backend,
 	}
 }
@@ -1511,6 +1521,45 @@ func TestAwsChunkedContentEncodingWithoutStreaming(t *testing.T) {
 	body, err := io.ReadAll(req.Body)
 	if err != nil || string(body) != "plain-body" {
 		t.Fatalf("body = %q err=%v", body, err)
+	}
+}
+
+func TestChunkedPutSizedByDecodedLength(t *testing.T) {
+	sig := strings.Repeat("a", 64)
+	body := signedChunk("5", "hello", sig) + signedChunk("6", " world", sig) +
+		"0;chunk-signature=" + sig + "\r\nx-amz-checksum-crc32: DUoRhQ==\r\n\r\n"
+	req := chunkedRequest(body)
+	req.Header.Set("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")
+	req.Header.Set("x-amz-decoded-content-length", "11")
+	req.Header.Set("x-amz-trailer", "x-amz-checksum-crc32")
+	backend := &fakeWriteBackend{putETag: "etag"}
+	s := testWriteServer(backend)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	s.readOverride = fakeReadBackend{res: &store.ReadResult{
+		Size: 11, ETag: "etag",
+		Body: io.NopCloser(bytes.NewReader(backend.stored)),
+		End:  10,
+	}}
+	get := httptest.NewRecorder()
+	s.ServeHTTP(get, httptest.NewRequest("GET", "/bucket/key", nil))
+	if get.Code != http.StatusOK || get.Body.String() != "hello world" {
+		t.Fatalf("GET status=%d body=%q", get.Code, get.Body.String())
+	}
+}
+
+func TestChunkedUploadPartNeedsDecodedLength(t *testing.T) {
+	backend := &fakeMultipartBackend{}
+	s := testMultipartServer(backend)
+	req := chunkedRequest("5\r\nhello\r\n0\r\n\r\n")
+	req.URL.RawQuery = "partNumber=1&uploadId=upload-1"
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || backend.startedPart {
+		t.Fatalf("status=%d startedPart=%v body=%s", rec.Code, backend.startedPart, rec.Body.String())
 	}
 }
 

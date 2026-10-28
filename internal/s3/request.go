@@ -422,6 +422,7 @@ var crc64NVMETables = func() [8][256]uint64 {
 type ingestInput struct {
 	opts store.WriteOptions
 	in   *integrity
+	size int64
 }
 
 func prepareIngest(r *http.Request) (ingestInput, error) {
@@ -450,7 +451,15 @@ func prepareIngest(r *http.Request) (ingestInput, error) {
 		UserMetadata: meta,
 		ContentType:  ct,
 	}
-	if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
+	in.size = r.ContentLength
+	if isStreaming(r) {
+		n, err := decodedLength(r)
+		if err != nil {
+			return in, err
+		}
+		in.size = n
+		in.opts.ExpectedSize = n
+	} else if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
 			in.opts.ExpectedSize = n
 		}
@@ -488,6 +497,10 @@ func readInlineBody(contentLength int64, body io.Reader, max int64) (inlineBody,
 		pooled := inlineBodyPool.Get().(*[]byte)
 		data := (*pooled)[:contentLength]
 		if _, err := io.ReadFull(body, data); err != nil {
+			inlineBodyPool.Put(pooled)
+			return inlineBody{}, err
+		}
+		if _, err := io.Copy(io.Discard, body); err != nil {
 			inlineBodyPool.Put(pooled)
 			return inlineBody{}, err
 		}
@@ -689,6 +702,18 @@ const (
 	maxChunkSize    = 8 << 20
 	maxTrailerBytes = 64 << 10
 )
+
+func isStreaming(r *http.Request) bool {
+	return strings.HasPrefix(r.Header.Get("x-amz-content-sha256"), "STREAMING-")
+}
+
+func decodedLength(r *http.Request) (int64, error) {
+	n, err := strconv.ParseInt(r.Header.Get("x-amz-decoded-content-length"), 10, 64)
+	if err != nil || n < 0 {
+		return 0, errInvalidRequest("invalid x-amz-decoded-content-length")
+	}
+	return n, nil
+}
 
 func prepareBody(r *http.Request) error {
 	payload := r.Header.Get("x-amz-content-sha256")

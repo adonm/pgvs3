@@ -401,7 +401,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		body = &integrityReader{r: r.Body, in: in}
 	}
 	var checks []store.Checksum
-	etag, err := s.writeBackendFor(r.Context(), bucket).Put(r.Context(), bucket, key, body, r.ContentLength, opts,
+	etag, err := s.writeBackendFor(r.Context(), bucket).Put(r.Context(), bucket, key, body, ing.size, opts,
 		func() ([]store.Checksum, error) {
 			got, err := in.verify(r.Trailer)
 			if err == nil {
@@ -650,7 +650,11 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 		return err
 	}
 	expectedSize := r.ContentLength
-	if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
+	if isStreaming(r) {
+		if expectedSize, err = decodedLength(r); err != nil {
+			return err
+		}
+	} else if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
 		if n, perr := strconv.ParseInt(v, 10, 64); perr == nil && n >= 0 {
 			expectedSize = n
 		}
