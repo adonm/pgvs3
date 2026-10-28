@@ -729,8 +729,12 @@ func doctor(args []string) int {
 			d.ServerVersion, d.AuroraVersion, d.Layout, d.Namespaces, d.OverScale, d.Buckets, d.Queues, d.Caches,
 			d.ChunksConfigured, d.Objects, d.GarbageFiles, d.GarbageReferenced,
 			d.OrphanSchemas, d.MissingSchemas, d.DatabaseBytes>>20)
+		for _, fn := range d.MissingQueueFuncs {
+			fmt.Fprintf(os.Stderr, "missing stream function %s\n", fn)
+		}
 		if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured ||
-			d.OrphanSchemas > 0 || d.MissingSchemas > 0 || d.GarbageReferenced > 0 || d.OverScale {
+			d.OrphanSchemas > 0 || d.MissingSchemas > 0 || d.GarbageReferenced > 0 || d.OverScale ||
+			len(d.MissingQueueFuncs) > 0 {
 			return 1
 		}
 		if err := st.EnsureMaintenance(ctx); err != nil {

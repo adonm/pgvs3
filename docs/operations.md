@@ -320,8 +320,10 @@ pre-release compatibility policy.
 
 `pgvs3 doctor` is the schema-as-code drift check. It verifies PostgreSQL 18+,
 the layout version, required relations and functions, per-namespace table
-settings, catalog/schema agreement and reaper safety. A gateway refuses to
-start if the same structural checks fail.
+settings, catalog/schema agreement, the stream functions of every queue (each missing
+one is printed by name) and reaper safety. A gateway refuses to start on the
+layout, relation and manifest checks; `doctor` also exits non-zero for missing
+queue stream functions.
 
 Before replacing a database, take a logical backup as described above. If you
 need to preserve data across a layout change, copy it out through S3/rclone or

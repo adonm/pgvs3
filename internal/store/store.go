@@ -1563,22 +1563,23 @@ func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, schema string, grac
 }
 
 type Diagnosis struct {
-	ServerVersion     int    `json:"server_version_num"`
-	AuroraVersion     string `json:"aurora_version,omitempty"`
-	Layout            int    `json:"layout"`
-	Namespaces        int64  `json:"namespaces"`
-	OverScale         bool   `json:"over_supported_scale"`
-	Buckets           int64  `json:"buckets"`
-	Queues            int64  `json:"queues"`
-	Caches            int64  `json:"caches"`
-	ChunksRelkind     string `json:"chunks_relkind"`
-	ChunksConfigured  bool   `json:"chunks_configured"`
-	Objects           int64  `json:"objects"`
-	GarbageFiles      int64  `json:"garbage_files"`
-	GarbageReferenced int64  `json:"garbage_referenced"`
-	DatabaseBytes     int64  `json:"database_bytes"`
-	OrphanSchemas     int64  `json:"orphan_schemas"`
-	MissingSchemas    int64  `json:"missing_schemas"`
+	ServerVersion     int      `json:"server_version_num"`
+	AuroraVersion     string   `json:"aurora_version,omitempty"`
+	Layout            int      `json:"layout"`
+	Namespaces        int64    `json:"namespaces"`
+	OverScale         bool     `json:"over_supported_scale"`
+	Buckets           int64    `json:"buckets"`
+	Queues            int64    `json:"queues"`
+	Caches            int64    `json:"caches"`
+	ChunksRelkind     string   `json:"chunks_relkind"`
+	ChunksConfigured  bool     `json:"chunks_configured"`
+	Objects           int64    `json:"objects"`
+	GarbageFiles      int64    `json:"garbage_files"`
+	GarbageReferenced int64    `json:"garbage_referenced"`
+	DatabaseBytes     int64    `json:"database_bytes"`
+	OrphanSchemas     int64    `json:"orphan_schemas"`
+	MissingSchemas    int64    `json:"missing_schemas"`
+	MissingQueueFuncs []string `json:"missing_queue_functions,omitempty"`
 }
 
 func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
@@ -1600,6 +1601,9 @@ func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 		}
 	}
 	if err := s.diagnoseSchemas(ctx, &d); err != nil {
+		return d, err
+	}
+	if err := s.diagnoseStreamFunctions(ctx, &d); err != nil {
 		return d, err
 	}
 	size, err := s.databaseSize(ctx)
@@ -1698,6 +1702,30 @@ func (s *Store) diagnoseSchemas(ctx context.Context, d *Diagnosis) error {
 		(SELECT count(*) FROM s3p.namespaces n
 		  WHERE to_regnamespace(format('%I', n.schema_name)) IS NULL)`).
 		Scan(&d.OrphanSchemas, &d.MissingSchemas)
+}
+
+var queueStreamFunctions = []string{
+	"stream_new_tick", "stream_latest_tick", "stream_append", "stream_subscribe",
+	"stream_batch", "stream_receive", "stream_ack", "stream_nack",
+	"stream_process_retries", "stream_prune_ticks", "stream_rotate",
+	"stream_replay_dead_letter", "stream_replay_dead_letters",
+}
+
+func (s *Store) diagnoseStreamFunctions(ctx context.Context, d *Diagnosis) error {
+	rows, err := s.pool.Query(ctx, `SELECT n.schema_name || '.' || f.name
+		FROM s3p.namespaces n
+		CROSS JOIN unnest($1::text[]) AS f(name)
+		WHERE n.kind = 'queue'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM pg_proc p
+		    JOIN pg_namespace ns ON ns.oid = p.pronamespace
+		    WHERE ns.nspname = n.schema_name AND p.proname = f.name)
+		ORDER BY 1`, queueStreamFunctions)
+	if err != nil {
+		return err
+	}
+	d.MissingQueueFuncs, err = pgx.CollectRows(rows, pgx.RowTo[string])
+	return err
 }
 
 func (s *Store) databaseSize(ctx context.Context) (int64, error) {

@@ -415,7 +415,7 @@ Subcommands:
 - `pgvs3 origin [--bucket B] [--cache-namespace NS] set|clear|list [origin.json]`
   — persist or remove global or per-bucket origin cache configs inside
   PostgreSQL (gateways discover them automatically with no external files).
-- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v25, table settings,
+- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v25, table settings, per-queue stream functions,
   namespace drift, the 100-namespace supported scale, and reaper safety.
 - `pgvs3 reap [--all]` — reconcile schemas and run garbage collection immediately.
 - `pgvs3 health` — poll `/readyz` for container health checks.

@@ -2425,6 +2425,29 @@ func TestStreamEmptyReceiveDoesNotChurnTicks(t *testing.T) {
 	}
 }
 
+func TestDiagnoseNamesMissingStreamFunction(t *testing.T) {
+	ctx := testCtx
+	q := unique("stream-diagnose")
+	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	sc, err := ns.Queue.Schema(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.pool.Exec(ctx, "DROP FUNCTION "+quoteIdent(sc)+".stream_ack(int8)"); err != nil {
+		t.Fatal(err)
+	}
+	d, err := testStore.Diagnose(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := sc + ".stream_ack"; !slices.Contains(d.MissingQueueFuncs, want) {
+		t.Fatalf("missing queue functions = %v, want %s", d.MissingQueueFuncs, want)
+	}
+}
+
 func BenchmarkCacheCommands(b *testing.B) {
 	for _, size := range []int{256, 64 << 10, 10 << 20} {
 		data := make([]byte, size)
