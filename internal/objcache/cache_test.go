@@ -2249,3 +2249,9 @@ func TestS3OriginMapping(t *testing.T) {
 		t.Fatalf("listing issued %d HEADs", after-before)
 	}
 }
+
+func TestSaveSpecRejectsInvalidOriginConfig(t *testing.T) {
+	if err := SaveSpec(context.Background(), nil, "", Spec{Config: `{"type":"bogus","config":{}}`}); err == nil {
+		t.Fatal("invalid origin type accepted")
+	}
+}

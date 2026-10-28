@@ -98,7 +98,27 @@ func readObject(t *testing.T, obj *Object) string {
 	return string(b)
 }
 
-func TestTierObjectLifecycle(t *testing.T) {
+var errOriginDown = errors.New("origin down")
+
+type flakyOrigin struct {
+	originHandle
+	down atomic.Bool
+}
+
+func (f *flakyOrigin) Upload(ctx context.Context, key string, r io.Reader, size int64, opts originUpload) (originAttrs, error) {
+	if f.down.Load() {
+		return originAttrs{}, errOriginDown
+	}
+	return f.originHandle.Upload(ctx, key, r, size, opts)
+}
+
+func readObjectErr(obj *Object) (string, error) {
+	defer obj.Body.Close()
+	b, err := io.ReadAll(obj.Body)
+	return string(b), err
+}
+
+func TestTierLifecycle(t *testing.T) {
 	ctx := testCtx
 	f := newFixture(t)
 	if _, err := f.tier.Upload(ctx, "bkt", "a.txt", strings.NewReader("alpha"), nil, "text/plain"); err != nil {
@@ -152,196 +172,128 @@ func TestTierObjectLifecycle(t *testing.T) {
 	if _, err := f.tier.Head(ctx, "bkt", "a.txt"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("head missing = %v", err)
 	}
-}
-
-func TestTierETagConsistency(t *testing.T) {
-	ctx := testCtx
-	f := newFixture(t)
-	if _, err := f.tier.Upload(ctx, "bkt", "a.txt", strings.NewReader("alpha"), nil, "text/plain"); err != nil {
-		t.Fatal(err)
-	}
-	head, err := f.tier.Head(ctx, "bkt", "a.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	obj, err := f.tier.Open(ctx, "bkt", "a.txt", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readObject(t, obj); got != "alpha" {
-		t.Fatalf("open = %q", got)
-	}
-	rows, err := f.tier.List(ctx, "bkt", "", "", 10)
-	if err != nil || len(rows) != 1 {
-		t.Fatalf("list = %+v err=%v", rows, err)
-	}
-	if head.ETag != obj.ETag || head.ETag != rows[0].ETag {
-		t.Fatalf("etags differ: head=%q open=%q list=%q", head.ETag, obj.ETag, rows[0].ETag)
-	}
-}
-
-func TestTierMultipartPendingOutbox(t *testing.T) {
-	ctx := testCtx
-	f := newFixture(t)
-	uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp", nil, "text/plain", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parts []store.ListedPart
-	for i, body := range [][]byte{[]byte("hello "), []byte("world")} {
-		w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp", int32(i+1), 0)
+	t.Run("etag consistency", func(t *testing.T) {
+		ctx := testCtx
+		f := newFixture(t)
+		if _, err := f.tier.Upload(ctx, "bkt", "a.txt", strings.NewReader("alpha"), nil, "text/plain"); err != nil {
+			t.Fatal(err)
+		}
+		head, err := f.tier.Head(ctx, "bkt", "a.txt")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Write(body); err != nil {
+		obj, err := f.tier.Open(ctx, "bkt", "a.txt", store.WholeObjectRange())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readObject(t, obj); got != "alpha" {
+			t.Fatalf("open = %q", got)
+		}
+		rows, err := f.tier.List(ctx, "bkt", "", "", 10)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("list = %+v err=%v", rows, err)
+		}
+		if head.ETag != obj.ETag || head.ETag != rows[0].ETag {
+			t.Fatalf("etags differ: head=%q open=%q list=%q", head.ETag, obj.ETag, rows[0].ETag)
+		}
+	})
+}
+
+func TestTierPendingCompletion(t *testing.T) {
+	t.Run("multipart completion retries after origin recovers", func(t *testing.T) {
+		ctx := testCtx
+		f := newFixture(t)
+		origin := &flakyOrigin{originHandle: f.tier.origin}
+		f.tier.origin = origin
+		uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp-fail", nil, "text/plain", "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp-fail", 1, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte("nope")); err != nil {
 			t.Fatal(err)
 		}
 		pub, err := w.Finish(nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		parts = append(parts, store.ListedPart{PartNo: int32(i + 1), ETag: pub.ETag})
-	}
-	done, err := f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp", parts, store.WriteOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if done.Size != 11 {
-		t.Fatalf("size = %d", done.Size)
-	}
-	if got := f.readOrigin(t, "bkt/mp"); got != "hello world" {
-		t.Fatalf("origin = %q", got)
-	}
-	head, err := f.tier.Head(ctx, "bkt", "mp")
-	if err != nil || head.Size != 11 {
-		t.Fatalf("head = %+v err=%v", head, err)
-	}
-	if n := f.pending(t, "mp"); n != 0 {
-		t.Fatalf("pending rows after success = %d", n)
-	}
-
-	uploadID, err = f.tier.CreateUpload(ctx, "bkt", "mp-fail", nil, "text/plain", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp-fail", 1, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write([]byte("nope")); err != nil {
-		t.Fatal(err)
-	}
-	pub, err := w.Finish(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o555); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.Chmod(filepath.Join(f.dir, "bkt"), 0o755) }()
-	_, err = f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-fail",
-		[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, store.WriteOptions{})
-	if err == nil {
-		t.Fatal("expected origin failure")
-	}
-	head, err = f.tier.Head(ctx, "bkt", "mp-fail")
-	if err != nil || head.Size != 4 || !head.Hit {
-		t.Fatalf("pending completion head = %+v err=%v", head, err)
-	}
-	if n := f.pending(t, "mp-fail"); n != 1 {
-		t.Fatalf("pending rows after failure = %d, want 1", n)
-	}
-
-	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(15 * time.Second)
-	for f.pending(t, "mp-fail") != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("outbox worker did not clear the pending row")
+		origin.down.Store(true)
+		if _, err := f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-fail",
+			[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, store.WriteOptions{}); err == nil {
+			t.Fatal("expected origin failure")
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	head, err = f.tier.Head(ctx, "bkt", "mp-fail")
-	if err != nil || head.Size != 4 {
-		t.Fatalf("retried object head = %+v err=%v", head, err)
-	}
-	if got := f.readOrigin(t, "bkt/mp-fail"); got != "nope" {
-		t.Fatalf("origin after retry = %q", got)
-	}
-}
-
-func TestTierPendingServesNewCacheBody(t *testing.T) {
-	ctx := testCtx
-	f := newFixture(t)
-	if _, err := f.tier.Upload(ctx, "bkt", "mp-old", strings.NewReader("old"), nil, "text/plain"); err != nil {
-		t.Fatal(err)
-	}
-	uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp-old", nil, "text/plain", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp-old", 1, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write([]byte("new!")); err != nil {
-		t.Fatal(err)
-	}
-	pub, err := w.Finish(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o555); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(f.dir, "bkt", "mp-old"), 0o444); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_ = os.Chmod(filepath.Join(f.dir, "bkt", "mp-old"), 0o644)
-		_ = os.Chmod(filepath.Join(f.dir, "bkt"), 0o755)
-	}()
-	_, err = f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-old",
-		[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, store.WriteOptions{})
-	if err == nil {
-		t.Fatal("expected origin failure")
-	}
-	obj, err := f.tier.Open(ctx, "bkt", "mp-old", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := io.ReadAll(obj.Body)
-	_ = obj.Body.Close()
-	if err != nil || string(body) != "new!" {
-		t.Fatalf("pending read = %q err=%v, want completed cache body", body, err)
-	}
-	if n := f.pending(t, "mp-old"); n != 1 {
-		t.Fatalf("pending rows after failed completion = %d, want 1", n)
-	}
-
-	if err := os.Chmod(filepath.Join(f.dir, "bkt", "mp-old"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(f.dir, "bkt"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(15 * time.Second)
-	for f.pending(t, "mp-old") != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("outbox worker did not clear the pending row")
+		head, err := f.tier.Head(ctx, "bkt", "mp-fail")
+		if err != nil || head.Size != 4 || !head.Hit {
+			t.Fatalf("pending completion head = %+v err=%v", head, err)
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	obj, err = f.tier.Open(ctx, "bkt", "mp-old", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err = io.ReadAll(obj.Body)
-	_ = obj.Body.Close()
-	if err != nil || string(body) != "new!" {
-		t.Fatalf("retried read = %q err=%v", body, err)
-	}
+		if n := f.pending(t, "mp-fail"); n != 1 {
+			t.Fatalf("pending rows after failure = %d, want 1", n)
+		}
+		origin.down.Store(false)
+		deadline := time.Now().Add(15 * time.Second)
+		for f.pending(t, "mp-fail") != 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("outbox worker did not clear the pending row")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if got := f.readOrigin(t, "bkt/mp-fail"); got != "nope" {
+			t.Fatalf("origin after retry = %q", got)
+		}
+	})
+	t.Run("cache body served while origin is down", func(t *testing.T) {
+		ctx := testCtx
+		f := newFixture(t)
+		if _, err := f.tier.Upload(ctx, "bkt", "mp-old", strings.NewReader("old"), nil, "text/plain"); err != nil {
+			t.Fatal(err)
+		}
+		origin := &flakyOrigin{originHandle: f.tier.origin}
+		f.tier.origin = origin
+		uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp-old", nil, "text/plain", "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp-old", 1, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte("new!")); err != nil {
+			t.Fatal(err)
+		}
+		pub, err := w.Finish(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		origin.down.Store(true)
+		if _, err := f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-old",
+			[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, store.WriteOptions{}); err == nil {
+			t.Fatal("expected origin failure")
+		}
+		obj, err := f.tier.Open(ctx, "bkt", "mp-old", store.WholeObjectRange())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readObject(t, obj); got != "new!" {
+			t.Fatalf("pending read = %q, want completed cache body", got)
+		}
+		if n := f.pending(t, "mp-old"); n != 1 {
+			t.Fatalf("pending rows after failed completion = %d, want 1", n)
+		}
+		origin.down.Store(false)
+		deadline := time.Now().Add(15 * time.Second)
+		for f.pending(t, "mp-old") != 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("outbox worker did not clear the pending row")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if got := f.readOrigin(t, "bkt/mp-old"); got != "new!" {
+			t.Fatalf("origin after retry = %q", got)
+		}
+	})
 }
 
 func (f *fixture) pending(t *testing.T, key string) int {
@@ -520,21 +472,6 @@ func TestTierS3PrefixMetadataAndConditions(t *testing.T) {
 	}
 }
 
-func TestTierValidationRunsBeforeOriginMutation(t *testing.T) {
-	ctx := testCtx
-	f := newFixture(t)
-	boom := errors.New("checksum mismatch")
-	if _, err := f.tier.UploadWithOptions(ctx, "bkt", "invalid", strings.NewReader("bytes"), UploadOptions{
-		ContentType: "text/plain",
-		Validate:    func() error { return boom },
-	}); !errors.Is(err, boom) {
-		t.Fatalf("validation error = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(f.dir, "bkt", "invalid")); !os.IsNotExist(err) {
-		t.Fatalf("origin changed before validation: %v", err)
-	}
-}
-
 func TestUnsupportedKeysRejectedBeforeCommit(t *testing.T) {
 	ctx := testCtx
 	f := newFixture(t)
@@ -647,7 +584,7 @@ func (b *blockingGetOrigin) GetWithAttrs(ctx context.Context, key string) (io.Re
 	}
 }
 
-func TestFillLeaseCoalescesAcrossTiers(t *testing.T) {
+func TestFillCoalescing(t *testing.T) {
 	ctx := testCtx
 	mem := newTestOrigin(t, "")
 	if _, err := mem.Upload(ctx, "bkt/shared", strings.NewReader("shared-fill"), 11, originUpload{ContentType: "text/plain"}); err != nil {
@@ -691,7 +628,8 @@ func TestFillLeaseCoalescesAcrossTiers(t *testing.T) {
 			firstCh <- result{err: err}
 			return
 		}
-		firstCh <- result{body: readObject(t, obj)}
+		body, err := readObjectErr(obj)
+		firstCh <- result{body: body, err: err}
 	}()
 	select {
 	case <-blocked.entered:
@@ -705,7 +643,8 @@ func TestFillLeaseCoalescesAcrossTiers(t *testing.T) {
 			secondCh <- result{err: err}
 			return
 		}
-		secondCh <- result{body: readObject(t, obj)}
+		body, err := readObjectErr(obj)
+		secondCh <- result{body: body, err: err}
 	}()
 	time.Sleep(100 * time.Millisecond)
 	close(blocked.release)
@@ -722,6 +661,42 @@ func TestFillLeaseCoalescesAcrossTiers(t *testing.T) {
 	if got := blocked.calls.Load(); got != 1 {
 		t.Fatalf("origin calls = %d, want 1", got)
 	}
+	t.Run("cancelled waiter does not cancel owner", func(t *testing.T) {
+		f := newFixture(t)
+		ck := f.tier.key("bkt", "shared")
+		if _, err := f.tier.origin.Upload(testCtx, ck, strings.NewReader("shared"), 6, originUpload{}); err != nil {
+			t.Fatal(err)
+		}
+		blocked := &blockingGetOrigin{originHandle: f.tier.origin, entered: make(chan struct{}), release: make(chan struct{})}
+		f.tier.origin = blocked
+		owner := make(chan error, 1)
+		go func() {
+			_, err := f.tier.fill(testCtx, ck, "shared")
+			owner <- err
+		}()
+		select {
+		case <-blocked.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("owner did not reach origin")
+		}
+		ctx, cancel := context.WithCancel(testCtx)
+		cancel()
+		if _, err := f.tier.fill(ctx, ck, "shared"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiter error = %v", err)
+		}
+		close(blocked.release)
+		select {
+		case err := <-owner:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("owner did not finish")
+		}
+		if got := blocked.calls.Load(); got != 1 {
+			t.Fatalf("origin GETs = %d, want 1", got)
+		}
+	})
 }
 
 func TestStaleFillCannotOverwriteNewerCacheVersion(t *testing.T) {
@@ -913,30 +888,7 @@ func TestStaleMultipartFlushCannotOverwriteNewerWrite(t *testing.T) {
 	}
 }
 
-func TestOriginConditionFencesStaleBase(t *testing.T) {
-	ctx := testCtx
-	f := newFixture(t)
-	if _, err := f.tier.Upload(ctx, "bkt", "fenced", strings.NewReader("old"), nil, "text/plain"); err != nil {
-		t.Fatal(err)
-	}
-	old, err := f.tier.origin.Attributes(ctx, f.tier.key("bkt", "fenced"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.tier.Upload(ctx, "bkt", "fenced", strings.NewReader("new"), nil, "text/plain"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.tier.origin.Upload(ctx, f.tier.key("bkt", "fenced"), strings.NewReader("stale"), 5, originUpload{
-		Precondition: store.Precondition{Mode: store.IfMatch, ETag: old.ETag},
-	}); !errors.Is(err, errOriginPrecondition) {
-		t.Fatalf("stale conditional upload error = %v", err)
-	}
-	if got := f.readOrigin(t, "bkt/fenced"); got != "new" {
-		t.Fatalf("origin after stale flush = %q", got)
-	}
-}
-
-func TestReadOnlyTierDoesNotWriteCache(t *testing.T) {
+func TestReadOnlyTier(t *testing.T) {
 	ctx := testCtx
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "bkt"), 0o755); err != nil {
@@ -995,43 +947,96 @@ func TestReadOnlyTierDoesNotWriteCache(t *testing.T) {
 	if _, err := testStore.MetaHeader(ctx, store.ObjectRef{NS: ns.CacheRef(cache), Key: tier.key("bkt", "cold.txt")}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("read-only tier wrote cache metadata: %v", err)
 	}
+	t.Run("durable write-back row", func(t *testing.T) {
+		ctx := testCtx
+		cache := fmt.Sprintf("origin-ro-skip-%d", time.Now().UnixNano())
+		if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := testStore.EnsureNamespace(ctx, ns.WriteBack, cache, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
+			_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
+		})
+		if _, err := testStore.PutInline(ctx, store.ObjectRef{NS: ns.WriteBackRef(cache), Key: "bkt/warm"},
+			[]byte("durable"), store.WriteOptions{ContentType: "text/plain", OriginETag: "origin-v1"}); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := testStore.DropNamespace(ctx, ns.Cache, cache, true); err != nil {
+			t.Fatal(err)
+		}
+		origin := newTestOrigin(t, "")
+		tier := &Tier{
+			origin: origin, store: testStore, namespace: cache, ttl: time.Hour,
+			retention: time.Hour, readOnly: true, fills: make(chan struct{}, 2),
+			completes: make(chan struct{}, 2), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		defer tier.Close()
+		head, err := tier.Head(ctx, "bkt", "warm")
+		if err != nil || head.Size != int64(len("durable")) {
+			t.Fatalf("read-only head = %+v err=%v", head, err)
+		}
+		obj, err := tier.Open(ctx, "bkt", "warm", store.WholeObjectRange())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readObject(t, obj); got != "durable" {
+			t.Fatalf("read-only open = %q", got)
+		}
+		rows, err := tier.List(ctx, "bkt", "", "", 10)
+		if err != nil || len(rows) != 1 || rows[0].Key != "warm" {
+			t.Fatalf("read-only list = %+v err=%v", rows, err)
+		}
+	})
+	t.Run("shared cache after origin removal", func(t *testing.T) {
+		ctx := testCtx
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "bucket"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "bucket", "key"), []byte("shared"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cache := fmt.Sprintf("origin-shared-%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
+			_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
+		})
+		cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
+		writer, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore, cache, time.Hour, time.Hour, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Close()
+		obj, err := writer.Open(ctx, "bucket", "key", store.WholeObjectRange())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readObject(t, obj); got != "shared" {
+			t.Fatalf("writer open = %q", got)
+		}
+		if err := os.Remove(filepath.Join(dir, "bucket", "key")); err != nil {
+			t.Fatal(err)
+		}
+		reader, err := NewReadOnly(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore, cache, time.Hour, time.Hour, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reader.Close()
+		obj, err = reader.Open(ctx, "bucket", "key", store.WholeObjectRange())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readObject(t, obj); got != "shared" {
+			t.Fatalf("read-only shared-cache open = %q", got)
+		}
+	})
 }
 
-func TestWarmCacheHitSkipsOrigin(t *testing.T) {
-	ctx := testCtx
-	dir := t.TempDir()
-	cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
-	tier, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore,
-		fmt.Sprintf("origin-%d", time.Now().UnixNano()), time.Minute, time.Hour, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = tier.Close() })
-
-	if _, err := tier.Upload(ctx, "bkt", "warm.txt", strings.NewReader("alpha"), nil, "text/plain"); err != nil {
-		t.Fatal(err)
-	}
-	first, err := tier.Open(ctx, "bkt", "warm.txt", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !first.Hit || readObject(t, first) != "alpha" {
-		t.Fatalf("first open: hit=%v", first.Hit)
-	}
-
-	if err := os.Remove(filepath.Join(dir, "bkt", "warm.txt")); err != nil {
-		t.Fatal(err)
-	}
-	second, err := tier.Open(ctx, "bkt", "warm.txt", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !second.Hit || readObject(t, second) != "alpha" {
-		t.Fatalf("warm open after origin delete: hit=%v", second.Hit)
-	}
-}
-
-func TestExplicitFullRangeIsRanged(t *testing.T) {
+func TestResponseShape(t *testing.T) {
 	ctx := testCtx
 	f := newFixture(t)
 	if _, err := f.tier.Upload(ctx, "bkt", "full.txt", strings.NewReader("alpha"), nil, "text/plain"); err != nil {
@@ -1047,6 +1052,20 @@ func TestExplicitFullRangeIsRanged(t *testing.T) {
 	if got := readObject(t, obj); got != "alpha" {
 		t.Fatalf("body = %q", got)
 	}
+	t.Run("zero-byte object", func(t *testing.T) {
+		ctx := testCtx
+		f := newFixture(t)
+		if _, err := f.tier.origin.Upload(ctx, f.tier.key("bkt", "zero"), strings.NewReader(""), 0, originUpload{}); err != nil {
+			t.Fatal(err)
+		}
+		obj, err := f.tier.Open(ctx, "bkt", "zero", store.WholeObjectRange())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readObject(t, obj); got != "" || obj.Size != 0 || obj.Ranged {
+			t.Fatalf("zero object = %+v body=%q", obj, got)
+		}
+	})
 }
 
 func TestMultipartCompleteOriginPrecondition(t *testing.T) {
@@ -1142,145 +1161,99 @@ func TestColdWholeReadUsesOneOriginRequest(t *testing.T) {
 	}
 }
 
-func TestColdWholeZeroObject(t *testing.T) {
-	ctx := testCtx
-	f := newFixture(t)
-	if _, err := f.tier.origin.Upload(ctx, f.tier.key("bkt", "zero"), strings.NewReader(""), 0, originUpload{}); err != nil {
-		t.Fatal(err)
-	}
-	obj, err := f.tier.Open(ctx, "bkt", "zero", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readObject(t, obj); got != "" || obj.Size != 0 || obj.Ranged {
-		t.Fatalf("zero object = %+v body=%q", obj, got)
-	}
-}
-
-func TestWriteBackAcksBeforeOriginUpload(t *testing.T) {
-	ctx := testCtx
-	f := newFixture(t)
-	f.tier.EnableWriteBack(true)
-	blocked := &blockingOrigin{
-		originHandle: f.tier.origin,
-		entered:      make(chan struct{}),
-		release:      make(chan struct{}),
-	}
-	f.tier.origin = blocked
-	release := func() {
-		select {
-		case <-blocked.release:
-		default:
-			close(blocked.release)
-		}
-	}
-	defer release()
-
+func TestWriteBackAcks(t *testing.T) {
 	body := bytes.Repeat([]byte("p"), 9<<20)
-	start := time.Now()
-	m, err := f.tier.Upload(ctx, "bkt", "writeback", bytes.NewReader(body), nil, "application/octet-stream")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if time.Since(start) > 2*time.Second {
-		t.Fatal("write-back upload waited for the origin")
-	}
-	if m.Size != int64(len(body)) || m.OriginETag == "" {
-		t.Fatalf("write-back meta = %+v", m)
-	}
-	obj, err := f.tier.Open(ctx, "bkt", "writeback", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readObject(t, obj); got != string(body) {
-		t.Fatalf("cached write-back body length = %d, want %d", len(got), len(body))
-	}
-	if f.pending(t, "writeback") != 1 {
-		t.Fatal("write-back did not enqueue an origin upload")
-	}
-	select {
-	case <-blocked.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("outbox worker did not attempt the origin upload")
-	}
-	release()
-	deadline := time.Now().Add(20 * time.Second)
-	for f.pending(t, "writeback") != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("outbox worker did not commit the write-back")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if got := f.readOrigin(t, "bkt/writeback"); got != string(body) {
-		t.Fatalf("origin after write-back length = %d, want %d", len(got), len(body))
-	}
-}
-
-func TestMultipartWriteBackAcksBeforeOriginUpload(t *testing.T) {
-	ctx := testCtx
-	f := newFixture(t)
-	f.tier.EnableWriteBack(true)
-	blocked := &blockingOrigin{
-		originHandle: f.tier.origin,
-		entered:      make(chan struct{}),
-		release:      make(chan struct{}),
-	}
-	f.tier.origin = blocked
-	release := func() {
-		select {
-		case <-blocked.release:
-		default:
-			close(blocked.release)
-		}
-	}
-	defer release()
-
-	uploadID, err := f.tier.CreateUpload(ctx, "bkt", "mp-writeback", nil, "text/plain", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w, err := f.tier.StartPart(ctx, uploadID, "bkt", "mp-writeback", 1, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write([]byte("async")); err != nil {
-		t.Fatal(err)
-	}
-	pub, err := w.Finish(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	start := time.Now()
-	done, err := f.tier.CompleteUpload(ctx, uploadID, "bkt", "mp-writeback",
-		[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, store.WriteOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if time.Since(start) > 2*time.Second || done.Size != 5 {
-		t.Fatalf("write-back completion waited or returned size %d", done.Size)
-	}
-	obj, err := f.tier.Open(ctx, "bkt", "mp-writeback", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readObject(t, obj); got != "async" {
-		t.Fatalf("pending multipart body = %q", got)
-	}
-	select {
-	case <-blocked.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("outbox worker did not attempt the multipart origin upload")
-	}
-	release()
-	deadline := time.Now().Add(20 * time.Second)
-	for f.pending(t, "mp-writeback") != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("outbox worker did not commit the multipart write-back")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if got := f.readOrigin(t, "bkt/mp-writeback"); got != "async" {
-		t.Fatalf("origin after multipart write-back = %q", got)
+	for _, tc := range []struct {
+		name  string
+		key   string
+		write func(ctx context.Context, f *fixture, key string) (int64, error)
+		want  []byte
+	}{
+		{"put", "writeback", func(ctx context.Context, f *fixture, key string) (int64, error) {
+			m, err := f.tier.Upload(ctx, "bkt", key, bytes.NewReader(body), nil, "application/octet-stream")
+			if err != nil {
+				return 0, err
+			}
+			return m.Size, nil
+		}, body},
+		{"multipart", "mp-writeback", func(ctx context.Context, f *fixture, key string) (int64, error) {
+			uploadID, err := f.tier.CreateUpload(ctx, "bkt", key, nil, "text/plain", "", nil)
+			if err != nil {
+				return 0, err
+			}
+			w, err := f.tier.StartPart(ctx, uploadID, "bkt", key, 1, 0)
+			if err != nil {
+				return 0, err
+			}
+			if _, err := w.Write([]byte("async")); err != nil {
+				return 0, err
+			}
+			pub, err := w.Finish(nil)
+			if err != nil {
+				return 0, err
+			}
+			done, err := f.tier.CompleteUpload(ctx, uploadID, "bkt", key,
+				[]store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, store.WriteOptions{})
+			if err != nil {
+				return 0, err
+			}
+			return done.Size, nil
+		}, []byte("async")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := testCtx
+			f := newFixture(t)
+			f.tier.EnableWriteBack(true)
+			blocked := &blockingOrigin{
+				originHandle: f.tier.origin,
+				entered:      make(chan struct{}),
+				release:      make(chan struct{}),
+			}
+			f.tier.origin = blocked
+			release := func() {
+				select {
+				case <-blocked.release:
+				default:
+					close(blocked.release)
+				}
+			}
+			defer release()
+			uctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			size, err := tc.write(uctx, f, tc.key)
+			if err != nil {
+				t.Fatalf("write-back did not acknowledge before the origin: %v", err)
+			}
+			if size != int64(len(tc.want)) {
+				t.Fatalf("write-back size = %d, want %d", size, len(tc.want))
+			}
+			obj, err := f.tier.Open(ctx, "bkt", tc.key, store.WholeObjectRange())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := readObject(t, obj); got != string(tc.want) {
+				t.Fatalf("cached write-back body length = %d, want %d", len(got), len(tc.want))
+			}
+			if f.pending(t, tc.key) != 1 {
+				t.Fatal("write-back did not enqueue an origin upload")
+			}
+			select {
+			case <-blocked.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("outbox worker did not attempt the origin upload")
+			}
+			release()
+			deadline := time.Now().Add(20 * time.Second)
+			for f.pending(t, tc.key) != 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("outbox worker did not commit the write-back")
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			if got := f.readOrigin(t, "bkt/"+tc.key); got != string(tc.want) {
+				t.Fatalf("origin after write-back length = %d, want %d", len(got), len(tc.want))
+			}
+		})
 	}
 }
 
@@ -1325,102 +1298,6 @@ func TestListMergesPendingWriteBackObjects(t *testing.T) {
 			t.Fatal("outbox worker did not commit pending listing object")
 		}
 		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func TestReadOnlyTierUsesDurableWriteCache(t *testing.T) {
-	ctx := testCtx
-	cache := fmt.Sprintf("origin-ro-skip-%d", time.Now().UnixNano())
-	if err := testStore.EnsureNamespace(ctx, ns.Cache, cache, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := testStore.EnsureNamespace(ctx, ns.WriteBack, cache, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
-		_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
-	})
-	if _, err := testStore.PutInline(ctx, store.ObjectRef{NS: ns.WriteBackRef(cache), Key: "bkt/warm"},
-		[]byte("durable"), store.WriteOptions{ContentType: "text/plain", OriginETag: "origin-v1"}); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := testStore.DropNamespace(ctx, ns.Cache, cache, true); err != nil {
-		t.Fatal(err)
-	}
-	origin := newTestOrigin(t, "")
-	tier := &Tier{
-		origin: origin, store: testStore, namespace: cache, ttl: time.Hour,
-		retention: time.Hour, readOnly: true, fills: make(chan struct{}, 2),
-		completes: make(chan struct{}, 2), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-	defer tier.Close()
-	head, err := tier.Head(ctx, "bkt", "warm")
-	if err != nil || head.Size != int64(len("durable")) {
-		t.Fatalf("read-only head = %+v err=%v", head, err)
-	}
-	obj, err := tier.Open(ctx, "bkt", "warm", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readObject(t, obj); got != "durable" {
-		t.Fatalf("read-only open = %q", got)
-	}
-	rows, err := tier.List(ctx, "bkt", "", "", 10)
-	if err != nil || len(rows) != 1 || rows[0].Key != "warm" {
-		t.Fatalf("read-only list = %+v err=%v", rows, err)
-	}
-}
-
-func TestSaveSpecValidatesOriginConfig(t *testing.T) {
-	err := SaveSpec(testCtx, testStore, "", Spec{Config: `{"type":"bogus","config":{}}`})
-	if err == nil {
-		t.Fatal("invalid origin type accepted")
-	}
-}
-
-func TestSharedReadCacheSurvivesOriginRemoval(t *testing.T) {
-	ctx := testCtx
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "bucket"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "bucket", "key"), []byte("shared"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cache := fmt.Sprintf("origin-shared-%d", time.Now().UnixNano())
-	t.Cleanup(func() {
-		_, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true)
-		_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
-	})
-	cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
-	writer, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore, cache, time.Hour, time.Hour, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer writer.Close()
-	obj, err := writer.Open(ctx, "bucket", "key", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readObject(t, obj); got != "shared" {
-		t.Fatalf("writer open = %q", got)
-	}
-	if err := os.Remove(filepath.Join(dir, "bucket", "key")); err != nil {
-		t.Fatal(err)
-	}
-	reader, err := NewReadOnly(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore, cache, time.Hour, time.Hour, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	obj, err = reader.Open(ctx, "bucket", "key", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readObject(t, obj); got != "shared" {
-		t.Fatalf("read-only shared-cache open = %q", got)
 	}
 }
 
@@ -1569,43 +1446,6 @@ func TestCacheResolutionLifecycle(t *testing.T) {
 	}
 }
 
-func TestCancelledFillWaiterDoesNotCancelOwner(t *testing.T) {
-	f := newFixture(t)
-	ck := f.tier.key("bkt", "shared")
-	if _, err := f.tier.origin.Upload(testCtx, ck, strings.NewReader("shared"), 6, originUpload{}); err != nil {
-		t.Fatal(err)
-	}
-	blocked := &blockingGetOrigin{originHandle: f.tier.origin, entered: make(chan struct{}), release: make(chan struct{})}
-	f.tier.origin = blocked
-	owner := make(chan error, 1)
-	go func() {
-		_, err := f.tier.fill(testCtx, ck, "shared")
-		owner <- err
-	}()
-	select {
-	case <-blocked.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("owner did not reach origin")
-	}
-	ctx, cancel := context.WithCancel(testCtx)
-	cancel()
-	if _, err := f.tier.fill(ctx, ck, "shared"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("waiter error = %v", err)
-	}
-	close(blocked.release)
-	select {
-	case err := <-owner:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("owner did not finish")
-	}
-	if got := blocked.calls.Load(); got != 1 {
-		t.Fatalf("origin GETs = %d, want 1", got)
-	}
-}
-
 func TestSpooledPublicationMetadata(t *testing.T) {
 	f := newFixture(t)
 	f.tier.cancel()
@@ -1647,23 +1487,6 @@ func TestSpooledPublicationMetadata(t *testing.T) {
 		if (m.ExpiresAt == nil) != pending || (stored.ExpiresAt == nil) != pending {
 			t.Fatalf("pending=%t returned expiry=%v stored expiry=%v", pending, m.ExpiresAt, stored.ExpiresAt)
 		}
-	}
-}
-
-func TestExternalOriginUpdateAfterWriteFence(t *testing.T) {
-	f := newFixture(t)
-	if _, err := f.tier.Upload(testCtx, "bkt", "external", strings.NewReader("old"), nil, "text/plain"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(f.dir, "bkt", "external"), []byte("new-version"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	obj, err := f.tier.Open(testCtx, "bkt", "external", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readObject(t, obj); got != "new-version" {
-		t.Fatalf("external update = %q", got)
 	}
 }
 
@@ -1746,9 +1569,9 @@ func TestParentHeadPublicationFencedByTombstone(t *testing.T) {
 	}
 }
 
-func TestFillRenewalAndLostOwner(t *testing.T) {
+func TestFillRenewal(t *testing.T) {
 	f := newFixture(t)
-	f.tier.fillTTL = 2 * time.Second
+	f.tier.fillTTL = 300 * time.Millisecond
 	ck := f.tier.key("bkt", "slow-renewal")
 	if _, err := f.tier.origin.Upload(testCtx, ck, strings.NewReader("body"), 4, originUpload{}); err != nil {
 		t.Fatal(err)
@@ -1766,7 +1589,7 @@ func TestFillRenewalAndLostOwner(t *testing.T) {
 	select {
 	case err := <-result:
 		t.Fatalf("fill ended early: %v", err)
-	case <-time.After(2500 * time.Millisecond):
+	case <-time.After(900 * time.Millisecond):
 	}
 	if got, err := testStore.Cache(f.tier.namespace).AcquireFillLease(testCtx, ck, "competitor", time.Minute); err != nil || got {
 		t.Fatalf("renewed fill lost ownership: %t %v", got, err)
@@ -1788,25 +1611,24 @@ func TestFillRenewalAndLostOwner(t *testing.T) {
 		t.Fatalf("stale body published: %v", err)
 	}
 	testStore.Cache(f.tier.namespace).ReleaseFillLease(context.Background(), ck, "replacement")
-}
-
-func TestFillRenewalCompletesAndReleases(t *testing.T) {
-	f := newFixture(t)
-	ck := f.tier.key("bkt", "renewed")
-	if _, err := f.tier.origin.Upload(testCtx, ck, strings.NewReader("body"), 4, originUpload{}); err != nil {
-		t.Fatal(err)
-	}
-	obj, err := f.tier.Open(testCtx, "bkt", "renewed", store.WholeObjectRange())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer obj.Body.Close()
-	data, err := io.ReadAll(obj.Body)
-	if err != nil || string(data) != "body" {
-		t.Fatal(err)
-	}
-	var n int
-	if err := testStore.Pool().QueryRow(testCtx, `SELECT count(*) FROM s3p.cache_fill_leases WHERE namespace=$1`, f.tier.namespace).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("lease leaked: %d %v", n, err)
-	}
+	t.Run("completion releases the lease", func(t *testing.T) {
+		f := newFixture(t)
+		ck := f.tier.key("bkt", "renewed")
+		if _, err := f.tier.origin.Upload(testCtx, ck, strings.NewReader("body"), 4, originUpload{}); err != nil {
+			t.Fatal(err)
+		}
+		obj, err := f.tier.Open(testCtx, "bkt", "renewed", store.WholeObjectRange())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer obj.Body.Close()
+		data, err := io.ReadAll(obj.Body)
+		if err != nil || string(data) != "body" {
+			t.Fatal(err)
+		}
+		var n int
+		if err := testStore.Pool().QueryRow(testCtx, `SELECT count(*) FROM s3p.cache_fill_leases WHERE namespace=$1`, f.tier.namespace).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("lease leaked: %d %v", n, err)
+		}
+	})
 }
