@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	mathrand "math/rand"
 	"os"
@@ -30,28 +29,18 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	url, cleanup, err := testutil.Postgres(testCtx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "start postgres:", err)
-		os.Exit(1)
-	}
-	code := 1
-	defer func() {
-		cleanup()
-		os.Exit(code)
-	}()
-	st, err := Open(testCtx, url, 8, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "open store:", err)
-		return
-	}
-	defer st.Close()
-	if err := st.Init(testCtx); err != nil {
-		fmt.Fprintln(os.Stderr, "init schema:", err)
-		return
-	}
-	testStore = st
-	code = m.Run()
+	os.Exit(testutil.RunMain(m, func(ctx context.Context, url string) (func(), error) {
+		st, err := Open(ctx, url, 8, testutil.DiscardLogger())
+		if err != nil {
+			return nil, fmt.Errorf("open store: %w", err)
+		}
+		if err := st.Init(ctx); err != nil {
+			st.Close()
+			return nil, fmt.Errorf("init schema: %w", err)
+		}
+		testStore = st
+		return st.Close, nil
+	}))
 }
 
 func unique(prefix string) string {
@@ -470,7 +459,7 @@ func TestBucketWritesCannotResurrectDroppedNamespace(t *testing.T) {
 	url := testStore.Pool().Config().ConnString()
 	openStore := func(t *testing.T, label string) *Store {
 		t.Helper()
-		st, err := Open(ctx, url, 8, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		st, err := Open(ctx, url, 8, testutil.DiscardLogger())
 		if err != nil {
 			t.Fatalf("open %s store: %v", label, err)
 		}
@@ -940,7 +929,7 @@ func TestOpenWithOptionsAppliesSessionPolicy(t *testing.T) {
 		IdleTxTimeout:         30 * time.Second,
 		MaxConnLifetime:       time.Minute,
 		MaxConnLifetimeJitter: 5 * time.Second,
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}, testutil.DiscardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1611,7 +1600,7 @@ func TestObjectModelAcrossWorkers(t *testing.T) {
 	t.Cleanup(func() { _, _ = testStore.DropBucket(context.WithoutCancel(ctx), bucket, true) })
 
 	other, err := Open(ctx, testStore.Pool().Config().ConnString(), 8,
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		testutil.DiscardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}

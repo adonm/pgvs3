@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,25 +27,18 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	url, cleanup, err := testutil.Postgres(intCtx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "integration postgres:", err)
-		os.Exit(1)
-	}
-	st, err := store.Open(intCtx, url, 8, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "open store:", err)
-		os.Exit(1)
-	}
-	if err := st.Init(intCtx); err != nil {
-		fmt.Fprintln(os.Stderr, "init schema:", err)
-		os.Exit(1)
-	}
-	intStore = st
-	code := m.Run()
-	st.Close()
-	cleanup()
-	os.Exit(code)
+	os.Exit(testutil.RunMain(m, func(ctx context.Context, url string) (func(), error) {
+		st, err := store.Open(ctx, url, 8, testutil.DiscardLogger())
+		if err != nil {
+			return nil, fmt.Errorf("open store: %w", err)
+		}
+		if err := st.Init(ctx); err != nil {
+			st.Close()
+			return nil, fmt.Errorf("init schema: %w", err)
+		}
+		intStore = st
+		return st.Close, nil
+	}))
 }
 
 type apiReply struct {
@@ -57,7 +49,7 @@ type apiReply struct {
 
 func newIntServer(t *testing.T, readOnly bool) (string, *Server) {
 	t.Helper()
-	srv := New(intStore, slog.New(slog.NewTextHandler(io.Discard, nil)), readOnly, 8, "test")
+	srv := New(intStore, testutil.DiscardLogger(), readOnly, 8, "test")
 	srv.longPoll = 0
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
@@ -178,9 +170,11 @@ func TestIntegrationLeaseAckAndStale(t *testing.T) {
 	enqueue(t, base, q, "email.send", `[]`, "")
 	jobs = fetch(t, base, q, 1, 10)
 	oldID, oldToken := jobs[0]["id"].(string), jobs[0]["lease_token"].(string)
-	time.Sleep(30 * time.Millisecond)
-	jobs = fetch(t, base, q, 1, 1000)
-	if len(jobs) != 1 || jobs[0]["id"] != oldID {
+	testutil.Eventually(t, 5*time.Second, "expired lease was not redelivered", func() bool {
+		jobs = fetch(t, base, q, 1, 1000)
+		return len(jobs) == 1
+	})
+	if jobs[0]["id"] != oldID {
 		t.Fatalf("refetch = %+v", jobs)
 	}
 	newToken := jobs[0]["lease_token"].(string)
@@ -260,14 +254,10 @@ func TestIntegrationPriorityAndScheduled(t *testing.T) {
 	if got := fetch(t, base, q, 1, 1000); len(got) != 0 {
 		t.Fatalf("scheduled job fetched before scheduled_at: %+v", got)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	testutil.Eventually(t, 5*time.Second, "scheduled job was not fetched when due", func() bool {
 		jobs = fetch(t, base, q, 1, 1000)
-		if len(jobs) != 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return len(jobs) != 0
+	})
 	if len(jobs) != 1 || jobs[0]["type"] != "later" {
 		t.Fatalf("due scheduled fetch = %+v", jobs)
 	}

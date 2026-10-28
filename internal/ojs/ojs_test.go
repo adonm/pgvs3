@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -16,6 +14,7 @@ import (
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
+	"github.com/adonm/pgvs3/internal/testutil"
 )
 
 type fakeStore struct {
@@ -196,7 +195,7 @@ func (f *fakeStore) PurgeDeadLetters(context.Context, string, time.Duration) (in
 
 func testServer(t *testing.T, st Store, readOnly bool) *Server {
 	t.Helper()
-	return New(st, slog.New(slog.NewTextHandler(io.Discard, nil)), readOnly, 4, "test")
+	return New(st, testutil.DiscardLogger(), readOnly, 4, "test")
 }
 
 func post(t *testing.T, s *Server, path, body string) *httptest.ResponseRecorder {
@@ -1308,7 +1307,7 @@ func BenchmarkHTTPBinding(b *testing.B) {
 		{"invalid", "/ojs/v1/jobs", `{"type":"INVALID","args":[]}`},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			s := New(st, slog.New(slog.NewTextHandler(io.Discard, nil)), false, 4, "bench")
+			s := New(st, testutil.DiscardLogger(), false, 4, "bench")
 			b.ReportAllocs()
 			for b.Loop() {
 				r := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))

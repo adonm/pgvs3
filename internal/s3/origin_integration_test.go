@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -29,41 +28,31 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	url, cleanup, err := testutil.Postgres(originTestCtx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "start postgres:", err)
-		os.Exit(1)
-	}
-	code := 1
-	defer func() {
-		cleanup()
-		os.Exit(code)
-	}()
-	st, err := store.Open(originTestCtx, url, 8, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "open store:", err)
-		return
-	}
-	defer st.Close()
-	if err := st.Init(originTestCtx); err != nil {
-		fmt.Fprintln(os.Stderr, "init schema:", err)
-		return
-	}
-	originTestStore = st
-	code = m.Run()
+	os.Exit(testutil.RunMain(m, func(ctx context.Context, url string) (func(), error) {
+		st, err := store.Open(ctx, url, 8, testutil.DiscardLogger())
+		if err != nil {
+			return nil, fmt.Errorf("open store: %w", err)
+		}
+		if err := st.Init(ctx); err != nil {
+			st.Close()
+			return nil, fmt.Errorf("init schema: %w", err)
+		}
+		originTestStore = st
+		return st.Close, nil
+	}))
 }
 
 func TestOriginWriteValidationAndConditions(t *testing.T) {
 	ctx := originTestCtx
 	dir := t.TempDir()
-	tier, err := objcache.New(slog.New(slog.NewTextHandler(io.Discard, nil)),
+	tier, err := objcache.New(testutil.DiscardLogger(),
 		fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir),
 		originTestStore, fmt.Sprintf("origin-http-%d", os.Getpid()), 0, time.Hour, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tier.Close()
-	srv := New(originTestStore, slog.New(slog.NewTextHandler(io.Discard, nil)), false, 8)
+	srv := New(originTestStore, testutil.DiscardLogger(), false, 8)
 	srv.SetOrigin(tier)
 	httpSrv := httptest.NewServer(srv)
 	defer httpSrv.Close()
@@ -246,7 +235,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 
 func TestS3MissingBucketAndInvalidRange(t *testing.T) {
 	bucket := fmt.Sprintf("errbucket-%d", time.Now().UnixNano())
-	local := New(originTestStore, slog.New(slog.NewTextHandler(io.Discard, nil)), false, 8)
+	local := New(originTestStore, testutil.DiscardLogger(), false, 8)
 	httpSrv := httptest.NewServer(local)
 	defer httpSrv.Close()
 	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}

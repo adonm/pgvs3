@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -32,28 +31,18 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	url, cleanup, err := testutil.Postgres(testCtx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "start postgres:", err)
-		os.Exit(1)
-	}
-	code := 1
-	defer func() {
-		cleanup()
-		os.Exit(code)
-	}()
-	st, err := store.Open(testCtx, url, 8, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "open store:", err)
-		return
-	}
-	defer st.Close()
-	if err := st.Init(testCtx); err != nil {
-		fmt.Fprintln(os.Stderr, "init schema:", err)
-		return
-	}
-	testStore = st
-	code = m.Run()
+	os.Exit(testutil.RunMain(m, func(ctx context.Context, url string) (func(), error) {
+		st, err := store.Open(ctx, url, 8, testutil.DiscardLogger())
+		if err != nil {
+			return nil, fmt.Errorf("open store: %w", err)
+		}
+		if err := st.Init(ctx); err != nil {
+			st.Close()
+			return nil, fmt.Errorf("init schema: %w", err)
+		}
+		testStore = st
+		return st.Close, nil
+	}))
 }
 
 type fixture struct {
@@ -65,7 +54,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
-	tier, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore,
+	tier, err := New(testutil.DiscardLogger(), cfg, testStore,
 		fmt.Sprintf("origin-%d", time.Now().UnixNano()), 0, 24*time.Hour, 4)
 	if err != nil {
 		t.Fatal(err)
@@ -233,13 +222,7 @@ func TestTierPendingCompletion(t *testing.T) {
 			t.Fatalf("pending rows after failure = %d, want 1", n)
 		}
 		origin.down.Store(false)
-		deadline := time.Now().Add(15 * time.Second)
-		for f.pending(t, "mp-fail") != 0 {
-			if time.Now().After(deadline) {
-				t.Fatal("outbox worker did not clear the pending row")
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+		testutil.Eventually(t, 15*time.Second, "outbox worker did not clear the pending row", func() bool { return f.pending(t, "mp-fail") == 0 })
 		if got := f.readOrigin(t, "bkt/mp-fail"); got != "nope" {
 			t.Fatalf("origin after retry = %q", got)
 		}
@@ -283,13 +266,7 @@ func TestTierPendingCompletion(t *testing.T) {
 			t.Fatalf("pending rows after failed completion = %d, want 1", n)
 		}
 		origin.down.Store(false)
-		deadline := time.Now().Add(15 * time.Second)
-		for f.pending(t, "mp-old") != 0 {
-			if time.Now().After(deadline) {
-				t.Fatal("outbox worker did not clear the pending row")
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+		testutil.Eventually(t, 15*time.Second, "outbox worker did not clear the pending row", func() bool { return f.pending(t, "mp-old") == 0 })
 		if got := f.readOrigin(t, "bkt/mp-old"); got != "new!" {
 			t.Fatalf("origin after retry = %q", got)
 		}
@@ -352,7 +329,7 @@ func newS3Fixture(t *testing.T, prefix string) *s3Fixture {
 			"bucket_lookup_type":"path"
 		}
 	}`, prefix, bucket, cfg.Endpoint, cfg.AccessKey, cfg.SecretKey)
-	tier, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), originCfg, testStore,
+	tier, err := New(testutil.DiscardLogger(), originCfg, testStore,
 		fmt.Sprintf("origin-s3-%d", time.Now().UnixNano()), 0, 24*time.Hour, 4)
 	if err != nil {
 		t.Fatal(err)
@@ -610,7 +587,7 @@ func TestFillCoalescing(t *testing.T) {
 		return &Tier{
 			origin: blocked, store: testStore, namespace: cache, ttl: 0, retention: time.Hour,
 			fills: make(chan struct{}, 2), completes: make(chan struct{}, 2),
-			log: slog.New(slog.NewTextHandler(io.Discard, nil)), workerID: randomID(),
+			log: testutil.DiscardLogger(), workerID: randomID(),
 			cancel: func() {},
 		}
 	}
@@ -717,7 +694,7 @@ func TestStaleFillCannotOverwriteNewerCacheVersion(t *testing.T) {
 		return &Tier{
 			origin: origin, store: testStore, namespace: cache, ttl: 0, retention: time.Hour,
 			fills: make(chan struct{}, 2), completes: make(chan struct{}, 2),
-			log: slog.New(slog.NewTextHandler(io.Discard, nil)), workerID: randomID(),
+			log: testutil.DiscardLogger(), workerID: randomID(),
 			cancel: func() {},
 		}
 	}
@@ -781,7 +758,7 @@ func TestDeleteDuringFillCannotResurrectCache(t *testing.T) {
 		return &Tier{
 			origin: origin, store: testStore, namespace: cache, ttl: 0, retention: time.Hour,
 			fills: make(chan struct{}, 2), completes: make(chan struct{}, 2),
-			log: slog.New(slog.NewTextHandler(io.Discard, nil)), workerID: randomID(),
+			log: testutil.DiscardLogger(), workerID: randomID(),
 			cancel: func() {},
 		}
 	}
@@ -899,7 +876,7 @@ func TestReadOnlyTier(t *testing.T) {
 	}
 	cache := fmt.Sprintf("origin-ro-%d", time.Now().UnixNano())
 	cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
-	seed, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore, cache, 0, time.Hour, 2)
+	seed, err := New(testutil.DiscardLogger(), cfg, testStore, cache, 0, time.Hour, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -911,7 +888,7 @@ func TestReadOnlyTier(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tier, err := NewReadOnly(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore, cache, 0, time.Hour, 2)
+	tier, err := NewReadOnly(testutil.DiscardLogger(), cfg, testStore, cache, 0, time.Hour, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -972,7 +949,7 @@ func TestReadOnlyTier(t *testing.T) {
 		tier := &Tier{
 			origin: origin, store: testStore, namespace: cache, ttl: time.Hour,
 			retention: time.Hour, readOnly: true, fills: make(chan struct{}, 2),
-			completes: make(chan struct{}, 2), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			completes: make(chan struct{}, 2), log: testutil.DiscardLogger(),
 		}
 		defer tier.Close()
 		head, err := tier.Head(ctx, "bkt", "warm")
@@ -1006,7 +983,7 @@ func TestReadOnlyTier(t *testing.T) {
 			_, _ = testStore.DropNamespace(ctx, ns.WriteBack, cache, true)
 		})
 		cfg := fmt.Appendf(nil, `{"type":"filesystem","config":{"directory":%q}}`, dir)
-		writer, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore, cache, time.Hour, time.Hour, 2)
+		writer, err := New(testutil.DiscardLogger(), cfg, testStore, cache, time.Hour, time.Hour, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1021,7 +998,7 @@ func TestReadOnlyTier(t *testing.T) {
 		if err := os.Remove(filepath.Join(dir, "bucket", "key")); err != nil {
 			t.Fatal(err)
 		}
-		reader, err := NewReadOnly(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, testStore, cache, time.Hour, time.Hour, 2)
+		reader, err := NewReadOnly(testutil.DiscardLogger(), cfg, testStore, cache, time.Hour, time.Hour, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1243,13 +1220,7 @@ func TestWriteBackAcks(t *testing.T) {
 				t.Fatal("outbox worker did not attempt the origin upload")
 			}
 			release()
-			deadline := time.Now().Add(20 * time.Second)
-			for f.pending(t, tc.key) != 0 {
-				if time.Now().After(deadline) {
-					t.Fatal("outbox worker did not commit the write-back")
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
+			testutil.Eventually(t, 20*time.Second, "outbox worker did not commit the write-back", func() bool { return f.pending(t, tc.key) == 0 })
 			if got := f.readOrigin(t, "bkt/"+tc.key); got != string(tc.want) {
 				t.Fatalf("origin after write-back length = %d, want %d", len(got), len(tc.want))
 			}
@@ -1292,13 +1263,7 @@ func TestListMergesPendingWriteBackObjects(t *testing.T) {
 		t.Fatalf("second page = %+v err=%v", second, err)
 	}
 	release()
-	deadline := time.Now().Add(20 * time.Second)
-	for f.pending(t, "b") != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("outbox worker did not commit pending listing object")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	testutil.Eventually(t, 20*time.Second, "outbox worker did not commit pending listing object", func() bool { return f.pending(t, "b") == 0 })
 }
 
 func TestTierModelAcrossWorkers(t *testing.T) {
@@ -1308,7 +1273,7 @@ func TestTierModelAcrossWorkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache := fmt.Sprintf("origin-model-%d", time.Now().UnixNano())
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log := testutil.DiscardLogger()
 	newTier := func() *Tier {
 		return &Tier{
 			origin: mem, store: testStore, namespace: cache, ttl: 0, retention: time.Hour,

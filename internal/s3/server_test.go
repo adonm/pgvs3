@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,6 +20,7 @@ import (
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/adonm/pgvs3/internal/telemetry"
+	"github.com/adonm/pgvs3/internal/testutil"
 )
 
 func TestCRC64NVMEAgainstBitwise(t *testing.T) {
@@ -98,7 +98,7 @@ func TestRangeDoesNotAdvertiseWholeObjectChecksum(t *testing.T) {
 }
 
 func TestSpoolAdmissionMapsToRetryableSlowDown(t *testing.T) {
-	s := &Server{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s := &Server{log: testutil.DiscardLogger()}
 	err := fmt.Errorf("spool: %w", objcache.ErrSpoolBusy)
 	ae, ok := s.apiError(err).(*APIError)
 	if !ok || ae.Status != http.StatusServiceUnavailable || ae.Code != "SlowDown" {
@@ -138,7 +138,7 @@ func TestIngestErrorMapsUnrepresentableKeyToBadRequest(t *testing.T) {
 }
 
 func TestServerRequestSemaphore(t *testing.T) {
-	s := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), false, 1)
+	s := New(nil, testutil.DiscardLogger(), false, 1)
 	release, ok := s.acquire()
 	if !ok {
 		t.Fatal("first acquisition failed")
@@ -421,7 +421,7 @@ func TestValidateWriteHeaders(t *testing.T) {
 
 func TestPresignedRequestRejected(t *testing.T) {
 	s := &Server{
-		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		log:     testutil.DiscardLogger(),
 		metrics: telemetry.NewRequestMetrics(),
 	}
 	for _, target := range []string{
@@ -470,7 +470,7 @@ func callHandler(t *testing.T, s *Server, rec *httptest.ResponseRecorder, req *h
 
 func testReadServer(backend readBackend) *Server {
 	return &Server{
-		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		log:          testutil.DiscardLogger(),
 		readOverride: backend,
 	}
 }
@@ -647,7 +647,7 @@ func (f *fakeWriteBackend) DeleteMany(_ context.Context, _ string, keys []string
 
 func testWriteServer(backend *fakeWriteBackend) *Server {
 	return &Server{
-		log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		log:           testutil.DiscardLogger(),
 		writeOverride: backend,
 	}
 }
@@ -781,7 +781,7 @@ func (f *fakeMultipartBackend) ListUploads(context.Context, string, string, stri
 
 func testMultipartServer(backend *fakeMultipartBackend) *Server {
 	return &Server{
-		log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		log:               testutil.DiscardLogger(),
 		multipartOverride: backend,
 	}
 }
