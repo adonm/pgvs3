@@ -90,6 +90,35 @@ func Open(ctx context.Context, url string, maxConns int32, log *slog.Logger) (*S
 }
 
 func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slog.Logger) (*Store, error) {
+	opts, err := normalizeOpenOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := newPoolConfig(url, opts)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := openPool(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	chunkPool, err := openPool(ctx, newChunkPoolConfig(cfg, opts))
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if err := warmPool(ctx, pool, cfg.MinConns); err != nil {
+		pool.Close()
+		chunkPool.Close()
+		return nil, err
+	}
+	return &Store{
+		pool: pool, chunkPool: chunkPool, log: log,
+		jobRetention: DefaultJobRetention,
+	}, nil
+}
+
+func normalizeOpenOptions(opts OpenOptions) (OpenOptions, error) {
 	if opts.MaxConns <= 0 {
 		opts.MaxConns = 64
 	}
@@ -97,11 +126,15 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 		opts.WorkMem = "16MB"
 	}
 	if !validWorkMem(opts.WorkMem) {
-		return nil, fmt.Errorf("invalid work_mem %q", opts.WorkMem)
+		return opts, fmt.Errorf("invalid work_mem %q", opts.WorkMem)
 	}
 	if opts.MinIdleConns <= 0 {
 		opts.MinIdleConns = min(opts.MaxConns, 8)
 	}
+	return opts, nil
+}
+
+func newPoolConfig(url string, opts OpenOptions) (*pgxpool.Config, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, err
@@ -125,50 +158,46 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 	if opts.Tracer != nil {
 		cfg.ConnConfig.Tracer = opts.Tracer
 	}
-	sessionSQL := func(indexScan bool, statementTimeout time.Duration) string {
-		scan := "off"
-		if indexScan {
-			scan = "on"
-		}
-		return "SET enable_indexscan = " + scan + ";" +
-			"\nSET work_mem = '" + opts.WorkMem + "';" +
-			"\nSET effective_io_concurrency = 32;" +
-			"\nSET statement_timeout = '" + durationMillis(statementTimeout) + "';" +
-			"\nSET lock_timeout = '" + durationMillis(opts.LockTimeout) + "';" +
-			"\nSET idle_in_transaction_session_timeout = '" + durationMillis(opts.IdleTxTimeout) + "';" +
-			"\nSET tcp_keepalives_idle = 30;" +
-			"\nSET tcp_keepalives_interval = 10;" +
-			"\nSET tcp_keepalives_count = 3;" +
-			"\nSET synchronous_commit = on;"
-	}
 	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-
-		_, err := conn.Exec(ctx, sessionSQL(true, opts.StatementTimeout))
+		_, err := conn.Exec(ctx, sessionSQL(opts, true, opts.StatementTimeout))
 		return err
 	}
+	return cfg, nil
+}
 
-	pool, err := openPool(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-
+func newChunkPoolConfig(cfg *pgxpool.Config, opts OpenOptions) *pgxpool.Config {
 	chunkCfg := cfg.Copy()
 	chunkCfg.MaxConns = min(opts.MaxConns, 64)
 	chunkCfg.MinConns = min(opts.MaxConns, 4)
 	chunkCfg.MinIdleConns = min(opts.MinIdleConns, chunkCfg.MaxConns)
 	chunkCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, sessionSQL(false, 0))
+		_, err := conn.Exec(ctx, sessionSQL(opts, false, 0))
 		return err
 	}
-	chunkPool, err := openPool(ctx, chunkCfg)
-	if err != nil {
-		pool.Close()
-		return nil, err
-	}
+	return chunkCfg
+}
 
+func sessionSQL(opts OpenOptions, indexScan bool, statementTimeout time.Duration) string {
+	scan := "off"
+	if indexScan {
+		scan = "on"
+	}
+	return "SET enable_indexscan = " + scan + ";" +
+		"\nSET work_mem = '" + opts.WorkMem + "';" +
+		"\nSET effective_io_concurrency = 32;" +
+		"\nSET statement_timeout = '" + durationMillis(statementTimeout) + "';" +
+		"\nSET lock_timeout = '" + durationMillis(opts.LockTimeout) + "';" +
+		"\nSET idle_in_transaction_session_timeout = '" + durationMillis(opts.IdleTxTimeout) + "';" +
+		"\nSET tcp_keepalives_idle = 30;" +
+		"\nSET tcp_keepalives_interval = 10;" +
+		"\nSET tcp_keepalives_count = 3;" +
+		"\nSET synchronous_commit = on;"
+}
+
+func warmPool(ctx context.Context, pool *pgxpool.Pool, conns int32) error {
 	var wg sync.WaitGroup
-	errs := make(chan error, cfg.MinConns)
-	for range cfg.MinConns {
+	errs := make(chan error, conns)
+	for range conns {
 		wg.Go(func() {
 			c, err := pool.Acquire(ctx)
 			if err != nil {
@@ -180,15 +209,7 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 	}
 	wg.Wait()
 	close(errs)
-	for err := range errs {
-		pool.Close()
-		chunkPool.Close()
-		return nil, err
-	}
-	return &Store{
-		pool: pool, chunkPool: chunkPool, log: log,
-		jobRetention: DefaultJobRetention,
-	}, nil
+	return <-errs
 }
 
 func openPool(ctx context.Context, cfg *pgxpool.Config) (*pgxpool.Pool, error) {
@@ -1098,9 +1119,9 @@ func checkNamespaceLayout(ctx context.Context, conn *pgxpool.Conn, n NamespaceIn
 	return checkRelations(ctx, conn, q, bucketRelations, n.Kind == ns.Cache)
 }
 
-func relationExists(ctx context.Context, conn *pgxpool.Conn, relation string) (bool, error) {
+func relationExists(ctx context.Context, db rowQuerier, relation string) (bool, error) {
 	var exists bool
-	err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", relation).Scan(&exists)
+	err := db.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", relation).Scan(&exists)
 	return exists, err
 }
 
@@ -1163,20 +1184,7 @@ func (s *Store) Stat(ctx context.Context) (Stats, error) { return s.StatNamespac
 
 func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (Stats, error) {
 	var st Stats
-	rows, err := s.pool.Query(ctx, `SELECT kind, name, schema_name
-		FROM s3p.namespaces
-		WHERE ($1 = '' OR kind = $1) AND ($2 = '' OR name = $2)
-		ORDER BY kind, name`, string(kind), name)
-	if err != nil {
-		return st, err
-	}
-	infos, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (NamespaceInfo, error) {
-		var n NamespaceInfo
-		var k string
-		err := row.Scan(&k, &n.Name, &n.Schema)
-		n.Kind = ns.Kind(k)
-		return n, err
-	})
+	infos, err := s.listNamespaceStats(ctx, kind, name)
 	if err != nil {
 		return st, err
 	}
@@ -1184,12 +1192,67 @@ func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (S
 	var hasOldest bool
 	for _, n := range infos {
 		st.Namespaces++
-		q := quoteIdent(n.Schema)
-		var logical, physical, objs, chunks, events, garb int64
-		var oldest pgtype.Float8
-		var err error
-		if n.Kind == ns.Queue {
-			err = s.pool.QueryRow(ctx, `SELECT
+		u, err := s.queryNamespaceUsage(ctx, n)
+		if isMissingBucketSchema(err) {
+			continue
+		}
+		if err != nil {
+			return st, err
+		}
+		st.LogicalBytes += u.logical
+		st.PhysicalBytes += u.physical
+		st.Objects += u.objects
+		st.Chunks += u.chunks
+		st.Events += u.events
+		st.GarbageFiles += u.garbage
+		if n.Kind == ns.Bucket {
+			st.Buckets++
+		}
+		if u.oldest.Valid && (!hasOldest || u.oldest.Float64 > maxOldest) {
+			maxOldest = u.oldest.Float64
+			hasOldest = true
+		}
+	}
+	size, err := s.databaseSize(ctx)
+	if err != nil {
+		return st, err
+	}
+	st.DatabaseBytes = size
+	if hasOldest {
+		d := time.Duration(maxOldest * float64(time.Second))
+		st.OldestGarbage = &d
+	}
+	return st, nil
+}
+
+func (s *Store) listNamespaceStats(ctx context.Context, kind ns.Kind, name string) ([]NamespaceInfo, error) {
+	rows, err := s.pool.Query(ctx, `SELECT kind, name, schema_name
+		FROM s3p.namespaces
+		WHERE ($1 = '' OR kind = $1) AND ($2 = '' OR name = $2)
+		ORDER BY kind, name`, string(kind), name)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (NamespaceInfo, error) {
+		var n NamespaceInfo
+		var k string
+		err := row.Scan(&k, &n.Name, &n.Schema)
+		n.Kind = ns.Kind(k)
+		return n, err
+	})
+}
+
+type namespaceUsage struct {
+	logical, physical, objects, chunks, events, garbage int64
+	oldest                                              pgtype.Float8
+}
+
+func (s *Store) queryNamespaceUsage(ctx context.Context, n NamespaceInfo) (namespaceUsage, error) {
+	q := quoteIdent(n.Schema)
+	var u namespaceUsage
+	var err error
+	if n.Kind == ns.Queue {
+		err = s.pool.QueryRow(ctx, `SELECT
 				(SELECT COALESCE(sum(pg_column_size(args) + coalesce(pg_column_size(meta),0) + octet_length(type)),0)::int8 FROM `+q+`.jobs)
 				+ (SELECT COALESCE(sum(pg_column_size(payload) + pg_column_size(headers)),0)::int8 FROM `+q+`.stream_events),
 				pg_total_relation_size('`+q+`.jobs')
@@ -1207,9 +1270,9 @@ func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (S
 				0,
 				(SELECT count(*) FROM `+q+`.stream_events),
 				0, NULL`).
-				Scan(&logical, &physical, &objs, &chunks, &events, &garb, &oldest)
-		} else {
-			err = s.pool.QueryRow(ctx, `SELECT
+			Scan(&u.logical, &u.physical, &u.objects, &u.chunks, &u.events, &u.garbage, &u.oldest)
+	} else {
+		err = s.pool.QueryRow(ctx, `SELECT
 				(SELECT COALESCE(sum(size),0)::int8 FROM `+q+`.objects),
 				pg_total_relation_size('`+q+`.objects') + pg_total_relation_size('`+q+`.chunks') + pg_total_relation_size('`+q+`.origin_metadata'),
 				(SELECT count(*) FROM `+q+`.objects),
@@ -1225,36 +1288,9 @@ func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (S
 				0,
 				(SELECT count(*) FROM `+q+`.garbage),
 				(SELECT EXTRACT(EPOCH FROM now() - min(queued_at))::float8 FROM `+q+`.garbage)`).
-				Scan(&logical, &physical, &objs, &chunks, &events, &garb, &oldest)
-		}
-		if isMissingBucketSchema(err) {
-			continue
-		}
-		if err != nil {
-			return st, err
-		}
-		st.LogicalBytes += logical
-		st.PhysicalBytes += physical
-		st.Objects += objs
-		st.Chunks += chunks
-		st.Events += events
-		st.GarbageFiles += garb
-		if n.Kind == ns.Bucket {
-			st.Buckets++
-		}
-		if oldest.Valid && (!hasOldest || oldest.Float64 > maxOldest) {
-			maxOldest = oldest.Float64
-			hasOldest = true
-		}
+			Scan(&u.logical, &u.physical, &u.objects, &u.chunks, &u.events, &u.garbage, &u.oldest)
 	}
-	if err := s.pool.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&st.DatabaseBytes); err != nil {
-		return st, err
-	}
-	if hasOldest {
-		d := time.Duration(maxOldest * float64(time.Second))
-		st.OldestGarbage = &d
-	}
-	return st, nil
+	return u, err
 }
 
 const expirePassRounds = 128
@@ -1547,23 +1583,8 @@ type Diagnosis struct {
 
 func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 	var d Diagnosis
-	var versionText string
-	if err := s.pool.QueryRow(ctx, "SHOW server_version_num").Scan(&versionText); err != nil {
+	if err := s.diagnoseServer(ctx, &d); err != nil {
 		return d, err
-	}
-	d.ServerVersion, _ = strconv.Atoi(versionText)
-	var aurora pgtype.Text
-	if err := s.pool.QueryRow(ctx, `SELECT CASE
-		WHEN to_regprocedure('aurora_version()') IS NULL THEN ''
-		ELSE aurora_version()::text END`).Scan(&aurora); err == nil && aurora.Valid {
-		d.AuroraVersion = aurora.String
-	}
-	var layout pgtype.Int4
-	if err := s.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&layout); err != nil {
-		return d, err
-	}
-	if layout.Valid {
-		d.Layout = int(layout.Int32)
 	}
 	d.ChunksRelkind = "r"
 	d.ChunksConfigured = true
@@ -1574,70 +1595,113 @@ func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 	d.Namespaces = int64(len(infos))
 	d.OverScale = d.Namespaces > SupportedNamespaces
 	for _, n := range infos {
-		switch n.Kind {
-		case ns.Bucket:
-			d.Buckets++
-		case ns.Queue:
-			d.Queues++
-		case ns.Cache, ns.WriteBack:
-			d.Caches++
-		}
-		q := quoteIdent(n.Schema)
-		var present bool
-		if err := s.pool.QueryRow(ctx, "SELECT to_regnamespace($1) IS NOT NULL", n.Schema).Scan(&present); err != nil {
+		if err := s.diagnoseNamespace(ctx, n, &d); err != nil {
 			return d, err
 		}
-		if !present {
-			continue
-		}
-		if n.Kind == ns.Queue {
-			var hasIndex bool
-			if err := s.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", q+".jobs_claim").Scan(&hasIndex); err != nil || !hasIndex {
-				d.ChunksConfigured = false
-			}
-			var jobs int64
-			if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM "+q+".jobs").Scan(&jobs); err == nil {
-				d.Objects += jobs
-			}
-			continue
-		}
-		configured, relkind, err := chunksConfigured(ctx, s.pool, n.Schema)
-		if err != nil || !configured {
+	}
+	if err := s.diagnoseSchemas(ctx, &d); err != nil {
+		return d, err
+	}
+	size, err := s.databaseSize(ctx)
+	if err != nil {
+		return d, err
+	}
+	d.DatabaseBytes = size
+	return d, nil
+}
+
+func (s *Store) diagnoseServer(ctx context.Context, d *Diagnosis) error {
+	var versionText string
+	if err := s.pool.QueryRow(ctx, "SHOW server_version_num").Scan(&versionText); err != nil {
+		return err
+	}
+	d.ServerVersion, _ = strconv.Atoi(versionText)
+	var aurora pgtype.Text
+	if err := s.pool.QueryRow(ctx, `SELECT CASE
+		WHEN to_regprocedure('aurora_version()') IS NULL THEN ''
+		ELSE aurora_version()::text END`).Scan(&aurora); err == nil && aurora.Valid {
+		d.AuroraVersion = aurora.String
+	}
+	var layout pgtype.Int4
+	if err := s.pool.QueryRow(ctx, "SELECT max(version) FROM s3p.layout").Scan(&layout); err != nil {
+		return err
+	}
+	if layout.Valid {
+		d.Layout = int(layout.Int32)
+	}
+	return nil
+}
+
+func (s *Store) diagnoseNamespace(ctx context.Context, n NamespaceInfo, d *Diagnosis) error {
+	switch n.Kind {
+	case ns.Bucket:
+		d.Buckets++
+	case ns.Queue:
+		d.Queues++
+	case ns.Cache, ns.WriteBack:
+		d.Caches++
+	}
+	q := quoteIdent(n.Schema)
+	var present bool
+	if err := s.pool.QueryRow(ctx, "SELECT to_regnamespace($1) IS NOT NULL", n.Schema).Scan(&present); err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	if n.Kind == ns.Queue {
+		hasIndex, err := relationExists(ctx, s.pool, q+".jobs_claim")
+		if err != nil || !hasIndex {
 			d.ChunksConfigured = false
 		}
-		if relkind != "" {
-			d.ChunksRelkind = relkind
+		var jobs int64
+		if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM "+q+".jobs").Scan(&jobs); err == nil {
+			d.Objects += jobs
 		}
-		var objs, garb int64
-		if err := s.pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM "+q+".objects), (SELECT count(*) FROM "+q+".garbage)").
-			Scan(&objs, &garb); err == nil {
-			d.Objects += objs
-			d.GarbageFiles += garb
-		}
-
-		uploadCheck := ""
-		if n.Kind == ns.Bucket {
-			uploadCheck = " OR EXISTS (SELECT 1 FROM " + q + ".upload_parts p WHERE p.file_id = g.file_id)"
-		}
-		var referenced int64
-		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+q+`.garbage g
+		return nil
+	}
+	configured, relkind, err := chunksConfigured(ctx, s.pool, n.Schema)
+	if err != nil || !configured {
+		d.ChunksConfigured = false
+	}
+	if relkind != "" {
+		d.ChunksRelkind = relkind
+	}
+	var objs, garb int64
+	if err := s.pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM "+q+".objects), (SELECT count(*) FROM "+q+".garbage)").
+		Scan(&objs, &garb); err == nil {
+		d.Objects += objs
+		d.GarbageFiles += garb
+	}
+	var referenced int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+q+`.garbage g
 			WHERE EXISTS (SELECT 1 FROM `+q+`.objects o WHERE o.file_id = g.file_id)
 			   OR EXISTS (SELECT 1 FROM `+q+`.objects o WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[g.file_id])`+
-			uploadCheck).Scan(&referenced); err == nil {
-			d.GarbageReferenced += referenced
-		}
+		garbageUploadCheck(q, n.Kind)).Scan(&referenced); err == nil {
+		d.GarbageReferenced += referenced
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT
+	return nil
+}
+
+func garbageUploadCheck(q string, kind ns.Kind) string {
+	if kind != ns.Bucket {
+		return ""
+	}
+	return " OR EXISTS (SELECT 1 FROM " + q + ".upload_parts p WHERE p.file_id = g.file_id)"
+}
+
+func (s *Store) diagnoseSchemas(ctx context.Context, d *Diagnosis) error {
+	return s.pool.QueryRow(ctx, `SELECT
 		(SELECT count(*) FROM pg_namespace p
 		  WHERE p.nspname ~ '^s3[bcqw]_[a-z0-9._-]{1,58}$'
 		    AND NOT EXISTS (SELECT 1 FROM s3p.namespaces n WHERE n.schema_name = p.nspname)),
 		(SELECT count(*) FROM s3p.namespaces n
 		  WHERE to_regnamespace(format('%I', n.schema_name)) IS NULL)`).
-		Scan(&d.OrphanSchemas, &d.MissingSchemas); err != nil {
-		return d, err
-	}
-	if err := s.pool.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&d.DatabaseBytes); err != nil {
-		return d, err
-	}
-	return d, nil
+		Scan(&d.OrphanSchemas, &d.MissingSchemas)
+}
+
+func (s *Store) databaseSize(ctx context.Context) (int64, error) {
+	var size int64
+	err := s.pool.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&size)
+	return size, err
 }

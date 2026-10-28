@@ -207,29 +207,16 @@ func serve(args []string) int {
 		return 2
 	}
 	log := newLogger(cfg.logLevel)
-	traceShutdown, err := telemetry.Setup(context.Background(), version, log)
+	shutdownTracing, err := setupTracing(log)
 	if err != nil {
 		log.Error("initializing tracing", "err", err)
 		return 1
 	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = traceShutdown(ctx)
-	}()
+	defer shutdownTracing()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.OpenWithOptions(ctx, cfg.url, store.OpenOptions{
-		MaxConns:              int32(cfg.poolMax),
-		WorkMem:               cfg.dbWorkMem,
-		StatementTimeout:      cfg.dbStatementTimeout,
-		LockTimeout:           cfg.dbLockTimeout,
-		IdleTxTimeout:         cfg.dbIdleTxTimeout,
-		MaxConnLifetime:       cfg.dbMaxConnLifetime,
-		MaxConnLifetimeJitter: cfg.dbMaxConnLifetimeJitter,
-		Tracer:                telemetry.PGXTracer{},
-	}, log)
+	st, err := store.OpenWithOptions(ctx, cfg.url, storeOpenOptions(cfg), log)
 	if err != nil {
 		log.Error("connecting to PostgreSQL", "err", err)
 		return 1
@@ -238,68 +225,128 @@ func serve(args []string) int {
 	st.SetMaxDBBytes(cfg.maxDBBytes)
 	st.SetJobRetention(cfg.jobRetention)
 
+	stopMaintenance, err := prepareStore(ctx, st, cfg, log)
+	defer stopMaintenance()
+	if err != nil {
+		return 1
+	}
+	if !configureObjcache(cfg, log) {
+		return 1
+	}
+	origin, err := openOrigin(st, cfg, log)
+	if err != nil {
+		return 1
+	}
+	if origin != nil {
+		defer origin.Close()
+	}
+	g := newGateway(ctx, st, cfg, origin, log)
+	startPprof(cfg.pprofAddr, log)
+	return runGateway(ctx, g, cfg, log)
+}
+
+func setupTracing(log *slog.Logger) (func(), error) {
+	shutdown, err := telemetry.Setup(context.Background(), version, log)
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdown(ctx)
+	}, nil
+}
+
+func storeOpenOptions(cfg serveConfig) store.OpenOptions {
+	return store.OpenOptions{
+		MaxConns:              int32(cfg.poolMax),
+		WorkMem:               cfg.dbWorkMem,
+		StatementTimeout:      cfg.dbStatementTimeout,
+		LockTimeout:           cfg.dbLockTimeout,
+		IdleTxTimeout:         cfg.dbIdleTxTimeout,
+		MaxConnLifetime:       cfg.dbMaxConnLifetime,
+		MaxConnLifetimeJitter: cfg.dbMaxConnLifetimeJitter,
+		Tracer:                telemetry.PGXTracer{},
+	}
+}
+
+func prepareStore(ctx context.Context, st *store.Store, cfg serveConfig, log *slog.Logger) (func(), error) {
+	noop := func() {}
 	if cfg.readOnly {
 		if err := st.CheckLayout(ctx); err != nil {
 			log.Error("checking storage layout", "err", err)
-			return 1
+			return noop, err
 		}
-	} else {
-		if err := st.Init(ctx); err != nil {
-			log.Error("initializing schema", "err", err)
-			return 1
-		}
-		if err := st.EnsureMaintenance(ctx); err != nil {
-			log.Error("verifying maintenance schema", "err", err)
-			return 1
-		}
-		maintainCtx, cancelMaintain := context.WithCancel(ctx)
-		maintainDone := make(chan struct{})
-		go func() {
-			defer close(maintainDone)
-			maintain(maintainCtx, st, cfg.reapGrace, time.Minute, log)
-		}()
-		defer func() {
-			cancelMaintain()
-			select {
-			case <-maintainDone:
-			case <-time.After(10 * time.Second):
-				log.Warn("maintenance did not stop within shutdown timeout")
-			}
-		}()
+		return noop, nil
 	}
+	if err := st.Init(ctx); err != nil {
+		log.Error("initializing schema", "err", err)
+		return noop, err
+	}
+	if err := st.EnsureMaintenance(ctx); err != nil {
+		log.Error("verifying maintenance schema", "err", err)
+		return noop, err
+	}
+	return startMaintenance(ctx, st, cfg.reapGrace, log), nil
+}
 
+func startMaintenance(ctx context.Context, st *store.Store, reapGrace time.Duration, log *slog.Logger) func() {
+	maintainCtx, cancelMaintain := context.WithCancel(ctx)
+	maintainDone := make(chan struct{})
+	go func() {
+		defer close(maintainDone)
+		maintain(maintainCtx, st, reapGrace, time.Minute, log)
+	}()
+	return func() {
+		cancelMaintain()
+		select {
+		case <-maintainDone:
+		case <-time.After(10 * time.Second):
+			log.Warn("maintenance did not stop within shutdown timeout")
+		}
+	}
+}
+
+func configureObjcache(cfg serveConfig, log *slog.Logger) bool {
 	objcache.ConfigureLimits(cfg.fillConcurrency, min(cfg.fillConcurrency, 8))
 	if cfg.spoolDir != "" {
 		info, err := os.Stat(cfg.spoolDir)
 		if err != nil || !info.IsDir() {
 			log.Error("invalid spool directory", "dir", cfg.spoolDir, "err", err)
-			return 1
+			return false
 		}
 	}
 	objcache.ConfigureSpoolDir(cfg.spoolDir)
 	objcache.ConfigureSpoolBytes(cfg.spoolMaxBytes)
 	objcache.ConfigureWriteBack(cfg.cacheWriteBack)
-	var origin *objcache.Tier
-	if cfg.originConfig != "" {
-		raw, err := os.ReadFile(cfg.originConfig)
-		if err != nil {
-			log.Error("reading origin config", "err", err)
-			return 1
-		}
-		if cfg.readOnly {
-			origin, err = objcache.NewReadOnly(log, raw, st, cfg.cacheNamespace, cfg.cacheTTL, cfg.cacheRetention, cfg.fillConcurrency)
-		} else {
-			origin, err = objcache.New(log, raw, st, cfg.cacheNamespace, cfg.cacheTTL, cfg.cacheRetention, cfg.fillConcurrency)
-		}
-		if err != nil {
-			log.Error("opening origin", "err", err)
-			return 1
-		}
-		origin.EnableRangeCache(cfg.rangeCacheChunk)
-		log.Info("origin cache enabled", "namespace", origin.Name(), "capabilities", origin.Capabilities())
-		defer origin.Close()
-	}
+	return true
+}
 
+func openOrigin(st *store.Store, cfg serveConfig, log *slog.Logger) (*objcache.Tier, error) {
+	if cfg.originConfig == "" {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(cfg.originConfig)
+	if err != nil {
+		log.Error("reading origin config", "err", err)
+		return nil, err
+	}
+	var origin *objcache.Tier
+	if cfg.readOnly {
+		origin, err = objcache.NewReadOnly(log, raw, st, cfg.cacheNamespace, cfg.cacheTTL, cfg.cacheRetention, cfg.fillConcurrency)
+	} else {
+		origin, err = objcache.New(log, raw, st, cfg.cacheNamespace, cfg.cacheTTL, cfg.cacheRetention, cfg.fillConcurrency)
+	}
+	if err != nil {
+		log.Error("opening origin", "err", err)
+		return nil, err
+	}
+	origin.EnableRangeCache(cfg.rangeCacheChunk)
+	log.Info("origin cache enabled", "namespace", origin.Name(), "capabilities", origin.Capabilities())
+	return origin, nil
+}
+
+func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, origin *objcache.Tier, log *slog.Logger) *gateway.Gateway {
 	g := gateway.New(st, log, cfg.readOnly, origin, gateway.Limits{
 		S3: cfg.s3Concurrency, OJS: cfg.queueConcurrency, RESP: cfg.respConcurrency,
 	})
@@ -308,20 +355,32 @@ func serve(args []string) int {
 		<-ctx.Done()
 		g.SetDraining(true)
 	}()
-	if cfg.pprofAddr != "" {
-		go func() {
-			log.Info("pprof listening", "addr", cfg.pprofAddr)
-			if err := http.ListenAndServe(cfg.pprofAddr, http.DefaultServeMux); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Error("pprof server", "err", err)
-			}
-		}()
+	return g
+}
+
+func startPprof(addr string, log *slog.Logger) {
+	if addr == "" {
+		return
 	}
+	go func() {
+		log.Info("pprof listening", "addr", addr)
+		if err := http.ListenAndServe(addr, http.DefaultServeMux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("pprof server", "err", err)
+		}
+	}()
+}
+
+func serveHandler(g *gateway.Gateway, cfg serveConfig) http.Handler {
 	handler := telemetry.Middleware(g)
 	sim := gateway.Simulation{Latency: cfg.simulateLatency, RPS: cfg.simulateRPS, Bandwidth: cfg.simulateBandwidth}
 	if sim.Enabled() {
 		handler = gateway.Constrain(handler, sim)
 	}
-	srv := gateway.NewHTTPServer(cfg.addr, handler, log)
+	return handler
+}
+
+func runGateway(ctx context.Context, g *gateway.Gateway, cfg serveConfig, log *slog.Logger) int {
+	srv := gateway.NewHTTPServer(cfg.addr, serveHandler(g, cfg), log)
 	srv.ReadTimeout = cfg.httpReadTimeout
 	srv.WriteTimeout = cfg.httpWriteTimeout
 	log.Info("pgvs3 starting", "version", version, "addr", cfg.addr)

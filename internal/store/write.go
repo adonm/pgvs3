@@ -389,6 +389,32 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 		_ = tx.Rollback(ctx)
 		w.done <- err
 	}
+	if err := w.copyRows(ctx, tx, pr, t); err != nil {
+		fail(err)
+		return
+	}
+	size, sha, md5 := w.framer.digests()
+	checksum, err := w.verifyUpload(&t, size)
+	if err != nil {
+		fail(err)
+		return
+	}
+	pub := Published{FileID: w.framer.fileID, Size: size, ETag: hex.EncodeToString(md5), SHA256: sha, MD5: md5, Checksum: checksum}
+	if err := publishUpload(ctx, tx, t, pub); err != nil {
+		fail(err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		w.done <- err
+		return
+	}
+	w.mu.Lock()
+	w.published = pub
+	w.mu.Unlock()
+	w.done <- nil
+}
+
+func (w *ChunkWriter) copyRows(ctx context.Context, tx pgx.Tx, pr *io.PipeReader, t writerTarget) error {
 	copySQL := "COPY " + t.schema + ".chunks (file_id, no, data) FROM STDIN WITH (FORMAT binary)"
 	if _, err := tx.Conn().PgConn().CopyFrom(ctx, pr, copySQL); err != nil {
 		if isMissingBucketSchema(err) {
@@ -398,84 +424,94 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			}
 		}
 		_ = pr.CloseWithError(err)
-		fail(err)
-		return
+		return err
 	}
-	size, sha, md5 := w.framer.digests()
-	if want := t.opts.ExpectedSize; want > 0 && size != want {
-		fail(fmt.Errorf("uploaded %d bytes, expected %d", size, want))
-		return
-	}
-	etag := hex.EncodeToString(md5)
+	return nil
+}
 
+func (w *ChunkWriter) verifyUpload(t *writerTarget, size int64) (*Checksum, error) {
+	if want := t.opts.ExpectedSize; want > 0 && size != want {
+		return nil, fmt.Errorf("uploaded %d bytes, expected %d", size, want)
+	}
 	w.mu.Lock()
 	checksums := append([]Checksum(nil), w.checksums...)
 	w.mu.Unlock()
-	if t.kind == writeObject && t.opts.Checksum == nil {
-		if c := FirstObjectChecksum(checksums); c != nil {
-			t.opts.Checksum = c
-			if t.opts.ChecksumType == "" {
-				t.opts.ChecksumType = "FULL_OBJECT"
-			}
-		}
-	}
-
-	var checksum *Checksum
-	switch t.kind {
-	case writeObject:
-		condText, match := t.opts.Precondition.SQL()
-		var expected any
-		if t.opts.ExpectedOrigin != "" {
-			expected = t.opts.ExpectedOrigin
-		}
-		var outcome string
-		err := tx.QueryRow(ctx, "SELECT "+t.schema+".publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
-			t.key, w.framer.fileID, size, sha, etag, t.opts.UserMetadata, t.opts.ContentType, condText, match,
-			t.opts.ExpiresAt, t.opts.KeepTTL, t.opts.OriginETag, expected, t.opts.SkipLock,
-			t.opts.s3MetaJSON()).Scan(&outcome)
-		if err == nil {
-			switch outcome {
-			case "precondition":
-				err = ErrPrecondition
-			case "stale":
-				err = ErrStaleCache
-			}
-		}
-		if err != nil {
-			fail(err)
-			return
-		}
-	case writePart:
-		if t.checksumAl != "" {
-			name := "x-amz-checksum-" + strings.ToLower(t.checksumAl)
-			found := false
-			for _, c := range checksums {
-				if c.Name == name {
-					checksum = &c
-					found = true
-					break
+	if t.kind == writeObject {
+		if t.opts.Checksum == nil {
+			if c := FirstObjectChecksum(checksums); c != nil {
+				t.opts.Checksum = c
+				if t.opts.ChecksumType == "" {
+					t.opts.ChecksumType = "FULL_OBJECT"
 				}
 			}
-			if !found {
-				fail(ErrMissingChecksum)
-				return
-			}
 		}
-		if err := commitPart(ctx, tx, t.schema, t.uploadID, t.partNo, w.framer.fileID, size, sha, md5, checksum); err != nil {
-			fail(err)
-			return
+		return nil, nil
+	}
+	return lookupPartChecksum(t.checksumAl, checksums)
+}
+
+func lookupPartChecksum(algorithm string, checksums []Checksum) (*Checksum, error) {
+	if algorithm == "" {
+		return nil, nil
+	}
+	name := "x-amz-checksum-" + strings.ToLower(algorithm)
+	for _, c := range checksums {
+		if c.Name == name {
+			return &c, nil
 		}
 	}
-	if po := t.opts.PendingOrigin; po != nil {
-		if t.kind != writeObject || (t.nsKind != ns.Cache && t.nsKind != ns.WriteBack) || po.Token == "" || po.Token != t.opts.OriginETag {
-			fail(errors.New("invalid pending origin publication"))
-			return
+	return nil, ErrMissingChecksum
+}
+
+func publishUpload(ctx context.Context, tx pgx.Tx, t writerTarget, pub Published) error {
+	var err error
+	switch t.kind {
+	case writeObject:
+		err = publishObject(ctx, tx, t, pub)
+	case writePart:
+		err = commitPart(ctx, tx, t.schema, t.uploadID, t.partNo, pub.FileID, pub.Size, pub.SHA256, pub.MD5, pub.Checksum)
+	}
+	if err != nil {
+		return err
+	}
+	return publishPendingOrigin(ctx, tx, t, pub.Size)
+}
+
+func publishObject(ctx context.Context, tx pgx.Tx, t writerTarget, pub Published) error {
+	condText, match := t.opts.Precondition.SQL()
+	var expected any
+	if t.opts.ExpectedOrigin != "" {
+		expected = t.opts.ExpectedOrigin
+	}
+	var outcome string
+	err := tx.QueryRow(ctx, "SELECT "+t.schema+".publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+		t.key, pub.FileID, pub.Size, pub.SHA256, pub.ETag, t.opts.UserMetadata, t.opts.ContentType, condText, match,
+		t.opts.ExpiresAt, t.opts.KeepTTL, t.opts.OriginETag, expected, t.opts.SkipLock,
+		t.opts.s3MetaJSON()).Scan(&outcome)
+	if err == nil {
+		switch outcome {
+		case "precondition":
+			err = ErrPrecondition
+		case "stale":
+			err = ErrStaleCache
 		}
-		var base any
-		if po.BaseETag != "" {
-			base = po.BaseETag
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO s3p.pending_uploads
+	}
+	return err
+}
+
+func publishPendingOrigin(ctx context.Context, tx pgx.Tx, t writerTarget, size int64) error {
+	po := t.opts.PendingOrigin
+	if po == nil {
+		return nil
+	}
+	if t.kind != writeObject || (t.nsKind != ns.Cache && t.nsKind != ns.WriteBack) || po.Token == "" || po.Token != t.opts.OriginETag {
+		return errors.New("invalid pending origin publication")
+	}
+	var base any
+	if po.BaseETag != "" {
+		base = po.BaseETag
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO s3p.pending_uploads
 			(kind, namespace, key, token, size, attempts, next_attempt, last_error, created_at,
 			 base_etag, base_missing, lease_owner, lease_until)
 			VALUES ('cache', $1, $2, $3, $4, 0, now(), NULL, now(), $5, $6, NULL, NULL)
@@ -485,20 +521,8 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 			      created_at = now(), base_etag = EXCLUDED.base_etag,
 			      base_missing = EXCLUDED.base_missing,
 			      lease_owner = NULL, lease_until = NULL`,
-			t.bucket, t.key, po.Token, size, base, po.BaseMissing); err != nil {
-			fail(err)
-			return
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		w.done <- err
-		return
-	}
-	pub := Published{FileID: w.framer.fileID, Size: size, ETag: etag, SHA256: sha, MD5: md5, Checksum: checksum}
-	w.mu.Lock()
-	w.published = pub
-	w.mu.Unlock()
-	w.done <- nil
+		t.bucket, t.key, po.Token, size, base, po.BaseMissing)
+	return err
 }
 
 func (w *ChunkWriter) ChecksumAlgorithm() string { return w.algorithm }
@@ -1186,56 +1210,92 @@ func (s *Store) copyObject(ctx context.Context, src, dst ObjectRef, srcSchema, d
 	if err := lockTwo(ctx, tx, srcSchema, src.Key, dstSchema, dst.Key); err != nil {
 		return nil, err
 	}
-	srcMeta, srcFile, err := readCopySource(ctx, tx, srcSchema, src.Key)
+	srcMeta, srcFile, err := resolveCopySource(ctx, tx, srcSchema, src.Key, opts.Source)
 	if err != nil {
 		return nil, err
-	}
-	if !opts.Source.Allows(true, srcMeta.ETag) {
-		return nil, ErrPrecondition
 	}
 	if s.checkQuota(ctx, ns.Bucket, dst.NS.Name, srcMeta.Size) {
 		return nil, ErrQuotaExceeded
 	}
-	var oldFile pgtype.Int8
-	var oldParts []int64
-	var destETag string
-	var destExpires pgtype.Timestamptz
-	err = tx.QueryRow(ctx, `SELECT file_id, parts, etag, expires_at FROM `+dstSchema+`.objects WHERE key = $1 FOR UPDATE`,
-		dst.Key).Scan(&oldFile, &oldParts, &destETag, &destExpires)
-	destExists := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, err
-	}
-	destLive := destExists && (!destExpires.Valid || destExpires.Time.After(time.Now()))
-	if !opts.Dest.Allows(destLive, destETag) {
-		return nil, ErrPrecondition
-	}
-	meta, ct := srcMeta.UserMetadata, srcMeta.ContentType
-	encoding := srcMeta.ContentEncoding
-	var originModified, checksumName, checksumValue, checksumType any
-	if srcMeta.ChecksumName != "" {
-		checksumName, checksumValue, checksumType = srcMeta.ChecksumName, srcMeta.ChecksumValue, srcMeta.ChecksumType
-	}
-	if opts.ReplaceMetadata {
-		meta, ct = opts.UserMetadata, opts.ContentType
-		encoding = opts.ContentEncoding
-		checksumName, checksumValue, checksumType = nil, nil, nil
-	}
-	if !opts.OriginModified.IsZero() {
-		originModified = opts.OriginModified
-	}
-	dstFileID, dstParts, idMap, err := s.prepareDestFiles(ctx, tx, srcSchema, dstSchema, src.NS == dst.NS, srcMeta, srcFile)
+	dest, err := readCopyDest(ctx, tx, dstSchema, dst.Key, opts.Dest)
 	if err != nil {
 		return nil, err
 	}
-	var dstFileVal any
-	if srcFile.Valid {
-		dstFileVal = dstFileID
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM "+dstSchema+".object_part_checksums WHERE key = $1", dst.Key); err != nil {
+	return s.publishCopy(ctx, tx, copyPlan{
+		src: src, dst: dst, srcSchema: srcSchema, dstSchema: dstSchema,
+		srcMeta: srcMeta, srcFile: srcFile, dest: dest, opts: opts,
+	})
+}
+
+type copyPlan struct {
+	src, dst  ObjectRef
+	srcSchema string
+	dstSchema string
+	srcMeta   Meta
+	srcFile   pgtype.Int8
+	dest      copyDest
+	opts      CopyOptions
+}
+
+func (s *Store) publishCopy(ctx context.Context, tx pgx.Tx, p copyPlan) (*Meta, error) {
+	fields := copyFieldsFor(p.srcMeta, p.opts)
+	sameBucket := p.src.NS == p.dst.NS
+	dstFileID, dstParts, idMap, err := s.prepareDestFiles(ctx, tx, p.srcSchema, p.dstSchema, sameBucket, p.srcMeta, p.srcFile)
+	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+dstSchema+`.objects
+	if err := replaceCopiedObject(ctx, tx, p, fields, dstFileID, dstParts); err != nil {
+		return nil, err
+	}
+	if err := copyPartChecksums(ctx, tx, p.srcSchema, p.src.Key, p.dstSchema, p.dst.Key, sameBucket, len(dstParts) > 0, idMap); err != nil {
+		return nil, err
+	}
+	if p.dest.exists && p.dest.file.Valid {
+		if err := queueFiles(ctx, tx, p.dstSchema, p.dest.file.Int64, p.dest.parts); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return copiedMeta(p.srcMeta, fields, dstFileID, dstParts), nil
+}
+
+type copyFields struct {
+	userMeta        []string
+	contentType     string
+	contentEncoding string
+	originModified  any
+	checksumName    any
+	checksumValue   any
+	checksumType    any
+}
+
+func copyFieldsFor(src Meta, opts CopyOptions) copyFields {
+	f := copyFields{userMeta: src.UserMetadata, contentType: src.ContentType, contentEncoding: src.ContentEncoding}
+	if src.ChecksumName != "" {
+		f.checksumName, f.checksumValue, f.checksumType = src.ChecksumName, src.ChecksumValue, src.ChecksumType
+	}
+	if opts.ReplaceMetadata {
+		f.userMeta, f.contentType = opts.UserMetadata, opts.ContentType
+		f.contentEncoding = opts.ContentEncoding
+		f.checksumName, f.checksumValue, f.checksumType = nil, nil, nil
+	}
+	if !opts.OriginModified.IsZero() {
+		f.originModified = opts.OriginModified
+	}
+	return f
+}
+
+func replaceCopiedObject(ctx context.Context, tx pgx.Tx, p copyPlan, f copyFields, fileID int64, parts []int64) error {
+	var fileVal any
+	if p.srcFile.Valid {
+		fileVal = fileID
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM "+p.dstSchema+".object_part_checksums WHERE key = $1", p.dst.Key); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO `+p.dstSchema+`.objects
 		(key, file_id, size, sha256, etag, user_metadata, content_type, content_encoding,
 		 origin_modified, checksum_name, checksum_value, checksum_type, parts, part_ends, inline_data)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
@@ -1246,34 +1306,25 @@ func (s *Store) copyObject(ctx context.Context, src, dst ObjectRef, srcSchema, d
 		  checksum_name = EXCLUDED.checksum_name, checksum_value = EXCLUDED.checksum_value,
 		  checksum_type = EXCLUDED.checksum_type, parts = EXCLUDED.parts,
 		  part_ends = EXCLUDED.part_ends, inline_data = EXCLUDED.inline_data, created_at = now()`,
-		dst.Key, dstFileVal, srcMeta.Size, srcMeta.SHA256, srcMeta.ETag, meta, ct, encoding,
-		originModified, checksumName, checksumValue, checksumType, dstParts, srcMeta.PartEnds, srcMeta.Inline); err != nil {
-		return nil, err
-	}
-	if err := copyPartChecksums(ctx, tx, srcSchema, src.Key, dstSchema, dst.Key, src.NS == dst.NS, len(dstParts) > 0, idMap); err != nil {
-		return nil, err
-	}
-	if destExists && oldFile.Valid {
-		if err := queueFiles(ctx, tx, dstSchema, oldFile.Int64, oldParts); err != nil {
-			return nil, err
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	out := srcMeta
-	out.FileID = dstFileID
-	out.Parts = dstParts
-	out.UserMetadata, out.ContentType = meta, ct
-	out.ContentEncoding = encoding
+		p.dst.Key, fileVal, p.srcMeta.Size, p.srcMeta.SHA256, p.srcMeta.ETag, f.userMeta, f.contentType, f.contentEncoding,
+		f.originModified, f.checksumName, f.checksumValue, f.checksumType, parts, p.srcMeta.PartEnds, p.srcMeta.Inline)
+	return err
+}
+
+func copiedMeta(src Meta, f copyFields, fileID int64, parts []int64) *Meta {
+	out := src
+	out.FileID = fileID
+	out.Parts = parts
+	out.UserMetadata, out.ContentType = f.userMeta, f.contentType
+	out.ContentEncoding = f.contentEncoding
 	out.ChecksumName, out.ChecksumValue, out.ChecksumType = "", "", ""
 	out.OriginModified = time.Time{}
 	out.ExpiresAt, out.OriginETag = nil, ""
 	out.CreatedAt = time.Now()
-	return &out, nil
+	return &out
 }
 
-func readCopySource(ctx context.Context, tx pgx.Tx, srcSchema, srcKey string) (Meta, pgtype.Int8, error) {
+func resolveCopySource(ctx context.Context, tx pgx.Tx, srcSchema, srcKey string, cond ReadCondition) (Meta, pgtype.Int8, error) {
 	src, err := queryMetadata(ctx, tx, srcSchema, srcKey, metadataStored)
 	if errors.Is(err, ErrNotFound) {
 		err = ErrNoBucket
@@ -1281,7 +1332,33 @@ func readCopySource(ctx context.Context, tx pgx.Tx, srcSchema, srcKey string) (M
 	if err != nil {
 		return Meta{}, pgtype.Int8{}, err
 	}
+	if !cond.Allows(true, src.ETag) {
+		return Meta{}, pgtype.Int8{}, ErrPrecondition
+	}
 	return *src, pgtype.Int8{Int64: src.FileID, Valid: src.FileID != 0}, nil
+}
+
+type copyDest struct {
+	exists bool
+	file   pgtype.Int8
+	parts  []int64
+}
+
+func readCopyDest(ctx context.Context, tx pgx.Tx, dstSchema, dstKey string, cond Precondition) (copyDest, error) {
+	var d copyDest
+	var etag string
+	var expires pgtype.Timestamptz
+	err := tx.QueryRow(ctx, `SELECT file_id, parts, etag, expires_at FROM `+dstSchema+`.objects WHERE key = $1 FOR UPDATE`,
+		dstKey).Scan(&d.file, &d.parts, &etag, &expires)
+	d.exists = err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return copyDest{}, err
+	}
+	live := d.exists && (!expires.Valid || expires.Time.After(time.Now()))
+	if !cond.Allows(live, etag) {
+		return copyDest{}, ErrPrecondition
+	}
+	return d, nil
 }
 
 func (s *Store) prepareDestFiles(ctx context.Context, tx pgx.Tx, srcSchema, dstSchema string, sameBucket bool, src Meta, srcFile pgtype.Int8) (int64, []int64, map[int64]int64, error) {
