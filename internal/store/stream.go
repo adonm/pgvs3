@@ -131,6 +131,11 @@ func streamErr(err, missing error) error {
 	return err
 }
 
+func isMissingNamespaceSchema(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "3F000"
+}
+
 func scanStreamMessage(row pgx.CollectableRow) (StreamMessage, error) {
 	var m StreamMessage
 	err := row.Scan(&m.ID, &m.Type, &m.Payload, &m.Headers, &m.RetryCount, &m.CreatedAt)
@@ -345,7 +350,7 @@ func (q Queue) ProcessRetries(ctx context.Context, max int) (int64, error) {
 	}
 	var moved int64
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_process_retries($1)`, max).Scan(&moved)
-	if isMissingBucketSchema(err) {
+	if isMissingNamespaceSchema(err) {
 		return 0, nil
 	}
 	return moved, err
@@ -537,7 +542,7 @@ func (q Queue) PruneTicks(ctx context.Context, max int) (int64, error) {
 	}
 	var pruned int64
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_prune_ticks($1)`, max).Scan(&pruned)
-	if isMissingBucketSchema(err) {
+	if isMissingNamespaceSchema(err) {
 		return 0, nil
 	}
 	return pruned, err
@@ -549,7 +554,7 @@ func (q Queue) Rotate(ctx context.Context) (int64, error) {
 	}
 	var events int64
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_rotate()`).Scan(&events)
-	if isMissingBucketSchema(err) {
+	if isMissingNamespaceSchema(err) {
 		return 0, nil
 	}
 	return events, err

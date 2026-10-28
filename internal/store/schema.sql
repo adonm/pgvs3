@@ -1096,7 +1096,14 @@ BEGIN
       moved int8;
     BEGIN
       PERFORM pg_advisory_xact_lock_shared(hashtextextended(%2$L, 0));
-      SELECT c.current_segment INTO v_segment FROM %1$I.stream_config c;
+      BEGIN
+        SELECT c.current_segment INTO v_segment FROM %1$I.stream_config c;
+        IF NOT FOUND THEN
+          RETURN 0;
+        END IF;
+      EXCEPTION WHEN undefined_table THEN
+        RETURN 0;
+      END;
       WITH due AS (
         DELETE FROM %1$I.stream_retry_events
         WHERE retry_id IN (
@@ -1113,11 +1120,20 @@ BEGIN
     END $body$;
 
     CREATE OR REPLACE FUNCTION %1$I.stream_prune_ticks(p_max int4) RETURNS int8
-    LANGUAGE sql AS $body$
+    LANGUAGE plpgsql AS $body$
+    DECLARE
+      keep_for interval;
+      pruned int8;
+    BEGIN
+      BEGIN
+        SELECT c.retention INTO keep_for FROM %1$I.stream_config c;
+      EXCEPTION WHEN undefined_table THEN
+        RETURN 0;
+      END;
       WITH gone AS (
         DELETE FROM %1$I.stream_ticks t
         WHERE t.tick_id <> (SELECT min(m.tick_id) FROM %1$I.stream_ticks m)
-          AND t.created_at < now() - (SELECT c.retention FROM %1$I.stream_config c)
+          AND t.created_at < now() - keep_for
           AND NOT EXISTS (SELECT 1 FROM %1$I.stream_subscriptions s WHERE s.last_tick = t.tick_id)
           AND NOT EXISTS (SELECT 1 FROM %1$I.stream_batches b
                           WHERE b.start_tick = t.tick_id OR b.end_tick = t.tick_id)
@@ -1127,8 +1143,9 @@ BEGIN
             ORDER BY x.tick_id LIMIT p_max)
         RETURNING 1
       )
-      SELECT count(*) FROM gone;
-    $body$;
+      SELECT count(*) INTO pruned FROM gone;
+      RETURN pruned;
+    END $body$;
 
     CREATE OR REPLACE FUNCTION %1$I.stream_rotate() RETURNS int8
     LANGUAGE plpgsql AS $body$
@@ -1141,12 +1158,16 @@ BEGIN
       batched boolean;
     BEGIN
       PERFORM pg_advisory_xact_lock(hashtextextended(%2$L, 0));
-      SELECT c.current_segment, (c.segment_started_at + c.retention / 2.0) <= now()
-        INTO current_seg, is_due
-        FROM %1$I.stream_config c FOR UPDATE;
-      IF NOT FOUND OR NOT is_due THEN
+      BEGIN
+        SELECT c.current_segment, (c.segment_started_at + c.retention / 2.0) <= now()
+          INTO current_seg, is_due
+          FROM %1$I.stream_config c FOR UPDATE;
+        IF NOT FOUND OR NOT is_due THEN
+          RETURN 0;
+        END IF;
+      EXCEPTION WHEN undefined_table THEN
         RETURN 0;
-      END IF;
+      END;
       target := ((current_seg + 1) %% 3)::int2;
       SELECT
         (SELECT count(*) FROM %1$I.stream_events e WHERE e.segment = target),
