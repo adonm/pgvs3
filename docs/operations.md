@@ -153,7 +153,7 @@ application namespaces that need S3/OJS/RESP, and do not create a public
 ## Probes and Prometheus metrics
 
 - `GET /healthz` — process liveness (does not touch PostgreSQL).
-- `GET /readyz` — checks PostgreSQL connectivity and schema layout **v24**;
+- `GET /readyz` — checks PostgreSQL connectivity and schema layout **v25**;
   returns `503` while draining or if the database is unreachable. It does not
   check whether the endpoint is a primary or standby.
 - `GET /metrics` — Prometheus metrics:
@@ -169,7 +169,7 @@ application namespaces that need S3/OJS/RESP, and do not create a public
   - reaper and maintenance pass counters
 
 TTL expiry counts include expired metadata-only origin parent records in layout
-v24. Range metadata is used only when range caching is enabled, never substitutes
+v25. Range metadata is used only when range caching is enabled, never substitutes
 for a cached body, and expires no later than the validation TTL or cache retention.
 Read-only workers can use the replicated metadata and existing range blocks
 without filling either. Warm ranged reads report `X-Cache: HIT` only when all
@@ -198,7 +198,7 @@ tracing is a no-op. Successful requests expose the trace ID in `X-Trace-Id`.
 ## CLI diagnostics and maintenance
 
 ```sh
-pgvs3 doctor --url "$PGVS3_URL"                         # PG 18+, layout v24, drift, scale and reaper checks
+pgvs3 doctor --url "$PGVS3_URL"                         # PG 18+, layout v25, drift, scale and reaper checks
 pgvs3 stat   --url "$PGVS3_URL" [--kind K] [--name N] --json
 pgvs3 reap   --url "$PGVS3_URL" --all                   # reconcile schemas + garbage + TTL sweep
 pgvs3 clone  --url "$PGVS3_URL" [--kind bucket|cache] <src> <dst>
@@ -310,7 +310,7 @@ until the origin copy commits.
 The schema is a single embedded baseline, `internal/store/schema.sql`. A
 non-read-only gateway creates it on first start against an empty database; a
 read-only gateway only verifies the installed layout, so initialize against the
-primary first. The current layout is **v24**, adding logged parent metadata for
+primary first. The current layout is **v25**, adding logged parent metadata for
 range caching and consolidated PostgreSQL 18 publication SQL. It retains the
 consolidated queue/stream schema, three-segment stream rotation, and the logged
 `s3c_` shared read cache plus `s3w_` write-back namespace; the OJS claim and terminal-retention change landed in

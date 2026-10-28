@@ -42,6 +42,9 @@ the stream log is a separate append-only log in the same namespace.
 - `retention` is a minimum. Table-granular rotation can keep events longer; a
   slow consumer extends it rather than losing data.
 - All stream mutations go through OJS. There is no supported direct-SQL API.
+- Each stream operation is one PL/pgSQL call. The `stream_*` functions in every
+  queue schema (`internal/store/schema.sql`) hold the transaction, segment lock,
+  row locks and cursor arithmetic; Go validates arguments and maps errors.
 
 ## Stream tables
 

@@ -32,7 +32,7 @@ For a quick start see [README.md](../README.md); for deployment see
 | **Writes** | Only through writable workers connected to the primary. DuckLake keeps one writer per bucket; many gateway workers share the database, but the lake writer remains single. |
 | **Backups** | Physical base backup plus WAL archiving/PITR for production; logical `pg_dump` for export or small deployments. Origin data is backed up separately. See [operations.md](operations.md#backup-and-restore). |
 | **Security** | Trusted network only. Authentication, authorization, TLS termination, audit logging, and per-tenant isolation are permanent non-goals. |
-| **Layout** | Current layout is **v24** (logged parent metadata for range caching, renewable owner-fenced fills, and consolidated PostgreSQL 18 publication SQL, retaining the v23 logged `s3c_`/`s3w_` split and segmented streams). There is no in-place migration path; a layout change requires a fresh database and a re-import. |
+| **Layout** | Current layout is **v25** (logged parent metadata for range caching, renewable owner-fenced fills, and consolidated PostgreSQL 18 publication SQL, retaining the v23 logged `s3c_`/`s3w_` split and segmented streams). There is no in-place migration path; a layout change requires a fresh database and a re-import. |
 | **Coordination** | PostgreSQL catalog, advisory locks, database leases, conditional writes, token fences, and sequences. No local process state is authoritative. |
 
 ## Trust model (permanent)

@@ -24,7 +24,7 @@ ships as a ~15 MB distroless static container built with
 
 **Status: early alpha.** Production PostgreSQL targets Aurora PostgreSQL 18.3+
 or community/self-managed PostgreSQL 18. The PostgreSQL schema is one embedded baseline
-(`internal/store/schema.sql`), currently layout **v24**, including shared origin
+(`internal/store/schema.sql`), currently layout **v25**, including shared origin
 parent metadata and PostgreSQL 18 publication SQL, with no in-place upgrade path.
 A layout change requires a fresh database and a re-import; there are no stable
 on-disk compatibility guarantees yet.
@@ -55,7 +55,7 @@ on-disk compatibility guarantees yet.
 | **Coordination** | `s3p.namespaces` catalog, advisory locks, database leases, conditional/version-fenced writes, and database sequences. No local process state is authoritative. |
 | **Backups** | Physical base backup plus WAL archiving/PITR for production clusters; logical `pg_dump` for export or small deployments. Origin data, when using the cache tier, is backed up separately. |
 | **Security** | Trusted network only: no authentication, authorization, TLS termination, audit log, or per-tenant isolation. |
-| **Layout** | Current layout is **v24**. There is no in-place migration path; a layout change needs a fresh database and re-import. |
+| **Layout** | Current layout is **v25**. There is no in-place migration path; a layout change needs a fresh database and re-import. |
 
 ## Tracing
 
@@ -406,7 +406,7 @@ Subcommands:
 - `pgvs3 origin [--bucket B] [--cache-namespace NS] set|clear|list [origin.json]`
   — persist or remove global or per-bucket origin cache configs inside
   PostgreSQL (gateways discover them automatically with no external files).
-- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v24, table settings,
+- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v25, table settings,
   namespace drift, the 100-namespace supported scale, and reaper safety.
 - `pgvs3 reap [--all]` — reconcile schemas and run garbage collection immediately.
 - `pgvs3 health` — poll `/readyz` for container health checks.

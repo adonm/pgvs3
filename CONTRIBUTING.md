@@ -95,7 +95,7 @@ just fix
 ## Schema changes
 
 There is one embedded baseline, `internal/store/schema.sql`, applied only to an
-empty database. The current baseline is layout **v24**. `store.LayoutVersion` is
+empty database. The current baseline is layout **v25**. `store.LayoutVersion` is
 the on-disk compatibility marker and there is no in-place migration path
 between layouts.
 

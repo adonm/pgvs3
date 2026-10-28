@@ -21,7 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const LayoutVersion = 24
+const LayoutVersion = 25
 
 const (
 	smallMax            = 8 << 20

@@ -1,5 +1,5 @@
 --
--- pgvs3 schema baseline. Layout v24; apply only to an empty database.
+-- pgvs3 schema baseline. Layout v25; apply only to an empty database.
 --
 
 
@@ -811,6 +811,431 @@ BEGIN
     INSERT INTO %1$I.stream_ticks (max_seq)
       SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM %1$I.stream_ticks);
   $ddl$, p_schema);
+  EXECUTE format($fn$
+    CREATE OR REPLACE FUNCTION %1$I.stream_new_tick() RETURNS int8
+    LANGUAGE sql AS $body$
+      INSERT INTO %1$I.stream_ticks (max_seq)
+        VALUES ((SELECT coalesce(max(seq), 0) FROM %1$I.stream_events))
+        RETURNING tick_id;
+    $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_latest_tick() RETURNS int8
+    LANGUAGE plpgsql AS $body$
+    DECLARE tick int8;
+    BEGIN
+      SELECT coalesce(max(t.tick_id), 0) INTO tick FROM %1$I.stream_ticks t;
+      IF tick = 0 THEN
+        tick := %1$I.stream_new_tick();
+      END IF;
+      RETURN tick;
+    END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_append(
+      p_ids text[], p_types text[], p_payloads text[], p_headers text[]
+    ) RETURNS SETOF %1$I.stream_events
+    LANGUAGE plpgsql AS $body$
+    DECLARE v_segment int2;
+    BEGIN
+      PERFORM pg_advisory_xact_lock_shared(hashtextextended(%2$L, 0));
+      SELECT c.current_segment INTO v_segment FROM %1$I.stream_config c;
+      RETURN QUERY
+        WITH inserted AS (
+          INSERT INTO %1$I.stream_events (segment, event_id, type, payload, headers)
+          SELECT v_segment, i.id, i.type, i.payload::jsonb, i.headers::jsonb
+          FROM unnest(p_ids, p_types, p_payloads, p_headers)
+            WITH ORDINALITY AS i(id, type, payload, headers, ord)
+          ORDER BY i.ord
+          RETURNING *
+        )
+        SELECT * FROM inserted ORDER BY seq;
+    END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_subscribe(p_consumer text, p_from_tick int8)
+    RETURNS %1$I.stream_subscriptions
+    LANGUAGE plpgsql AS $body$
+    DECLARE
+      target int8;
+      sub %1$I.stream_subscriptions;
+    BEGIN
+      PERFORM pg_advisory_xact_lock_shared(hashtextextended(%2$L, 0));
+      IF p_from_tick IS NULL THEN
+        target := %1$I.stream_latest_tick();
+      ELSIF p_from_tick = 0 THEN
+        SELECT coalesce(min(t.tick_id), 0) INTO target FROM %1$I.stream_ticks t;
+        IF target = 0 THEN
+          target := %1$I.stream_new_tick();
+        END IF;
+      ELSE
+        IF NOT EXISTS (SELECT 1 FROM %1$I.stream_ticks t WHERE t.tick_id = p_from_tick) THEN
+          RAISE EXCEPTION 'stream tick not found' USING ERRCODE = 'PV004';
+        END IF;
+        target := p_from_tick;
+      END IF;
+      INSERT INTO %1$I.stream_subscriptions (consumer, last_tick, next_tick)
+        VALUES (p_consumer, target, target)
+        ON CONFLICT (consumer) DO NOTHING
+        RETURNING * INTO sub;
+      IF NOT FOUND THEN
+        SELECT * INTO sub FROM %1$I.stream_subscriptions s WHERE s.consumer = p_consumer;
+      END IF;
+      RETURN sub;
+    END $body$;
+  $fn$, p_schema, p_schema);
+  EXECUTE format($fn$
+    CREATE OR REPLACE FUNCTION %1$I.stream_batch(p_batch int8)
+    RETURNS TABLE (batch_id int8, consumer text, member text, start_tick int8, end_tick int8,
+                   batch_created_at timestamptz, seq int8, event_id text, type text,
+                   payload jsonb, headers jsonb, retry_count int4, created_at timestamptz)
+    LANGUAGE sql AS $body$
+      SELECT r.* FROM (
+        SELECT b.batch_id, b.consumer, b.member, b.start_tick, b.end_tick,
+               b.created_at AS batch_created_at,
+               NULL::int8 AS seq, NULL::text AS event_id, NULL::text AS type,
+               NULL::jsonb AS payload, NULL::jsonb AS headers,
+               NULL::int4 AS retry_count, NULL::timestamptz AS created_at
+        FROM %1$I.stream_batches b
+        WHERE b.batch_id = p_batch
+        UNION ALL
+        SELECT be.batch_id, NULL::text, NULL::text, NULL::int8, NULL::int8, NULL::timestamptz,
+               e.seq, e.event_id, e.type, e.payload, e.headers, e.retry_count, e.created_at
+        FROM %1$I.stream_batch_events be
+        JOIN %1$I.stream_events e ON e.seq = be.seq
+        WHERE be.batch_id = p_batch
+      ) r
+      ORDER BY r.seq NULLS FIRST;
+    $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_receive(p_consumer text, p_member text, p_limit int4)
+    RETURNS TABLE (batch_id int8, consumer text, member text, start_tick int8, end_tick int8,
+                   batch_created_at timestamptz, seq int8, event_id text, type text,
+                   payload jsonb, headers jsonb, retry_count int4, created_at timestamptz)
+    LANGUAGE plpgsql AS $body$
+    #variable_conflict use_column
+    DECLARE
+      last_seen int8;
+      next_seen int8;
+      start_at int8;
+      end_at int8;
+      batch int8;
+      seqs int8[];
+      found_count int8;
+      visible boolean;
+    BEGIN
+      PERFORM pg_advisory_xact_lock_shared(hashtextextended(%2$L, 0));
+      SELECT s.last_tick INTO last_seen FROM %1$I.stream_subscriptions s
+        WHERE s.consumer = p_consumer FOR UPDATE;
+      IF NOT FOUND THEN
+        last_seen := %1$I.stream_latest_tick();
+        INSERT INTO %1$I.stream_subscriptions (consumer, last_tick, next_tick)
+          VALUES (p_consumer, last_seen, last_seen);
+      END IF;
+      SELECT b.batch_id INTO batch FROM %1$I.stream_batches b
+        WHERE b.consumer = p_consumer AND b.member = p_member AND b.acked_at IS NULL;
+      IF FOUND THEN
+        RETURN QUERY SELECT * FROM %1$I.stream_batch(batch);
+        RETURN;
+      END IF;
+      SELECT s.next_tick INTO next_seen FROM %1$I.stream_subscriptions s
+        WHERE s.consumer = p_consumer;
+      IF p_member = '' AND next_seen > last_seen THEN
+        RAISE EXCEPTION 'stream has active cooperative batches' USING ERRCODE = 'PV003';
+      END IF;
+      start_at := greatest(next_seen, last_seen);
+      SELECT coalesce(max(t.tick_id), 0) INTO end_at
+        FROM %1$I.stream_ticks t WHERE t.tick_id > start_at;
+      IF end_at = 0 THEN
+        SELECT EXISTS (
+          SELECT 1
+          FROM %1$I.stream_events e, %1$I.stream_ticks lt,
+               (SELECT pg_current_snapshot() AS snapshot) cur
+          WHERE lt.tick_id = start_at
+            AND pg_visible_in_snapshot(e.txid, cur.snapshot)
+            AND NOT pg_visible_in_snapshot(e.txid, lt.snapshot)
+            AND (e.txid >= pg_snapshot_xmax(lt.snapshot)
+                 OR e.txid IN (SELECT * FROM pg_snapshot_xip(lt.snapshot)
+                               EXCEPT SELECT * FROM pg_snapshot_xip(cur.snapshot)))
+        ) INTO visible;
+        IF NOT visible THEN
+          RETURN QUERY SELECT NULL::int8, p_consumer, p_member, start_at, start_at,
+            NULL::timestamptz, NULL::int8, NULL::text, NULL::text, NULL::jsonb,
+            NULL::jsonb, NULL::int4, NULL::timestamptz;
+          RETURN;
+        END IF;
+        end_at := %1$I.stream_new_tick();
+      END IF;
+      SELECT coalesce(array_agg(x.seq ORDER BY x.seq), '{}'::int8[]), count(*)
+        INTO seqs, found_count
+        FROM (
+          SELECT e.seq
+          FROM %1$I.stream_events e, %1$I.stream_ticks lt, %1$I.stream_ticks ct
+          WHERE lt.tick_id = start_at AND ct.tick_id = end_at
+            AND pg_visible_in_snapshot(e.txid, ct.snapshot)
+            AND NOT pg_visible_in_snapshot(e.txid, lt.snapshot)
+            AND (e.txid >= pg_snapshot_xmax(lt.snapshot)
+                 OR e.txid IN (SELECT * FROM pg_snapshot_xip(lt.snapshot)
+                               EXCEPT SELECT * FROM pg_snapshot_xip(ct.snapshot)))
+          ORDER BY e.seq
+          LIMIT p_limit + 1
+        ) x;
+      IF found_count > p_limit THEN
+        RAISE EXCEPTION 'stream batch exceeds the requested ceiling' USING ERRCODE = 'PV005';
+      END IF;
+      IF found_count = 0 THEN
+        UPDATE %1$I.stream_subscriptions s
+          SET next_tick = end_at,
+              last_tick = CASE WHEN p_member = '' OR NOT EXISTS (
+                            SELECT 1 FROM %1$I.stream_batches b
+                            WHERE b.consumer = p_consumer AND b.acked_at IS NULL)
+                           THEN end_at ELSE s.last_tick END,
+              updated_at = now()
+          WHERE s.consumer = p_consumer;
+        RETURN QUERY SELECT NULL::int8, p_consumer, p_member, start_at, end_at,
+          NULL::timestamptz, NULL::int8, NULL::text, NULL::text, NULL::jsonb,
+          NULL::jsonb, NULL::int4, NULL::timestamptz;
+        RETURN;
+      END IF;
+      INSERT INTO %1$I.stream_batches (consumer, member, start_tick, end_tick)
+        VALUES (p_consumer, p_member, start_at, end_at)
+        RETURNING batch_id INTO batch;
+      UPDATE %1$I.stream_subscriptions s
+        SET next_tick = end_at, updated_at = now()
+        WHERE s.consumer = p_consumer;
+      INSERT INTO %1$I.stream_batch_events (batch_id, seq)
+        SELECT batch, unnest(seqs);
+      RETURN QUERY SELECT * FROM %1$I.stream_batch(batch);
+    END $body$;
+  $fn$, p_schema, p_schema);
+  EXECUTE format($fn$
+    CREATE OR REPLACE FUNCTION %1$I.stream_ack(p_batch int8) RETURNS int8
+    LANGUAGE plpgsql AS $body$
+    DECLARE
+      owner text;
+      end_at int8;
+      acked timestamptz;
+      chained int8[];
+      chain_end int8;
+    BEGIN
+      SELECT b.consumer, b.end_tick, b.acked_at INTO owner, end_at, acked
+        FROM %1$I.stream_batches b WHERE b.batch_id = p_batch FOR UPDATE;
+      IF NOT FOUND OR acked IS NOT NULL THEN
+        RAISE EXCEPTION 'stream batch not found' USING ERRCODE = 'PV001';
+      END IF;
+      UPDATE %1$I.stream_batches b SET acked_at = now() WHERE b.batch_id = p_batch;
+      WITH RECURSIVE chain AS (
+        SELECT b.batch_id, b.end_tick
+        FROM %1$I.stream_batches b
+        WHERE b.consumer = owner AND b.acked_at IS NOT NULL
+          AND b.start_tick = (SELECT s.last_tick FROM %1$I.stream_subscriptions s
+                              WHERE s.consumer = owner)
+        UNION ALL
+        SELECT n.batch_id, n.end_tick
+        FROM chain c
+        JOIN %1$I.stream_batches n
+          ON n.consumer = owner AND n.acked_at IS NOT NULL AND n.start_tick = c.end_tick
+      )
+      SELECT coalesce(array_agg(c.batch_id), '{}'::int8[]), max(c.end_tick)
+        INTO chained, chain_end
+        FROM chain c;
+      IF cardinality(chained) > 0 THEN
+        UPDATE %1$I.stream_subscriptions s
+          SET last_tick = chain_end, next_tick = GREATEST(s.next_tick, chain_end),
+              updated_at = now()
+          WHERE s.consumer = owner;
+        DELETE FROM %1$I.stream_batches b WHERE b.batch_id = ANY(chained);
+      END IF;
+      RETURN end_at;
+    END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_nack(
+      p_batch int8, p_event text, p_retry_secs float8, p_reason text
+    ) RETURNS text
+    LANGUAGE plpgsql AS $body$
+    DECLARE
+      msg_type text;
+      msg_payload jsonb;
+      msg_headers jsonb;
+      msg_retry int4;
+      max_retry int4;
+      next_retry int4;
+    BEGIN
+      PERFORM 1 FROM %1$I.stream_batches b
+        WHERE b.batch_id = p_batch AND b.acked_at IS NULL FOR UPDATE;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'stream batch not found' USING ERRCODE = 'PV001';
+      END IF;
+      SELECT e.type, e.payload, e.headers, e.retry_count
+        INTO msg_type, msg_payload, msg_headers, msg_retry
+        FROM %1$I.stream_batch_events be
+        JOIN %1$I.stream_events e ON e.seq = be.seq
+        WHERE be.batch_id = p_batch AND e.event_id = p_event;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'stream message not in batch' USING ERRCODE = 'PV002';
+      END IF;
+      max_retry := coalesce((SELECT c.max_retries FROM %1$I.stream_config c), 5);
+      next_retry := msg_retry + 1;
+      IF next_retry > max_retry THEN
+        INSERT INTO %1$I.stream_dead_letters
+          (batch_id, event_id, type, payload, headers, retry_count, reason)
+        VALUES (p_batch, p_event, msg_type, msg_payload, msg_headers, next_retry, p_reason)
+        ON CONFLICT (batch_id, event_id) DO NOTHING;
+        RETURN 'dead_letter';
+      END IF;
+      INSERT INTO %1$I.stream_retry_events
+        (batch_id, event_id, type, payload, headers, retry_count, due_at)
+      VALUES (p_batch, p_event, msg_type, msg_payload, msg_headers, next_retry,
+              now() + make_interval(secs => p_retry_secs))
+      ON CONFLICT (batch_id, event_id) DO NOTHING;
+      RETURN 'retryable';
+    END $body$;
+  $fn$, p_schema, p_schema);
+  EXECUTE format($fn$
+    CREATE OR REPLACE FUNCTION %1$I.stream_process_retries(p_max int4) RETURNS int8
+    LANGUAGE plpgsql AS $body$
+    DECLARE
+      v_segment int2;
+      moved int8;
+    BEGIN
+      PERFORM pg_advisory_xact_lock_shared(hashtextextended(%2$L, 0));
+      SELECT c.current_segment INTO v_segment FROM %1$I.stream_config c;
+      WITH due AS (
+        DELETE FROM %1$I.stream_retry_events
+        WHERE retry_id IN (
+          SELECT r.retry_id FROM %1$I.stream_retry_events r
+          WHERE r.due_at <= now() ORDER BY r.due_at LIMIT p_max)
+        RETURNING event_id, type, payload, headers, retry_count
+      ), inserted AS (
+        INSERT INTO %1$I.stream_events (segment, event_id, type, payload, headers, retry_count)
+        SELECT v_segment, d.event_id, d.type, d.payload, d.headers, d.retry_count FROM due d
+        RETURNING 1
+      )
+      SELECT count(*) INTO moved FROM inserted;
+      RETURN moved;
+    END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_prune_ticks(p_max int4) RETURNS int8
+    LANGUAGE sql AS $body$
+      WITH gone AS (
+        DELETE FROM %1$I.stream_ticks t
+        WHERE t.tick_id <> (SELECT min(m.tick_id) FROM %1$I.stream_ticks m)
+          AND t.created_at < now() - (SELECT c.retention FROM %1$I.stream_config c)
+          AND NOT EXISTS (SELECT 1 FROM %1$I.stream_subscriptions s WHERE s.last_tick = t.tick_id)
+          AND NOT EXISTS (SELECT 1 FROM %1$I.stream_batches b
+                          WHERE b.start_tick = t.tick_id OR b.end_tick = t.tick_id)
+          AND t.tick_id IN (
+            SELECT x.tick_id FROM %1$I.stream_ticks x
+            WHERE x.tick_id <> (SELECT min(m.tick_id) FROM %1$I.stream_ticks m)
+            ORDER BY x.tick_id LIMIT p_max)
+        RETURNING 1
+      )
+      SELECT count(*) FROM gone;
+    $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_rotate() RETURNS int8
+    LANGUAGE plpgsql AS $body$
+    DECLARE
+      current_seg int2;
+      target int2;
+      is_due boolean;
+      events int8;
+      pinned boolean;
+      batched boolean;
+    BEGIN
+      PERFORM pg_advisory_xact_lock(hashtextextended(%2$L, 0));
+      SELECT c.current_segment, (c.segment_started_at + c.retention / 2.0) <= now()
+        INTO current_seg, is_due
+        FROM %1$I.stream_config c FOR UPDATE;
+      IF NOT FOUND OR NOT is_due THEN
+        RETURN 0;
+      END IF;
+      target := ((current_seg + 1) %% 3)::int2;
+      SELECT
+        (SELECT count(*) FROM %1$I.stream_events e WHERE e.segment = target),
+        EXISTS (
+          SELECT 1 FROM %1$I.stream_segments seg
+          WHERE seg.segment = target
+            AND (seg.sealed_xid IS NULL OR EXISTS (
+              SELECT 1 FROM %1$I.stream_subscriptions s
+              LEFT JOIN %1$I.stream_ticks t ON t.tick_id = s.last_tick
+              WHERE t.tick_id IS NULL OR pg_snapshot_xmin(t.snapshot) <= seg.sealed_xid))),
+        EXISTS (
+          SELECT 1 FROM %1$I.stream_batch_events be
+          JOIN %1$I.stream_events e ON e.seq = be.seq
+          WHERE e.segment = target)
+        INTO events, pinned, batched;
+      IF events > 0 AND (pinned OR batched) THEN
+        RETURN 0;
+      END IF;
+      BEGIN
+        EXECUTE 'LOCK TABLE %1$I.stream_events_' || target::text
+          || ' IN ACCESS EXCLUSIVE MODE NOWAIT';
+      EXCEPTION WHEN lock_not_available THEN
+        RETURN 0;
+      END;
+      EXECUTE 'TRUNCATE TABLE %1$I.stream_events_' || target::text;
+      DELETE FROM %1$I.stream_ticks t
+        WHERE t.tick_id <> (SELECT min(m.tick_id) FROM %1$I.stream_ticks m)
+          AND NOT EXISTS (SELECT 1 FROM %1$I.stream_subscriptions s WHERE s.last_tick = t.tick_id)
+          AND NOT EXISTS (SELECT 1 FROM %1$I.stream_batches b
+                          WHERE b.start_tick = t.tick_id OR b.end_tick = t.tick_id)
+          AND pg_snapshot_xmin(t.snapshot) <= (
+            SELECT seg.sealed_xid FROM %1$I.stream_segments seg WHERE seg.segment = target);
+      UPDATE %1$I.stream_segments seg SET sealed_xid = pg_current_xact_id(), sealed_at = now()
+        WHERE seg.segment = current_seg;
+      UPDATE %1$I.stream_segments seg SET sealed_xid = NULL, sealed_at = NULL
+        WHERE seg.segment = target;
+      UPDATE %1$I.stream_config c SET current_segment = target, segment_started_at = now();
+      DELETE FROM %1$I.stream_ticks t
+        WHERE t.tick_id <> (SELECT min(m.tick_id) FROM %1$I.stream_ticks m)
+          AND t.created_at < now() - (SELECT c.retention FROM %1$I.stream_config c)
+          AND NOT EXISTS (SELECT 1 FROM %1$I.stream_subscriptions s WHERE s.last_tick = t.tick_id)
+          AND NOT EXISTS (SELECT 1 FROM %1$I.stream_batches b
+                          WHERE b.start_tick = t.tick_id OR b.end_tick = t.tick_id);
+      RETURN events;
+    END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_replay_dead_letter(p_dead int8) RETURNS text
+    LANGUAGE plpgsql AS $body$
+    DECLARE
+      v_segment int2;
+      ev_id text;
+      ev_type text;
+      ev_payload jsonb;
+      ev_headers jsonb;
+    BEGIN
+      PERFORM pg_advisory_xact_lock_shared(hashtextextended(%2$L, 0));
+      SELECT c.current_segment INTO v_segment FROM %1$I.stream_config c;
+      SELECT d.event_id, d.type, d.payload, d.headers
+        INTO ev_id, ev_type, ev_payload, ev_headers
+        FROM %1$I.stream_dead_letters d WHERE d.dead_id = p_dead FOR UPDATE;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'stream message not in batch' USING ERRCODE = 'PV002';
+      END IF;
+      INSERT INTO %1$I.stream_events (segment, event_id, type, payload, headers, retry_count)
+        VALUES (v_segment, ev_id, ev_type, ev_payload, ev_headers, 0);
+      DELETE FROM %1$I.stream_dead_letters d WHERE d.dead_id = p_dead;
+      RETURN ev_id;
+    END $body$;
+
+    CREATE OR REPLACE FUNCTION %1$I.stream_replay_dead_letters() RETURNS int8
+    LANGUAGE plpgsql AS $body$
+    DECLARE
+      v_segment int2;
+      replayed int8;
+    BEGIN
+      PERFORM pg_advisory_xact_lock_shared(hashtextextended(%2$L, 0));
+      SELECT c.current_segment INTO v_segment FROM %1$I.stream_config c;
+      WITH gone AS (
+        DELETE FROM %1$I.stream_dead_letters
+        RETURNING event_id, type, payload, headers
+      ), inserted AS (
+        INSERT INTO %1$I.stream_events (segment, event_id, type, payload, headers, retry_count)
+        SELECT v_segment, g.event_id, g.type, g.payload, g.headers, 0 FROM gone g
+        RETURNING 1
+      )
+      SELECT count(*) INTO replayed FROM inserted;
+      RETURN replayed;
+    END $body$;
+  $fn$, p_schema, p_schema);
 END $_$;
 
 
@@ -1047,6 +1472,6 @@ ALTER TABLE ONLY s3p.pending_uploads
     ADD CONSTRAINT pending_uploads_kind_namespace_fkey FOREIGN KEY (kind, namespace) REFERENCES s3p.namespaces(kind, name) ON DELETE CASCADE;
 
 
-INSERT INTO s3p.layout (version) VALUES (24);
+INSERT INTO s3p.layout (version) VALUES (25);
 
 -- End of pgvs3 schema baseline.

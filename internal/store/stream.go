@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -25,7 +24,13 @@ var (
 	ErrInvalidStreamTick      = errors.New("invalid stream tick")
 )
 
-const streamSegmentCount = 3
+const (
+	streamErrBatchNotFound   = "PV001"
+	streamErrMessageNotFound = "PV002"
+	streamErrBatchActive     = "PV003"
+	streamErrTickNotFound    = "PV004"
+	streamErrBatchTooLarge   = "PV005"
+)
 
 type StreamMessage struct {
 	ID         string
@@ -100,17 +105,65 @@ type DeadLetter struct {
 	CreatedAt  time.Time
 }
 
-func streamCurrentSegment(ctx context.Context, tx pgx.Tx, sc string) (int16, error) {
-	var segment int16
-	err := tx.QueryRow(ctx, `WITH _lock AS (
-		SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))
-	)
-	SELECT current_segment FROM `+sc+`.stream_config, _lock`, sc).Scan(&segment)
-	return segment, err
+func streamErr(err, missing error) error {
+	if err == nil {
+		return nil
+	}
+	if missing != nil && isMissingBucketSchema(err) {
+		return missing
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	switch pgErr.Code {
+	case streamErrBatchNotFound:
+		return ErrStreamBatchNotFound
+	case streamErrMessageNotFound:
+		return ErrStreamMessageNotFound
+	case streamErrBatchActive:
+		return ErrStreamBatchActive
+	case streamErrTickNotFound:
+		return ErrStreamTickNotFound
+	case streamErrBatchTooLarge:
+		return ErrStreamBatchTooLarge
+	}
+	return err
 }
 
-func streamEventPartition(sc string, segment int16) string {
-	return sc + ".stream_events_" + strconv.Itoa(int(segment))
+func scanStreamMessage(row pgx.CollectableRow) (StreamMessage, error) {
+	var m StreamMessage
+	err := row.Scan(&m.ID, &m.Type, &m.Payload, &m.Headers, &m.RetryCount, &m.CreatedAt)
+	return m, err
+}
+
+func streamAppendArgs(inputs []StreamMessageInput) (ids, types, payloads, headers []string, err error) {
+	ids = make([]string, len(inputs))
+	types = make([]string, len(inputs))
+	payloads = make([]string, len(inputs))
+	headers = make([]string, len(inputs))
+	for i, in := range inputs {
+		ids[i] = in.ID
+		if ids[i] == "" {
+			ids[i] = work.NewID()
+		}
+		if len(ids[i]) > 1024 {
+			return nil, nil, nil, nil, fmt.Errorf("stream event id exceeds 1024 bytes")
+		}
+		types[i] = in.Type
+		if types[i] == "" {
+			types[i] = "default"
+		}
+		payloads[i] = string(in.Payload)
+		if len(in.Payload) == 0 {
+			payloads[i] = "{}"
+		}
+		headers[i] = string(in.Headers)
+		if len(in.Headers) == 0 {
+			headers[i] = "{}"
+		}
+	}
+	return ids, types, payloads, headers, nil
 }
 
 func (q Queue) AppendMessages(ctx context.Context, inputs []StreamMessageInput) ([]StreamMessage, error) {
@@ -125,47 +178,16 @@ func (q Queue) AppendMessages(ctx context.Context, inputs []StreamMessageInput) 
 		if q.s.checkQuota(ctx, ns.Queue, q.name, add) {
 			return nil, ErrQuotaExceeded
 		}
-		return withTx(ctx, q.s, func(tx pgx.Tx) ([]StreamMessage, error) {
-			segment, err := streamCurrentSegment(ctx, tx, sc)
-			if err != nil {
-				return nil, err
-			}
-			out := make([]StreamMessage, 0, len(inputs))
-			for _, in := range inputs {
-				id := in.ID
-				if id == "" {
-					id = work.NewID()
-				}
-				if len(id) > 1024 {
-					return nil, fmt.Errorf("stream event id exceeds 1024 bytes")
-				}
-				typ := in.Type
-				if typ == "" {
-					typ = "default"
-				}
-				payload := in.Payload
-				if len(payload) == 0 {
-					payload = []byte("{}")
-				}
-				headers := in.Headers
-				if len(headers) == 0 {
-					headers = []byte("{}")
-				}
-				var outMsg StreamMessage
-				err := tx.QueryRow(ctx, `INSERT INTO `+sc+`.stream_events
-				(segment, event_id, type, payload, headers)
-				VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
-				RETURNING event_id, type, payload, headers, retry_count, created_at`,
-					segment, id, typ, string(payload), string(headers)).
-					Scan(&outMsg.ID, &outMsg.Type, &outMsg.Payload, &outMsg.Headers,
-						&outMsg.RetryCount, &outMsg.CreatedAt)
-				if err != nil {
-					return nil, err
-				}
-				out = append(out, outMsg)
-			}
-			return out, nil
-		})
+		ids, types, payloads, headers, err := streamAppendArgs(inputs)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := q.s.pool.Query(ctx, `SELECT event_id, type, payload, headers, retry_count, created_at
+			FROM `+sc+`.stream_append($1,$2,$3,$4)`, ids, types, payloads, headers)
+		if err != nil {
+			return nil, err
+		}
+		return pgx.CollectRows(rows, scanStreamMessage)
 	})
 }
 
@@ -174,77 +196,18 @@ func (q Queue) Subscribe(ctx context.Context, consumer string, fromTick *int64) 
 		return StreamSubscription{}, err
 	}
 	return withAutoCreate(ctx, q.s, ns.Queue, q.name, func(sc string) (StreamSubscription, error) {
-		return withTx(ctx, q.s, func(tx pgx.Tx) (StreamSubscription, error) {
-			if _, err := streamCurrentSegment(ctx, tx, sc); err != nil {
-				return StreamSubscription{}, err
-			}
-			target, err := streamStartTick(ctx, tx, sc, fromTick)
-			if err != nil {
-				return StreamSubscription{}, err
-			}
-			var sub StreamSubscription
-			err = tx.QueryRow(ctx, `INSERT INTO `+sc+`.stream_subscriptions
-			(consumer, last_tick, next_tick) VALUES ($1, $2, $2)
-			ON CONFLICT (consumer) DO NOTHING
-			RETURNING consumer, last_tick, created_at, updated_at`, consumer, target).
-				Scan(&sub.Consumer, &sub.LastTick, &sub.CreatedAt, &sub.UpdatedAt)
-			if errors.Is(err, pgx.ErrNoRows) {
-				err = tx.QueryRow(ctx, `SELECT consumer, last_tick, created_at, updated_at
-				FROM `+sc+`.stream_subscriptions WHERE consumer=$1`, consumer).
-					Scan(&sub.Consumer, &sub.LastTick, &sub.CreatedAt, &sub.UpdatedAt)
-			}
-			if err != nil {
-				return StreamSubscription{}, err
-			}
-			return sub, nil
-		})
+		if fromTick != nil && *fromTick < 0 {
+			return StreamSubscription{}, ErrInvalidStreamTick
+		}
+		var sub StreamSubscription
+		err := q.s.pool.QueryRow(ctx, `SELECT consumer, last_tick, created_at, updated_at
+			FROM `+sc+`.stream_subscribe($1,$2)`, consumer, fromTick).
+			Scan(&sub.Consumer, &sub.LastTick, &sub.CreatedAt, &sub.UpdatedAt)
+		if err != nil {
+			return StreamSubscription{}, streamErr(err, nil)
+		}
+		return sub, nil
 	})
-}
-
-func streamStartTick(ctx context.Context, tx pgx.Tx, sc string, fromTick *int64) (int64, error) {
-	if fromTick == nil {
-		return latestStreamTick(ctx, tx, sc)
-	}
-	tick := *fromTick
-	switch {
-	case tick < 0:
-		return 0, ErrInvalidStreamTick
-	case tick == 0:
-		if err := tx.QueryRow(ctx, `SELECT coalesce(min(tick_id),0) FROM `+sc+`.stream_ticks`).Scan(&tick); err != nil {
-			return 0, err
-		}
-		if tick == 0 {
-			return createStreamTick(ctx, tx, sc)
-		}
-		return tick, nil
-	default:
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM `+sc+`.stream_ticks WHERE tick_id=$1)`, tick).Scan(&exists); err != nil {
-			return 0, err
-		}
-		if !exists {
-			return 0, ErrStreamTickNotFound
-		}
-		return tick, nil
-	}
-}
-
-func latestStreamTick(ctx context.Context, tx pgx.Tx, sc string) (int64, error) {
-	var tick int64
-	if err := tx.QueryRow(ctx, `SELECT coalesce(max(tick_id), 0) FROM `+sc+`.stream_ticks`).Scan(&tick); err != nil {
-		return 0, err
-	}
-	if tick == 0 {
-		return createStreamTick(ctx, tx, sc)
-	}
-	return tick, nil
-}
-
-func createStreamTick(ctx context.Context, tx pgx.Tx, sc string) (int64, error) {
-	var tick int64
-	err := tx.QueryRow(ctx, `INSERT INTO `+sc+`.stream_ticks (max_seq)
-		VALUES ((SELECT coalesce(max(seq),0) FROM `+sc+`.stream_events)) RETURNING tick_id`).Scan(&tick)
-	return tick, err
 }
 
 func (q Queue) Unsubscribe(ctx context.Context, consumer string) (bool, error) {
@@ -285,284 +248,76 @@ func (q Queue) receiveBatch(ctx context.Context, consumer, member string, limit 
 		limit = 100000
 	}
 	return withAutoCreate(ctx, q.s, ns.Queue, q.name, func(sc string) (*StreamBatch, error) {
-		return withTx(ctx, q.s, func(tx pgx.Tx) (*StreamBatch, error) {
-			if _, err := streamCurrentSegment(ctx, tx, sc); err != nil {
-				return nil, err
-			}
-			lastTick, err := ensureStreamSubscription(ctx, tx, sc, consumer)
-			if err != nil {
-				return nil, err
-			}
-			if batch, err := loadActiveStreamBatch(ctx, tx, sc, consumer, member); err != nil {
-				return nil, err
-			} else if batch != nil {
-				return batch, nil
-			}
-			var nextTick int64
-			if err := tx.QueryRow(ctx, `SELECT next_tick FROM `+sc+`.stream_subscriptions
-			WHERE consumer=$1`, consumer).Scan(&nextTick); err != nil {
-				return nil, err
-			}
-			if member == "" && nextTick > lastTick {
-				return nil, ErrStreamBatchActive
-			}
-			startTick := max(nextTick, lastTick)
-			var endTick int64
-			if err := tx.QueryRow(ctx, `SELECT coalesce(max(tick_id),0) FROM `+sc+`.stream_ticks
-			WHERE tick_id > $1`, startTick).Scan(&endTick); err != nil {
-				return nil, err
-			}
-			if endTick == 0 {
-				visible, err := streamHasVisibleEventsSince(ctx, tx, sc, startTick)
-				if err != nil {
-					return nil, err
-				}
-				if !visible {
-					return &StreamBatch{Consumer: consumer, Member: member, StartTick: startTick, EndTick: startTick}, nil
-				}
-				if err := tx.QueryRow(ctx, `INSERT INTO `+sc+`.stream_ticks (max_seq)
-				VALUES ((SELECT coalesce(max(seq),0) FROM `+sc+`.stream_events))
-				RETURNING tick_id`).Scan(&endTick); err != nil {
-					return nil, err
-				}
-			}
-			messages, seqs, err := selectStreamBatch(ctx, tx, sc, startTick, endTick, limit)
-			if err != nil {
-				return nil, err
-			}
-			if len(messages) == 0 {
-				advance := "$2"
-				if member != "" {
-					advance = `CASE WHEN EXISTS (SELECT 1 FROM ` + sc + `.stream_batches
-					WHERE consumer=$1 AND acked_at IS NULL) THEN last_tick ELSE $2 END`
-				}
-				if _, err := tx.Exec(ctx, `UPDATE `+sc+`.stream_subscriptions
-				SET next_tick=$2, last_tick=`+advance+`,
-				    updated_at=now()
-				WHERE consumer=$1`, consumer, endTick); err != nil {
-					return nil, err
-				}
-				return &StreamBatch{Consumer: consumer, Member: member, StartTick: startTick, EndTick: endTick}, nil
-			}
-			var batchID int64
-			if err := tx.QueryRow(ctx, `INSERT INTO `+sc+`.stream_batches
-			(consumer, member, start_tick, end_tick) VALUES ($1,$2,$3,$4)
-			RETURNING batch_id`, consumer, member, startTick, endTick).Scan(&batchID); err != nil {
-				return nil, err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE `+sc+`.stream_subscriptions
-			SET next_tick=$2, updated_at=now() WHERE consumer=$1`, consumer, endTick); err != nil {
-				return nil, err
-			}
-			if _, err := tx.Exec(ctx, `INSERT INTO `+sc+`.stream_batch_events (batch_id, seq)
-			SELECT $1, unnest($2::bigint[])`, batchID, seqs); err != nil {
-				return nil, err
-			}
-			return &StreamBatch{
-				ID: batchID, Consumer: consumer, Member: member, StartTick: startTick,
-				EndTick: endTick, Messages: messages,
-			}, nil
-		})
+		rows, err := q.s.pool.Query(ctx, `SELECT * FROM `+sc+`.stream_receive($1,$2,$3)`,
+			consumer, member, limit)
+		return collectStreamBatch(rows, err, nil)
 	})
 }
 
-func ensureStreamSubscription(ctx context.Context, tx pgx.Tx, sc, consumer string) (int64, error) {
-	var tick int64
-	err := tx.QueryRow(ctx, `SELECT last_tick FROM `+sc+`.stream_subscriptions
-		WHERE consumer=$1 FOR UPDATE`, consumer).Scan(&tick)
-	if err == nil {
-		return tick, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return 0, err
-	}
-	tick, err = streamStartTick(ctx, tx, sc, nil)
-	if err != nil {
-		return 0, err
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO `+sc+`.stream_subscriptions
-		(consumer, last_tick, next_tick) VALUES ($1,$2,$2)`, consumer, tick)
-	return tick, err
+type streamBatchRow struct {
+	batchID        pgtype.Int8
+	consumer       pgtype.Text
+	member         pgtype.Text
+	startTick      pgtype.Int8
+	endTick        pgtype.Int8
+	batchCreatedAt pgtype.Timestamptz
+	seq            pgtype.Int8
+	eventID        pgtype.Text
+	typ            pgtype.Text
+	payload        []byte
+	headers        []byte
+	retryCount     pgtype.Int4
+	createdAt      pgtype.Timestamptz
 }
 
-func loadActiveStreamBatch(ctx context.Context, tx pgx.Tx, sc, consumer, member string) (*StreamBatch, error) {
-	var batch StreamBatch
-	err := tx.QueryRow(ctx, `SELECT batch_id, consumer, member, start_tick, end_tick, created_at
-		FROM `+sc+`.stream_batches
-		WHERE consumer=$1 AND member=$2 AND acked_at IS NULL`, consumer, member).
-		Scan(&batch.ID, &batch.Consumer, &batch.Member, &batch.StartTick, &batch.EndTick, &batch.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
+func collectStreamBatch(rows pgx.Rows, err, missing error) (*StreamBatch, error) {
 	if err != nil {
-		return nil, err
+		return nil, streamErr(err, missing)
 	}
-	messages, _, err := selectStreamBatchEvents(ctx, tx, sc, batch.ID)
-	if err != nil {
-		return nil, err
-	}
-	batch.Messages = messages
-	return &batch, nil
-}
-
-func streamHasVisibleEventsSince(ctx context.Context, tx pgx.Tx, sc string, startTick int64) (bool, error) {
-	var visible bool
-	err := tx.QueryRow(ctx, `WITH cur AS (SELECT pg_current_snapshot() AS snapshot)
-		SELECT EXISTS (
-			SELECT 1 FROM `+sc+`.stream_events e, `+sc+`.stream_ticks last, cur
-			WHERE last.tick_id=$1
-			  AND pg_visible_in_snapshot(e.txid, cur.snapshot)
-			  AND NOT pg_visible_in_snapshot(e.txid, last.snapshot)
-			  AND (e.txid >= pg_snapshot_xmax(last.snapshot)
-			       OR e.txid IN (
-			         SELECT * FROM pg_snapshot_xip(last.snapshot)
-			         EXCEPT
-			         SELECT * FROM pg_snapshot_xip(cur.snapshot)
-			       ))
-		)`, startTick).Scan(&visible)
-	return visible, err
-}
-
-func selectStreamBatch(ctx context.Context, tx pgx.Tx, sc string, startTick, endTick int64, max int) ([]StreamMessage, []int64, error) {
-	rows, err := tx.Query(ctx, `SELECT e.seq, e.event_id, e.type, e.payload, e.headers,
-			e.retry_count, e.created_at
-		FROM `+sc+`.stream_events e, `+sc+`.stream_ticks last, `+sc+`.stream_ticks cur
-		WHERE last.tick_id=$1 AND cur.tick_id=$2
-		  AND pg_visible_in_snapshot(e.txid, cur.snapshot)
-		  AND NOT pg_visible_in_snapshot(e.txid, last.snapshot)
-		  AND (e.txid >= pg_snapshot_xmax(last.snapshot)
-		       OR e.txid IN (
-		         SELECT * FROM pg_snapshot_xip(last.snapshot)
-		         EXCEPT
-		         SELECT * FROM pg_snapshot_xip(cur.snapshot)
-		       ))
-		ORDER BY e.seq
-		LIMIT $3`, startTick, endTick, max+1)
-	if err != nil {
-		return nil, nil, err
-	}
-	messages, seqs, err := collectStreamMessages(rows, max)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(messages) > max {
-		return nil, nil, ErrStreamBatchTooLarge
-	}
-	return messages, seqs, nil
-}
-
-func selectStreamBatchEvents(ctx context.Context, tx pgx.Tx, sc string, batchID int64) ([]StreamMessage, []int64, error) {
-	rows, err := tx.Query(ctx, `SELECT e.seq, e.event_id, e.type, e.payload, e.headers,
-			e.retry_count, e.created_at
-		FROM `+sc+`.stream_batch_events be
-		JOIN `+sc+`.stream_events e ON e.seq = be.seq
-		WHERE be.batch_id=$1 ORDER BY be.seq`, batchID)
-	if err != nil {
-		return nil, nil, err
-	}
-	return collectStreamMessages(rows, 0)
-}
-
-func collectStreamMessages(rows pgx.Rows, capacity int) ([]StreamMessage, []int64, error) {
 	defer rows.Close()
-	var messages []StreamMessage
-	var seqs []int64
-	if capacity > 0 {
-		messages = make([]StreamMessage, 0, capacity)
-		seqs = make([]int64, 0, capacity)
-	}
+	var batch *StreamBatch
 	for rows.Next() {
-		var m StreamMessage
-		var seq int64
-		if err := rows.Scan(&seq, &m.ID, &m.Type, &m.Payload, &m.Headers,
-			&m.RetryCount, &m.CreatedAt); err != nil {
-			return nil, nil, err
+		var r streamBatchRow
+		if err := rows.Scan(&r.batchID, &r.consumer, &r.member, &r.startTick, &r.endTick,
+			&r.batchCreatedAt, &r.seq, &r.eventID, &r.typ, &r.payload, &r.headers,
+			&r.retryCount, &r.createdAt); err != nil {
+			return nil, streamErr(err, missing)
 		}
-		messages = append(messages, m)
-		seqs = append(seqs, seq)
+		if !r.seq.Valid {
+			batch = &StreamBatch{ID: r.batchID.Int64, Consumer: r.consumer.String, Member: r.member.String,
+				StartTick: r.startTick.Int64, EndTick: r.endTick.Int64, CreatedAt: r.batchCreatedAt.Time}
+			continue
+		}
+		batch.Messages = append(batch.Messages, StreamMessage{ID: r.eventID.String, Type: r.typ.String,
+			Payload: r.payload, Headers: r.headers, RetryCount: int(r.retryCount.Int32), CreatedAt: r.createdAt.Time})
 	}
-	return messages, seqs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, streamErr(err, missing)
+	}
+	if batch == nil {
+		return nil, ErrStreamBatchNotFound
+	}
+	return batch, nil
 }
 
 func (q Queue) GetBatch(ctx context.Context, batchID int64) (*StreamBatch, error) {
 	if q.err != nil {
 		return nil, q.err
 	}
-	return withTx(ctx, q.s, func(tx pgx.Tx) (*StreamBatch, error) {
-		var batch StreamBatch
-		err := tx.QueryRow(ctx, `SELECT batch_id, consumer, member, start_tick, end_tick, created_at
-		FROM `+q.sc+`.stream_batches WHERE batch_id=$1`, batchID).
-			Scan(&batch.ID, &batch.Consumer, &batch.Member, &batch.StartTick, &batch.EndTick, &batch.CreatedAt)
-		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
-			return nil, ErrStreamBatchNotFound
-		}
-		if err != nil {
-			return nil, err
-		}
-		messages, _, err := selectStreamBatchEvents(ctx, tx, q.sc, batchID)
-		if err != nil {
-			return nil, err
-		}
-		batch.Messages = messages
-		return &batch, nil
-	})
+	rows, err := q.s.pool.Query(ctx, `SELECT * FROM `+q.sc+`.stream_batch($1)`, batchID)
+	return collectStreamBatch(rows, err, ErrStreamBatchNotFound)
 }
 
 func (q Queue) AckBatch(ctx context.Context, batchID int64) (int64, error) {
 	if q.err != nil {
 		return 0, q.err
 	}
-	return withTx(ctx, q.s, func(tx pgx.Tx) (int64, error) {
-		var (
-			consumer string
-			endTick  int64
-			acked    pgtype.Timestamptz
-		)
-		err := tx.QueryRow(ctx, `SELECT consumer, end_tick, acked_at FROM `+q.sc+`.stream_batches
-		WHERE batch_id=$1 FOR UPDATE`, batchID).Scan(&consumer, &endTick, &acked)
-		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
-			return 0, ErrStreamBatchNotFound
-		}
-		if err != nil {
-			return 0, err
-		}
-		if acked.Valid {
-			return 0, ErrStreamBatchNotFound
-		}
-		if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_batches
-		SET acked_at=now() WHERE batch_id=$1`, batchID); err != nil {
-			return 0, err
-		}
-
-		for {
-			var (
-				nextID  int64
-				nextEnd int64
-			)
-			err := tx.QueryRow(ctx, `SELECT b.batch_id, b.end_tick
-			FROM `+q.sc+`.stream_batches b
-			WHERE b.consumer=$1 AND b.acked_at IS NOT NULL
-			  AND b.start_tick=(SELECT last_tick FROM `+q.sc+`.stream_subscriptions
-			                    WHERE consumer=$1)
-			ORDER BY b.start_tick LIMIT 1`, consumer).Scan(&nextID, &nextEnd)
-			if errors.Is(err, pgx.ErrNoRows) {
-				break
-			}
-			if err != nil {
-				return 0, err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_subscriptions
-			SET last_tick=$2, next_tick=GREATEST(next_tick,$2), updated_at=now()
-			WHERE consumer=$1`, consumer, nextEnd); err != nil {
-				return 0, err
-			}
-			if _, err := tx.Exec(ctx, `DELETE FROM `+q.sc+`.stream_batches
-			WHERE batch_id=$1`, nextID); err != nil {
-				return 0, err
-			}
-		}
-		return endTick, nil
-	})
+	var endTick int64
+	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_ack($1)`, batchID).Scan(&endTick)
+	if err != nil {
+		return 0, streamErr(err, ErrStreamBatchNotFound)
+	}
+	return endTick, nil
 }
 
 func (q Queue) NackMessage(ctx context.Context, batchID int64, eventID string, retryAfter time.Duration, reason string) (string, error) {
@@ -572,62 +327,13 @@ func (q Queue) NackMessage(ctx context.Context, batchID int64, eventID string, r
 	if retryAfter <= 0 {
 		retryAfter = 60 * time.Second
 	}
-	return withTx(ctx, q.s, func(tx pgx.Tx) (string, error) {
-		var consumer string
-		err := tx.QueryRow(ctx, `SELECT consumer FROM `+q.sc+`.stream_batches
-		WHERE batch_id=$1 AND acked_at IS NULL FOR UPDATE`, batchID).Scan(&consumer)
-		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
-			return "", ErrStreamBatchNotFound
-		}
-		if err != nil {
-			return "", err
-		}
-		var (
-			typ     string
-			payload []byte
-			headers []byte
-			retry   int
-		)
-		err = tx.QueryRow(ctx, `SELECT e.type, e.payload, e.headers, e.retry_count
-		FROM `+q.sc+`.stream_batch_events be
-		JOIN `+q.sc+`.stream_events e ON e.seq = be.seq
-		WHERE be.batch_id=$1 AND e.event_id=$2`, batchID, eventID).
-			Scan(&typ, &payload, &headers, &retry)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrStreamMessageNotFound
-		}
-		if err != nil {
-			return "", err
-		}
-		var maxRetries int
-		err = tx.QueryRow(ctx, `SELECT max_retries FROM `+q.sc+`.stream_config`).Scan(&maxRetries)
-		if errors.Is(err, pgx.ErrNoRows) {
-			maxRetries = 5
-		} else if err != nil {
-			return "", err
-		}
-		next := retry + 1
-		if next > maxRetries {
-			_, err = tx.Exec(ctx, `INSERT INTO `+q.sc+`.stream_dead_letters
-			(batch_id, event_id, type, payload, headers, retry_count, reason)
-			VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7)
-			ON CONFLICT (batch_id, event_id) DO NOTHING`,
-				batchID, eventID, typ, string(payload), string(headers), next, reason)
-			if err != nil {
-				return "", err
-			}
-			return "dead_letter", nil
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO `+q.sc+`.stream_retry_events
-		(batch_id, event_id, type, payload, headers, retry_count, due_at)
-		VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6, now() + make_interval(secs => $7))
-		ON CONFLICT (batch_id, event_id) DO NOTHING`,
-			batchID, eventID, typ, string(payload), string(headers), next, retryAfter.Seconds())
-		if err != nil {
-			return "", err
-		}
-		return "retryable", nil
-	})
+	var state string
+	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_nack($1,$2,$3,$4)`,
+		batchID, eventID, retryAfter.Seconds(), reason).Scan(&state)
+	if err != nil {
+		return "", streamErr(err, ErrStreamBatchNotFound)
+	}
+	return state, nil
 }
 
 func (q Queue) ProcessRetries(ctx context.Context, max int) (int64, error) {
@@ -637,38 +343,12 @@ func (q Queue) ProcessRetries(ctx context.Context, max int) (int64, error) {
 	if max <= 0 {
 		max = ExpireBatch
 	}
-	tx, err := q.s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	segment, err := streamCurrentSegment(ctx, tx, q.sc)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	var moved int64
+	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_process_retries($1)`, max).Scan(&moved)
+	if isMissingBucketSchema(err) {
 		return 0, nil
 	}
-	if err != nil {
-		return 0, err
-	}
-	var moved int64
-	err = tx.QueryRow(ctx, `WITH due AS (
-			DELETE FROM `+q.sc+`.stream_retry_events WHERE retry_id IN (
-				SELECT retry_id FROM `+q.sc+`.stream_retry_events
-				WHERE due_at <= now() ORDER BY due_at LIMIT $1
-			) RETURNING event_id, type, payload, headers, retry_count
-		), inserted AS (
-			INSERT INTO `+q.sc+`.stream_events
-				(segment, event_id, type, payload, headers, retry_count)
-			SELECT $2, event_id, type, payload, headers, retry_count FROM due
-			RETURNING 1
-		)
-		SELECT count(*) FROM inserted`, max, segment).Scan(&moved)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return moved, nil
+	return moved, err
 }
 
 func (q Queue) Config(ctx context.Context) (StreamConfig, error) {
@@ -813,73 +493,21 @@ func (q Queue) ReplayDeadLetter(ctx context.Context, id int64) (string, error) {
 	if q.err != nil {
 		return "", q.err
 	}
-	return withTx(ctx, q.s, func(tx pgx.Tx) (string, error) {
-		segment, err := streamCurrentSegment(ctx, tx, q.sc)
-		if err != nil {
-			return "", err
-		}
-		var (
-			eventID string
-			typ     string
-			payload []byte
-			headers []byte
-		)
-		err = tx.QueryRow(ctx, `SELECT event_id, type, payload, headers
-		FROM `+q.sc+`.stream_dead_letters WHERE dead_id=$1 FOR UPDATE`, id).
-			Scan(&eventID, &typ, &payload, &headers)
-		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
-			return "", ErrStreamMessageNotFound
-		}
-		if err != nil {
-			return "", err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO `+q.sc+`.stream_events
-		(segment, event_id, type, payload, headers, retry_count)
-		VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,0)`,
-			segment, eventID, typ, string(payload), string(headers)); err != nil {
-			return "", err
-		}
-		if _, err := tx.Exec(ctx, `DELETE FROM `+q.sc+`.stream_dead_letters WHERE dead_id=$1`, id); err != nil {
-			return "", err
-		}
-		return eventID, nil
-	})
+	var eventID string
+	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_replay_dead_letter($1)`, id).Scan(&eventID)
+	if err != nil {
+		return "", streamErr(err, nil)
+	}
+	return eventID, nil
 }
 
 func (q Queue) ReplayAllDeadLetters(ctx context.Context) (int64, error) {
 	if q.err != nil {
 		return 0, q.err
 	}
-	tx, err := q.s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	segment, err := streamCurrentSegment(ctx, tx, q.sc)
-	if err != nil {
-		return 0, err
-	}
 	var replayed int64
-	err = tx.QueryRow(ctx, `WITH gone AS (
-			DELETE FROM `+q.sc+`.stream_dead_letters
-			RETURNING event_id, type, payload, headers
-		), inserted AS (
-			INSERT INTO `+q.sc+`.stream_events
-				(segment, event_id, type, payload, headers, retry_count)
-			SELECT $1, event_id, type, payload, headers, 0 FROM gone
-			RETURNING 1
-		)
-		SELECT count(*) FROM inserted`, segment).Scan(&replayed)
-	if isMissingBucketSchema(err) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return replayed, nil
+	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_replay_dead_letters()`).Scan(&replayed)
+	return replayed, err
 }
 
 func (q Queue) PurgeDeadLetters(ctx context.Context, olderThan time.Duration) (int64, error) {
@@ -907,134 +535,24 @@ func (q Queue) PruneTicks(ctx context.Context, max int) (int64, error) {
 	if max <= 0 {
 		max = ExpireBatch
 	}
-	tag, err := q.s.pool.Exec(ctx, `DELETE FROM `+q.sc+`.stream_ticks t
-		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+q.sc+`.stream_ticks)
-		  AND t.created_at < now() - (SELECT retention FROM `+q.sc+`.stream_config)
-		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
-		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_batches b
-		                  WHERE b.start_tick=t.tick_id OR b.end_tick=t.tick_id)
-		  AND t.tick_id IN (
-		    SELECT tick_id FROM `+q.sc+`.stream_ticks
-		    WHERE tick_id <> (SELECT min(tick_id) FROM `+q.sc+`.stream_ticks)
-		    ORDER BY tick_id LIMIT $1
-		  )`, max)
+	var pruned int64
+	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_prune_ticks($1)`, max).Scan(&pruned)
 	if isMissingBucketSchema(err) {
 		return 0, nil
 	}
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
+	return pruned, err
 }
 
 func (q Queue) Rotate(ctx context.Context) (int64, error) {
 	if q.err != nil {
 		return 0, q.err
 	}
-	tx, err := q.s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, q.sc); err != nil {
-		return 0, err
-	}
-
-	var (
-		current int16
-		due     bool
-	)
-	err = tx.QueryRow(ctx, `SELECT current_segment,
-			(segment_started_at + retention / 2.0) <= now()
-		FROM `+q.sc+`.stream_config FOR UPDATE`).Scan(&current, &due)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	var events int64
+	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_rotate()`).Scan(&events)
+	if isMissingBucketSchema(err) {
 		return 0, nil
 	}
-	if err != nil {
-		return 0, err
-	}
-	if !due {
-		return 0, nil
-	}
-	target := int16((int(current) + 1) % streamSegmentCount)
-
-	var (
-		events  int64
-		pinned  bool
-		batched bool
-	)
-	err = tx.QueryRow(ctx, `SELECT
-			(SELECT count(*) FROM `+q.sc+`.stream_events WHERE segment=$1),
-			EXISTS (
-				SELECT 1 FROM `+q.sc+`.stream_segments seg
-				WHERE seg.segment=$1
-				  AND (seg.sealed_xid IS NULL OR EXISTS (
-					SELECT 1 FROM `+q.sc+`.stream_subscriptions s
-					LEFT JOIN `+q.sc+`.stream_ticks t ON t.tick_id=s.last_tick
-					WHERE t.tick_id IS NULL
-					   OR pg_snapshot_xmin(t.snapshot) <= seg.sealed_xid
-				  ))
-			),
-			EXISTS (
-				SELECT 1 FROM `+q.sc+`.stream_batch_events be
-				JOIN `+q.sc+`.stream_events e ON e.seq=be.seq
-				WHERE e.segment=$1
-			)`, target).Scan(&events, &pinned, &batched)
-	if err != nil {
-		return 0, err
-	}
-	if events > 0 && (pinned || batched) {
-		return 0, nil
-	}
-
-	partition := streamEventPartition(q.sc, target)
-	if _, err := tx.Exec(ctx, `LOCK TABLE `+partition+` IN ACCESS EXCLUSIVE MODE NOWAIT`); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
-			return 0, nil
-		}
-		return 0, err
-	}
-	if _, err := tx.Exec(ctx, `TRUNCATE TABLE `+partition); err != nil {
-		return 0, err
-	}
-
-	if _, err := tx.Exec(ctx, `DELETE FROM `+q.sc+`.stream_ticks t
-		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+q.sc+`.stream_ticks)
-		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
-		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_batches b
-		                  WHERE b.start_tick=t.tick_id OR b.end_tick=t.tick_id)
-		  AND pg_snapshot_xmin(t.snapshot) <= (
-		    SELECT sealed_xid FROM `+q.sc+`.stream_segments WHERE segment=$1
-		  )`, target); err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_segments
-		SET sealed_xid=pg_current_xact_id(), sealed_at=now()
-		WHERE segment=$1`, current); err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_segments
-		SET sealed_xid=NULL, sealed_at=NULL
-		WHERE segment=$1`, target); err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_config
-		SET current_segment=$1, segment_started_at=now()`, target); err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM `+q.sc+`.stream_ticks t
-		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+q.sc+`.stream_ticks)
-		  AND t.created_at < now() - (SELECT retention FROM `+q.sc+`.stream_config)
-		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
-		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_batches b
-		                  WHERE b.start_tick=t.tick_id OR b.end_tick=t.tick_id)`); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return events, nil
+	return events, err
 }
 
 func validateConsumer(consumer string) error {
