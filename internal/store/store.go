@@ -443,7 +443,7 @@ func (s *Store) ExpiredObjects() int64 { return s.expiredObjects.Load() }
 
 func (s *Store) MaintenanceRuns() int64 { return s.maintenanceRuns.Load() }
 
-func isMissingBucketSchema(err error) bool {
+func isSchemaLookupError(err error) bool {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return false
@@ -453,6 +453,43 @@ func isMissingBucketSchema(err error) bool {
 		return true
 	}
 	return false
+}
+
+type namespaceQueryError struct {
+	schema string
+	err    error
+}
+
+func (e *namespaceQueryError) Error() string { return e.err.Error() }
+
+func (e *namespaceQueryError) Unwrap() error { return e.err }
+
+func inNamespace(schema string, err error) error {
+	if !isSchemaLookupError(err) {
+		return err
+	}
+	return &namespaceQueryError{schema: schema, err: err}
+}
+
+func missingNamespace(ctx context.Context, db rowQuerier, schema string, err error) bool {
+	if !isSchemaLookupError(err) {
+		return false
+	}
+	if scoped, ok := errors.AsType[*namespaceQueryError](err); ok {
+		schema = scoped.schema
+	}
+	if schema == "" {
+		return false
+	}
+	var absent bool
+	return db.QueryRow(ctx, `SELECT to_regnamespace($1) IS NULL`, schema).Scan(&absent) == nil && absent
+}
+
+func namespaceResultError(ctx context.Context, db rowQuerier, schema string, err, absent error) error {
+	if missingNamespace(ctx, db, schema, err) {
+		return absent
+	}
+	return err
 }
 
 //go:embed schema.sql
@@ -493,6 +530,8 @@ func applySchema(ctx context.Context, conn *pgxpool.Conn) error {
 const SupportedNamespaces = 100
 
 var ErrQuotaExceeded = errors.New("namespace or database storage budget exceeded")
+
+var ErrNamespaceLayout = errors.New("incomplete namespace layout")
 
 func NewNamespaceRef(kind ns.Kind, name string) (ns.Ref, error) {
 	if !kind.Valid() {
@@ -560,18 +599,17 @@ func writableNamespaceSchema(ctx context.Context, s *Store, kind ns.Kind, name s
 	if s.known(ref) {
 		return sc, nil
 	}
-	if kind != ns.Bucket {
-		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
-			return "", err
-		}
-		return sc, nil
-	}
 	present, err := s.NamespaceExists(ctx, kind, name)
 	if err != nil {
 		return "", err
 	}
 	if !present {
-		return "", ErrNoBucket
+		if kind == ns.Bucket {
+			return "", ErrNoBucket
+		}
+		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
+			return "", err
+		}
 	}
 	return sc, nil
 }
@@ -588,7 +626,7 @@ func withAutoCreate[T any](ctx context.Context, s *Store, kind ns.Kind, name str
 		s.markKnown(ref)
 		return v, nil
 	}
-	if !isMissingBucketSchema(err) {
+	if !missingNamespace(ctx, s.pool, sc, err) {
 		return v, err
 	}
 	if kind == ns.Bucket {
@@ -612,7 +650,7 @@ func withSchema[T any](ctx context.Context, s *Store, ref ns.Ref, missingBucket,
 		return zero, err
 	}
 	v, err := fn(sc)
-	if !isMissingBucketSchema(err) {
+	if !missingNamespace(ctx, s.pool, sc, err) {
 		return v, err
 	}
 	if ref.Kind == ns.Bucket {
@@ -712,6 +750,15 @@ func (s *Store) NamespaceExists(ctx context.Context, kind ns.Kind, name string) 
 	if err := s.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL",
 		sc+"."+table).Scan(&present); err != nil {
 		return false, err
+	}
+	if !present {
+		var hasSchema bool
+		if err := s.pool.QueryRow(ctx, "SELECT to_regnamespace($1) IS NOT NULL", sc).Scan(&hasSchema); err != nil {
+			return false, err
+		}
+		if hasSchema {
+			return false, fmt.Errorf("%w: namespace %s is missing required relation %s", ErrNamespaceLayout, sc, table)
+		}
 	}
 	if present && !s.known(ns.Ref{Kind: kind, Name: name}) {
 		_, _ = s.Adopt(ctx, kind, name)
@@ -980,7 +1027,7 @@ func (s *Store) checkQuota(ctx context.Context, kind ns.Kind, name string, add i
 		err := s.pool.QueryRow(ctx,
 			"SELECT quota_bytes FROM s3p.namespaces WHERE kind = $1 AND name = $2",
 			string(kind), name).Scan(&q)
-		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return false
 		}
 		if err != nil || !q.Valid {
@@ -1193,7 +1240,7 @@ func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (S
 	for _, n := range infos {
 		st.Namespaces++
 		u, err := s.queryNamespaceUsage(ctx, n)
-		if isMissingBucketSchema(err) {
+		if missingNamespace(ctx, s.pool, quoteIdent(n.Schema), err) {
 			continue
 		}
 		if err != nil {
@@ -1366,7 +1413,7 @@ func (s *Store) expirePass(ctx context.Context, conn *pgxpool.Conn, infos []Name
 		q := quoteIdent(n.Schema)
 		var uploads int
 		if err := conn.QueryRow(ctx, "SELECT "+q+".expire_uploads(interval '24 hours', 64)").Scan(&uploads); err != nil {
-			if isMissingBucketSchema(err) {
+			if missingNamespace(ctx, conn, q, err) {
 				continue
 			}
 			return err
@@ -1432,7 +1479,7 @@ func (s *Store) expireNamespace(ctx context.Context, conn *pgxpool.Conn, schema 
 	for range rounds {
 		var v int
 		if err := conn.QueryRow(ctx, "SELECT "+schema+".expire_objects($1)", ExpireBatch).Scan(&v); err != nil {
-			if isMissingBucketSchema(err) {
+			if missingNamespace(ctx, conn, schema, err) {
 				return nil
 			}
 			return err
@@ -1466,7 +1513,7 @@ func (s *Store) reapPass(ctx context.Context, conn *pgxpool.Conn, infos []Namesp
 func (s *Store) reapNamespace(ctx context.Context, conn *pgx.Conn, schema string, grace time.Duration, remaining int) (int, error) {
 	for remaining > 0 {
 		got, done, err := s.reapOne(ctx, conn, schema, grace, remaining)
-		if isMissingBucketSchema(err) {
+		if missingNamespace(ctx, conn, schema, err) {
 			return remaining, nil
 		}
 		if err != nil {
@@ -1491,7 +1538,7 @@ func (s *Store) ExpireObjects(ctx context.Context, kind ns.Kind, name string, ma
 	}
 	var n int
 	err = s.pool.QueryRow(ctx, "SELECT "+q+".expire_objects($1)", max).Scan(&n)
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, s.pool, q, err) {
 		return 0, nil
 	}
 	return n, err

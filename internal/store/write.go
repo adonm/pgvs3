@@ -324,7 +324,8 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 		return nil, err
 	}
 	t.schema = sc
-	return s.beginWriter(ctx, t)
+	w, err := s.beginWriter(ctx, t)
+	return w, namespaceResultError(ctx, s.pool, sc, err, ErrNoUpload)
 }
 
 func (s *Store) beginWriter(ctx context.Context, t writerTarget) (*ChunkWriter, error) {
@@ -352,7 +353,7 @@ func (s *Store) beginWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 		err = tx.QueryRow(ctx,
 			"SELECT checksum_algorithm FROM "+t.schema+".uploads WHERE upload_id = $1 AND key = $2 FOR KEY SHARE",
 			t.uploadID, t.key).Scan(&alg)
-		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return fail(ErrNoUpload)
 		}
 		if err != nil {
@@ -417,7 +418,8 @@ func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr
 func (w *ChunkWriter) copyRows(ctx context.Context, tx pgx.Tx, pr *io.PipeReader, t writerTarget) error {
 	copySQL := "COPY " + t.schema + ".chunks (file_id, no, data) FROM STDIN WITH (FORMAT binary)"
 	if _, err := tx.Conn().PgConn().CopyFrom(ctx, pr, copySQL); err != nil {
-		if isMissingBucketSchema(err) {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		if missingNamespace(ctx, tx.Conn(), t.schema, err) {
 			w.store.forget(ns.Ref{Kind: t.nsKind, Name: t.bucket})
 			if t.nsKind == ns.Bucket {
 				err = ErrNoBucket
@@ -857,7 +859,7 @@ func loadUploadRecord(ctx context.Context, tx pgx.Tx, schema, uploadID, requestK
 	err := tx.QueryRow(ctx, `SELECT key, checksum_algorithm, user_metadata, content_type, content_encoding
 		FROM `+schema+`.uploads WHERE upload_id = $1 FOR UPDATE`, uploadID).
 		Scan(&rec.key, &algorithm, &rec.userMeta, &rec.contentType, &rec.contentEncoding)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return uploadRecord{}, ErrNoUpload
 	}
 	if err != nil {
@@ -958,7 +960,7 @@ func storePartChecksums(ctx context.Context, tx pgx.Tx, schema, key string, algo
 	return err
 }
 
-func (s *Store) completeUploadRef(ctx context.Context, ref ObjectRef, uploadID string, listed []ListedPart, opts WriteOptions, pending pendingUpload) (*Completed, error) {
+func (s *Store) completeUploadRef(ctx context.Context, ref ObjectRef, uploadID string, listed []ListedPart, opts WriteOptions, pending pendingUpload) (completed *Completed, err error) {
 	sc, err := ref.Schema()
 	if err != nil {
 		return nil, err
@@ -967,7 +969,10 @@ func (s *Store) completeUploadRef(ctx context.Context, ref ObjectRef, uploadID s
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
+	defer func() {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		err = namespaceResultError(ctx, s.pool, sc, err, ErrNoUpload)
+	}()
 	rec, err := loadUploadRecord(ctx, tx, sc, uploadID, ref.Key)
 	if err != nil {
 		return nil, err
@@ -1000,10 +1005,10 @@ func (s *Store) AbortUpload(ctx context.Context, ref ObjectRef, uploadID string)
 	if err != nil {
 		return false, err
 	}
-	return withTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+	aborted, err := withTx(ctx, s, func(tx pgx.Tx) (bool, error) {
 		var one int
 		err := tx.QueryRow(ctx, "SELECT 1 FROM "+sc+".uploads WHERE upload_id = $1 AND key = $2 FOR UPDATE", uploadID, ref.Key).Scan(&one)
-		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
 		if err != nil {
@@ -1022,6 +1027,7 @@ func (s *Store) AbortUpload(ctx context.Context, ref ObjectRef, uploadID string)
 		}
 		return true, queueFileIDs(ctx, tx, sc, ids)
 	})
+	return aborted, namespaceResultError(ctx, s.pool, sc, err, nil)
 }
 
 type PartInfo struct {
@@ -1102,7 +1108,7 @@ func (s *Store) ListParts(ctx context.Context, ref ObjectRef, uploadID string, m
 	err = s.pool.QueryRow(ctx, `SELECT checksum_algorithm, created_at
 		FROM `+sc+`.uploads WHERE upload_id = $1 AND key = $2`, uploadID, ref.Key).
 		Scan(&algorithm, &createdAt)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	if errors.Is(err, pgx.ErrNoRows) || missingNamespace(ctx, s.pool, sc, err) {
 		return nil, false, 0, ErrNoUpload
 	}
 	if err != nil {
@@ -1157,7 +1163,7 @@ func (s *Store) ListUploads(ctx context.Context, ref ObjectRef, prefix, bound, k
 		WHERE key >= $1 AND key < $2
 		  AND (key > $3 OR (key = $3 AND upload_id > $4))
 		ORDER BY key, upload_id LIMIT $5`, prefix, bound, keyMarker, uploadMarker, max+1)
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, s.pool, sc, err) {
 		return nil, false, nil
 	}
 	if err != nil {
@@ -1330,7 +1336,7 @@ func resolveCopySource(ctx context.Context, tx pgx.Tx, srcSchema, srcKey string,
 		err = ErrNoBucket
 	}
 	if err != nil {
-		return Meta{}, pgtype.Int8{}, err
+		return Meta{}, pgtype.Int8{}, inNamespace(srcSchema, err)
 	}
 	if !cond.Allows(true, src.ETag) {
 		return Meta{}, pgtype.Int8{}, ErrPrecondition
@@ -1443,7 +1449,7 @@ func lockTwo(ctx context.Context, tx pgx.Tx, b1, k1, b2, k2 string) error {
 	return lockObjectKey(ctx, tx, b2, k2)
 }
 
-func (s *Store) CopyPart(ctx context.Context, uploadID string, dst, src ObjectRef, partNo int32) (*Published, bool, error) {
+func (s *Store) CopyPart(ctx context.Context, uploadID string, dst, src ObjectRef, partNo int32) (published *Published, copied bool, err error) {
 	if src.NS != dst.NS {
 		return nil, false, nil
 	}
@@ -1466,12 +1472,15 @@ func (s *Store) CopyPart(ctx context.Context, uploadID string, dst, src ObjectRe
 	if err != nil {
 		return nil, false, err
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
+	defer func() {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		err = namespaceResultError(ctx, s.pool, sc, err, ErrNoUpload)
+	}()
 	var algorithm pgtype.Text
 	err = tx.QueryRow(ctx, `SELECT checksum_algorithm FROM `+sc+`.uploads
 		WHERE upload_id = $1 AND key = $2 FOR KEY SHARE`,
 		uploadID, dst.Key).Scan(&algorithm)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, ErrNoUpload
 	}
 	if err != nil {

@@ -301,9 +301,6 @@ func scanMetadata(row pgx.Row, body metadataBody) (*Meta, error) {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	if isMissingBucketSchema(err) {
-		return nil, ErrNoBucket
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -334,15 +331,9 @@ func (s *Store) MetaHeader(ctx context.Context, ref ObjectRef) (*Meta, error) {
 }
 
 func (s *Store) metaRef(ctx context.Context, ref ObjectRef, body metadataBody) (*Meta, error) {
-	schema, err := ref.Schema()
-	if err != nil {
-		return nil, err
-	}
-	m, err := queryMetadata(ctx, s.pool, schema, ref.Key, body)
-	if ref.NS.Kind != ns.Bucket && errors.Is(err, ErrNoBucket) {
-		return nil, ErrNotFound
-	}
-	return m, err
+	return withSchema(ctx, s, ref.NS, ErrNoBucket, ErrNotFound, func(schema string) (*Meta, error) {
+		return queryMetadata(ctx, s.pool, schema, ref.Key, body)
+	})
 }
 
 func (c Cache) Metadata(ctx context.Context, key string, withInline bool) (*Meta, ns.Ref, error) {
@@ -367,11 +358,10 @@ func (c Cache) Metadata(ctx context.Context, key string, withInline bool) (*Meta
 		 WHERE key=$1 AND (expires_at IS NULL OR expires_at > now())
 		) AS candidates ORDER BY source_priority LIMIT 1`, key), kind: &kind, priority: &priority}
 	m, err := scanMetadata(row, body)
-	if isMissingBucketSchema(row.err) {
+	if missingNamespace(ctx, c.s.pool, write, row.err) || missingNamespace(ctx, c.s.pool, read, row.err) {
 
 		for _, ref := range refs {
-			sc, _ := nsSQLIdent(ref.Kind, ref.Name)
-			m, err := queryMetadata(ctx, c.s.pool, sc, key, body)
+			m, err := c.s.metaRef(ctx, ObjectRef{NS: ref, Key: key}, body)
 			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNoBucket) {
 				continue
 			}

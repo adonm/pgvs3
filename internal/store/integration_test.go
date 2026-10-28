@@ -21,6 +21,7 @@ import (
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/testutil"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
@@ -1228,6 +1229,91 @@ func TestMetadataDistinguishesMissingKeyFromMissingBucket(t *testing.T) {
 	if _, err := testStore.Meta(testCtx, ObjectRef{NS: ns.CacheRef(unique("absent")), Key: "missing"}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing cache: %v", err)
 	}
+}
+
+func TestNamespaceAbsenceAndDamage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(testCtx, 15*time.Second)
+	defer cancel()
+	st, err := Open(ctx, testStore.pool.Config().ConnString(), 1, testutil.DiscardLogger())
+	testutil.Must(t, err)
+	defer st.Close()
+	for _, tc := range []struct {
+		name, table string
+		kind        ns.Kind
+		absent      error
+		call        func(ObjectRef) error
+	}{
+		{"metadata", "objects", ns.Bucket, ErrNoBucket, func(ref ObjectRef) error { _, err := st.Meta(ctx, ref); return err }},
+		{"cache read", "objects", ns.Cache, nil, func(ref ObjectRef) error { _, _, err := st.Cache(ref.NS.Name).Get(ctx, ref.Key); return err }},
+		{"cache bulk read", "objects", ns.Cache, nil, func(ref ObjectRef) error { _, err := st.Cache(ref.NS.Name).MGet(ctx, []string{ref.Key}); return err }},
+		{"cache read delete", "objects", ns.Cache, nil, func(ref ObjectRef) error { _, _, err := st.Cache(ref.NS.Name).GetDel(ctx, ref.Key); return err }},
+		{"cache write", "objects", ns.Cache, nil, func(ref ObjectRef) error {
+			_, _, _, err := st.Cache(ref.NS.Name).Set(ctx, ref.Key, []byte("x"), CacheSetOptions{})
+			return err
+		}},
+		{"queue stats", "jobs", ns.Queue, ErrQueueNotFound, func(ref ObjectRef) error { _, err := st.Queue(ref.NS.Name).Stats(ctx); return err }},
+		{"queue fetch", "jobs", ns.Queue, nil, func(ref ObjectRef) error {
+			_, err := st.FetchJobs(ctx, []string{ref.NS.Name}, 1, "worker", time.Second)
+			return err
+		}},
+		{"stream config", "stream_config", ns.Queue, ErrQueueNotFound, func(ref ObjectRef) error { _, err := st.Queue(ref.NS.Name).Config(ctx); return err }},
+		{"part start", "uploads", ns.Bucket, ErrNoUpload, func(ref ObjectRef) error { _, err := st.StartPart(ctx, ref, "missing", 1, 1); return err }},
+		{"multipart complete", "uploads", ns.Bucket, ErrNoUpload, func(ref ObjectRef) error {
+			_, err := st.CompleteUpload(ctx, ref, "missing", nil, WriteOptions{})
+			return err
+		}},
+		{"multipart abort", "uploads", ns.Bucket, nil, func(ref ObjectRef) error { _, err := st.AbortUpload(ctx, ref, "missing"); return err }},
+		{"part list", "uploads", ns.Bucket, ErrNoUpload, func(ref ObjectRef) error { _, _, _, err := st.ListParts(ctx, ref, "missing", 10, 0); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, damaged := range []bool{false, true} {
+				ref := ObjectRef{NS: ns.Ref{Kind: tc.kind, Name: unique("schema-error")}, Key: "key"}
+				dropOnCleanup(t, tc.kind, ref.NS.Name)
+				if damaged {
+					testutil.Must(t, st.EnsureNamespace(ctx, tc.kind, ref.NS.Name, nil, nil))
+					sc, _ := ref.Schema()
+					_, err := st.pool.Exec(ctx, "ALTER TABLE "+sc+"."+tc.table+" RENAME TO damaged_relation")
+					testutil.Must(t, err)
+					t.Cleanup(func() {
+						_, _ = testStore.pool.Exec(testCtx, "ALTER TABLE "+sc+".damaged_relation RENAME TO "+tc.table)
+					})
+				}
+				err := tc.call(ref)
+				if damaged {
+					var pgErr *pgconn.PgError
+					if !errors.As(err, &pgErr) || pgErr.Code != "42P01" {
+						t.Fatalf("damaged namespace: %v, want undefined table", err)
+					}
+					if tc.name == "metadata" {
+						if exists, err := st.BucketExists(ctx, ref.NS.Name); exists || !errors.Is(err, ErrNamespaceLayout) {
+							t.Fatalf("damaged bucket reported as absent: exists=%t err=%v", exists, err)
+						}
+					}
+					if tc.name == "cache write" {
+						st.forget(ref.NS)
+						if err := tc.call(ref); !errors.Is(err, ErrNamespaceLayout) {
+							t.Fatalf("cold writer silently repaired a partial namespace: %v", err)
+						}
+					}
+				} else if !errors.Is(err, tc.absent) {
+					t.Fatalf("absent namespace: %v, want %v", err, tc.absent)
+				}
+			}
+		})
+	}
+	t.Run("missing stream function", func(t *testing.T) {
+		name := unique("missing-function")
+		testutil.Must(t, st.EnsureNamespace(ctx, ns.Queue, name, nil, nil))
+		dropOnCleanup(t, ns.Queue, name)
+		sc, _ := nsSQLIdent(ns.Queue, name)
+		_, err := st.pool.Exec(ctx, "DROP FUNCTION "+sc+".stream_append(text[],text[],text[],text[])")
+		testutil.Must(t, err)
+		_, err = st.Queue(name).AppendMessages(ctx, []StreamMessageInput{{ID: "event"}})
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42883" {
+			t.Fatalf("missing function silently repaired or hidden: %v", err)
+		}
+	})
 }
 
 func TestFillPublicationChecksLiveDatabaseOwner(t *testing.T) {

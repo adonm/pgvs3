@@ -105,11 +105,11 @@ type DeadLetter struct {
 	CreatedAt  time.Time
 }
 
-func streamErr(err, missingQueue error) error {
+func (q Queue) streamErr(ctx context.Context, err, missingQueue error) error {
 	if err == nil {
 		return nil
 	}
-	if missingQueue != nil && isMissingNamespaceSchema(err) {
+	if missingQueue != nil && missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return missingQueue
 	}
 	var pgErr *pgconn.PgError
@@ -129,11 +129,6 @@ func streamErr(err, missingQueue error) error {
 		return ErrStreamBatchTooLarge
 	}
 	return err
-}
-
-func isMissingNamespaceSchema(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "3F000"
 }
 
 func scanStreamMessage(row pgx.CollectableRow) (StreamMessage, error) {
@@ -209,7 +204,7 @@ func (q Queue) Subscribe(ctx context.Context, consumer string, fromTick *int64) 
 			FROM `+sc+`.stream_subscribe($1,$2)`, consumer, fromTick).
 			Scan(&sub.Consumer, &sub.LastTick, &sub.CreatedAt, &sub.UpdatedAt)
 		if err != nil {
-			return StreamSubscription{}, streamErr(err, nil)
+			return StreamSubscription{}, q.streamErr(ctx, err, nil)
 		}
 		return sub, nil
 	})
@@ -222,7 +217,7 @@ func (q Queue) Unsubscribe(ctx context.Context, consumer string) (bool, error) {
 	var one int
 	err := q.s.pool.QueryRow(ctx, `DELETE FROM `+q.sc+`.stream_subscriptions
 		WHERE consumer=$1 RETURNING 1`, consumer).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	if errors.Is(err, pgx.ErrNoRows) || missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return false, nil
 	}
 	return err == nil, err
@@ -255,7 +250,7 @@ func (q Queue) receiveBatch(ctx context.Context, consumer, member string, limit 
 	return withAutoCreate(ctx, q.s, ns.Queue, q.name, func(sc string) (*StreamBatch, error) {
 		rows, err := q.s.pool.Query(ctx, `SELECT * FROM `+sc+`.stream_receive($1,$2,$3)`,
 			consumer, member, limit)
-		return collectStreamBatch(rows, err, nil)
+		return q.collectStreamBatch(ctx, rows, err, nil)
 	})
 }
 
@@ -275,9 +270,9 @@ type streamBatchRow struct {
 	createdAt      pgtype.Timestamptz
 }
 
-func collectStreamBatch(rows pgx.Rows, err, missingQueue error) (*StreamBatch, error) {
+func (q Queue) collectStreamBatch(ctx context.Context, rows pgx.Rows, err, missingQueue error) (*StreamBatch, error) {
 	if err != nil {
-		return nil, streamErr(err, missingQueue)
+		return nil, q.streamErr(ctx, err, missingQueue)
 	}
 	defer rows.Close()
 	var batch *StreamBatch
@@ -286,7 +281,8 @@ func collectStreamBatch(rows pgx.Rows, err, missingQueue error) (*StreamBatch, e
 		if err := rows.Scan(&r.batchID, &r.consumer, &r.member, &r.startTick, &r.endTick,
 			&r.batchCreatedAt, &r.seq, &r.eventID, &r.typ, &r.payload, &r.headers,
 			&r.retryCount, &r.createdAt); err != nil {
-			return nil, streamErr(err, missingQueue)
+			rows.Close()
+			return nil, q.streamErr(ctx, err, missingQueue)
 		}
 		if !r.seq.Valid {
 			batch = &StreamBatch{ID: r.batchID.Int64, Consumer: r.consumer.String, Member: r.member.String,
@@ -297,7 +293,8 @@ func collectStreamBatch(rows pgx.Rows, err, missingQueue error) (*StreamBatch, e
 			Payload: r.payload, Headers: r.headers, RetryCount: int(r.retryCount.Int32), CreatedAt: r.createdAt.Time})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, streamErr(err, missingQueue)
+		rows.Close()
+		return nil, q.streamErr(ctx, err, missingQueue)
 	}
 	if batch == nil {
 		return nil, ErrStreamBatchNotFound
@@ -310,7 +307,7 @@ func (q Queue) GetBatch(ctx context.Context, batchID int64) (*StreamBatch, error
 		return nil, q.err
 	}
 	rows, err := q.s.pool.Query(ctx, `SELECT * FROM `+q.sc+`.stream_batch($1)`, batchID)
-	return collectStreamBatch(rows, err, ErrStreamBatchNotFound)
+	return q.collectStreamBatch(ctx, rows, err, ErrStreamBatchNotFound)
 }
 
 func (q Queue) AckBatch(ctx context.Context, batchID int64) (int64, error) {
@@ -320,7 +317,7 @@ func (q Queue) AckBatch(ctx context.Context, batchID int64) (int64, error) {
 	var endTick int64
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_ack($1)`, batchID).Scan(&endTick)
 	if err != nil {
-		return 0, streamErr(err, ErrStreamBatchNotFound)
+		return 0, q.streamErr(ctx, err, ErrStreamBatchNotFound)
 	}
 	return endTick, nil
 }
@@ -336,7 +333,7 @@ func (q Queue) NackMessage(ctx context.Context, batchID int64, eventID string, r
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_nack($1,$2,$3,$4)`,
 		batchID, eventID, retryAfter.Seconds(), reason).Scan(&state)
 	if err != nil {
-		return "", streamErr(err, ErrStreamBatchNotFound)
+		return "", q.streamErr(ctx, err, ErrStreamBatchNotFound)
 	}
 	return state, nil
 }
@@ -350,7 +347,7 @@ func (q Queue) ProcessRetries(ctx context.Context, max int) (int64, error) {
 	}
 	var moved int64
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_process_retries($1)`, max).Scan(&moved)
-	if isMissingNamespaceSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return 0, nil
 	}
 	return moved, err
@@ -364,7 +361,7 @@ func (q Queue) Config(ctx context.Context) (StreamConfig, error) {
 	var retention pgtype.Interval
 	err := q.s.pool.QueryRow(ctx, `SELECT max_retries, retention
 		FROM `+q.sc+`.stream_config`).Scan(&cfg.MaxRetries, &retention)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	if errors.Is(err, pgx.ErrNoRows) || missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return StreamConfig{}, ErrQueueNotFound
 	}
 	if err != nil {
@@ -396,7 +393,7 @@ func (q Queue) SetConfig(ctx context.Context, maxRetries int, retention time.Dur
 		                     THEN make_interval(secs => $2) ELSE retention END
 		RETURNING max_retries, retention`, maxRetries, retention.Seconds()).
 		Scan(&cfg.MaxRetries, &outRetention)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	if errors.Is(err, pgx.ErrNoRows) || missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return StreamConfig{}, ErrQueueNotFound
 	}
 	if err != nil {
@@ -428,7 +425,7 @@ func (q Queue) Info(ctx context.Context) (StreamInfo, error) {
 		Scan(&info.Events, &info.Consumers, &info.Active, &info.Retries,
 			&info.DeadLetters, &oldest, &info.LastTick, &info.MaxRetries, &retention,
 			&info.Segment, &info.SegmentStartedAt)
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	if errors.Is(err, pgx.ErrNoRows) || missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return StreamInfo{}, ErrQueueNotFound
 	}
 	if err != nil {
@@ -457,7 +454,7 @@ func (q Queue) ListConsumers(ctx context.Context) ([]StreamConsumerInfo, error) 
 			s.updated_at
 		FROM `+q.sc+`.stream_subscriptions s
 		ORDER BY s.consumer`)
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return nil, ErrQueueNotFound
 	}
 	if err != nil {
@@ -480,7 +477,7 @@ func (q Queue) ListDeadLetters(ctx context.Context, limit int) ([]DeadLetter, er
 	rows, err := q.s.pool.Query(ctx, `SELECT dead_id, batch_id, event_id, type, payload,
 			headers, retry_count, reason, created_at
 		FROM `+q.sc+`.stream_dead_letters ORDER BY dead_id DESC LIMIT $1`, limit)
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return nil, ErrQueueNotFound
 	}
 	if err != nil {
@@ -501,7 +498,7 @@ func (q Queue) ReplayDeadLetter(ctx context.Context, id int64) (string, error) {
 	var eventID string
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_replay_dead_letter($1)`, id).Scan(&eventID)
 	if err != nil {
-		return "", streamErr(err, nil)
+		return "", q.streamErr(ctx, err, nil)
 	}
 	return eventID, nil
 }
@@ -524,7 +521,7 @@ func (q Queue) PurgeDeadLetters(ctx context.Context, olderThan time.Duration) (i
 	}
 	tag, err := q.s.pool.Exec(ctx, `DELETE FROM `+q.sc+`.stream_dead_letters
 		WHERE created_at < now() - make_interval(secs => $1)`, olderThan.Seconds())
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return 0, nil
 	}
 	if err != nil {
@@ -542,7 +539,7 @@ func (q Queue) PruneTicks(ctx context.Context, max int) (int64, error) {
 	}
 	var pruned int64
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_prune_ticks($1)`, max).Scan(&pruned)
-	if isMissingNamespaceSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return 0, nil
 	}
 	return pruned, err
@@ -554,7 +551,7 @@ func (q Queue) Rotate(ctx context.Context) (int64, error) {
 	}
 	var events int64
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_rotate()`).Scan(&events)
-	if isMissingNamespaceSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return 0, nil
 	}
 	return events, err

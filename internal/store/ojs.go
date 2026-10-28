@@ -309,7 +309,8 @@ func (s *Store) FetchJobs(ctx context.Context, queues []string, count int, worke
 		}
 		jobs, err := fetchQueueTx(ctx, tx, sc, count-len(out), workerID, visSeconds)
 		if err != nil {
-			return nil, err
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+			return nil, namespaceResultError(ctx, s.pool, sc, err, ErrQueueNotFound)
 		}
 		out = append(out, jobs...)
 	}
@@ -358,12 +359,10 @@ func fetchQueueTx(ctx context.Context, tx pgx.Tx, sc string, count int, workerID
 	ORDER BY priority DESC, coalesce(scheduled_at, enqueued_at, created_at), id`,
 		states, JobActive.String(), workerID, newJobID(), visSeconds, count)
 	if err != nil {
-		if isMissingBucketSchema(err) {
-			return nil, ErrQueueNotFound
-		}
-		return nil, err
+		return nil, inNamespace(sc, err)
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Job, error) { return scanJob(row) })
+	jobs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Job, error) { return scanJob(row) })
+	return jobs, inNamespace(sc, err)
 }
 
 func (s *Store) queueForJob(ctx context.Context, id string) (string, error) {
@@ -385,7 +384,7 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 		return Job{}, err
 	}
 	j, err := scanJob(s.pool.QueryRow(ctx, `SELECT `+jobCols+` FROM `+sc+`.jobs WHERE id=$1`, id))
-	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+	if errors.Is(err, pgx.ErrNoRows) || missingNamespace(ctx, s.pool, sc, err) {
 		return Job{}, ErrJobNotFound
 	}
 	return j, err
@@ -412,7 +411,7 @@ func (s *Store) mutateJob(ctx context.Context, id, leaseToken string, event JobE
 	if err != nil {
 		return Job{}, err
 	}
-	return withTx(ctx, s, func(tx pgx.Tx) (Job, error) {
+	j, err := withTx(ctx, s, func(tx pgx.Tx) (Job, error) {
 		var (
 			rawState   string
 			attempt    int
@@ -428,7 +427,7 @@ func (s *Store) mutateJob(ctx context.Context, id, leaseToken string, event JobE
 		(lease_until IS NOT NULL AND lease_until > now())
 		FROM `+sc+`.jobs WHERE id=$1 FOR UPDATE`, id).
 			Scan(&rawState, &attempt, &maxAttempt, &initial, &maxRetry, &coeff, &stored, &leaseLive)
-		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return Job{}, ErrJobNotFound
 		}
 		if err != nil {
@@ -479,6 +478,7 @@ func (s *Store) mutateJob(ctx context.Context, id, leaseToken string, event JobE
 		}
 		return j, err
 	})
+	return j, namespaceResultError(ctx, s.pool, sc, err, ErrJobNotFound)
 }
 
 func (s *Store) HeartbeatJobs(ctx context.Context, workerID string, leases map[string]string, visibility time.Duration) ([]string, error) {
@@ -490,7 +490,7 @@ func (s *Store) HeartbeatJobs(ctx context.Context, workerID string, leases map[s
 		return nil, err
 	}
 
-	return withTx(ctx, s, func(tx pgx.Tx) ([]string, error) {
+	ids, err := withTx(ctx, s, func(tx pgx.Tx) ([]string, error) {
 		if err := validateQueuedLeases(ctx, tx, byQueue); err != nil {
 			return nil, err
 		}
@@ -499,6 +499,7 @@ func (s *Store) HeartbeatJobs(ctx context.Context, workerID string, leases map[s
 		}
 		return order, nil
 	})
+	return ids, namespaceResultError(ctx, s.pool, "", err, ErrJobNotFound)
 }
 
 type jobQueue struct {
@@ -553,11 +554,8 @@ func validateQueueLeases(ctx context.Context, tx pgx.Tx, queue string, tokens ma
 	rows, err := tx.Query(ctx, `SELECT id, state, coalesce(lease_token,''),
 			(lease_until IS NOT NULL AND lease_until > now())
 		FROM `+sc+`.jobs WHERE id = ANY($1::text[]) FOR UPDATE`, ids)
-	if isMissingBucketSchema(err) {
-		return ErrJobNotFound
-	}
 	if err != nil {
-		return err
+		return inNamespace(sc, err)
 	}
 	now := time.Now()
 	seen, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (string, error) {
@@ -585,7 +583,7 @@ func validateQueueLeases(ctx context.Context, tx pgx.Tx, queue string, tokens ma
 		return id, nil
 	})
 	if err != nil {
-		return err
+		return inNamespace(sc, err)
 	}
 	if len(seen) != len(ids) {
 		return ErrJobNotFound
@@ -618,7 +616,7 @@ func extendQueueLeases(ctx context.Context, tx pgx.Tx, queue string, tokens map[
 		FROM unnest($1::text[], $2::text[]) AS t(id, token)
 		WHERE j.id=t.id AND j.state=$5 AND j.lease_token=t.token`,
 		ids, toks, visibility.Seconds(), workerID, JobActive.String())
-	return err
+	return inNamespace(sc, err)
 }
 
 func sortedLeaseIDs(tokens map[string]string) []string {
@@ -672,7 +670,7 @@ func (q Queue) Stats(ctx context.Context) (QueueStats, error) {
 		JobDiscarded.String()).
 		Scan(&st.Available, &st.Active, &st.Scheduled, &st.Retryable,
 			&st.Completed, &st.Cancelled, &st.Discarded, &st.Total)
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return QueueStats{}, ErrQueueNotFound
 	}
 	return st, err
@@ -700,7 +698,7 @@ func (q Queue) ExpireMessages(ctx context.Context, max int) (int64, error) {
 			RETURNING id)
 		DELETE FROM s3p.job_index WHERE id IN (SELECT id FROM gone)`,
 		max, retention.Seconds(), terminal)
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return 0, nil
 	}
 	if err != nil {
@@ -730,7 +728,7 @@ func (q Queue) DiscardExpiredLeases(ctx context.Context, max int) (int64, error)
 		  AND (j.lease_until IS NULL OR j.lease_until <= now())
 		  AND j.attempt >= j.max_attempts`,
 		max, JobDiscarded.String())
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, q.s.pool, q.sc, err) {
 		return 0, nil
 	}
 	if err != nil {

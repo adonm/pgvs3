@@ -237,7 +237,7 @@ func (c Cache) MGet(ctx context.Context, keys []string) ([][]byte, error) {
 		JOIN `+c.sc+`.objects o ON o.key = k.key
 		WHERE (o.expires_at IS NULL OR o.expires_at > now())
 		  AND (o.origin_etag IS NULL OR o.origin_etag NOT LIKE 'deleted:%')`, keys)
-	if isMissingBucketSchema(err) {
+	if missingNamespace(ctx, c.s.pool, c.sc, err) {
 		return out, nil
 	}
 	if err != nil {
@@ -361,6 +361,7 @@ func (c Cache) GetDel(ctx context.Context, key string) ([]byte, bool, error) {
 		}
 		return result, nil
 	})
+	err = namespaceResultError(ctx, c.s.pool, sc, err, ErrNotFound)
 	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNoBucket) {
 		return nil, false, nil
 	}
