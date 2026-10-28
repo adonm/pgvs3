@@ -105,9 +105,12 @@ type DeadLetter struct {
 	CreatedAt  time.Time
 }
 
-func streamErr(err error) error {
+func streamErr(err, missingQueue error) error {
 	if err == nil {
 		return nil
+	}
+	if missingQueue != nil && isMissingNamespaceSchema(err) {
+		return missingQueue
 	}
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
@@ -206,7 +209,7 @@ func (q Queue) Subscribe(ctx context.Context, consumer string, fromTick *int64) 
 			FROM `+sc+`.stream_subscribe($1,$2)`, consumer, fromTick).
 			Scan(&sub.Consumer, &sub.LastTick, &sub.CreatedAt, &sub.UpdatedAt)
 		if err != nil {
-			return StreamSubscription{}, streamErr(err)
+			return StreamSubscription{}, streamErr(err, nil)
 		}
 		return sub, nil
 	})
@@ -252,7 +255,7 @@ func (q Queue) receiveBatch(ctx context.Context, consumer, member string, limit 
 	return withAutoCreate(ctx, q.s, ns.Queue, q.name, func(sc string) (*StreamBatch, error) {
 		rows, err := q.s.pool.Query(ctx, `SELECT * FROM `+sc+`.stream_receive($1,$2,$3)`,
 			consumer, member, limit)
-		return collectStreamBatch(rows, err)
+		return collectStreamBatch(rows, err, nil)
 	})
 }
 
@@ -272,9 +275,9 @@ type streamBatchRow struct {
 	createdAt      pgtype.Timestamptz
 }
 
-func collectStreamBatch(rows pgx.Rows, err error) (*StreamBatch, error) {
+func collectStreamBatch(rows pgx.Rows, err, missingQueue error) (*StreamBatch, error) {
 	if err != nil {
-		return nil, streamErr(err)
+		return nil, streamErr(err, missingQueue)
 	}
 	defer rows.Close()
 	var batch *StreamBatch
@@ -283,7 +286,7 @@ func collectStreamBatch(rows pgx.Rows, err error) (*StreamBatch, error) {
 		if err := rows.Scan(&r.batchID, &r.consumer, &r.member, &r.startTick, &r.endTick,
 			&r.batchCreatedAt, &r.seq, &r.eventID, &r.typ, &r.payload, &r.headers,
 			&r.retryCount, &r.createdAt); err != nil {
-			return nil, streamErr(err)
+			return nil, streamErr(err, missingQueue)
 		}
 		if !r.seq.Valid {
 			batch = &StreamBatch{ID: r.batchID.Int64, Consumer: r.consumer.String, Member: r.member.String,
@@ -294,7 +297,7 @@ func collectStreamBatch(rows pgx.Rows, err error) (*StreamBatch, error) {
 			Payload: r.payload, Headers: r.headers, RetryCount: int(r.retryCount.Int32), CreatedAt: r.createdAt.Time})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, streamErr(err)
+		return nil, streamErr(err, missingQueue)
 	}
 	if batch == nil {
 		return nil, ErrStreamBatchNotFound
@@ -307,7 +310,7 @@ func (q Queue) GetBatch(ctx context.Context, batchID int64) (*StreamBatch, error
 		return nil, q.err
 	}
 	rows, err := q.s.pool.Query(ctx, `SELECT * FROM `+q.sc+`.stream_batch($1)`, batchID)
-	return collectStreamBatch(rows, err)
+	return collectStreamBatch(rows, err, ErrStreamBatchNotFound)
 }
 
 func (q Queue) AckBatch(ctx context.Context, batchID int64) (int64, error) {
@@ -317,7 +320,7 @@ func (q Queue) AckBatch(ctx context.Context, batchID int64) (int64, error) {
 	var endTick int64
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_ack($1)`, batchID).Scan(&endTick)
 	if err != nil {
-		return 0, streamErr(err)
+		return 0, streamErr(err, ErrStreamBatchNotFound)
 	}
 	return endTick, nil
 }
@@ -333,7 +336,7 @@ func (q Queue) NackMessage(ctx context.Context, batchID int64, eventID string, r
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_nack($1,$2,$3,$4)`,
 		batchID, eventID, retryAfter.Seconds(), reason).Scan(&state)
 	if err != nil {
-		return "", streamErr(err)
+		return "", streamErr(err, ErrStreamBatchNotFound)
 	}
 	return state, nil
 }
@@ -498,7 +501,7 @@ func (q Queue) ReplayDeadLetter(ctx context.Context, id int64) (string, error) {
 	var eventID string
 	err := q.s.pool.QueryRow(ctx, `SELECT `+q.sc+`.stream_replay_dead_letter($1)`, id).Scan(&eventID)
 	if err != nil {
-		return "", streamErr(err)
+		return "", streamErr(err, nil)
 	}
 	return eventID, nil
 }

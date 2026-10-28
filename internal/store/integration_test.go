@@ -2127,6 +2127,35 @@ func TestStreamErrorMappings(t *testing.T) {
 	}
 }
 
+func TestStreamBatchOpsOnMissingQueue(t *testing.T) {
+	ctx := testCtx
+	q := unique("stream-absent")
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{"get", func() error {
+			_, err := testStore.Queue(q).GetBatch(ctx, 1)
+			return err
+		}},
+		{"ack", func() error {
+			_, err := testStore.Queue(q).AckBatch(ctx, 1)
+			return err
+		}},
+		{"nack", func() error {
+			_, err := testStore.Queue(q).NackMessage(ctx, 1, "evt-1", time.Second, "x")
+			return err
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); !errors.Is(err, ErrStreamBatchNotFound) {
+				t.Fatalf("err = %v, want %v", err, ErrStreamBatchNotFound)
+			}
+		})
+	}
+}
+
 func TestStreamAppendStoresInInputOrder(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-order")
