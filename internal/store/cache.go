@@ -123,7 +123,7 @@ func (s *Store) CacheFlushAll(ctx context.Context) (int64, error) {
 	}
 	var n int64
 	for _, info := range infos {
-		if err := s.CacheFlush(ctx, info.Name); err != nil {
+		if err := s.Cache(info.Name).Flush(ctx); err != nil {
 			return n, err
 		}
 		n++
@@ -138,12 +138,12 @@ type CacheSetOptions struct {
 	ReturnOld    bool
 }
 
-func (s *Store) CacheGet(ctx context.Context, name, key string) ([]byte, bool, error) {
-	return withSchema2(ctx, s, ns.CacheRef(name), nil, nil, func(sc string) ([]byte, bool, error) {
+func (c Cache) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	return withSchema2(ctx, c.s, ns.CacheRef(c.name), nil, nil, func(sc string) ([]byte, bool, error) {
 		var size int64
 		var inline []byte
 		var hasInline bool
-		err := s.pool.QueryRow(ctx, `SELECT size, inline_data, inline_data IS NOT NULL
+		err := c.s.pool.QueryRow(ctx, `SELECT size, inline_data, inline_data IS NOT NULL
 			FROM `+sc+`.objects WHERE key = $1
 			  AND (expires_at IS NULL OR expires_at > now())
 			  AND (origin_etag IS NULL OR origin_etag NOT LIKE 'deleted:%')`, key).
@@ -155,7 +155,7 @@ func (s *Store) CacheGet(ctx context.Context, name, key string) ([]byte, bool, e
 			return nil, false, err
 		}
 		if !hasInline {
-			sl, err := s.Get(ctx, ObjectRef{NS: ns.CacheRef(name), Key: key}, WholeObjectRange())
+			sl, err := c.s.Get(ctx, ObjectRef{NS: ns.CacheRef(c.name), Key: key}, WholeObjectRange())
 			if errors.Is(err, ErrNotFound) {
 				return nil, false, nil
 			}
@@ -209,11 +209,11 @@ func (s *Store) writeCacheValue(ctx context.Context, ref ObjectRef, val []byte, 
 	return true, nil
 }
 
-func (s *Store) CacheSet(ctx context.Context, name, key string, val []byte, opts CacheSetOptions) ([]byte, bool, bool, error) {
+func (c Cache) Set(ctx context.Context, key string, val []byte, opts CacheSetOptions) ([]byte, bool, bool, error) {
 	if opts.ReturnOld {
-		return s.CacheGetSet(ctx, name, key, val, opts)
+		return c.GetSet(ctx, key, val, opts)
 	}
-	wrote, err := s.writeCacheValue(ctx, ObjectRef{NS: ns.CacheRef(name), Key: key}, val, WriteOptions{
+	wrote, err := c.s.writeCacheValue(ctx, ObjectRef{NS: ns.CacheRef(c.name), Key: key}, val, WriteOptions{
 		Precondition: opts.Precondition,
 		ExpiresAt:    opts.ExpiresAt,
 		KeepTTL:      opts.KeepTTL,
@@ -224,18 +224,17 @@ func (s *Store) CacheSet(ctx context.Context, name, key string, val []byte, opts
 	return nil, false, wrote, nil
 }
 
-func (s *Store) CacheMGet(ctx context.Context, name string, keys []string) ([][]byte, error) {
+func (c Cache) MGet(ctx context.Context, keys []string) ([][]byte, error) {
 	out := make([][]byte, len(keys))
 	if len(keys) == 0 {
 		return out, nil
 	}
-	sc, err := nsSQLIdent(ns.Cache, name)
-	if err != nil {
-		return nil, err
+	if c.err != nil {
+		return nil, c.err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT k.ord, o.size, o.inline_data, o.inline_data IS NOT NULL
+	rows, err := c.s.pool.Query(ctx, `SELECT k.ord, o.size, o.inline_data, o.inline_data IS NOT NULL
 		FROM unnest($1::text[]) WITH ORDINALITY AS k(key, ord)
-		JOIN `+sc+`.objects o ON o.key = k.key
+		JOIN `+c.sc+`.objects o ON o.key = k.key
 		WHERE (o.expires_at IS NULL OR o.expires_at > now())
 		  AND (o.origin_etag IS NULL OR o.origin_etag NOT LIKE 'deleted:%')`, keys)
 	if isMissingBucketSchema(err) {
@@ -274,7 +273,7 @@ func (s *Store) CacheMGet(ctx context.Context, name string, keys []string) ([][]
 		return nil, err
 	}
 	for _, idx := range chunkedIdx {
-		v, ok, err := s.CacheGet(ctx, name, keys[idx])
+		v, ok, err := c.Get(ctx, keys[idx])
 		if err != nil {
 			return nil, err
 		}
@@ -285,12 +284,12 @@ func (s *Store) CacheMGet(ctx context.Context, name string, keys []string) ([][]
 	return out, nil
 }
 
-func (s *Store) CacheDel(ctx context.Context, name string, keys []string) (int64, error) {
-	return s.DeleteMany(ctx, ns.CacheRef(name), keys)
+func (c Cache) Del(ctx context.Context, keys []string) (int64, error) {
+	return c.s.DeleteMany(ctx, ns.CacheRef(c.name), keys)
 }
 
-func (s *Store) CacheDelExpected(ctx context.Context, name, key, originETag string) (int64, error) {
-	return s.DeleteExpected(ctx, ObjectRef{NS: ns.CacheRef(name), Key: key}, originETag)
+func (c Cache) DelExpected(ctx context.Context, key, originETag string) (int64, error) {
+	return c.s.DeleteExpected(ctx, ObjectRef{NS: ns.CacheRef(c.name), Key: key}, originETag)
 }
 
 func (s *Store) DeleteExpected(ctx context.Context, ref ObjectRef, originETag string) (int64, error) {
@@ -322,17 +321,17 @@ func (s *Store) DeleteExpected(ctx context.Context, ref ObjectRef, originETag st
 	})
 }
 
-func (s *Store) CacheGetDel(ctx context.Context, name, key string) ([]byte, bool, error) {
-	schema, err := ns.Cache.Schema(name)
-	if err != nil {
-		return nil, false, err
+func (c Cache) GetDel(ctx context.Context, key string) ([]byte, bool, error) {
+	if c.err != nil {
+		return nil, false, c.err
 	}
-	sc := quoteIdent(schema)
+	schema := strings.Trim(c.sc, `"`)
+	sc := c.sc
 	type value struct {
 		bytes []byte
 		live  bool
 	}
-	result, err := withTx(ctx, s, func(tx pgx.Tx) (value, error) {
+	result, err := withTx(ctx, c.s, func(tx pgx.Tx) (value, error) {
 		if err := lockObjectKey(ctx, tx, schema, key); err != nil {
 			return value{}, err
 		}
@@ -345,7 +344,7 @@ func (s *Store) CacheGetDel(ctx context.Context, name, key string) ([]byte, bool
 		result := value{live: m.Live(time.Now())}
 		if result.live {
 
-			_, body, err := s.bodyFromMeta(ctx, ObjectRef{NS: ns.CacheRef(name), Key: key}, m, WholeObjectRange())
+			_, body, err := c.s.bodyFromMeta(ctx, ObjectRef{NS: ns.CacheRef(c.name), Key: key}, m, WholeObjectRange())
 			if err != nil {
 				return value{}, err
 			}
@@ -368,13 +367,13 @@ func (s *Store) CacheGetDel(ctx context.Context, name, key string) ([]byte, bool
 	return result.bytes, result.live, err
 }
 
-func (s *Store) CacheExists(ctx context.Context, name string, keys []string) (int64, error) {
+func (c Cache) Exists(ctx context.Context, keys []string) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
-	return withSchema(ctx, s, ns.CacheRef(name), nil, nil, func(sc string) (int64, error) {
+	return withSchema(ctx, c.s, ns.CacheRef(c.name), nil, nil, func(sc string) (int64, error) {
 		var count int64
-		err := s.pool.QueryRow(ctx, `SELECT count(*)
+		err := c.s.pool.QueryRow(ctx, `SELECT count(*)
 			FROM unnest($1::text[]) AS k(key)
 			JOIN `+sc+`.objects o ON o.key = k.key
 			WHERE (o.expires_at IS NULL OR o.expires_at > now())
@@ -383,8 +382,8 @@ func (s *Store) CacheExists(ctx context.Context, name string, keys []string) (in
 	})
 }
 
-func (s *Store) CacheExpire(ctx context.Context, name, key string, expiresAt *time.Time, opts ...string) (bool, error) {
-	return withSchema(ctx, s, ns.CacheRef(name), nil, nil, func(sc string) (bool, error) {
+func (c Cache) Expire(ctx context.Context, key string, expiresAt *time.Time, opts ...string) (bool, error) {
+	return withSchema(ctx, c.s, ns.CacheRef(c.name), nil, nil, func(sc string) (bool, error) {
 		var condSQL strings.Builder
 		if expiresAt == nil {
 			condSQL.WriteString(" AND expires_at IS NOT NULL")
@@ -402,17 +401,17 @@ func (s *Store) CacheExpire(ctx context.Context, name, key string, expiresAt *ti
 				}
 			}
 		}
-		tag, err := s.pool.Exec(ctx, `UPDATE `+sc+`.objects SET expires_at = $2
+		tag, err := c.s.pool.Exec(ctx, `UPDATE `+sc+`.objects SET expires_at = $2
 			WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())
 			  AND (origin_etag IS NULL OR origin_etag NOT LIKE 'deleted:%')`+condSQL.String(), key, expiresAt)
 		return tag.RowsAffected() > 0, err
 	})
 }
 
-func (s *Store) CacheTTL(ctx context.Context, name, key string) (time.Duration, bool, bool, error) {
-	return withSchema3(ctx, s, ns.CacheRef(name), nil, nil, func(sc string) (time.Duration, bool, bool, error) {
+func (c Cache) TTL(ctx context.Context, key string) (time.Duration, bool, bool, error) {
+	return withSchema3(ctx, c.s, ns.CacheRef(c.name), nil, nil, func(sc string) (time.Duration, bool, bool, error) {
 		var remSec pgtype.Float8
-		err := s.pool.QueryRow(ctx, `SELECT EXTRACT(EPOCH FROM (expires_at - now()))::float8
+		err := c.s.pool.QueryRow(ctx, `SELECT EXTRACT(EPOCH FROM (expires_at - now()))::float8
 			FROM `+sc+`.objects
 			WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())
 			  AND (origin_etag IS NULL OR origin_etag NOT LIKE 'deleted:%')`, key).Scan(&remSec)
@@ -444,10 +443,10 @@ func cacheAdd(current []byte, delta int64) (int64, error) {
 	return cur + delta, nil
 }
 
-func (s *Store) CacheDBSize(ctx context.Context, name string) (int64, error) {
-	return withSchema(ctx, s, ns.CacheRef(name), nil, nil, func(sc string) (int64, error) {
+func (c Cache) DBSize(ctx context.Context) (int64, error) {
+	return withSchema(ctx, c.s, ns.CacheRef(c.name), nil, nil, func(sc string) (int64, error) {
 		var n int64
-		err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+sc+`.objects
+		err := c.s.pool.QueryRow(ctx, `SELECT count(*) FROM `+sc+`.objects
 			WHERE (expires_at IS NULL OR expires_at > now())
 			  AND (origin_etag IS NULL OR origin_etag NOT LIKE 'deleted:%')`).Scan(&n)
 		return n, err
@@ -456,13 +455,13 @@ func (s *Store) CacheDBSize(ctx context.Context, name string) (int64, error) {
 
 var ErrPendingUploads = errors.New("cache namespace has pending origin uploads")
 
-func (s *Store) CacheFlush(ctx context.Context, name string) error {
+func (c Cache) Flush(ctx context.Context) error {
 	var allTables []string
 	for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
-		if err := s.EnsureNamespace(ctx, kind, name, nil, nil); err != nil {
+		if err := c.s.EnsureNamespace(ctx, kind, c.name, nil, nil); err != nil {
 			return err
 		}
-		schema, err := nsSQLIdent(kind, name)
+		schema, err := nsSQLIdent(kind, c.name)
 		if err != nil {
 			return err
 		}
@@ -470,13 +469,13 @@ func (s *Store) CacheFlush(ctx context.Context, name string) error {
 			allTables = append(allTables, schema+"."+table)
 		}
 	}
-	_, err := withTx(ctx, s, func(tx pgx.Tx) (struct{}, error) {
+	_, err := withTx(ctx, c.s, func(tx pgx.Tx) (struct{}, error) {
 		if _, err := tx.Exec(ctx, "LOCK TABLE "+strings.Join(allTables, ", ")+" IN ACCESS EXCLUSIVE MODE"); err != nil {
 			return struct{}{}, err
 		}
 		var pending int64
 		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FROM s3p.pending_uploads WHERE namespace = $1`, name).Scan(&pending); err != nil {
+			`SELECT count(*) FROM s3p.pending_uploads WHERE namespace = $1`, c.name).Scan(&pending); err != nil {
 			return struct{}{}, err
 		}
 		if pending > 0 {
@@ -508,10 +507,10 @@ type cacheMutationResult struct {
 	size     int64
 }
 
-func (s *Store) mutateCache(ctx context.Context, name, key string, change cacheMutation) (cacheMutationResult, error) {
-	ref := ObjectRef{NS: ns.CacheRef(name), Key: key}
+func (c Cache) mutate(ctx context.Context, key string, change cacheMutation) (cacheMutationResult, error) {
+	ref := ObjectRef{NS: ns.CacheRef(c.name), Key: key}
 	for attempt := 0; change.retries == 0 || attempt < change.retries; attempt++ {
-		value, m, err := s.cacheValueWithMeta(ctx, ref, change.inlineOnly)
+		value, m, err := c.s.cacheValueWithMeta(ctx, ref, change.inlineOnly)
 		if err != nil {
 			return cacheMutationResult{}, err
 		}
@@ -528,7 +527,7 @@ func (s *Store) mutateCache(ctx context.Context, name, key string, change cacheM
 		if err != nil {
 			return cacheMutationResult{}, err
 		}
-		result.wrote, err = s.writeCacheValue(ctx, ref, next, opts)
+		result.wrote, err = c.s.writeCacheValue(ctx, ref, next, opts)
 		if err != nil {
 			return cacheMutationResult{}, err
 		}
@@ -569,8 +568,8 @@ func (s *Store) cacheValueWithMeta(ctx context.Context, ref ObjectRef, inlineOnl
 	return value, m, err
 }
 
-func (s *Store) CacheGetSet(ctx context.Context, name, key string, val []byte, opts CacheSetOptions) ([]byte, bool, bool, error) {
-	result, err := s.mutateCache(ctx, name, key, cacheMutation{
+func (c Cache) GetSet(ctx context.Context, key string, val []byte, opts CacheSetOptions) ([]byte, bool, bool, error) {
+	result, err := c.mutate(ctx, key, cacheMutation{
 		Precondition: opts.Precondition, ExpiresAt: opts.ExpiresAt, KeepTTL: opts.KeepTTL,
 		retries: cacheMutationRetries,
 		apply:   func([]byte) ([]byte, error) { return val, nil },
@@ -578,19 +577,19 @@ func (s *Store) CacheGetSet(ctx context.Context, name, key string, val []byte, o
 	return result.previous, result.existed, result.wrote, err
 }
 
-func (s *Store) CacheAppend(ctx context.Context, name, key string, suffix []byte) (int64, error) {
-	result, err := s.mutateCache(ctx, name, key, cacheMutation{
+func (c Cache) Append(ctx context.Context, key string, suffix []byte) (int64, error) {
+	result, err := c.mutate(ctx, key, cacheMutation{
 		KeepTTL: true, retries: cacheMutationRetries,
 		apply: func(current []byte) ([]byte, error) { return append(current, suffix...), nil },
 	})
 	return result.size, err
 }
 
-func (s *Store) CacheSetRange(ctx context.Context, name, key string, off int64, val []byte) (int64, error) {
+func (c Cache) SetRange(ctx context.Context, key string, off int64, val []byte) (int64, error) {
 	if off < 0 || off > int64(math.MaxInt)-int64(len(val)) {
 		return 0, errors.New("offset is out of range")
 	}
-	result, err := s.mutateCache(ctx, name, key, cacheMutation{
+	result, err := c.mutate(ctx, key, cacheMutation{
 		KeepTTL: true, retries: cacheMutationRetries,
 		apply: func(current []byte) ([]byte, error) {
 			if need := off + int64(len(val)); int64(len(current)) < need {
@@ -603,9 +602,9 @@ func (s *Store) CacheSetRange(ctx context.Context, name, key string, off int64, 
 	return result.size, err
 }
 
-func (s *Store) CacheIncrBy(ctx context.Context, name, key string, delta int64) (int64, error) {
+func (c Cache) IncrBy(ctx context.Context, key string, delta int64) (int64, error) {
 	var next int64
-	_, err := s.mutateCache(ctx, name, key, cacheMutation{
+	_, err := c.mutate(ctx, key, cacheMutation{
 		KeepTTL: true, ContentType: cacheCounterContentType, inlineOnly: true,
 		apply: func(current []byte) ([]byte, error) {
 			next = delta
@@ -622,17 +621,17 @@ func (s *Store) CacheIncrBy(ctx context.Context, name, key string, delta int64) 
 	return next, err
 }
 
-func (s *Store) CacheMSet(ctx context.Context, name string, keys []string, vals [][]byte) error {
+func (c Cache) MSet(ctx context.Context, keys []string, vals [][]byte) error {
 	if len(keys) == 0 {
 		return nil
 	}
 	inlineMax := int64(ns.Cache.InlineMax())
 	for _, v := range vals {
 		if int64(len(v)) > inlineMax {
-			ref := ObjectRef{NS: ns.CacheRef(name)}
+			ref := ObjectRef{NS: ns.CacheRef(c.name)}
 			for i := range keys {
 				ref.Key = keys[i]
-				if _, err := s.writeCacheValue(ctx, ref, vals[i], WriteOptions{}); err != nil {
+				if _, err := c.s.writeCacheValue(ctx, ref, vals[i], WriteOptions{}); err != nil {
 					return err
 				}
 			}
@@ -643,12 +642,12 @@ func (s *Store) CacheMSet(ctx context.Context, name string, keys []string, vals 
 	for _, v := range vals {
 		add += int64(len(v))
 	}
-	if s.checkQuota(ctx, ns.Cache, name, add) {
+	if c.s.checkQuota(ctx, ns.Cache, c.name, add) {
 		return ErrQuotaExceeded
 	}
 	batch := encodeCacheBatch(keys, vals)
-	_, err := withAutoCreate(ctx, s, ns.Cache, name, func(sc string) (struct{}, error) {
-		return struct{}{}, s.cacheMSet(ctx, sc, batch)
+	_, err := withAutoCreate(ctx, c.s, ns.Cache, c.name, func(sc string) (struct{}, error) {
+		return struct{}{}, c.s.cacheMSet(ctx, sc, batch)
 	})
 	return err
 }
@@ -844,8 +843,8 @@ type PendingUpload struct {
 	LeaseOwner  string
 }
 
-func (s *Store) ClaimPendingUploads(ctx context.Context, namespace, owner string, limit int, lease time.Duration) ([]PendingUpload, error) {
-	rows, err := s.pool.Query(ctx, `WITH due AS (
+func (c Cache) ClaimPendingUploads(ctx context.Context, owner string, limit int, lease time.Duration) ([]PendingUpload, error) {
+	rows, err := c.s.pool.Query(ctx, `WITH due AS (
 			SELECT namespace, key
 			FROM s3p.pending_uploads
 			WHERE namespace = $1 AND next_attempt <= now() AND NOT dead
@@ -860,7 +859,7 @@ func (s *Store) ClaimPendingUploads(ctx context.Context, namespace, owner string
 		WHERE p.namespace = due.namespace AND p.key = due.key
 		RETURNING p.key, p.token, p.size, p.attempts, coalesce(p.last_error, ''),
 		          coalesce(p.base_etag, ''), p.base_missing, coalesce(p.lease_owner, '')`,
-		namespace, limit, owner, lease.Seconds())
+		c.name, limit, owner, lease.Seconds())
 	if err != nil {
 		return nil, err
 	}
@@ -872,8 +871,8 @@ func (s *Store) ClaimPendingUploads(ctx context.Context, namespace, owner string
 	})
 }
 
-func (s *Store) MarkOriginCommitted(ctx context.Context, namespace, key, token, version string, originModified time.Time, expiresAt *time.Time) (bool, error) {
-	sc, err := ns.WriteBack.Schema(namespace)
+func (c Cache) MarkOriginCommitted(ctx context.Context, key, token, version string, originModified time.Time, expiresAt *time.Time) (bool, error) {
+	sc, err := ns.WriteBack.Schema(c.name)
 	if err != nil {
 		return false, err
 	}
@@ -884,7 +883,7 @@ func (s *Store) MarkOriginCommitted(ctx context.Context, namespace, key, token, 
 	if !originModified.IsZero() {
 		modified = originModified
 	}
-	return withTx(ctx, s, func(tx pgx.Tx) (bool, error) {
+	return withTx(ctx, c.s, func(tx pgx.Tx) (bool, error) {
 		tag, err := tx.Exec(ctx,
 			`UPDATE `+quoteIdent(sc)+`.objects SET origin_etag = $3, created_at = now(),
 			   origin_modified = COALESCE($5, origin_modified), expires_at = $4
@@ -894,19 +893,19 @@ func (s *Store) MarkOriginCommitted(ctx context.Context, namespace, key, token, 
 		}
 		if _, err := tx.Exec(ctx,
 			`DELETE FROM s3p.pending_uploads
-			 WHERE namespace = $1 AND key = $2 AND token = $3`, namespace, key, token); err != nil {
+			 WHERE namespace = $1 AND key = $2 AND token = $3`, c.name, key, token); err != nil {
 			return false, err
 		}
 		return tag.RowsAffected() == 1, nil
 	})
 }
 
-func (s *Store) AbandonPendingUpload(ctx context.Context, namespace, key, token string) error {
-	sc, err := ns.WriteBack.Schema(namespace)
+func (c Cache) AbandonPendingUpload(ctx context.Context, key, token string) error {
+	sc, err := ns.WriteBack.Schema(c.name)
 	if err != nil {
 		return err
 	}
-	_, err = withTx(ctx, s, func(tx pgx.Tx) (struct{}, error) {
+	_, err = withTx(ctx, c.s, func(tx pgx.Tx) (struct{}, error) {
 		var fileID pgtype.Int8
 		var parts []int64
 		err := tx.QueryRow(ctx,
@@ -924,27 +923,27 @@ func (s *Store) AbandonPendingUpload(ctx context.Context, namespace, key, token 
 		}
 		_, err = tx.Exec(ctx,
 			`DELETE FROM s3p.pending_uploads
-			 WHERE namespace = $1 AND key = $2 AND token = $3`, namespace, key, token)
+			 WHERE namespace = $1 AND key = $2 AND token = $3`, c.name, key, token)
 		return struct{}{}, err
 	})
 	return err
 }
 
-func (s *Store) FailPendingUpload(ctx context.Context, namespace, key, token, owner string, attempt int, cause error) error {
-	return s.failPending(ctx, namespace, key, token, owner, attempt, cause, false)
+func (c Cache) FailPendingUpload(ctx context.Context, key, token, owner string, attempt int, cause error) error {
+	return c.failPending(ctx, key, token, owner, attempt, cause, false)
 }
 
-func (s *Store) FailPendingUploadPermanent(ctx context.Context, namespace, key, token, owner string, attempt int, cause error) error {
-	return s.failPending(ctx, namespace, key, token, owner, attempt, cause, true)
+func (c Cache) FailPendingUploadPermanent(ctx context.Context, key, token, owner string, attempt int, cause error) error {
+	return c.failPending(ctx, key, token, owner, attempt, cause, true)
 }
 
-func (s *Store) failPending(ctx context.Context, namespace, key, token, owner string, attempt int, cause error, permanent bool) error {
+func (c Cache) failPending(ctx context.Context, key, token, owner string, attempt int, cause error, permanent bool) error {
 	delay := work.Backoff{
 		Initial: 2 * time.Second,
 		Factor:  2,
 		Max:     300 * time.Second,
 	}.Delay(attempt + 1)
-	_, err := s.pool.Exec(ctx, `UPDATE s3p.pending_uploads
+	_, err := c.s.pool.Exec(ctx, `UPDATE s3p.pending_uploads
 		SET attempts = attempts + 1,
 		    dead = $7,
 		    last_error = $4,
@@ -952,7 +951,7 @@ func (s *Store) failPending(ctx context.Context, namespace, key, token, owner st
 		    lease_until = NULL,
 		    next_attempt = now() + make_interval(secs => $6)
 		WHERE namespace = $1 AND key = $2 AND token = $3 AND lease_owner = $5`,
-		namespace, key, token, errorText(cause), owner, delay.Seconds(), permanent)
+		c.name, key, token, errorText(cause), owner, delay.Seconds(), permanent)
 	return err
 }
 
@@ -967,23 +966,23 @@ func (s *Store) RetryDeadPendingUploads(ctx context.Context, namespace string) (
 	return tag.RowsAffected(), nil
 }
 
-func (s *Store) ClearPendingUploads(ctx context.Context, namespace, key string) error {
-	_, err := s.pool.Exec(ctx,
-		`DELETE FROM s3p.pending_uploads WHERE namespace = $1 AND key = $2`, namespace, key)
+func (c Cache) ClearPendingUploads(ctx context.Context, key string) error {
+	_, err := c.s.pool.Exec(ctx,
+		`DELETE FROM s3p.pending_uploads WHERE namespace = $1 AND key = $2`, c.name, key)
 	return err
 }
 
-func (s *Store) ClearPendingUploadBefore(ctx context.Context, namespace, key string, before time.Time) error {
-	_, err := s.pool.Exec(ctx,
+func (c Cache) ClearPendingUploadBefore(ctx context.Context, key string, before time.Time) error {
+	_, err := c.s.pool.Exec(ctx,
 		`DELETE FROM s3p.pending_uploads
-		 WHERE namespace = $1 AND key = $2 AND created_at < $3`, namespace, key, before)
+		 WHERE namespace = $1 AND key = $2 AND created_at < $3`, c.name, key, before)
 	return err
 }
 
-func (s *Store) ClearPendingUploadToken(ctx context.Context, namespace, key, token string) error {
-	_, err := s.pool.Exec(ctx,
+func (c Cache) ClearPendingUploadToken(ctx context.Context, key, token string) error {
+	_, err := c.s.pool.Exec(ctx,
 		`DELETE FROM s3p.pending_uploads WHERE namespace = $1 AND key = $2 AND token = $3`,
-		namespace, key, token)
+		c.name, key, token)
 	return err
 }
 
@@ -999,26 +998,26 @@ func errorText(err error) string {
 
 var ErrFillLeaseBusy = errors.New("origin fill already in progress")
 
-func (s *Store) AcquireFillLease(ctx context.Context, namespace, key, owner string, ttl time.Duration) (bool, error) {
+func (c Cache) AcquireFillLease(ctx context.Context, key, owner string, ttl time.Duration) (bool, error) {
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
-	tag, err := s.pool.Exec(ctx, `INSERT INTO s3p.cache_fill_leases (namespace, key, owner, expires_at)
+	tag, err := c.s.pool.Exec(ctx, `INSERT INTO s3p.cache_fill_leases (namespace, key, owner, expires_at)
 		VALUES ($1, $2, $3, now() + make_interval(secs => $4))
 		ON CONFLICT (namespace, key) DO UPDATE
 		  SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at
 		  WHERE s3p.cache_fill_leases.expires_at <= now()`,
-		namespace, key, owner, ttl.Seconds())
+		c.name, key, owner, ttl.Seconds())
 	if err != nil {
 		return false, err
 	}
 	return tag.RowsAffected() == 1, nil
 }
 
-func (s *Store) ReleaseFillLease(ctx context.Context, namespace, key, owner string) {
-	_, _ = s.pool.Exec(ctx,
+func (c Cache) ReleaseFillLease(ctx context.Context, key, owner string) {
+	_, _ = c.s.pool.Exec(ctx,
 		`DELETE FROM s3p.cache_fill_leases WHERE namespace = $1 AND key = $2 AND owner = $3`,
-		namespace, key, owner)
+		c.name, key, owner)
 }
 
 func (s *Store) RenewFillLease(ctx context.Context, lease FillLease, ttl time.Duration) (bool, error) {
@@ -1037,10 +1036,10 @@ func (s *Store) CleanupFillLeases(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
-func (s *Store) OriginMetadata(ctx context.Context, namespace, key string, maxAge time.Duration) (*ObjectInfo, error) {
-	return withSchema(ctx, s, ns.CacheRef(namespace), nil, nil, func(sc string) (*ObjectInfo, error) {
+func (c Cache) OriginMetadata(ctx context.Context, key string, maxAge time.Duration) (*ObjectInfo, error) {
+	return withSchema(ctx, c.s, ns.CacheRef(c.name), nil, nil, func(sc string) (*ObjectInfo, error) {
 		var raw []byte
-		err := s.pool.QueryRow(ctx, `SELECT info FROM `+sc+`.origin_metadata
+		err := c.s.pool.QueryRow(ctx, `SELECT info FROM `+sc+`.origin_metadata
 			WHERE key = $1 AND expires_at > now()
 			AND validated_at > now() - make_interval(secs => $2)`, key, maxAge.Seconds()).Scan(&raw)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1057,8 +1056,8 @@ func (s *Store) OriginMetadata(ctx context.Context, namespace, key string, maxAg
 	})
 }
 
-func (s *Store) RememberOriginMetadata(ctx context.Context, namespace, key string, info ObjectInfo, validated time.Time, ttl time.Duration) error {
-	ref := ObjectRef{NS: ns.CacheRef(namespace), Key: key}
+func (c Cache) RememberOriginMetadata(ctx context.Context, key string, info ObjectInfo, validated time.Time, ttl time.Duration) error {
+	ref := ObjectRef{NS: ns.CacheRef(c.name), Key: key}
 	sc, err := ref.Schema()
 	if err != nil {
 		return err
@@ -1068,7 +1067,7 @@ func (s *Store) RememberOriginMetadata(ctx context.Context, namespace, key strin
 		return err
 	}
 	schema, _ := ref.NS.Schema()
-	_, err = withTx(ctx, s, func(tx pgx.Tx) (struct{}, error) {
+	_, err = withTx(ctx, c.s, func(tx pgx.Tx) (struct{}, error) {
 		if err := lockObjectKey(ctx, tx, schema, key); err != nil {
 			return struct{}{}, err
 		}
@@ -1083,12 +1082,11 @@ func (s *Store) RememberOriginMetadata(ctx context.Context, namespace, key strin
 	return err
 }
 
-func (s *Store) ForgetOriginMetadata(ctx context.Context, namespace, key, version string) error {
-	sc, err := nsSQLIdent(ns.Cache, namespace)
-	if err != nil {
-		return err
+func (c Cache) ForgetOriginMetadata(ctx context.Context, key, version string) error {
+	if c.err != nil {
+		return c.err
 	}
-	_, err = s.pool.Exec(ctx, `DELETE FROM `+sc+`.origin_metadata WHERE key = $1 AND info->>'OriginETag' = $2`, key, version)
+	_, err := c.s.pool.Exec(ctx, `DELETE FROM `+c.sc+`.origin_metadata WHERE key = $1 AND info->>'OriginETag' = $2`, key, version)
 	return err
 }
 

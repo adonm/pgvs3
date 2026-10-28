@@ -163,7 +163,7 @@ func (s *Store) prepareEnqueueQueues(ctx context.Context, inputs []EnqueueInput)
 			return ErrQuotaExceeded
 		}
 		if !s.known(ns.QueueRef(queue)) {
-			if err := s.EnsureQueue(ctx, queue, nil); err != nil {
+			if err := s.queue(queue).Ensure(ctx, nil); err != nil {
 				return err
 			}
 		}
@@ -653,13 +653,12 @@ func (s *Store) ListQueues(ctx context.Context, limit, offset int) ([]NamespaceI
 	return infos, total, nil
 }
 
-func (s *Store) QueueStats(ctx context.Context, name string) (QueueStats, error) {
-	sc, err := nsSQLIdent(ns.Queue, name)
-	if err != nil {
-		return QueueStats{}, err
+func (q Queue) Stats(ctx context.Context) (QueueStats, error) {
+	if q.err != nil {
+		return QueueStats{}, q.err
 	}
 	var st QueueStats
-	err = s.pool.QueryRow(ctx, `SELECT
+	err := q.s.pool.QueryRow(ctx, `SELECT
 		count(*) FILTER (WHERE state=$1),
 		count(*) FILTER (WHERE state=$2),
 		count(*) FILTER (WHERE state=$3),
@@ -667,7 +666,7 @@ func (s *Store) QueueStats(ctx context.Context, name string) (QueueStats, error)
 		count(*) FILTER (WHERE state=$5),
 		count(*) FILTER (WHERE state=$6),
 		count(*) FILTER (WHERE state=$7),
-		count(*) FROM `+sc+`.jobs`,
+		count(*) FROM `+q.sc+`.jobs`,
 		JobAvailable.String(), JobActive.String(), JobScheduled.String(),
 		JobRetryable.String(), JobCompleted.String(), JobCancelled.String(),
 		JobDiscarded.String()).
@@ -679,18 +678,17 @@ func (s *Store) QueueStats(ctx context.Context, name string) (QueueStats, error)
 	return st, err
 }
 
-func (s *Store) ExpireQueueMessages(ctx context.Context, queue string, max int) (int64, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return 0, err
+func (q Queue) ExpireMessages(ctx context.Context, max int) (int64, error) {
+	if q.err != nil {
+		return 0, q.err
 	}
-	retention := s.jobRetention
+	retention := q.s.jobRetention
 	if retention < 0 {
 		retention = 0
 	}
 	terminal := jobStateStrings([]JobState{JobCompleted, JobCancelled, JobDiscarded})
-	tag, err := s.pool.Exec(ctx, `WITH victims AS (
-			SELECT ctid FROM `+sc+`.jobs
+	tag, err := q.s.pool.Exec(ctx, `WITH victims AS (
+			SELECT ctid FROM `+q.sc+`.jobs
 			WHERE (expires_at IS NOT NULL AND expires_at <= now())
 			   OR ($2::float8 > 0 AND state = ANY($3::text[]) AND
 			       coalesce(completed_at, cancelled_at, discarded_at, created_at)
@@ -698,7 +696,7 @@ func (s *Store) ExpireQueueMessages(ctx context.Context, queue string, max int) 
 			ORDER BY coalesce(completed_at, cancelled_at, discarded_at, created_at, expires_at)
 			LIMIT $1)
 		, gone AS (
-			DELETE FROM `+sc+`.jobs WHERE ctid IN (SELECT ctid FROM victims)
+			DELETE FROM `+q.sc+`.jobs WHERE ctid IN (SELECT ctid FROM victims)
 			RETURNING id)
 		DELETE FROM s3p.job_index WHERE id IN (SELECT id FROM gone)`,
 		max, retention.Seconds(), terminal)
@@ -711,16 +709,15 @@ func (s *Store) ExpireQueueMessages(ctx context.Context, queue string, max int) 
 	return tag.RowsAffected(), nil
 }
 
-func (s *Store) DiscardExpiredLeases(ctx context.Context, queue string, max int) (int64, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return 0, err
+func (q Queue) DiscardExpiredLeases(ctx context.Context, max int) (int64, error) {
+	if q.err != nil {
+		return 0, q.err
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE `+sc+`.jobs j
+	tag, err := q.s.pool.Exec(ctx, `UPDATE `+q.sc+`.jobs j
 		SET state=$2, discarded_at=now(), completed_at=now(),
 		    worker_id=NULL, lease_token=NULL, lease_until=NULL
 		FROM (
-			SELECT ctid FROM `+sc+`.jobs
+			SELECT ctid FROM `+q.sc+`.jobs
 			WHERE state='active'
 			  AND (lease_until IS NULL OR lease_until <= now())
 			  AND attempt >= max_attempts

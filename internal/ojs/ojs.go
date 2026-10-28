@@ -36,32 +36,12 @@ type jobStore interface {
 	AckJob(context.Context, string, string, []byte) (store.Job, error)
 	NackJob(context.Context, string, string, []byte, bool) (store.Job, error)
 	HeartbeatJobs(context.Context, string, map[string]string, time.Duration) ([]string, error)
-	QueueStats(context.Context, string) (store.QueueStats, error)
 	AnyQueueExists(context.Context, []string) (bool, error)
-}
-
-type streamStore interface {
-	AppendStreamMessages(context.Context, string, []store.StreamMessageInput) ([]store.StreamMessage, error)
-	SubscribeStream(context.Context, string, string, *int64) (store.StreamSubscription, error)
-	UnsubscribeStream(context.Context, string, string) (bool, error)
-	ReceiveStreamBatch(context.Context, string, string, int) (*store.StreamBatch, error)
-	ReceiveStreamCoopBatch(context.Context, string, string, string, int) (*store.StreamBatch, error)
-	GetStreamBatch(context.Context, string, int64) (*store.StreamBatch, error)
-	AckStreamBatch(context.Context, string, int64) (int64, error)
-	NackStreamMessage(context.Context, string, int64, string, time.Duration, string) (string, error)
-	StreamInfo(context.Context, string) (store.StreamInfo, error)
-	StreamConfig(context.Context, string) (store.StreamConfig, error)
-	SetStreamConfig(context.Context, string, int, time.Duration) (store.StreamConfig, error)
-	ListStreamConsumers(context.Context, string) ([]store.StreamConsumerInfo, error)
-	ListDeadLetters(context.Context, string, int) ([]store.DeadLetter, error)
-	ReplayDeadLetter(context.Context, string, int64) (string, error)
-	ReplayAllDeadLetters(context.Context, string) (int64, error)
-	PurgeDeadLetters(context.Context, string, time.Duration) (int64, error)
 }
 
 type Store interface {
 	jobStore
-	streamStore
+	Queue(name string) store.QueueHandle
 	ListQueues(context.Context, int, int) ([]store.NamespaceInfo, int64, error)
 	NamespaceExists(context.Context, ns.Kind, string) (bool, error)
 	Ping(context.Context) error
@@ -1160,14 +1140,14 @@ func (s *Server) handleQueueStats(_ http.ResponseWriter, r *http.Request) (any, 
 	if !ns.ValidName(name) {
 		return nil, badRequest("invalid queue name")
 	}
-	st, err := s.st.QueueStats(r.Context(), name)
+	st, err := s.st.Queue(name).Stats(r.Context())
 	if err != nil {
 		return nil, err
 	}
 	body := queueStatsBody{Name: name, Status: "active", Available: st.Available, Active: st.Active,
 		Scheduled: st.Scheduled, Retryable: st.Retryable, Completed: st.Completed,
 		Cancelled: st.Cancelled, Discarded: st.Discarded, Total: st.Total}
-	if info, err := s.st.StreamInfo(r.Context(), name); err == nil {
+	if info, err := s.st.Queue(name).Info(r.Context()); err == nil {
 		body.Events, body.Consumers, body.Dead = info.Events, info.Consumers, info.DeadLetters
 	}
 	return map[string]any{"queue": body, "status": "active", "stats": body, "computed_at": timeString(time.Now())}, nil

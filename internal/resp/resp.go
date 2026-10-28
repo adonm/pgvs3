@@ -137,7 +137,7 @@ func (s *Server) tryCoalesceGet(ctx context.Context, conn redcon.Conn, currentCa
 	for m := 1; m < j; m++ {
 		_, _, keys[m] = resolveTarget(currentCache, string(batch[m].args[0]))
 	}
-	vals, err := s.store.CacheMGet(ctx, b0, keys)
+	vals, err := s.store.Cache(b0).MGet(ctx, keys)
 	if err != nil {
 		for range keys {
 			conn.WriteError("ERR " + err.Error())
@@ -182,7 +182,7 @@ func (s *Server) tryCoalesceSet(ctx context.Context, conn redcon.Conn, currentCa
 		keys[m], _ = isBatchableSet(batch[m])
 		vals[m] = batch[m].args[1]
 	}
-	if err := s.store.CacheMSet(ctx, currentCache, keys, vals); err != nil {
+	if err := s.store.Cache(currentCache).MSet(ctx, keys, vals); err != nil {
 		for range keys {
 			conn.WriteError("ERR " + err.Error())
 		}
@@ -468,7 +468,7 @@ func cmdInfo(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession
 }
 
 func cmdDBSize(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, _ [][]byte) error {
-	n, err := s.store.CacheDBSize(ctx, sess.bucket)
+	n, err := s.store.Cache(sess.bucket).DBSize(ctx)
 	return writeInt(conn, n, err)
 }
 
@@ -477,7 +477,7 @@ func cmdFlush(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessio
 		_, err := s.store.CacheFlushAll(ctx)
 		return writeOK(conn, err)
 	}
-	return writeOK(conn, s.store.CacheFlush(ctx, sess.bucket))
+	return writeOK(conn, s.store.Cache(sess.bucket).Flush(ctx))
 }
 
 func cmdGet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
@@ -496,7 +496,7 @@ func cmdGet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession,
 func (s *Server) readValue(ctx context.Context, current string, key []byte) ([]byte, error) {
 	kind, name, k := resolveTarget(current, string(key))
 	if kind == ns.Cache {
-		value, _, err := s.store.CacheGet(ctx, name, k)
+		value, _, err := s.store.Cache(name).Get(ctx, k)
 		return value, err
 	}
 	value, err := s.store.Get(ctx, targetRef(kind, name, k), store.WholeObjectRange())
@@ -521,7 +521,7 @@ func cmdMGet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession
 		cacheKeys[i] = key
 	}
 	if allCache {
-		vals, err := s.store.CacheMGet(ctx, sess.bucket, cacheKeys)
+		vals, err := s.store.Cache(sess.bucket).MGet(ctx, cacheKeys)
 		if err != nil {
 			sess.status = 500
 			return err
@@ -553,7 +553,7 @@ func cmdSet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession,
 	if err != nil {
 		return err
 	}
-	oldVal, _, wrote, err := s.store.CacheSet(ctx, b, k, args[1], opts)
+	oldVal, _, wrote, err := s.store.Cache(b).Set(ctx, k, args[1], opts)
 	if err != nil {
 		sess.status = 500
 		return err
@@ -575,7 +575,7 @@ func cmdSetNX(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessio
 	if err != nil {
 		return err
 	}
-	_, _, wrote, err := s.store.CacheSet(ctx, b, k, args[1], store.CacheSetOptions{Precondition: store.Precondition{Mode: store.IfAbsent}})
+	_, _, wrote, err := s.store.Cache(b).Set(ctx, k, args[1], store.CacheSetOptions{Precondition: store.Precondition{Mode: store.IfAbsent}})
 	return writeBoolInt(conn, wrote, err)
 }
 
@@ -589,7 +589,7 @@ func cmdSetEX(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessio
 	if err != nil {
 		return err
 	}
-	_, _, _, err = s.store.CacheSet(ctx, b, k, args[2], store.CacheSetOptions{ExpiresAt: &exp})
+	_, _, _, err = s.store.Cache(b).Set(ctx, k, args[2], store.CacheSetOptions{ExpiresAt: &exp})
 	return writeOK(conn, err)
 }
 
@@ -598,7 +598,7 @@ func cmdGetSet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessi
 	if err != nil {
 		return err
 	}
-	oldVal, _, _, err := s.store.CacheGetSet(ctx, b, k, args[1], store.CacheSetOptions{ReturnOld: true})
+	oldVal, _, _, err := s.store.Cache(b).GetSet(ctx, k, args[1], store.CacheSetOptions{ReturnOld: true})
 	if err != nil {
 		return err
 	}
@@ -611,7 +611,7 @@ func cmdGetDel(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessi
 	if err != nil {
 		return err
 	}
-	val, _, err := s.store.CacheGetDel(ctx, b, k)
+	val, _, err := s.store.Cache(b).GetDel(ctx, k)
 	if err != nil {
 		return err
 	}
@@ -633,7 +633,7 @@ func cmdMSet(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession
 		}
 		keys[i], vals[i] = k, args[2*i+1]
 	}
-	return writeOK(conn, s.store.CacheMSet(ctx, sess.bucket, keys, vals))
+	return writeOK(conn, s.store.Cache(sess.bucket).MSet(ctx, keys, vals))
 }
 
 func cmdAppend(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession, _ string, args [][]byte) error {
@@ -641,7 +641,7 @@ func cmdAppend(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessi
 	if err != nil {
 		return err
 	}
-	n, err := s.store.CacheAppend(ctx, b, k, args[1])
+	n, err := s.store.Cache(b).Append(ctx, k, args[1])
 	return writeInt(conn, n, err)
 }
 
@@ -654,7 +654,7 @@ func cmdSetRange(s *Server, ctx context.Context, conn redcon.Conn, sess *respSes
 	if err != nil {
 		return err
 	}
-	n, err := s.store.CacheSetRange(ctx, b, k, off, args[2])
+	n, err := s.store.Cache(b).SetRange(ctx, k, off, args[2])
 	return writeInt(conn, n, err)
 }
 
@@ -725,7 +725,7 @@ func cmdIncr(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession
 	if err != nil {
 		return err
 	}
-	next, err := s.store.CacheIncrBy(ctx, b, k, delta)
+	next, err := s.store.Cache(b).IncrBy(ctx, k, delta)
 	if errors.Is(err, store.ErrNotInteger) {
 		return errNotInt
 	}
@@ -755,7 +755,7 @@ func cmdDel(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession,
 		}
 		keys[i] = k
 	}
-	n, err := s.store.CacheDel(ctx, sess.bucket, keys)
+	n, err := s.store.Cache(sess.bucket).Del(ctx, keys)
 	return writeInt(conn, n, err)
 }
 
@@ -775,7 +775,7 @@ func cmdExists(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessi
 		cacheKeys = append(cacheKeys, k)
 	}
 	if len(cacheKeys) > 0 {
-		count, err := s.store.CacheExists(ctx, sess.bucket, cacheKeys)
+		count, err := s.store.Cache(sess.bucket).Exists(ctx, cacheKeys)
 		if err != nil {
 			return err
 		}
@@ -798,7 +798,7 @@ func cmdExpire(s *Server, ctx context.Context, conn redcon.Conn, sess *respSessi
 	for i, opt := range args[2:] {
 		opts[i] = string(opt)
 	}
-	ok, err := s.store.CacheExpire(ctx, b, k, &exp, opts...)
+	ok, err := s.store.Cache(b).Expire(ctx, k, &exp, opts...)
 	return writeBoolInt(conn, ok, err)
 }
 
@@ -807,7 +807,7 @@ func cmdPersist(s *Server, ctx context.Context, conn redcon.Conn, sess *respSess
 	if err != nil {
 		return err
 	}
-	ok, err := s.store.CacheExpire(ctx, b, k, nil)
+	ok, err := s.store.Cache(b).Expire(ctx, k, nil)
 	return writeBoolInt(conn, ok, err)
 }
 
@@ -824,7 +824,7 @@ func cmdTTL(s *Server, ctx context.Context, conn redcon.Conn, sess *respSession,
 		conn.WriteInt64(-1)
 		return nil
 	}
-	d, hasTTL, exists, err := s.store.CacheTTL(ctx, b, k)
+	d, hasTTL, exists, err := s.store.Cache(b).TTL(ctx, k)
 	if err != nil {
 		return err
 	}

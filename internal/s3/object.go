@@ -1582,7 +1582,7 @@ func (s *Server) serveCacheHTTP(w http.ResponseWriter, r *http.Request) error {
 		return nil
 
 	case http.MethodDelete:
-		if _, err := s.store.CacheDel(r.Context(), name, []string{key}); err != nil {
+		if _, err := s.store.Cache(name).Del(r.Context(), []string{key}); err != nil {
 			return err
 		}
 		w.WriteHeader(http.StatusNoContent)

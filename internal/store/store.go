@@ -695,8 +695,8 @@ func (s *Store) CreateBucket(ctx context.Context, name string) error {
 	return s.EnsureNamespace(ctx, ns.Bucket, name, nil, nil)
 }
 
-func (s *Store) EnsureQueue(ctx context.Context, name string, attrs map[string]any) error {
-	return s.EnsureNamespace(ctx, ns.Queue, name, nil, attrs)
+func (q Queue) Ensure(ctx context.Context, attrs map[string]any) error {
+	return q.s.EnsureNamespace(ctx, ns.Queue, q.name, nil, attrs)
 }
 
 func (s *Store) NamespaceExists(ctx context.Context, kind ns.Kind, name string) (bool, error) {
@@ -1356,7 +1356,7 @@ func (s *Store) expirePass(ctx context.Context, conn *pgxpool.Conn, infos []Name
 	var expiredUploads int
 	for _, n := range infos {
 		if n.Kind == ns.Queue {
-			removed, err := s.expireQueue(ctx, n.Name, rounds)
+			removed, err := s.queue(n.Name).expire(ctx, rounds)
 			if err != nil {
 				return err
 			}
@@ -1382,10 +1382,10 @@ func (s *Store) expirePass(ctx context.Context, conn *pgxpool.Conn, infos []Name
 	return nil
 }
 
-func (s *Store) expireQueue(ctx context.Context, queue string, rounds int) (int64, error) {
+func (q Queue) expire(ctx context.Context, rounds int) (int64, error) {
 	var total int64
 	for range rounds {
-		removed, err := s.ExpireQueueMessages(ctx, queue, ExpireBatch)
+		removed, err := q.ExpireMessages(ctx, ExpireBatch)
 		if err != nil {
 			return total, err
 		}
@@ -1395,7 +1395,7 @@ func (s *Store) expireQueue(ctx context.Context, queue string, rounds int) (int6
 		}
 	}
 	for range rounds {
-		discarded, err := s.DiscardExpiredLeases(ctx, queue, ExpireBatch)
+		discarded, err := q.DiscardExpiredLeases(ctx, ExpireBatch)
 		if err != nil {
 			return total, err
 		}
@@ -1405,7 +1405,7 @@ func (s *Store) expireQueue(ctx context.Context, queue string, rounds int) (int6
 		}
 	}
 	for range rounds {
-		moved, err := s.ProcessStreamRetries(ctx, queue, ExpireBatch)
+		moved, err := q.ProcessRetries(ctx, ExpireBatch)
 		if err != nil {
 			return total, err
 		}
@@ -1414,12 +1414,12 @@ func (s *Store) expireQueue(ctx context.Context, queue string, rounds int) (int6
 			break
 		}
 	}
-	if rotated, err := s.RotateStream(ctx, queue); err != nil {
+	if rotated, err := q.Rotate(ctx); err != nil {
 		return total, err
 	} else {
 		total += rotated
 	}
-	if pruned, err := s.PruneStreamTicks(ctx, queue, ExpireBatch); err != nil {
+	if pruned, err := q.PruneTicks(ctx, ExpireBatch); err != nil {
 		return total, err
 	} else {
 		total += pruned

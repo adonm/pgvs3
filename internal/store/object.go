@@ -345,13 +345,13 @@ func (s *Store) metaRef(ctx context.Context, ref ObjectRef, body metadataBody) (
 	return m, err
 }
 
-func (s *Store) CacheMetadata(ctx context.Context, name, key string, withInline bool) (*Meta, ns.Ref, error) {
-	refs := []ns.Ref{ns.WriteBackRef(name), ns.CacheRef(name)}
-	write, err := nsSQLIdent(ns.WriteBack, name)
+func (c Cache) Metadata(ctx context.Context, key string, withInline bool) (*Meta, ns.Ref, error) {
+	refs := []ns.Ref{ns.WriteBackRef(c.name), ns.CacheRef(c.name)}
+	write, err := nsSQLIdent(ns.WriteBack, c.name)
 	if err != nil {
 		return nil, ns.Ref{}, err
 	}
-	read, _ := nsSQLIdent(ns.Cache, name)
+	read, _ := nsSQLIdent(ns.Cache, c.name)
 	body := metadataHeader
 	if withInline {
 		body = metadataDecoded
@@ -359,7 +359,7 @@ func (s *Store) CacheMetadata(ctx context.Context, name, key string, withInline 
 	cols := metadataColumns(body)
 	var kind string
 	var priority int
-	row := &cacheMetadataRow{Row: s.pool.QueryRow(ctx, `SELECT * FROM (
+	row := &cacheMetadataRow{Row: c.s.pool.QueryRow(ctx, `SELECT * FROM (
 		SELECT `+cols+`, 'writeback'::text, 0 AS source_priority FROM `+write+`.objects
 		 WHERE key=$1 AND (expires_at IS NULL OR expires_at > now())
 		UNION ALL
@@ -371,7 +371,7 @@ func (s *Store) CacheMetadata(ctx context.Context, name, key string, withInline 
 
 		for _, ref := range refs {
 			sc, _ := nsSQLIdent(ref.Kind, ref.Name)
-			m, err := queryMetadata(ctx, s.pool, sc, key, body)
+			m, err := queryMetadata(ctx, c.s.pool, sc, key, body)
 			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNoBucket) {
 				continue
 			}
@@ -379,7 +379,7 @@ func (s *Store) CacheMetadata(ctx context.Context, name, key string, withInline 
 		}
 		return nil, ns.Ref{}, ErrNotFound
 	}
-	return m, ns.Ref{Kind: ns.Kind(kind), Name: name}, err
+	return m, ns.Ref{Kind: ns.Kind(kind), Name: c.name}, err
 }
 
 type cacheMetadataRow struct {

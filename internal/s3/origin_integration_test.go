@@ -227,7 +227,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 		}
 	})
 
-	if _, err := originTestStore.CacheDel(ctx, tier.Name(), []string{"bkt/obj"}); err != nil {
+	if _, err := originTestStore.Cache(tier.Name()).Del(ctx, []string{"bkt/obj"}); err != nil {
 		t.Fatal(err)
 	}
 	head, _ := http.NewRequest(http.MethodHead, httpSrv.URL+"/bkt/obj", nil)

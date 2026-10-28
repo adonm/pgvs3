@@ -107,14 +107,14 @@ func TestCompleteUploadPendingOutbox(t *testing.T) {
 		t.Fatalf("token = %q, want %q", token, PendingOriginToken(uploadID))
 	}
 
-	if owned, err := testStore.MarkOriginCommitted(ctx, cache, "bkt/mp", "pending:stale", "stale-v1", time.Time{}, nil); err != nil || owned {
+	if owned, err := testStore.Cache(cache).MarkOriginCommitted(ctx, "bkt/mp", "pending:stale", "stale-v1", time.Time{}, nil); err != nil || owned {
 		t.Fatalf("stale commit owned=%v err=%v", owned, err)
 	}
 	m, err = testStore.MetaHeader(ctx, ObjectRef{NS: ns.WriteBackRef(cache), Key: "bkt/mp"})
 	if err != nil || !IsPendingOrigin(m.OriginETag) {
 		t.Fatalf("stale commit changed pending object: m=%+v err=%v", m, err)
 	}
-	if owned, err := testStore.MarkOriginCommitted(ctx, cache, "bkt/mp", token, "origin-v1", time.Time{}, nil); err != nil || !owned {
+	if owned, err := testStore.Cache(cache).MarkOriginCommitted(ctx, "bkt/mp", token, "origin-v1", time.Time{}, nil); err != nil || !owned {
 		t.Fatalf("commit owned=%v err=%v", owned, err)
 	}
 	m, err = testStore.MetaHeader(ctx, ObjectRef{NS: ns.WriteBackRef(cache), Key: "bkt/mp"})
@@ -145,7 +145,7 @@ func TestPendingUploadClaimsAreLeased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := testStore.ClaimPendingUploads(ctx, cache, "gateway-b", 8, time.Minute)
+	claimed, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "gateway-b", 8, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestPendingUploadClaimsAreLeased(t *testing.T) {
 		 WHERE namespace = $1 AND key = 'bkt/key'`, cache); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err = testStore.ClaimPendingUploads(ctx, cache, "gateway-b", 8, time.Minute)
+	claimed, err = testStore.Cache(cache).ClaimPendingUploads(ctx, "gateway-b", 8, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestPendingUploadClaimsAreLeased(t *testing.T) {
 		claimed[0].BaseETag != "base-v1" || claimed[0].BaseMissing {
 		t.Fatalf("claimed = %+v", claimed)
 	}
-	if err := testStore.FailPendingUpload(ctx, cache, "bkt/key", "pending:one", "gateway-a", 0, errors.New("wrong owner")); err != nil {
+	if err := testStore.Cache(cache).FailPendingUpload(ctx, "bkt/key", "pending:one", "gateway-a", 0, errors.New("wrong owner")); err != nil {
 		t.Fatal(err)
 	}
 	var attempts int
@@ -177,7 +177,7 @@ func TestPendingUploadClaimsAreLeased(t *testing.T) {
 	if attempts != 0 {
 		t.Fatalf("wrong owner updated attempts = %d", attempts)
 	}
-	if err := testStore.FailPendingUpload(ctx, cache, "bkt/key", "pending:one", "gateway-b", 0, errors.New("boom")); err != nil {
+	if err := testStore.Cache(cache).FailPendingUpload(ctx, "bkt/key", "pending:one", "gateway-b", 0, errors.New("boom")); err != nil {
 		t.Fatal(err)
 	}
 	if err := testStore.Pool().QueryRow(ctx,
@@ -210,7 +210,7 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 		WriteOptions{ContentType: "text/plain", OriginETag: "v0", ExpectedOrigin: "v0"}); !errors.Is(err, ErrStaleCache) {
 		t.Fatalf("stale inline publish error = %v, want ErrStaleCache", err)
 	}
-	got, ok, err := testStore.CacheGet(ctx, cache, inlineKey)
+	got, ok, err := testStore.Cache(cache).Get(ctx, inlineKey)
 	if err != nil || !ok || string(got) != "v1" {
 		t.Fatalf("inline after stale publish = %q ok=%v err=%v", got, ok, err)
 	}
@@ -222,7 +222,7 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 		WriteOptions{ContentType: "text/plain", OriginETag: "v2", ExpectedOrigin: "v1"}); err != nil {
 		t.Fatalf("matching inline publish: %v", err)
 	}
-	got, ok, err = testStore.CacheGet(ctx, cache, inlineKey)
+	got, ok, err = testStore.Cache(cache).Get(ctx, inlineKey)
 	if err != nil || !ok || string(got) != "v2" {
 		t.Fatalf("inline after matching publish = %q ok=%v err=%v", got, ok, err)
 	}
@@ -254,7 +254,7 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 	if _, err := stale.Finish(nil); !errors.Is(err, ErrStaleCache) {
 		t.Fatalf("stale chunked publish error = %v, want ErrStaleCache", err)
 	}
-	got, ok, err = testStore.CacheGet(ctx, cache, chunkKey)
+	got, ok, err = testStore.Cache(cache).Get(ctx, chunkKey)
 	if err != nil || !ok || string(got) != "chunk-v1" {
 		t.Fatalf("chunked after stale publish = %q ok=%v err=%v", got, ok, err)
 	}
@@ -273,7 +273,7 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 	if _, err := match.Finish(nil); err != nil {
 		t.Fatalf("matching chunked publish: %v", err)
 	}
-	got, ok, err = testStore.CacheGet(ctx, cache, chunkKey)
+	got, ok, err = testStore.Cache(cache).Get(ctx, chunkKey)
 	if err != nil || !ok || string(got) != "chunk-v2" {
 		t.Fatalf("chunked after matching publish = %q ok=%v err=%v", got, ok, err)
 	}
@@ -296,11 +296,11 @@ func TestPendingUploadClaimsAreDistributedAcrossOwners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := testStore.ClaimPendingUploads(ctx, cache, "worker-a", 1, 5*time.Minute)
+	a, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-a", 1, 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := testStore.ClaimPendingUploads(ctx, cache, "worker-b", 1, 5*time.Minute)
+	b, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-b", 1, 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestPendingUploadClaimsAreDistributedAcrossOwners(t *testing.T) {
 	if a[0].LeaseOwner != "worker-a" || b[0].LeaseOwner != "worker-b" {
 		t.Fatalf("claim owners = %q / %q", a[0].LeaseOwner, b[0].LeaseOwner)
 	}
-	rest, err := testStore.ClaimPendingUploads(ctx, cache, "worker-c", 2, 5*time.Minute)
+	rest, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker-c", 2, 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestBucketWritesCannotResurrectDroppedNamespace(t *testing.T) {
 			WriteOptions{ContentType: "text/plain"}); err != nil {
 			t.Fatalf("implicit cache write: %v", err)
 		}
-		got, ok, err := other.CacheGet(ctx, cache, "k")
+		got, ok, err := other.Cache(cache).Get(ctx, "k")
 		if err != nil || !ok || string(got) != "value" {
 			t.Fatalf("read cache through second store: got=%q ok=%v err=%v", got, ok, err)
 		}
@@ -474,18 +474,18 @@ func TestBucketWritesCannotResurrectDroppedNamespace(t *testing.T) {
 func TestCacheBasics(t *testing.T) {
 	ctx := testCtx
 	cache := unique("cache")
-	if _, _, _, err := testStore.CacheSet(ctx, cache, "k", []byte("value"), CacheSetOptions{}); err != nil {
+	if _, _, _, err := testStore.Cache(cache).Set(ctx, "k", []byte("value"), CacheSetOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := testStore.CacheGet(ctx, cache, "k")
+	got, ok, err := testStore.Cache(cache).Get(ctx, "k")
 	if err != nil || !ok || string(got) != "value" {
 		t.Fatalf("get: %q %v %v", got, ok, err)
 	}
-	n, err := testStore.CacheIncrBy(ctx, cache, "counter", 2)
+	n, err := testStore.Cache(cache).IncrBy(ctx, "counter", 2)
 	if err != nil || n != 2 {
 		t.Fatalf("incr: %d %v", n, err)
 	}
-	n, err = testStore.CacheIncrBy(ctx, cache, "counter", -1)
+	n, err = testStore.Cache(cache).IncrBy(ctx, "counter", -1)
 	if err != nil || n != 1 {
 		t.Fatalf("decr: %d %v", n, err)
 	}
@@ -547,7 +547,7 @@ func TestPendingUploadPermanentFailureDeadLetters(t *testing.T) {
 		cache); err != nil {
 		t.Fatal(err)
 	}
-	if err := testStore.FailPendingUpload(ctx, cache, "bkt/key", "pending:dead", "owner", 0, errors.New("origin down")); err != nil {
+	if err := testStore.Cache(cache).FailPendingUpload(ctx, "bkt/key", "pending:dead", "owner", 0, errors.New("origin down")); err != nil {
 		t.Fatal(err)
 	}
 	var dead bool
@@ -565,7 +565,7 @@ func TestPendingUploadPermanentFailureDeadLetters(t *testing.T) {
 		 WHERE namespace = $1 AND key = 'bkt/key'`, cache); err != nil {
 		t.Fatal(err)
 	}
-	if err := testStore.FailPendingUploadPermanent(ctx, cache, "bkt/key", "pending:dead", "owner", 1, errors.New("missing durable body")); err != nil {
+	if err := testStore.Cache(cache).FailPendingUploadPermanent(ctx, "bkt/key", "pending:dead", "owner", 1, errors.New("missing durable body")); err != nil {
 		t.Fatal(err)
 	}
 	if err := testStore.Pool().QueryRow(ctx,
@@ -576,7 +576,7 @@ func TestPendingUploadPermanentFailureDeadLetters(t *testing.T) {
 	if !dead {
 		t.Fatalf("permanent failure dead=%v attempts=%d", dead, attempts)
 	}
-	claimed, err := testStore.ClaimPendingUploads(ctx, cache, "worker", 1, time.Minute)
+	claimed, err := testStore.Cache(cache).ClaimPendingUploads(ctx, "worker", 1, time.Minute)
 	if err != nil || len(claimed) != 0 {
 		t.Fatalf("dead row claimed: %+v err=%v", claimed, err)
 	}
@@ -673,13 +673,13 @@ func TestCacheFlushPreservesAttrsAndRejectsPending(t *testing.T) {
 		VALUES ('cache', $1, 'bkt/key', 'pending:flush', 1, 0, now(), false)`, cache); err != nil {
 		t.Fatal(err)
 	}
-	if err := testStore.CacheFlush(ctx, cache); !errors.Is(err, ErrPendingUploads) {
+	if err := testStore.Cache(cache).Flush(ctx); !errors.Is(err, ErrPendingUploads) {
 		t.Fatalf("flush with pending error = %v, want ErrPendingUploads", err)
 	}
 	if _, err := testStore.Pool().Exec(ctx, `DELETE FROM s3p.pending_uploads WHERE namespace=$1`, cache); err != nil {
 		t.Fatal(err)
 	}
-	if err := testStore.CacheFlush(ctx, cache); err != nil {
+	if err := testStore.Cache(cache).Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 	attrs, ok, err := testStore.NamespaceAttrs(ctx, ns.Cache, cache)
@@ -697,7 +697,7 @@ func TestCacheFlushPreservesAttrsAndRejectsPending(t *testing.T) {
 func TestDoctorQueueUsesClaimIndex(t *testing.T) {
 	ctx := testCtx
 	queue := unique("doctor")
-	if err := testStore.EnsureQueue(ctx, queue, nil); err != nil {
+	if err := testStore.queue(queue).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, queue, true) })
@@ -717,10 +717,10 @@ func TestCacheAtomicReadModifyWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Cache, cache, true) })
-	if _, _, wrote, err := testStore.CacheSet(ctx, cache, "k", []byte("a"), CacheSetOptions{}); err != nil || !wrote {
+	if _, _, wrote, err := testStore.Cache(cache).Set(ctx, "k", []byte("a"), CacheSetOptions{}); err != nil || !wrote {
 		t.Fatalf("initial set wrote=%v err=%v", wrote, err)
 	}
-	old, had, wrote, err := testStore.CacheGetSet(ctx, cache, "k", []byte("b"), CacheSetOptions{})
+	old, had, wrote, err := testStore.Cache(cache).GetSet(ctx, "k", []byte("b"), CacheSetOptions{})
 	if err != nil || !had || !wrote || string(old) != "a" {
 		t.Fatalf("getset old=%q had=%v wrote=%v err=%v", old, had, wrote, err)
 	}
@@ -728,16 +728,16 @@ func TestCacheAtomicReadModifyWrite(t *testing.T) {
 	var wg sync.WaitGroup
 	for range writers {
 		wg.Go(func() {
-			if _, err := testStore.CacheAppend(ctx, cache, "k", []byte("x")); err != nil {
+			if _, err := testStore.Cache(cache).Append(ctx, "k", []byte("x")); err != nil {
 				t.Errorf("append: %v", err)
 			}
 		})
 	}
 	wg.Wait()
-	if n, err := testStore.CacheSetRange(ctx, cache, "k", 0, []byte("Z")); err != nil || n != int64(writers+1) {
+	if n, err := testStore.Cache(cache).SetRange(ctx, "k", 0, []byte("Z")); err != nil || n != int64(writers+1) {
 		t.Fatalf("setrange n=%d err=%v", n, err)
 	}
-	got, ok, err := testStore.CacheGet(ctx, cache, "k")
+	got, ok, err := testStore.Cache(cache).Get(ctx, "k")
 	if err != nil || !ok || string(got) != "Z"+strings.Repeat("x", writers) {
 		t.Fatalf("final value len=%d ok=%v err=%v", len(got), ok, err)
 	}
@@ -874,18 +874,18 @@ func TestCacheFillLeaseCoalescesOwners(t *testing.T) {
 	t.Cleanup(func() {
 		_, _ = testStore.Pool().Exec(ctx, `DELETE FROM s3p.cache_fill_leases WHERE namespace=$1`, namespace)
 	})
-	ok, err := testStore.AcquireFillLease(ctx, namespace, key, "owner-a", time.Minute)
+	ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-a", time.Minute)
 	if err != nil || !ok {
 		t.Fatalf("first acquire ok=%v err=%v", ok, err)
 	}
-	if ok, err := testStore.AcquireFillLease(ctx, namespace, key, "owner-b", time.Minute); err != nil || ok {
+	if ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-b", time.Minute); err != nil || ok {
 		t.Fatalf("second acquire ok=%v err=%v", ok, err)
 	}
-	testStore.ReleaseFillLease(ctx, namespace, key, "owner-a")
-	if ok, err := testStore.AcquireFillLease(ctx, namespace, key, "owner-b", time.Minute); err != nil || !ok {
+	testStore.Cache(namespace).ReleaseFillLease(ctx, key, "owner-a")
+	if ok, err := testStore.Cache(namespace).AcquireFillLease(ctx, key, "owner-b", time.Minute); err != nil || !ok {
 		t.Fatalf("post-release acquire ok=%v err=%v", ok, err)
 	}
-	testStore.ReleaseFillLease(ctx, namespace, key, "owner-b")
+	testStore.Cache(namespace).ReleaseFillLease(ctx, key, "owner-b")
 }
 
 func TestOpenWithOptionsAppliesSessionPolicy(t *testing.T) {
@@ -1139,7 +1139,7 @@ func TestCacheSetReturnOldConditions(t *testing.T) {
 	name := mutationCache(t)
 	set := func(value []byte, cond Condition) ([]byte, bool, bool) {
 		t.Helper()
-		old, had, wrote, err := testStore.CacheSet(testCtx, name, "key", value, CacheSetOptions{
+		old, had, wrote, err := testStore.Cache(name).Set(testCtx, "key", value, CacheSetOptions{
 			ReturnOld: true, Precondition: Precondition{Mode: cond},
 		})
 		if err != nil {
@@ -1167,7 +1167,7 @@ func TestCacheSetReturnOldConditions(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range writers {
 		wg.Go(func() {
-			old, had, wrote, err := testStore.CacheSet(testCtx, name, "key", fmt.Appendf(nil, "writer-%d", i), CacheSetOptions{ReturnOld: true})
+			old, had, wrote, err := testStore.Cache(name).Set(testCtx, "key", fmt.Appendf(nil, "writer-%d", i), CacheSetOptions{ReturnOld: true})
 			if err != nil || !had || !wrote {
 				t.Errorf("concurrent SET GET had=%t wrote=%t err=%v", had, wrote, err)
 			}
@@ -1188,16 +1188,16 @@ func TestCacheSetReturnOldConditions(t *testing.T) {
 func TestCacheMutationsPreserveTTLAndCounterSemantics(t *testing.T) {
 	name := mutationCache(t)
 	expires := time.Now().Add(time.Hour).Truncate(time.Microsecond)
-	if _, _, _, err := testStore.CacheSet(testCtx, name, "key", []byte("10"), CacheSetOptions{ExpiresAt: &expires}); err != nil {
+	if _, _, _, err := testStore.Cache(name).Set(testCtx, "key", []byte("10"), CacheSetOptions{ExpiresAt: &expires}); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := testStore.CacheAppend(testCtx, name, "key", []byte("0")); err != nil || n != 3 {
+	if n, err := testStore.Cache(name).Append(testCtx, "key", []byte("0")); err != nil || n != 3 {
 		t.Fatalf("append = %d %v", n, err)
 	}
-	if n, err := testStore.CacheSetRange(testCtx, name, "key", 0, []byte("2")); err != nil || n != 3 {
+	if n, err := testStore.Cache(name).SetRange(testCtx, "key", 0, []byte("2")); err != nil || n != 3 {
 		t.Fatalf("setrange = %d %v", n, err)
 	}
-	if n, err := testStore.CacheIncrBy(testCtx, name, "key", 1); err != nil || n != 201 {
+	if n, err := testStore.Cache(name).IncrBy(testCtx, "key", 1); err != nil || n != 201 {
 		t.Fatalf("incr = %d %v", n, err)
 	}
 	m, err := testStore.MetaHeader(testCtx, ObjectRef{NS: ns.CacheRef(name), Key: "key"})
@@ -1205,20 +1205,20 @@ func TestCacheMutationsPreserveTTLAndCounterSemantics(t *testing.T) {
 		t.Fatalf("mutation changed TTL: %+v %v", m, err)
 	}
 	for _, off := range []int64{-1, math.MaxInt64} {
-		if _, err := testStore.CacheSetRange(testCtx, name, "key", off, []byte("x")); err == nil {
+		if _, err := testStore.Cache(name).SetRange(testCtx, "key", off, []byte("x")); err == nil {
 			t.Fatalf("accepted offset %d", off)
 		}
 	}
-	if _, _, _, err := testStore.CacheSet(testCtx, name, "empty", []byte{}, CacheSetOptions{}); err != nil {
+	if _, _, _, err := testStore.Cache(name).Set(testCtx, "empty", []byte{}, CacheSetOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.CacheIncrBy(testCtx, name, "empty", 1); !errors.Is(err, ErrNotInteger) {
+	if _, err := testStore.Cache(name).IncrBy(testCtx, "empty", 1); !errors.Is(err, ErrNotInteger) {
 		t.Fatalf("empty counter = %v", err)
 	}
 	if err := testStore.CacheTombstone(testCtx, ns.CacheRef(name), "deleted", expires); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.CacheIncrBy(testCtx, name, "deleted", 1); !errors.Is(err, ErrNotInteger) {
+	if _, err := testStore.Cache(name).IncrBy(testCtx, "deleted", 1); !errors.Is(err, ErrNotInteger) {
 		t.Fatalf("tombstone counter = %v", err)
 	}
 	const workers, increments = 8, 25
@@ -1226,14 +1226,14 @@ func TestCacheMutationsPreserveTTLAndCounterSemantics(t *testing.T) {
 	for range workers {
 		wg.Go(func() {
 			for range increments {
-				if _, err := testStore.CacheIncrBy(testCtx, name, "counter", 1); err != nil {
+				if _, err := testStore.Cache(name).IncrBy(testCtx, "counter", 1); err != nil {
 					t.Error(err)
 				}
 			}
 		})
 	}
 	wg.Wait()
-	value, ok, err := testStore.CacheGet(testCtx, name, "counter")
+	value, ok, err := testStore.Cache(name).Get(testCtx, "counter")
 	if err != nil || !ok || string(value) != fmt.Sprint(workers*increments) {
 		t.Fatalf("lost increments: %q %t %v", value, ok, err)
 	}
@@ -1266,15 +1266,15 @@ func TestCacheGetDelMultipartAndRollback(t *testing.T) {
 	if _, err := testStore.CompleteUpload(testCtx, ref, upload, listed, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := testStore.CacheGetDel(testCtx, name, ref.Key)
+	got, ok, err := testStore.Cache(name).GetDel(testCtx, ref.Key)
 	if err != nil || !ok || !bytes.Equal(got, bytes.Join(parts, nil)) {
 		t.Fatalf("multipart GETDEL bytes=%d ok=%t err=%v", len(got), ok, err)
 	}
-	if _, ok, err := testStore.CacheGetDel(testCtx, name, ref.Key); err != nil || ok {
+	if _, ok, err := testStore.Cache(name).GetDel(testCtx, ref.Key); err != nil || ok {
 		t.Fatalf("second GETDEL ok=%t err=%v", ok, err)
 	}
 	ref.Key = "corrupt"
-	if _, _, _, err := testStore.CacheSet(testCtx, name, ref.Key, bytes.Repeat([]byte("x"), 64<<10), CacheSetOptions{}); err != nil {
+	if _, _, _, err := testStore.Cache(name).Set(testCtx, ref.Key, bytes.Repeat([]byte("x"), 64<<10), CacheSetOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	m, err := testStore.MetaHeader(testCtx, ref)
@@ -1285,7 +1285,7 @@ func TestCacheGetDelMultipartAndRollback(t *testing.T) {
 	if _, err := testStore.pool.Exec(testCtx, "DELETE FROM "+schema+".chunks WHERE file_id=$1 AND no=0", m.FileID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := testStore.CacheGetDel(testCtx, name, ref.Key); err == nil {
+	if _, _, err := testStore.Cache(name).GetDel(testCtx, ref.Key); err == nil {
 		t.Fatal("GETDEL accepted a truncated body")
 	}
 	if _, err := testStore.MetaHeader(testCtx, ref); err != nil {
@@ -1303,16 +1303,16 @@ func TestCacheExpirationConditions(t *testing.T) {
 			if withTTL {
 				opts.ExpiresAt = &future
 			}
-			if _, _, _, err := testStore.CacheSet(testCtx, name, key, []byte("value"), opts); err != nil {
+			if _, _, _, err := testStore.Cache(name).Set(testCtx, key, []byte("value"), opts); err != nil {
 				t.Fatal(err)
 			}
 			past := time.Now().Add(-time.Minute)
 			want := condition == "" || condition == "LT" || (condition == "NX" && !withTTL) || (condition == "XX" && withTTL)
-			changed, err := testStore.CacheExpire(testCtx, name, key, &past, condition)
+			changed, err := testStore.Cache(name).Expire(testCtx, key, &past, condition)
 			if err != nil || changed != want {
 				t.Fatalf("condition=%q ttl=%t: changed=%t want=%t err=%v", condition, withTTL, changed, want, err)
 			}
-			if _, exists, err := testStore.CacheGet(testCtx, name, key); err != nil || exists == changed {
+			if _, exists, err := testStore.Cache(name).Get(testCtx, key); err != nil || exists == changed {
 				t.Fatalf("expired key visibility: exists=%t changed=%t err=%v", exists, changed, err)
 			}
 		}
@@ -1327,7 +1327,7 @@ func TestCacheGetDelWithSingleConnection(t *testing.T) {
 	}
 	defer other.Close()
 	data := bytes.Repeat([]byte("x"), 64<<10)
-	if _, _, _, err := testStore.CacheSet(testCtx, name, "key", data, CacheSetOptions{}); err != nil {
+	if _, _, _, err := testStore.Cache(name).Set(testCtx, "key", data, CacheSetOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(testCtx, 5*time.Second)
@@ -1336,7 +1336,7 @@ func TestCacheGetDelWithSingleConnection(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 2 {
 		wg.Go(func() {
-			got, found, err := other.CacheGetDel(ctx, name, "key")
+			got, found, err := other.Cache(name).GetDel(ctx, "key")
 			if err != nil || (found && !bytes.Equal(got, data)) {
 				t.Errorf("GETDEL found=%t bytes=%d err=%v", found, len(got), err)
 			}
@@ -1347,7 +1347,7 @@ func TestCacheGetDelWithSingleConnection(t *testing.T) {
 	if first, second := <-results, <-results; first == second {
 		t.Fatalf("concurrent GETDEL results = %t, %t", first, second)
 	}
-	if _, found, err := other.CacheGetDel(ctx, name+"-absent", "key"); err != nil || found {
+	if _, found, err := other.Cache(name+"-absent").GetDel(ctx, "key"); err != nil || found {
 		t.Fatalf("GETDEL on missing namespace found=%t err=%v", found, err)
 	}
 }
@@ -1383,7 +1383,7 @@ func TestFillPublicationChecksLiveDatabaseOwner(t *testing.T) {
 		_, _ = testStore.Pool().Exec(testCtx, `DELETE FROM s3p.cache_fill_leases WHERE namespace=$1`, name)
 	})
 	lease := FillLease{Namespace: name, Key: ref.Key, Owner: "first"}
-	if ok, err := testStore.AcquireFillLease(testCtx, name, ref.Key, lease.Owner, time.Minute); err != nil || !ok {
+	if ok, err := testStore.Cache(name).AcquireFillLease(testCtx, ref.Key, lease.Owner, time.Minute); err != nil || !ok {
 		t.Fatal(err)
 	}
 	if _, err := testStore.PutInline(testCtx, ref, []byte("original"), WriteOptions{FillLease: &lease}); err != nil {
@@ -1398,10 +1398,10 @@ func TestFillPublicationChecksLiveDatabaseOwner(t *testing.T) {
 	if _, err := testStore.PutInline(testCtx, ref, []byte("stale"), WriteOptions{FillLease: &lease}); !errors.Is(err, ErrStaleCache) {
 		t.Fatalf("expired inline owner: %v", err)
 	}
-	if ok, err := testStore.AcquireFillLease(testCtx, name, ref.Key, "second", time.Minute); err != nil || !ok {
+	if ok, err := testStore.Cache(name).AcquireFillLease(testCtx, ref.Key, "second", time.Minute); err != nil || !ok {
 		t.Fatal(err)
 	}
-	testStore.ReleaseFillLease(testCtx, name, ref.Key, "first")
+	testStore.Cache(name).ReleaseFillLease(testCtx, ref.Key, "first")
 	for _, owner := range []string{"first", "second"} {
 		attempt := lease
 		attempt.Owner = owner
@@ -1466,7 +1466,7 @@ func TestRetiringWriteCacheRevokesOldFillsNotNewWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease := FillLease{Namespace: name, Key: read.Key, Owner: "old-fill"}
-	if ok, err := testStore.AcquireFillLease(testCtx, name, read.Key, lease.Owner, time.Minute); err != nil || !ok {
+	if ok, err := testStore.Cache(name).AcquireFillLease(testCtx, read.Key, lease.Owner, time.Minute); err != nil || !ok {
 		t.Fatal(err)
 	}
 
@@ -1502,7 +1502,7 @@ func TestOriginMetadataTTLFlushAndCacheOnlyLookup(t *testing.T) {
 		}
 	})
 	info := ObjectInfo{Size: 10 << 20, OriginETag: "version", ContentType: "application/parquet"}
-	if err := testStore.RememberOriginMetadata(testCtx, name, "parent", info, time.Now(), time.Hour); err != nil {
+	if err := testStore.Cache(name).RememberOriginMetadata(testCtx, "parent", info, time.Now(), time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	for _, table := range []string{"objects", "chunks", "origin_metadata"} {
@@ -1515,24 +1515,24 @@ func TestOriginMetadataTTLFlushAndCacheOnlyLookup(t *testing.T) {
 	if _, err := testStore.Pool().Exec(testCtx, `UPDATE `+schema+`.origin_metadata SET validated_at=now()-interval '5 seconds'`); err != nil {
 		t.Fatal(err)
 	}
-	if m, err := testStore.OriginMetadata(testCtx, name, "parent", time.Second); err != nil || m != nil {
+	if m, err := testStore.Cache(name).OriginMetadata(testCtx, "parent", time.Second); err != nil || m != nil {
 		t.Fatalf("ignored reader TTL: %+v %v", m, err)
 	}
-	if m, err := testStore.OriginMetadata(testCtx, name, "parent", time.Hour); err != nil || m == nil {
+	if m, err := testStore.Cache(name).OriginMetadata(testCtx, "parent", time.Hour); err != nil || m == nil {
 		t.Fatalf("lost fresh parent: %+v %v", m, err)
 	}
 	ref := ObjectRef{NS: ns.CacheRef(name), Key: "body"}
 	if _, err := testStore.PutInline(testCtx, ref, []byte("body"), WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	m, selected, err := testStore.CacheMetadata(testCtx, name, "body", true)
+	m, selected, err := testStore.Cache(name).Metadata(testCtx, "body", true)
 	if err != nil || selected.Kind != ns.Cache || string(m.Inline) != "body" {
 		t.Fatalf("cache-only lookup: %+v %v %v", m, selected, err)
 	}
-	if err := testStore.CacheFlush(testCtx, name); err != nil {
+	if err := testStore.Cache(name).Flush(testCtx); err != nil {
 		t.Fatal(err)
 	}
-	if m, err := testStore.OriginMetadata(testCtx, name, "parent", time.Hour); err != nil || m != nil {
+	if m, err := testStore.Cache(name).OriginMetadata(testCtx, "parent", time.Hour); err != nil || m != nil {
 		t.Fatalf("flush retained parent: %+v %v", m, err)
 	}
 }
@@ -1683,7 +1683,7 @@ func TestTerminalJobRetentionRemovesIndex(t *testing.T) {
 	}
 	time.Sleep(10 * time.Millisecond)
 
-	removed, err := testStore.ExpireQueueMessages(ctx, q, ExpireBatch)
+	removed, err := testStore.queue(q).ExpireMessages(ctx, ExpireBatch)
 	if err != nil || removed != 1 {
 		t.Fatalf("expire = %d, %v; want 1", removed, err)
 	}
@@ -1709,7 +1709,7 @@ func TestDiscardExpiredLeasesExhaustsAttempts(t *testing.T) {
 	}
 	time.Sleep(20 * time.Millisecond)
 
-	discarded, err := testStore.DiscardExpiredLeases(ctx, q, ExpireBatch)
+	discarded, err := testStore.queue(q).DiscardExpiredLeases(ctx, ExpireBatch)
 	if err != nil || discarded != 1 {
 		t.Fatalf("discard = %d, %v; want 1", discarded, err)
 	}
@@ -1824,7 +1824,7 @@ func TestAnyQueueExists(t *testing.T) {
 	ctx := testCtx
 	q := unique("ojs-any-exists")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if ok, err := testStore.AnyQueueExists(ctx, []string{unique("ojs-missing"), q}); err != nil || !ok {
@@ -1966,10 +1966,10 @@ func TestStreamAppendRollback(t *testing.T) {
 	ctx := testCtx
 	queue := unique("stream-append-rollback")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, queue, true) })
-	if _, err := testStore.SubscribeStream(ctx, queue, "reader", ptrInt64(0)); err != nil {
+	if _, err := testStore.Queue(queue).Subscribe(ctx, "reader", ptrInt64(0)); err != nil {
 		t.Fatal(err)
 	}
-	_, err := testStore.AppendStreamMessages(ctx, queue, []StreamMessageInput{
+	_, err := testStore.Queue(queue).AppendMessages(ctx, []StreamMessageInput{
 		{ID: "valid", Payload: []byte(`{"ok":true}`)},
 		{ID: "invalid", Payload: []byte(`not json`)},
 	})
@@ -1993,26 +1993,26 @@ func TestStreamFanoutAndAck(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-fanout")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, consumer := range []string{"a", "b"} {
-		if _, err := testStore.SubscribeStream(ctx, q, consumer, ptrInt64(0)); err != nil {
+		if _, err := testStore.Queue(q).Subscribe(ctx, consumer, ptrInt64(0)); err != nil {
 			t.Fatalf("subscribe %s: %v", consumer, err)
 		}
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{Type: "t", Payload: []byte(`{"n":1}`)},
 		{Type: "t", Payload: []byte(`{"n":2}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	a, err := testStore.ReceiveStreamBatch(ctx, q, "a", 10)
+	a, err := testStore.Queue(q).ReceiveBatch(ctx, "a", 10)
 	if err != nil || len(a.Messages) != 2 || a.ID == 0 {
 		t.Fatalf("a receive = %+v, %v", a, err)
 	}
-	b, err := testStore.ReceiveStreamBatch(ctx, q, "b", 10)
+	b, err := testStore.Queue(q).ReceiveBatch(ctx, "b", 10)
 	if err != nil || len(b.Messages) != 2 || b.ID == 0 {
 		t.Fatalf("b receive = %+v, %v", b, err)
 	}
@@ -2020,31 +2020,31 @@ func TestStreamFanoutAndAck(t *testing.T) {
 		t.Fatal("independent consumers shared a batch")
 	}
 
-	again, err := testStore.ReceiveStreamBatch(ctx, q, "a", 1)
+	again, err := testStore.Queue(q).ReceiveBatch(ctx, "a", 1)
 	if err != nil || again.ID != a.ID || len(again.Messages) != 2 {
 		t.Fatalf("active batch = %+v, %v", again, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, a.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, a.ID); err != nil {
 		t.Fatal(err)
 	}
-	empty, err := testStore.ReceiveStreamBatch(ctx, q, "a", 10)
+	empty, err := testStore.Queue(q).ReceiveBatch(ctx, "a", 10)
 	if err != nil || len(empty.Messages) != 0 {
 		t.Fatalf("post-ack receive = %+v, %v", empty, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, b.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, b.ID); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{Type: "t", Payload: []byte(`{"n":3}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	next, err := testStore.ReceiveStreamBatch(ctx, q, "a", 10)
+	next, err := testStore.Queue(q).ReceiveBatch(ctx, "a", 10)
 	if err != nil || len(next.Messages) != 1 {
 		t.Fatalf("next receive = %+v, %v", next, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, next.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, next.ID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2053,10 +2053,10 @@ func TestStreamSnapshotVisibilityAcrossCommitOrder(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-snapshot")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SubscribeStream(ctx, q, "worker", ptrInt64(0)); err != nil {
+	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
 		t.Fatal(err)
 	}
 	sc, err := nsSQLIdent(ns.Queue, q)
@@ -2084,21 +2084,21 @@ func TestStreamSnapshotVisibilityAcrossCommitOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 10)
+	first, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
 	if err != nil || len(first.Messages) != 1 || first.Messages[0].ID != "fast" {
 		t.Fatalf("first = %+v, %v", first, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, first.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, first.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := txA.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	second, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 10)
+	second, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
 	if err != nil || len(second.Messages) != 1 || second.Messages[0].ID != "slow" {
 		t.Fatalf("second = %+v, %v", second, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, second.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, second.ID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2107,35 +2107,35 @@ func TestStreamCooperativeConsumers(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-coop")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SubscribeStream(ctx, q, "group", ptrInt64(0)); err != nil {
+	if _, err := testStore.Queue(q).Subscribe(ctx, "group", ptrInt64(0)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{ID: "a1", Payload: []byte(`{"n":1}`)},
 		{ID: "a2", Payload: []byte(`{"n":2}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	m1, err := testStore.ReceiveStreamCoopBatch(ctx, q, "group", "m1", 10)
+	m1, err := testStore.Queue(q).ReceiveCoopBatch(ctx, "group", "m1", 10)
 	if err != nil || len(m1.Messages) != 2 {
 		t.Fatalf("m1 = %+v, %v", m1, err)
 	}
-	if again, err := testStore.ReceiveStreamCoopBatch(ctx, q, "group", "m1", 10); err != nil || again.ID != m1.ID {
+	if again, err := testStore.Queue(q).ReceiveCoopBatch(ctx, "group", "m1", 10); err != nil || again.ID != m1.ID {
 		t.Fatalf("cooperative replay = %+v, %v", again, err)
 	}
-	if _, err := testStore.ReceiveStreamBatch(ctx, q, "group", 10); !errors.Is(err, ErrStreamBatchActive) {
+	if _, err := testStore.Queue(q).ReceiveBatch(ctx, "group", 10); !errors.Is(err, ErrStreamBatchActive) {
 		t.Fatalf("normal receive bypassed cooperative batch: %v", err)
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{ID: "b1", Payload: []byte(`{"n":3}`)},
 		{ID: "b2", Payload: []byte(`{"n":4}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	m2, err := testStore.ReceiveStreamCoopBatch(ctx, q, "group", "m2", 10)
+	m2, err := testStore.Queue(q).ReceiveCoopBatch(ctx, "group", "m2", 10)
 	if err != nil || len(m2.Messages) != 2 {
 		t.Fatalf("m2 = %+v, %v", m2, err)
 	}
@@ -2143,16 +2143,16 @@ func TestStreamCooperativeConsumers(t *testing.T) {
 		t.Fatal("cooperative members received the same event")
 	}
 
-	if _, err := testStore.AckStreamBatch(ctx, q, m2.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, m2.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, m1.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, m1.ID); err != nil {
 		t.Fatal(err)
 	}
-	if normal, err := testStore.ReceiveStreamBatch(ctx, q, "group", 10); err != nil || len(normal.Messages) != 0 {
+	if normal, err := testStore.Queue(q).ReceiveBatch(ctx, "group", 10); err != nil || len(normal.Messages) != 0 {
 		t.Fatalf("normal receive after cooperative ack = %+v, %v", normal, err)
 	}
-	next, err := testStore.ReceiveStreamCoopBatch(ctx, q, "group", "m1", 10)
+	next, err := testStore.Queue(q).ReceiveCoopBatch(ctx, "group", "m1", 10)
 	if err != nil || len(next.Messages) != 0 {
 		t.Fatalf("after coop ack = %+v, %v", next, err)
 	}
@@ -2162,47 +2162,47 @@ func TestStreamNackRetryDLQAndReplay(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-dlq")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SetStreamConfig(ctx, q, 1, 0); err != nil {
+	if _, err := testStore.Queue(q).SetConfig(ctx, 1, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SubscribeStream(ctx, q, "worker", ptrInt64(0)); err != nil {
+	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{ID: "evt-1", Type: "t", Payload: []byte(`{"n":1}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	batch, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 10)
+	batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
 	if err != nil || len(batch.Messages) != 1 {
 		t.Fatalf("receive = %+v, %v", batch, err)
 	}
-	state, err := testStore.NackStreamMessage(ctx, q, batch.ID, "evt-1", time.Millisecond, "retry")
+	state, err := testStore.Queue(q).NackMessage(ctx, batch.ID, "evt-1", time.Millisecond, "retry")
 	if err != nil || state != "retryable" {
 		t.Fatalf("nack = %q, %v", state, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, batch.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(5 * time.Millisecond)
-	if moved, err := testStore.ProcessStreamRetries(ctx, q, 10); err != nil || moved != 1 {
+	if moved, err := testStore.queue(q).ProcessRetries(ctx, 10); err != nil || moved != 1 {
 		t.Fatalf("retry move = %d, %v", moved, err)
 	}
-	retried, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 10)
+	retried, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
 	if err != nil || len(retried.Messages) != 1 || retried.Messages[0].RetryCount != 1 {
 		t.Fatalf("retried = %+v, %v", retried, err)
 	}
-	state, err = testStore.NackStreamMessage(ctx, q, retried.ID, "evt-1", time.Millisecond, "dead")
+	state, err = testStore.Queue(q).NackMessage(ctx, retried.ID, "evt-1", time.Millisecond, "dead")
 	if err != nil || state != "dead_letter" {
 		t.Fatalf("dead nack = %q, %v", state, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, retried.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, retried.ID); err != nil {
 		t.Fatal(err)
 	}
-	dead, err := testStore.ListDeadLetters(ctx, q, 10)
+	dead, err := testStore.Queue(q).ListDeadLetters(ctx, 10)
 	if err != nil || len(dead) != 1 || dead[0].EventID != "evt-1" {
 		t.Fatalf("dead = %+v, %v", dead, err)
 	}
@@ -2215,13 +2215,13 @@ func TestStreamNackRetryDLQAndReplay(t *testing.T) {
 		VALUES (0,'evt-2','t','{}','{}',1,'direct')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.ReplayDeadLetter(ctx, q, dead[0].ID); err != nil {
+	if _, err := testStore.Queue(q).ReplayDeadLetter(ctx, dead[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := testStore.ReplayAllDeadLetters(ctx, q); err != nil || n != 1 {
+	if n, err := testStore.Queue(q).ReplayAllDeadLetters(ctx); err != nil || n != 1 {
 		t.Fatalf("replay all = %d, %v", n, err)
 	}
-	if dead, err = testStore.ListDeadLetters(ctx, q, 10); err != nil || len(dead) != 0 {
+	if dead, err = testStore.Queue(q).ListDeadLetters(ctx, 10); err != nil || len(dead) != 0 {
 		t.Fatalf("after replay = %+v, %v", dead, err)
 	}
 }
@@ -2230,25 +2230,25 @@ func TestStreamBatchCeiling(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-limit")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SubscribeStream(ctx, q, "worker", ptrInt64(0)); err != nil {
+	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{Payload: []byte(`{"n":1}`)}, {Payload: []byte(`{"n":2}`)}, {Payload: []byte(`{"n":3}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 2); !errors.Is(err, ErrStreamBatchTooLarge) {
+	if _, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 2); !errors.Is(err, ErrStreamBatchTooLarge) {
 		t.Fatalf("ceiling err = %v, want ErrStreamBatchTooLarge", err)
 	}
-	batch, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 10)
+	batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
 	if err != nil || len(batch.Messages) != 3 {
 		t.Fatalf("full receive = %+v, %v", batch, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, batch.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2257,13 +2257,13 @@ func TestStreamSegmentRotation(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-rotate")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SetStreamConfig(ctx, q, -1, 2*time.Millisecond); err != nil {
+	if _, err := testStore.Queue(q).SetConfig(ctx, -1, 2*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{Payload: []byte(`{"n":1}`)}, {Payload: []byte(`{"n":2}`)}, {Payload: []byte(`{"n":3}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -2271,25 +2271,25 @@ func TestStreamSegmentRotation(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		time.Sleep(5 * time.Millisecond)
-		if n, err := testStore.RotateStream(ctx, q); err != nil || n != 0 {
+		if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 0 {
 			t.Fatalf("rotation %d = %d, %v; want 0", i+1, n, err)
 		}
 	}
 	time.Sleep(5 * time.Millisecond)
-	if n, err := testStore.RotateStream(ctx, q); err != nil || n != 3 {
+	if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 3 {
 		t.Fatalf("truncating rotation = %d, %v; want 3", n, err)
 	}
-	info, err := testStore.StreamInfo(ctx, q)
+	info, err := testStore.Queue(q).Info(ctx)
 	if err != nil || info.Events != 0 {
 		t.Fatalf("info = %+v, %v", info, err)
 	}
 
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{Payload: []byte(`{"n":4}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if info, err = testStore.StreamInfo(ctx, q); err != nil || info.Events != 1 {
+	if info, err = testStore.Queue(q).Info(ctx); err != nil || info.Events != 1 {
 		t.Fatalf("post-reuse info = %+v, %v", info, err)
 	}
 }
@@ -2298,10 +2298,10 @@ func TestStreamStatAndSizeIncludeSegments(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-stat")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{Payload: []byte(`{"n":1}`)}, {Payload: []byte(`{"n":2}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -2330,16 +2330,16 @@ func TestStreamRotationPinsConsumer(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-rotate-pin")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SetStreamConfig(ctx, q, -1, 2*time.Millisecond); err != nil {
+	if _, err := testStore.Queue(q).SetConfig(ctx, -1, 2*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SubscribeStream(ctx, q, "worker", ptrInt64(0)); err != nil {
+	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{
 		{Payload: []byte(`{"n":1}`)}, {Payload: []byte(`{"n":2}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -2347,28 +2347,28 @@ func TestStreamRotationPinsConsumer(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		time.Sleep(5 * time.Millisecond)
-		if n, err := testStore.RotateStream(ctx, q); err != nil || n != 0 {
+		if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 0 {
 			t.Fatalf("empty rotation %d = %d, %v; want 0", i+1, n, err)
 		}
 	}
 	time.Sleep(5 * time.Millisecond)
-	if n, err := testStore.RotateStream(ctx, q); err != nil || n != 0 {
+	if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 0 {
 		t.Fatalf("pinned rotation = %d, %v; want 0", n, err)
 	}
-	info, err := testStore.StreamInfo(ctx, q)
+	info, err := testStore.Queue(q).Info(ctx)
 	if err != nil || info.Events != 2 {
 		t.Fatalf("pinned info = %+v, %v; want 2 events", info, err)
 	}
 
-	batch, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 10)
+	batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
 	if err != nil || len(batch.Messages) != 2 {
 		t.Fatalf("receive = %+v, %v", batch, err)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, batch.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(5 * time.Millisecond)
-	if n, err := testStore.RotateStream(ctx, q); err != nil || n != 2 {
+	if n, err := testStore.queue(q).Rotate(ctx); err != nil || n != 2 {
 		t.Fatalf("released rotation = %d, %v; want 2", n, err)
 	}
 }
@@ -2379,10 +2379,10 @@ func TestStreamEmptyReceiveDoesNotChurnTicks(t *testing.T) {
 	ctx := testCtx
 	q := unique("stream-idle-ticks")
 	t.Cleanup(func() { _, _ = testStore.DropNamespace(ctx, ns.Queue, q, true) })
-	if err := testStore.EnsureQueue(ctx, q, nil); err != nil {
+	if err := testStore.queue(q).Ensure(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SubscribeStream(ctx, q, "worker", ptrInt64(0)); err != nil {
+	if _, err := testStore.Queue(q).Subscribe(ctx, "worker", ptrInt64(0)); err != nil {
 		t.Fatal(err)
 	}
 	sc, err := nsSQLIdent(ns.Queue, q)
@@ -2401,7 +2401,7 @@ func TestStreamEmptyReceiveDoesNotChurnTicks(t *testing.T) {
 		t.Fatalf("initial ticks = %d, want 1", n)
 	}
 	for range 3 {
-		if batch, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 10); err != nil {
+		if batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10); err != nil {
 			t.Fatal(err)
 		} else if len(batch.Messages) != 0 {
 			t.Fatalf("empty receive = %+v", batch)
@@ -2410,17 +2410,17 @@ func TestStreamEmptyReceiveDoesNotChurnTicks(t *testing.T) {
 	if n := countTicks(); n != 1 {
 		t.Fatalf("ticks after empty polls = %d, want 1", n)
 	}
-	if _, err := testStore.AppendStreamMessages(ctx, q, []StreamMessageInput{{Payload: []byte(`{"n":1}`)}}); err != nil {
+	if _, err := testStore.Queue(q).AppendMessages(ctx, []StreamMessageInput{{Payload: []byte(`{"n":1}`)}}); err != nil {
 		t.Fatal(err)
 	}
-	batch, err := testStore.ReceiveStreamBatch(ctx, q, "worker", 10)
+	batch, err := testStore.Queue(q).ReceiveBatch(ctx, "worker", 10)
 	if err != nil || len(batch.Messages) != 1 {
 		t.Fatalf("receive = %+v, %v", batch, err)
 	}
 	if n := countTicks(); n != 2 {
 		t.Fatalf("ticks after event = %d, want 2", n)
 	}
-	if _, err := testStore.AckStreamBatch(ctx, q, batch.ID); err != nil {
+	if _, err := testStore.Queue(q).AckBatch(ctx, batch.ID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2436,7 +2436,7 @@ func BenchmarkCacheCommands(b *testing.B) {
 				name := unique("bench-cache")
 				b.Cleanup(func() { _, _ = testStore.DropNamespace(testCtx, ns.Cache, name, true) })
 				seed := func() {
-					if _, _, _, err := testStore.CacheSet(testCtx, name, "key", data, CacheSetOptions{}); err != nil {
+					if _, _, _, err := testStore.Cache(name).Set(testCtx, "key", data, CacheSetOptions{}); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -2453,17 +2453,17 @@ func BenchmarkCacheCommands(b *testing.B) {
 					var err error
 					switch op {
 					case "GET":
-						_, _, err = testStore.CacheGet(testCtx, name, "key")
+						_, _, err = testStore.Cache(name).Get(testCtx, "key")
 					case "SET":
-						_, _, _, err = testStore.CacheSet(testCtx, name, "key", data, CacheSetOptions{})
+						_, _, _, err = testStore.Cache(name).Set(testCtx, "key", data, CacheSetOptions{})
 					case "GETSET":
-						_, _, _, err = testStore.CacheGetSet(testCtx, name, "key", data, CacheSetOptions{})
+						_, _, _, err = testStore.Cache(name).GetSet(testCtx, "key", data, CacheSetOptions{})
 					case "APPEND":
-						_, err = testStore.CacheAppend(testCtx, name, "key", []byte("x"))
+						_, err = testStore.Cache(name).Append(testCtx, "key", []byte("x"))
 					case "SETRANGE":
-						_, err = testStore.CacheSetRange(testCtx, name, "key", 0, []byte("x"))
+						_, err = testStore.Cache(name).SetRange(testCtx, "key", 0, []byte("x"))
 					case "GETDEL":
-						_, _, err = testStore.CacheGetDel(testCtx, name, "key")
+						_, _, err = testStore.Cache(name).GetDel(testCtx, "key")
 					}
 					if err != nil {
 						b.Fatal(err)
@@ -2479,11 +2479,11 @@ func BenchmarkCacheIncrement(b *testing.B) {
 		b.Run(fmt.Sprintf("parallel=%t", parallel), func(b *testing.B) {
 			name := unique("bench-incr")
 			b.Cleanup(func() { _, _ = testStore.DropNamespace(testCtx, ns.Cache, name, true) })
-			if _, _, _, err := testStore.CacheSet(testCtx, name, "counter", []byte("0"), CacheSetOptions{}); err != nil {
+			if _, _, _, err := testStore.Cache(name).Set(testCtx, "counter", []byte("0"), CacheSetOptions{}); err != nil {
 				b.Fatal(err)
 			}
 			incr := func() {
-				if _, err := testStore.CacheIncrBy(testCtx, name, "counter", 1); err != nil {
+				if _, err := testStore.Cache(name).IncrBy(testCtx, "counter", 1); err != nil {
 					b.Error(err)
 				}
 			}

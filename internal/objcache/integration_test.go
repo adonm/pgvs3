@@ -494,7 +494,7 @@ func TestTierS3PrefixMetadataAndConditions(t *testing.T) {
 		t.Fatalf("conditional GET error = %v", err)
 	}
 
-	if _, err := f.tier.store.CacheDel(ctx, f.tier.namespace, []string{f.tier.key("bkt", "meta.txt")}); err != nil {
+	if _, err := f.tier.store.Cache(f.tier.namespace).Del(ctx, []string{f.tier.key("bkt", "meta.txt")}); err != nil {
 		t.Fatal(err)
 	}
 	head, err := f.tier.Head(ctx, "bkt", "meta.txt")
@@ -1663,10 +1663,10 @@ func TestParentHeadPublicationFencedByTombstone(t *testing.T) {
 	if err := f.tier.fenceReadCache(testCtx, ck); err != nil {
 		t.Fatal(err)
 	}
-	if err := testStore.RememberOriginMetadata(testCtx, f.tier.namespace, ck, info, time.Now(), time.Hour); err != nil {
+	if err := testStore.Cache(f.tier.namespace).RememberOriginMetadata(testCtx, ck, info, time.Now(), time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	got, err := testStore.OriginMetadata(testCtx, f.tier.namespace, ck, time.Hour)
+	got, err := testStore.Cache(f.tier.namespace).OriginMetadata(testCtx, ck, time.Hour)
 	if err != nil || got != nil {
 		t.Fatalf("late HEAD resurrected metadata: %+v %v", got, err)
 	}
@@ -1694,7 +1694,7 @@ func TestFillRenewalAndLostOwner(t *testing.T) {
 		t.Fatalf("fill ended early: %v", err)
 	case <-time.After(2500 * time.Millisecond):
 	}
-	if got, err := testStore.AcquireFillLease(testCtx, f.tier.namespace, ck, "competitor", time.Minute); err != nil || got {
+	if got, err := testStore.Cache(f.tier.namespace).AcquireFillLease(testCtx, ck, "competitor", time.Minute); err != nil || got {
 		t.Fatalf("renewed fill lost ownership: %t %v", got, err)
 	}
 
@@ -1713,7 +1713,7 @@ func TestFillRenewalAndLostOwner(t *testing.T) {
 	if _, err := testStore.Meta(testCtx, f.tier.cacheRef(ck)); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("stale body published: %v", err)
 	}
-	testStore.ReleaseFillLease(context.Background(), f.tier.namespace, ck, "replacement")
+	testStore.Cache(f.tier.namespace).ReleaseFillLease(context.Background(), ck, "replacement")
 }
 
 func TestFillRenewalCompletesAndReleases(t *testing.T) {

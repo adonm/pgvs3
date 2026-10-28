@@ -1335,3 +1335,78 @@ func TestPollUsesFakeTime(t *testing.T) {
 		}
 	})
 }
+
+type queueView struct {
+	f    *fakeStore
+	name string
+}
+
+func (v queueView) Stats(ctx context.Context) (store.QueueStats, error) {
+	return v.f.QueueStats(ctx, v.name)
+}
+
+func (v queueView) Info(ctx context.Context) (store.StreamInfo, error) {
+	return v.f.StreamInfo(ctx, v.name)
+}
+
+func (v queueView) AppendMessages(ctx context.Context, msgs []store.StreamMessageInput) ([]store.StreamMessage, error) {
+	return v.f.AppendStreamMessages(ctx, v.name, msgs)
+}
+
+func (v queueView) ReceiveBatch(ctx context.Context, consumer string, max int) (*store.StreamBatch, error) {
+	return v.f.ReceiveStreamBatch(ctx, v.name, consumer, max)
+}
+
+func (v queueView) ReceiveCoopBatch(ctx context.Context, consumer, member string, max int) (*store.StreamBatch, error) {
+	return v.f.ReceiveStreamCoopBatch(ctx, v.name, consumer, member, max)
+}
+
+func (v queueView) GetBatch(ctx context.Context, id int64) (*store.StreamBatch, error) {
+	return v.f.GetStreamBatch(ctx, v.name, id)
+}
+
+func (v queueView) AckBatch(ctx context.Context, id int64) (int64, error) {
+	return v.f.AckStreamBatch(ctx, v.name, id)
+}
+
+func (v queueView) NackMessage(ctx context.Context, batch int64, msg string, delay time.Duration, reason string) (string, error) {
+	return v.f.NackStreamMessage(ctx, v.name, batch, msg, delay, reason)
+}
+
+func (v queueView) ListConsumers(ctx context.Context) ([]store.StreamConsumerInfo, error) {
+	return v.f.ListStreamConsumers(ctx, v.name)
+}
+
+func (v queueView) Subscribe(ctx context.Context, consumer string, from *int64) (store.StreamSubscription, error) {
+	return v.f.SubscribeStream(ctx, v.name, consumer, from)
+}
+
+func (v queueView) Unsubscribe(ctx context.Context, consumer string) (bool, error) {
+	return v.f.UnsubscribeStream(ctx, v.name, consumer)
+}
+
+func (v queueView) Config(ctx context.Context) (store.StreamConfig, error) {
+	return v.f.StreamConfig(ctx, v.name)
+}
+
+func (v queueView) SetConfig(ctx context.Context, maxRetries int, retention time.Duration) (store.StreamConfig, error) {
+	return v.f.SetStreamConfig(ctx, v.name, maxRetries, retention)
+}
+
+func (v queueView) ListDeadLetters(ctx context.Context, limit int) ([]store.DeadLetter, error) {
+	return v.f.ListDeadLetters(ctx, v.name, limit)
+}
+
+func (v queueView) PurgeDeadLetters(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return v.f.PurgeDeadLetters(ctx, v.name, olderThan)
+}
+
+func (v queueView) ReplayAllDeadLetters(ctx context.Context) (int64, error) {
+	return v.f.ReplayAllDeadLetters(ctx, v.name)
+}
+
+func (v queueView) ReplayDeadLetter(ctx context.Context, id int64) (string, error) {
+	return v.f.ReplayDeadLetter(ctx, v.name, id)
+}
+
+func (f *fakeStore) Queue(name string) store.QueueHandle { return queueView{f: f, name: name} }

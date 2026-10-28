@@ -307,7 +307,7 @@ func (t *Tier) resolveCache(ctx context.Context, ck, key string, deleteStale, wi
 	}
 
 	if m == nil && t.rangeSize > 0 && t.ttl > 0 {
-		info, err := t.store.OriginMetadata(ctx, t.namespace, ck, t.ttl)
+		info, err := t.store.Cache(t.namespace).OriginMetadata(ctx, ck, t.ttl)
 		if err != nil {
 			return res, err
 		}
@@ -333,7 +333,7 @@ func (t *Tier) resolveCache(ctx context.Context, ck, key string, deleteStale, wi
 	}
 	res.attrs, res.info = a, a.objectInfo()
 	if m == nil && t.rangeSize > 0 && t.ttl > 0 && a.Size > fullCacheMax && !t.readOnly {
-		if err := t.store.RememberOriginMetadata(ctx, t.namespace, ck, res.info, validated, min(t.ttl, t.retention)); err != nil {
+		if err := t.store.Cache(t.namespace).RememberOriginMetadata(ctx, ck, res.info, validated, min(t.ttl, t.retention)); err != nil {
 			return res, err
 		}
 	}
@@ -645,7 +645,7 @@ func (t *Tier) rangeChunk(ctx context.Context, ck, key string, v readView, off i
 		rc, err := t.origin.GetRange(fillCtx, ck, off, length, version)
 		if err != nil {
 			if errors.Is(err, errOriginPrecondition) {
-				_ = t.store.ForgetOriginMetadata(fillCtx, t.namespace, ck, version)
+				_ = t.store.Cache(t.namespace).ForgetOriginMetadata(fillCtx, ck, version)
 				return nil, store.ErrStaleCache
 			}
 			if t.origin.IsObjNotFoundErr(err) {
@@ -689,7 +689,7 @@ func (t *Tier) rangeChunk(ctx context.Context, ck, key string, v readView, off i
 }
 
 func (t *Tier) lookupCached(ctx context.Context, ck string, withInline bool) (*store.Meta, store.ObjectRef, error) {
-	m, ref, err := t.store.CacheMetadata(ctx, t.namespace, ck, withInline)
+	m, ref, err := t.store.Cache(t.namespace).Metadata(ctx, ck, withInline)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, store.ObjectRef{}, nil
 	}
@@ -922,14 +922,14 @@ func (t *Tier) acquireFill(ctx context.Context, ck string, wait time.Duration) (
 			return nil, m, err
 		}
 		owner := t.workerID + "-" + randomID()
-		acquired, err := t.store.AcquireFillLease(ctx, t.namespace, ck, owner, t.leaseTTL())
+		acquired, err := t.store.Cache(t.namespace).AcquireFillLease(ctx, ck, owner, t.leaseTTL())
 		if err != nil {
 			return nil, nil, err
 		}
 		if acquired {
 
 			if m, err := probe(); err != nil || m != nil {
-				t.store.ReleaseFillLease(context.WithoutCancel(ctx), t.namespace, ck, owner)
+				t.store.Cache(t.namespace).ReleaseFillLease(context.WithoutCancel(ctx), ck, owner)
 				return nil, m, err
 			}
 			return &store.FillLease{Namespace: t.namespace, Key: ck, Owner: owner}, nil, nil
@@ -979,7 +979,7 @@ func (t *Tier) renewFill(ctx context.Context, lease store.FillLease) (context.Co
 		<-done
 		releaseCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer stop()
-		t.store.ReleaseFillLease(releaseCtx, lease.Namespace, lease.Key, lease.Owner)
+		t.store.Cache(lease.Namespace).ReleaseFillLease(releaseCtx, lease.Key, lease.Owner)
 	}
 }
 
@@ -1343,7 +1343,7 @@ func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body i
 	m, cacheErr := t.storeSpooled(ctx, t.writeRef(ck), sp, writeOpts)
 
 	_ = t.fenceReadCache(ctx, ck)
-	_ = t.store.ClearPendingUploads(context.WithoutCancel(ctx), t.namespace, ck)
+	_ = t.store.Cache(t.namespace).ClearPendingUploads(context.WithoutCancel(ctx), ck)
 	if cacheErr != nil {
 		t.log.Warn("populating durable origin write cache", "bucket", bucket, "key", key, "err", cacheErr)
 		return nil, fmt.Errorf("populate durable origin write cache: %w", cacheErr)
@@ -1507,7 +1507,7 @@ func (t *Tier) Delete(ctx context.Context, bucket, key string) error {
 	if err := t.fenceReadCache(ctx, ck); err != nil {
 		return err
 	}
-	_ = t.store.ClearPendingUploads(cleanupCtx, t.namespace, ck)
+	_ = t.store.Cache(t.namespace).ClearPendingUploads(cleanupCtx, ck)
 	return nil
 }
 
@@ -1552,7 +1552,7 @@ func (t *Tier) flushOneNoLock(ctx context.Context, p store.PendingUpload, owner 
 	sm, body, err := t.store.GetBody(ctx, t.writeRef(p.Key), store.WholeObjectRange(), nil)
 	if errors.Is(err, store.ErrNotFound) {
 		err = fmt.Errorf("durable pending body missing for %s: %w", p.Key, err)
-		_ = t.store.FailPendingUploadPermanent(context.WithoutCancel(ctx), t.namespace, p.Key, p.Token, owner, p.Attempts, err)
+		_ = t.store.Cache(t.namespace).FailPendingUploadPermanent(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
 		return "", err
 	}
 	if err != nil {
@@ -1560,13 +1560,13 @@ func (t *Tier) flushOneNoLock(ctx context.Context, p store.PendingUpload, owner 
 	}
 	if sm.OriginETag != p.Token {
 		_ = body.Close()
-		_ = t.store.ClearPendingUploadToken(context.WithoutCancel(ctx), t.namespace, p.Key, p.Token)
+		_ = t.store.Cache(t.namespace).ClearPendingUploadToken(context.WithoutCancel(ctx), p.Key, p.Token)
 		return "", nil
 	}
 	sp, cleanup, err := spoolStream(ctx, body, sm.Size)
 	_ = body.Close()
 	if err != nil {
-		_ = t.store.FailPendingUpload(context.WithoutCancel(ctx), t.namespace, p.Key, p.Token, owner, p.Attempts, err)
+		_ = t.store.Cache(t.namespace).FailPendingUpload(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
 		return "", err
 	}
 	defer cleanup()
@@ -1584,23 +1584,24 @@ func (t *Tier) flushOneNoLock(ctx context.Context, p store.PendingUpload, owner 
 		Precondition:    store.Precondition{Mode: condition, ETag: p.BaseETag},
 	})
 	if errors.Is(err, errOriginPrecondition) {
-		_ = t.store.AbandonPendingUpload(context.WithoutCancel(ctx), t.namespace, p.Key, p.Token)
+		_ = t.store.Cache(t.namespace).AbandonPendingUpload(context.WithoutCancel(ctx), p.Key, p.Token)
 
 		_, _ = t.store.Delete(context.WithoutCancel(ctx), t.cacheRef(p.Key))
 		return "", store.ErrPrecondition
 	}
 	if err != nil {
-		fail := t.store.FailPendingUpload
+		cache := t.store.Cache(t.namespace)
+		fail := cache.FailPendingUpload
 		if errors.Is(err, ErrOriginUnsupported) {
-			fail = t.store.FailPendingUploadPermanent
+			fail = cache.FailPendingUploadPermanent
 		}
-		_ = fail(context.WithoutCancel(ctx), t.namespace, p.Key, p.Token, owner, p.Attempts, err)
+		_ = fail(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
 		return "", err
 	}
 	expiresAt := time.Now().Add(t.durableRetention())
-	owned, err := t.store.MarkOriginCommitted(ctx, t.namespace, p.Key, p.Token, versionFor(attrs), attrs.LastModified, &expiresAt)
+	owned, err := t.store.Cache(t.namespace).MarkOriginCommitted(ctx, p.Key, p.Token, versionFor(attrs), attrs.LastModified, &expiresAt)
 	if err != nil {
-		_ = t.store.FailPendingUpload(context.WithoutCancel(ctx), t.namespace, p.Key, p.Token, owner, p.Attempts, err)
+		_ = t.store.Cache(t.namespace).FailPendingUpload(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
 		return "", err
 	}
 	if !owned {
@@ -1624,7 +1625,7 @@ func (t *Tier) runPendingWorker(ctx context.Context, owner string) {
 		if !acquireProcess(processPending, ctx) {
 			return
 		}
-		pending, err := t.store.ClaimPendingUploads(ctx, t.namespace, owner, 1, 5*time.Minute)
+		pending, err := t.store.Cache(t.namespace).ClaimPendingUploads(ctx, owner, 1, 5*time.Minute)
 		if err != nil || len(pending) == 0 {
 			<-processPending
 			if err != nil && ctx.Err() == nil {

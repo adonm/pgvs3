@@ -245,7 +245,7 @@ func (s *Server) sendStream(r *http.Request, requests []streamSendRequest, batch
 		inputs[i] = in
 	}
 	queue := r.PathValue("queue")
-	messages, err := s.st.AppendStreamMessages(r.Context(), queue, inputs)
+	messages, err := s.st.Queue(queue).AppendMessages(r.Context(), inputs)
 	if err != nil {
 		return nil, err
 	}
@@ -293,16 +293,16 @@ func (s *Server) receiveStreamOnce(ctx context.Context, queue string, req stream
 	}
 	defer release()
 	if req.Member != "" {
-		return s.st.ReceiveStreamCoopBatch(ctx, queue, req.Consumer, req.Member, req.Max)
+		return s.st.Queue(queue).ReceiveCoopBatch(ctx, req.Consumer, req.Member, req.Max)
 	}
-	return s.st.ReceiveStreamBatch(ctx, queue, req.Consumer, req.Max)
+	return s.st.Queue(queue).ReceiveBatch(ctx, req.Consumer, req.Max)
 }
 
 func (s *Server) handleStreamAck(r *http.Request, req streamAckRequest) (any, error) {
 	if !ns.ValidName(req.Queue) || req.BatchID <= 0 {
 		return nil, badRequest("valid queue and batch_id are required")
 	}
-	tick, err := s.st.AckStreamBatch(r.Context(), req.Queue, req.BatchID)
+	tick, err := s.st.Queue(req.Queue).AckBatch(r.Context(), req.BatchID)
 	return map[string]any{"batch_id": req.BatchID, "acknowledged": true, "tick": tick}, err
 }
 
@@ -313,13 +313,13 @@ func (s *Server) handleStreamNack(r *http.Request, req streamNackRequest) (any, 
 	if req.RetryAfterMS < 0 {
 		return nil, badRequest("retry_after_ms must be non-negative")
 	}
-	state, err := s.st.NackStreamMessage(r.Context(), req.Queue, req.BatchID, req.MessageID,
+	state, err := s.st.Queue(req.Queue).NackMessage(r.Context(), req.BatchID, req.MessageID,
 		time.Duration(req.RetryAfterMS)*time.Millisecond, req.Reason)
 	return map[string]any{"batch_id": req.BatchID, "message_id": req.MessageID, "state": state}, err
 }
 
 func (s *Server) handleStreamConsumers(_ http.ResponseWriter, r *http.Request) (any, error) {
-	consumers, err := s.st.ListStreamConsumers(r.Context(), r.PathValue("queue"))
+	consumers, err := s.st.Queue(r.PathValue("queue")).ListConsumers(r.Context())
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +334,7 @@ func (s *Server) handleStreamSubscribe(r *http.Request, req streamSubscriptionRe
 	if strings.TrimSpace(req.Consumer) == "" {
 		return nil, badRequest("'consumer' is required")
 	}
-	sub, err := s.st.SubscribeStream(r.Context(), r.PathValue("queue"), req.Consumer, req.FromTick)
+	sub, err := s.st.Queue(r.PathValue("queue")).Subscribe(r.Context(), req.Consumer, req.FromTick)
 	return reply{status: http.StatusCreated, body: map[string]any{"consumer": sub.Consumer, "last_tick": sub.LastTick,
 		"created_at": timeString(sub.CreatedAt), "updated_at": timeString(sub.UpdatedAt)}}, err
 }
@@ -344,7 +344,7 @@ func (s *Server) handleStreamUnsubscribe(_ http.ResponseWriter, r *http.Request)
 	if err != nil || strings.Contains(consumer, "/") {
 		return nil, badRequest("invalid consumer")
 	}
-	ok, err := s.st.UnsubscribeStream(r.Context(), r.PathValue("queue"), consumer)
+	ok, err := s.st.Queue(r.PathValue("queue")).Unsubscribe(r.Context(), consumer)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +367,7 @@ func (s *Server) handleStreamBatch(_ http.ResponseWriter, r *http.Request) (any,
 	if e != nil {
 		return nil, e
 	}
-	batch, err := s.st.GetStreamBatch(r.Context(), r.PathValue("queue"), id)
+	batch, err := s.st.Queue(r.PathValue("queue")).GetBatch(r.Context(), id)
 	if err != nil {
 		return nil, err
 	}
@@ -375,7 +375,7 @@ func (s *Server) handleStreamBatch(_ http.ResponseWriter, r *http.Request) (any,
 }
 
 func (s *Server) handleStreamInfo(_ http.ResponseWriter, r *http.Request) (any, error) {
-	info, err := s.st.StreamInfo(r.Context(), r.PathValue("queue"))
+	info, err := s.st.Queue(r.PathValue("queue")).Info(r.Context())
 	if err != nil {
 		return nil, err
 	}
@@ -392,7 +392,7 @@ func streamConfigBody(cfg store.StreamConfig) any {
 }
 
 func (s *Server) handleStreamConfig(_ http.ResponseWriter, r *http.Request) (any, error) {
-	cfg, err := s.st.StreamConfig(r.Context(), r.PathValue("queue"))
+	cfg, err := s.st.Queue(r.PathValue("queue")).Config(r.Context())
 	return streamConfigBody(cfg), err
 }
 
@@ -412,7 +412,7 @@ func (s *Server) handleStreamConfigUpdate(r *http.Request, req streamConfigReque
 		}
 		retention = d
 	}
-	cfg, err := s.st.SetStreamConfig(r.Context(), r.PathValue("queue"), maxRetries, retention)
+	cfg, err := s.st.Queue(r.PathValue("queue")).SetConfig(r.Context(), maxRetries, retention)
 	return streamConfigBody(cfg), err
 }
 
@@ -421,7 +421,7 @@ func (s *Server) handleStreamDLQ(_ http.ResponseWriter, r *http.Request) (any, e
 	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
 		limit = min(n, 1000)
 	}
-	rows, err := s.st.ListDeadLetters(r.Context(), r.PathValue("queue"), limit)
+	rows, err := s.st.Queue(r.PathValue("queue")).ListDeadLetters(r.Context(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -442,12 +442,12 @@ func (s *Server) handleStreamDLQPurge(_ http.ResponseWriter, r *http.Request) (a
 		}
 		olderThan = d
 	}
-	n, err := s.st.PurgeDeadLetters(r.Context(), r.PathValue("queue"), olderThan)
+	n, err := s.st.Queue(r.PathValue("queue")).PurgeDeadLetters(r.Context(), olderThan)
 	return map[string]any{"purged": n}, err
 }
 
 func (s *Server) handleStreamDLQReplayAll(_ http.ResponseWriter, r *http.Request) (any, error) {
-	n, err := s.st.ReplayAllDeadLetters(r.Context(), r.PathValue("queue"))
+	n, err := s.st.Queue(r.PathValue("queue")).ReplayAllDeadLetters(r.Context())
 	return map[string]any{"replayed": n}, err
 }
 
@@ -456,6 +456,6 @@ func (s *Server) handleStreamDLQReplay(_ http.ResponseWriter, r *http.Request) (
 	if e != nil {
 		return nil, e
 	}
-	idStr, err := s.st.ReplayDeadLetter(r.Context(), r.PathValue("queue"), id)
+	idStr, err := s.st.Queue(r.PathValue("queue")).ReplayDeadLetter(r.Context(), id)
 	return map[string]any{"replayed": true, "message_id": idStr}, err
 }

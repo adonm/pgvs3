@@ -113,19 +113,19 @@ func streamEventPartition(sc string, segment int16) string {
 	return sc + ".stream_events_" + strconv.Itoa(int(segment))
 }
 
-func (s *Store) AppendStreamMessages(ctx context.Context, queue string, inputs []StreamMessageInput) ([]StreamMessage, error) {
+func (q Queue) AppendMessages(ctx context.Context, inputs []StreamMessageInput) ([]StreamMessage, error) {
 	if len(inputs) == 0 {
 		return nil, nil
 	}
-	return withAutoCreate(ctx, s, ns.Queue, queue, func(sc string) ([]StreamMessage, error) {
+	return withAutoCreate(ctx, q.s, ns.Queue, q.name, func(sc string) ([]StreamMessage, error) {
 		var add int64
 		for _, in := range inputs {
 			add += int64(len(in.Payload) + len(in.Headers))
 		}
-		if s.checkQuota(ctx, ns.Queue, queue, add) {
+		if q.s.checkQuota(ctx, ns.Queue, q.name, add) {
 			return nil, ErrQuotaExceeded
 		}
-		return withTx(ctx, s, func(tx pgx.Tx) ([]StreamMessage, error) {
+		return withTx(ctx, q.s, func(tx pgx.Tx) ([]StreamMessage, error) {
 			segment, err := streamCurrentSegment(ctx, tx, sc)
 			if err != nil {
 				return nil, err
@@ -169,12 +169,12 @@ func (s *Store) AppendStreamMessages(ctx context.Context, queue string, inputs [
 	})
 }
 
-func (s *Store) SubscribeStream(ctx context.Context, queue, consumer string, fromTick *int64) (StreamSubscription, error) {
+func (q Queue) Subscribe(ctx context.Context, consumer string, fromTick *int64) (StreamSubscription, error) {
 	if err := validateConsumer(consumer); err != nil {
 		return StreamSubscription{}, err
 	}
-	return withAutoCreate(ctx, s, ns.Queue, queue, func(sc string) (StreamSubscription, error) {
-		return withTx(ctx, s, func(tx pgx.Tx) (StreamSubscription, error) {
+	return withAutoCreate(ctx, q.s, ns.Queue, q.name, func(sc string) (StreamSubscription, error) {
+		return withTx(ctx, q.s, func(tx pgx.Tx) (StreamSubscription, error) {
 			if _, err := streamCurrentSegment(ctx, tx, sc); err != nil {
 				return StreamSubscription{}, err
 			}
@@ -247,13 +247,12 @@ func createStreamTick(ctx context.Context, tx pgx.Tx, sc string) (int64, error) 
 	return tick, err
 }
 
-func (s *Store) UnsubscribeStream(ctx context.Context, queue, consumer string) (bool, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return false, err
+func (q Queue) Unsubscribe(ctx context.Context, consumer string) (bool, error) {
+	if q.err != nil {
+		return false, q.err
 	}
 	var one int
-	err = s.pool.QueryRow(ctx, `DELETE FROM `+sc+`.stream_subscriptions
+	err := q.s.pool.QueryRow(ctx, `DELETE FROM `+q.sc+`.stream_subscriptions
 		WHERE consumer=$1 RETURNING 1`, consumer).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return false, nil
@@ -261,21 +260,21 @@ func (s *Store) UnsubscribeStream(ctx context.Context, queue, consumer string) (
 	return err == nil, err
 }
 
-func (s *Store) ReceiveStreamBatch(ctx context.Context, queue, consumer string, max int) (*StreamBatch, error) {
-	return s.receiveStreamBatch(ctx, queue, consumer, "", max)
+func (q Queue) ReceiveBatch(ctx context.Context, consumer string, max int) (*StreamBatch, error) {
+	return q.receiveBatch(ctx, consumer, "", max)
 }
 
-func (s *Store) ReceiveStreamCoopBatch(ctx context.Context, queue, consumer, member string, limit int) (*StreamBatch, error) {
+func (q Queue) ReceiveCoopBatch(ctx context.Context, consumer, member string, limit int) (*StreamBatch, error) {
 	if err := validateConsumer(consumer); err != nil {
 		return nil, err
 	}
 	if member == "" || len(member) > 128 {
 		return nil, fmt.Errorf("stream member must be 1..128 bytes")
 	}
-	return s.receiveStreamBatch(ctx, queue, consumer, member, limit)
+	return q.receiveBatch(ctx, consumer, member, limit)
 }
 
-func (s *Store) receiveStreamBatch(ctx context.Context, queue, consumer, member string, limit int) (*StreamBatch, error) {
+func (q Queue) receiveBatch(ctx context.Context, consumer, member string, limit int) (*StreamBatch, error) {
 	if err := validateConsumer(consumer); err != nil {
 		return nil, err
 	}
@@ -285,8 +284,8 @@ func (s *Store) receiveStreamBatch(ctx context.Context, queue, consumer, member 
 	if limit > 100000 {
 		limit = 100000
 	}
-	return withAutoCreate(ctx, s, ns.Queue, queue, func(sc string) (*StreamBatch, error) {
-		return withTx(ctx, s, func(tx pgx.Tx) (*StreamBatch, error) {
+	return withAutoCreate(ctx, q.s, ns.Queue, q.name, func(sc string) (*StreamBatch, error) {
+		return withTx(ctx, q.s, func(tx pgx.Tx) (*StreamBatch, error) {
 			if _, err := streamCurrentSegment(ctx, tx, sc); err != nil {
 				return nil, err
 			}
@@ -485,15 +484,14 @@ func collectStreamMessages(rows pgx.Rows, capacity int) ([]StreamMessage, []int6
 	return messages, seqs, rows.Err()
 }
 
-func (s *Store) GetStreamBatch(ctx context.Context, queue string, batchID int64) (*StreamBatch, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return nil, err
+func (q Queue) GetBatch(ctx context.Context, batchID int64) (*StreamBatch, error) {
+	if q.err != nil {
+		return nil, q.err
 	}
-	return withTx(ctx, s, func(tx pgx.Tx) (*StreamBatch, error) {
+	return withTx(ctx, q.s, func(tx pgx.Tx) (*StreamBatch, error) {
 		var batch StreamBatch
 		err := tx.QueryRow(ctx, `SELECT batch_id, consumer, member, start_tick, end_tick, created_at
-		FROM `+sc+`.stream_batches WHERE batch_id=$1`, batchID).
+		FROM `+q.sc+`.stream_batches WHERE batch_id=$1`, batchID).
 			Scan(&batch.ID, &batch.Consumer, &batch.Member, &batch.StartTick, &batch.EndTick, &batch.CreatedAt)
 		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 			return nil, ErrStreamBatchNotFound
@@ -501,7 +499,7 @@ func (s *Store) GetStreamBatch(ctx context.Context, queue string, batchID int64)
 		if err != nil {
 			return nil, err
 		}
-		messages, _, err := selectStreamBatchEvents(ctx, tx, sc, batchID)
+		messages, _, err := selectStreamBatchEvents(ctx, tx, q.sc, batchID)
 		if err != nil {
 			return nil, err
 		}
@@ -510,18 +508,17 @@ func (s *Store) GetStreamBatch(ctx context.Context, queue string, batchID int64)
 	})
 }
 
-func (s *Store) AckStreamBatch(ctx context.Context, queue string, batchID int64) (int64, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return 0, err
+func (q Queue) AckBatch(ctx context.Context, batchID int64) (int64, error) {
+	if q.err != nil {
+		return 0, q.err
 	}
-	return withTx(ctx, s, func(tx pgx.Tx) (int64, error) {
+	return withTx(ctx, q.s, func(tx pgx.Tx) (int64, error) {
 		var (
 			consumer string
 			endTick  int64
 			acked    pgtype.Timestamptz
 		)
-		err := tx.QueryRow(ctx, `SELECT consumer, end_tick, acked_at FROM `+sc+`.stream_batches
+		err := tx.QueryRow(ctx, `SELECT consumer, end_tick, acked_at FROM `+q.sc+`.stream_batches
 		WHERE batch_id=$1 FOR UPDATE`, batchID).Scan(&consumer, &endTick, &acked)
 		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 			return 0, ErrStreamBatchNotFound
@@ -532,7 +529,7 @@ func (s *Store) AckStreamBatch(ctx context.Context, queue string, batchID int64)
 		if acked.Valid {
 			return 0, ErrStreamBatchNotFound
 		}
-		if _, err := tx.Exec(ctx, `UPDATE `+sc+`.stream_batches
+		if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_batches
 		SET acked_at=now() WHERE batch_id=$1`, batchID); err != nil {
 			return 0, err
 		}
@@ -543,9 +540,9 @@ func (s *Store) AckStreamBatch(ctx context.Context, queue string, batchID int64)
 				nextEnd int64
 			)
 			err := tx.QueryRow(ctx, `SELECT b.batch_id, b.end_tick
-			FROM `+sc+`.stream_batches b
+			FROM `+q.sc+`.stream_batches b
 			WHERE b.consumer=$1 AND b.acked_at IS NOT NULL
-			  AND b.start_tick=(SELECT last_tick FROM `+sc+`.stream_subscriptions
+			  AND b.start_tick=(SELECT last_tick FROM `+q.sc+`.stream_subscriptions
 			                    WHERE consumer=$1)
 			ORDER BY b.start_tick LIMIT 1`, consumer).Scan(&nextID, &nextEnd)
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -554,12 +551,12 @@ func (s *Store) AckStreamBatch(ctx context.Context, queue string, batchID int64)
 			if err != nil {
 				return 0, err
 			}
-			if _, err := tx.Exec(ctx, `UPDATE `+sc+`.stream_subscriptions
+			if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_subscriptions
 			SET last_tick=$2, next_tick=GREATEST(next_tick,$2), updated_at=now()
 			WHERE consumer=$1`, consumer, nextEnd); err != nil {
 				return 0, err
 			}
-			if _, err := tx.Exec(ctx, `DELETE FROM `+sc+`.stream_batches
+			if _, err := tx.Exec(ctx, `DELETE FROM `+q.sc+`.stream_batches
 			WHERE batch_id=$1`, nextID); err != nil {
 				return 0, err
 			}
@@ -568,17 +565,16 @@ func (s *Store) AckStreamBatch(ctx context.Context, queue string, batchID int64)
 	})
 }
 
-func (s *Store) NackStreamMessage(ctx context.Context, queue string, batchID int64, eventID string, retryAfter time.Duration, reason string) (string, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return "", err
+func (q Queue) NackMessage(ctx context.Context, batchID int64, eventID string, retryAfter time.Duration, reason string) (string, error) {
+	if q.err != nil {
+		return "", q.err
 	}
 	if retryAfter <= 0 {
 		retryAfter = 60 * time.Second
 	}
-	return withTx(ctx, s, func(tx pgx.Tx) (string, error) {
+	return withTx(ctx, q.s, func(tx pgx.Tx) (string, error) {
 		var consumer string
-		err := tx.QueryRow(ctx, `SELECT consumer FROM `+sc+`.stream_batches
+		err := tx.QueryRow(ctx, `SELECT consumer FROM `+q.sc+`.stream_batches
 		WHERE batch_id=$1 AND acked_at IS NULL FOR UPDATE`, batchID).Scan(&consumer)
 		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 			return "", ErrStreamBatchNotFound
@@ -593,8 +589,8 @@ func (s *Store) NackStreamMessage(ctx context.Context, queue string, batchID int
 			retry   int
 		)
 		err = tx.QueryRow(ctx, `SELECT e.type, e.payload, e.headers, e.retry_count
-		FROM `+sc+`.stream_batch_events be
-		JOIN `+sc+`.stream_events e ON e.seq = be.seq
+		FROM `+q.sc+`.stream_batch_events be
+		JOIN `+q.sc+`.stream_events e ON e.seq = be.seq
 		WHERE be.batch_id=$1 AND e.event_id=$2`, batchID, eventID).
 			Scan(&typ, &payload, &headers, &retry)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -604,7 +600,7 @@ func (s *Store) NackStreamMessage(ctx context.Context, queue string, batchID int
 			return "", err
 		}
 		var maxRetries int
-		err = tx.QueryRow(ctx, `SELECT max_retries FROM `+sc+`.stream_config`).Scan(&maxRetries)
+		err = tx.QueryRow(ctx, `SELECT max_retries FROM `+q.sc+`.stream_config`).Scan(&maxRetries)
 		if errors.Is(err, pgx.ErrNoRows) {
 			maxRetries = 5
 		} else if err != nil {
@@ -612,7 +608,7 @@ func (s *Store) NackStreamMessage(ctx context.Context, queue string, batchID int
 		}
 		next := retry + 1
 		if next > maxRetries {
-			_, err = tx.Exec(ctx, `INSERT INTO `+sc+`.stream_dead_letters
+			_, err = tx.Exec(ctx, `INSERT INTO `+q.sc+`.stream_dead_letters
 			(batch_id, event_id, type, payload, headers, retry_count, reason)
 			VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7)
 			ON CONFLICT (batch_id, event_id) DO NOTHING`,
@@ -622,7 +618,7 @@ func (s *Store) NackStreamMessage(ctx context.Context, queue string, batchID int
 			}
 			return "dead_letter", nil
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO `+sc+`.stream_retry_events
+		_, err = tx.Exec(ctx, `INSERT INTO `+q.sc+`.stream_retry_events
 		(batch_id, event_id, type, payload, headers, retry_count, due_at)
 		VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6, now() + make_interval(secs => $7))
 		ON CONFLICT (batch_id, event_id) DO NOTHING`,
@@ -634,20 +630,19 @@ func (s *Store) NackStreamMessage(ctx context.Context, queue string, batchID int
 	})
 }
 
-func (s *Store) ProcessStreamRetries(ctx context.Context, queue string, max int) (int64, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return 0, err
+func (q Queue) ProcessRetries(ctx context.Context, max int) (int64, error) {
+	if q.err != nil {
+		return 0, q.err
 	}
 	if max <= 0 {
 		max = ExpireBatch
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := q.s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	segment, err := streamCurrentSegment(ctx, tx, sc)
+	segment, err := streamCurrentSegment(ctx, tx, q.sc)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return 0, nil
 	}
@@ -656,12 +651,12 @@ func (s *Store) ProcessStreamRetries(ctx context.Context, queue string, max int)
 	}
 	var moved int64
 	err = tx.QueryRow(ctx, `WITH due AS (
-			DELETE FROM `+sc+`.stream_retry_events WHERE retry_id IN (
-				SELECT retry_id FROM `+sc+`.stream_retry_events
+			DELETE FROM `+q.sc+`.stream_retry_events WHERE retry_id IN (
+				SELECT retry_id FROM `+q.sc+`.stream_retry_events
 				WHERE due_at <= now() ORDER BY due_at LIMIT $1
 			) RETURNING event_id, type, payload, headers, retry_count
 		), inserted AS (
-			INSERT INTO `+sc+`.stream_events
+			INSERT INTO `+q.sc+`.stream_events
 				(segment, event_id, type, payload, headers, retry_count)
 			SELECT $2, event_id, type, payload, headers, retry_count FROM due
 			RETURNING 1
@@ -676,15 +671,14 @@ func (s *Store) ProcessStreamRetries(ctx context.Context, queue string, max int)
 	return moved, nil
 }
 
-func (s *Store) StreamConfig(ctx context.Context, queue string) (StreamConfig, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return StreamConfig{}, err
+func (q Queue) Config(ctx context.Context) (StreamConfig, error) {
+	if q.err != nil {
+		return StreamConfig{}, q.err
 	}
 	var cfg StreamConfig
 	var retention pgtype.Interval
-	err = s.pool.QueryRow(ctx, `SELECT max_retries, retention
-		FROM `+sc+`.stream_config`).Scan(&cfg.MaxRetries, &retention)
+	err := q.s.pool.QueryRow(ctx, `SELECT max_retries, retention
+		FROM `+q.sc+`.stream_config`).Scan(&cfg.MaxRetries, &retention)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return StreamConfig{}, ErrQueueNotFound
 	}
@@ -702,17 +696,16 @@ func intervalDuration(v pgtype.Interval) time.Duration {
 	return time.Duration(v.Microseconds) * time.Microsecond
 }
 
-func (s *Store) SetStreamConfig(ctx context.Context, queue string, maxRetries int, retention time.Duration) (StreamConfig, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return StreamConfig{}, err
+func (q Queue) SetConfig(ctx context.Context, maxRetries int, retention time.Duration) (StreamConfig, error) {
+	if q.err != nil {
+		return StreamConfig{}, q.err
 	}
 	if maxRetries < 0 && retention <= 0 {
-		return s.StreamConfig(ctx, queue)
+		return q.Config(ctx)
 	}
 	var cfg StreamConfig
 	var outRetention pgtype.Interval
-	err = s.pool.QueryRow(ctx, `UPDATE `+sc+`.stream_config
+	err := q.s.pool.QueryRow(ctx, `UPDATE `+q.sc+`.stream_config
 		SET max_retries = CASE WHEN $1::int4 >= 0 THEN $1 ELSE max_retries END,
 		    retention = CASE WHEN $2::float8 > 0
 		                     THEN make_interval(secs => $2) ELSE retention END
@@ -728,26 +721,25 @@ func (s *Store) SetStreamConfig(ctx context.Context, queue string, maxRetries in
 	return cfg, nil
 }
 
-func (s *Store) StreamInfo(ctx context.Context, queue string) (StreamInfo, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return StreamInfo{}, err
+func (q Queue) Info(ctx context.Context) (StreamInfo, error) {
+	if q.err != nil {
+		return StreamInfo{}, q.err
 	}
 	var info StreamInfo
 	var oldest pgtype.Timestamptz
 	var retention pgtype.Interval
-	err = s.pool.QueryRow(ctx, `SELECT
-		(SELECT count(*) FROM `+sc+`.stream_events),
-		(SELECT count(*) FROM `+sc+`.stream_subscriptions),
-		(SELECT count(*) FROM `+sc+`.stream_batches WHERE acked_at IS NULL),
-		(SELECT count(*) FROM `+sc+`.stream_retry_events),
-		(SELECT count(*) FROM `+sc+`.stream_dead_letters),
-		(SELECT min(created_at) FROM `+sc+`.stream_events),
-		(SELECT coalesce(max(tick_id),0) FROM `+sc+`.stream_ticks),
-		(SELECT max_retries FROM `+sc+`.stream_config),
-		(SELECT retention FROM `+sc+`.stream_config),
-		(SELECT current_segment FROM `+sc+`.stream_config),
-		(SELECT segment_started_at FROM `+sc+`.stream_config)`).
+	err := q.s.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM `+q.sc+`.stream_events),
+		(SELECT count(*) FROM `+q.sc+`.stream_subscriptions),
+		(SELECT count(*) FROM `+q.sc+`.stream_batches WHERE acked_at IS NULL),
+		(SELECT count(*) FROM `+q.sc+`.stream_retry_events),
+		(SELECT count(*) FROM `+q.sc+`.stream_dead_letters),
+		(SELECT min(created_at) FROM `+q.sc+`.stream_events),
+		(SELECT coalesce(max(tick_id),0) FROM `+q.sc+`.stream_ticks),
+		(SELECT max_retries FROM `+q.sc+`.stream_config),
+		(SELECT retention FROM `+q.sc+`.stream_config),
+		(SELECT current_segment FROM `+q.sc+`.stream_config),
+		(SELECT segment_started_at FROM `+q.sc+`.stream_config)`).
 		Scan(&info.Events, &info.Consumers, &info.Active, &info.Retries,
 			&info.DeadLetters, &oldest, &info.LastTick, &info.MaxRetries, &retention,
 			&info.Segment, &info.SegmentStartedAt)
@@ -766,20 +758,19 @@ func (s *Store) StreamInfo(ctx context.Context, queue string) (StreamInfo, error
 	return info, nil
 }
 
-func (s *Store) ListStreamConsumers(ctx context.Context, queue string) ([]StreamConsumerInfo, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return nil, err
+func (q Queue) ListConsumers(ctx context.Context) ([]StreamConsumerInfo, error) {
+	if q.err != nil {
+		return nil, q.err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT s.consumer, s.last_tick,
-			coalesce((SELECT b.batch_id FROM `+sc+`.stream_batches b
+	rows, err := q.s.pool.Query(ctx, `SELECT s.consumer, s.last_tick,
+			coalesce((SELECT b.batch_id FROM `+q.sc+`.stream_batches b
 			          WHERE b.consumer=s.consumer AND b.acked_at IS NULL
 			          ORDER BY b.batch_id LIMIT 1),0),
-			(SELECT count(*) FROM `+sc+`.stream_events e
-			 WHERE e.seq > coalesce((SELECT max_seq FROM `+sc+`.stream_ticks
+			(SELECT count(*) FROM `+q.sc+`.stream_events e
+			 WHERE e.seq > coalesce((SELECT max_seq FROM `+q.sc+`.stream_ticks
 			                         WHERE tick_id=s.last_tick), 0)),
 			s.updated_at
-		FROM `+sc+`.stream_subscriptions s
+		FROM `+q.sc+`.stream_subscriptions s
 		ORDER BY s.consumer`)
 	if isMissingBucketSchema(err) {
 		return nil, ErrQueueNotFound
@@ -794,17 +785,16 @@ func (s *Store) ListStreamConsumers(ctx context.Context, queue string) ([]Stream
 	})
 }
 
-func (s *Store) ListDeadLetters(ctx context.Context, queue string, limit int) ([]DeadLetter, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return nil, err
+func (q Queue) ListDeadLetters(ctx context.Context, limit int) ([]DeadLetter, error) {
+	if q.err != nil {
+		return nil, q.err
 	}
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := s.pool.Query(ctx, `SELECT dead_id, batch_id, event_id, type, payload,
+	rows, err := q.s.pool.Query(ctx, `SELECT dead_id, batch_id, event_id, type, payload,
 			headers, retry_count, reason, created_at
-		FROM `+sc+`.stream_dead_letters ORDER BY dead_id DESC LIMIT $1`, limit)
+		FROM `+q.sc+`.stream_dead_letters ORDER BY dead_id DESC LIMIT $1`, limit)
 	if isMissingBucketSchema(err) {
 		return nil, ErrQueueNotFound
 	}
@@ -819,13 +809,12 @@ func (s *Store) ListDeadLetters(ctx context.Context, queue string, limit int) ([
 	})
 }
 
-func (s *Store) ReplayDeadLetter(ctx context.Context, queue string, id int64) (string, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return "", err
+func (q Queue) ReplayDeadLetter(ctx context.Context, id int64) (string, error) {
+	if q.err != nil {
+		return "", q.err
 	}
-	return withTx(ctx, s, func(tx pgx.Tx) (string, error) {
-		segment, err := streamCurrentSegment(ctx, tx, sc)
+	return withTx(ctx, q.s, func(tx pgx.Tx) (string, error) {
+		segment, err := streamCurrentSegment(ctx, tx, q.sc)
 		if err != nil {
 			return "", err
 		}
@@ -836,7 +825,7 @@ func (s *Store) ReplayDeadLetter(ctx context.Context, queue string, id int64) (s
 			headers []byte
 		)
 		err = tx.QueryRow(ctx, `SELECT event_id, type, payload, headers
-		FROM `+sc+`.stream_dead_letters WHERE dead_id=$1 FOR UPDATE`, id).
+		FROM `+q.sc+`.stream_dead_letters WHERE dead_id=$1 FOR UPDATE`, id).
 			Scan(&eventID, &typ, &payload, &headers)
 		if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 			return "", ErrStreamMessageNotFound
@@ -844,39 +833,38 @@ func (s *Store) ReplayDeadLetter(ctx context.Context, queue string, id int64) (s
 		if err != nil {
 			return "", err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO `+sc+`.stream_events
+		if _, err := tx.Exec(ctx, `INSERT INTO `+q.sc+`.stream_events
 		(segment, event_id, type, payload, headers, retry_count)
 		VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,0)`,
 			segment, eventID, typ, string(payload), string(headers)); err != nil {
 			return "", err
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM `+sc+`.stream_dead_letters WHERE dead_id=$1`, id); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+q.sc+`.stream_dead_letters WHERE dead_id=$1`, id); err != nil {
 			return "", err
 		}
 		return eventID, nil
 	})
 }
 
-func (s *Store) ReplayAllDeadLetters(ctx context.Context, queue string) (int64, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return 0, err
+func (q Queue) ReplayAllDeadLetters(ctx context.Context) (int64, error) {
+	if q.err != nil {
+		return 0, q.err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := q.s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	segment, err := streamCurrentSegment(ctx, tx, sc)
+	segment, err := streamCurrentSegment(ctx, tx, q.sc)
 	if err != nil {
 		return 0, err
 	}
 	var replayed int64
 	err = tx.QueryRow(ctx, `WITH gone AS (
-			DELETE FROM `+sc+`.stream_dead_letters
+			DELETE FROM `+q.sc+`.stream_dead_letters
 			RETURNING event_id, type, payload, headers
 		), inserted AS (
-			INSERT INTO `+sc+`.stream_events
+			INSERT INTO `+q.sc+`.stream_events
 				(segment, event_id, type, payload, headers, retry_count)
 			SELECT $1, event_id, type, payload, headers, 0 FROM gone
 			RETURNING 1
@@ -894,15 +882,14 @@ func (s *Store) ReplayAllDeadLetters(ctx context.Context, queue string) (int64, 
 	return replayed, nil
 }
 
-func (s *Store) PurgeDeadLetters(ctx context.Context, queue string, olderThan time.Duration) (int64, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return 0, err
+func (q Queue) PurgeDeadLetters(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if q.err != nil {
+		return 0, q.err
 	}
 	if olderThan <= 0 {
 		olderThan = 30 * 24 * time.Hour
 	}
-	tag, err := s.pool.Exec(ctx, `DELETE FROM `+sc+`.stream_dead_letters
+	tag, err := q.s.pool.Exec(ctx, `DELETE FROM `+q.sc+`.stream_dead_letters
 		WHERE created_at < now() - make_interval(secs => $1)`, olderThan.Seconds())
 	if isMissingBucketSchema(err) {
 		return 0, nil
@@ -913,23 +900,22 @@ func (s *Store) PurgeDeadLetters(ctx context.Context, queue string, olderThan ti
 	return tag.RowsAffected(), nil
 }
 
-func (s *Store) PruneStreamTicks(ctx context.Context, queue string, max int) (int64, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return 0, err
+func (q Queue) PruneTicks(ctx context.Context, max int) (int64, error) {
+	if q.err != nil {
+		return 0, q.err
 	}
 	if max <= 0 {
 		max = ExpireBatch
 	}
-	tag, err := s.pool.Exec(ctx, `DELETE FROM `+sc+`.stream_ticks t
-		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+sc+`.stream_ticks)
-		  AND t.created_at < now() - (SELECT retention FROM `+sc+`.stream_config)
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.stream_batches b
+	tag, err := q.s.pool.Exec(ctx, `DELETE FROM `+q.sc+`.stream_ticks t
+		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+q.sc+`.stream_ticks)
+		  AND t.created_at < now() - (SELECT retention FROM `+q.sc+`.stream_config)
+		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
+		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_batches b
 		                  WHERE b.start_tick=t.tick_id OR b.end_tick=t.tick_id)
 		  AND t.tick_id IN (
-		    SELECT tick_id FROM `+sc+`.stream_ticks
-		    WHERE tick_id <> (SELECT min(tick_id) FROM `+sc+`.stream_ticks)
+		    SELECT tick_id FROM `+q.sc+`.stream_ticks
+		    WHERE tick_id <> (SELECT min(tick_id) FROM `+q.sc+`.stream_ticks)
 		    ORDER BY tick_id LIMIT $1
 		  )`, max)
 	if isMissingBucketSchema(err) {
@@ -941,17 +927,16 @@ func (s *Store) PruneStreamTicks(ctx context.Context, queue string, max int) (in
 	return tag.RowsAffected(), nil
 }
 
-func (s *Store) RotateStream(ctx context.Context, queue string) (int64, error) {
-	sc, err := nsSQLIdent(ns.Queue, queue)
-	if err != nil {
-		return 0, err
+func (q Queue) Rotate(ctx context.Context) (int64, error) {
+	if q.err != nil {
+		return 0, q.err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := q.s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, sc); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, q.sc); err != nil {
 		return 0, err
 	}
 
@@ -961,7 +946,7 @@ func (s *Store) RotateStream(ctx context.Context, queue string) (int64, error) {
 	)
 	err = tx.QueryRow(ctx, `SELECT current_segment,
 			(segment_started_at + retention / 2.0) <= now()
-		FROM `+sc+`.stream_config FOR UPDATE`).Scan(&current, &due)
+		FROM `+q.sc+`.stream_config FOR UPDATE`).Scan(&current, &due)
 	if errors.Is(err, pgx.ErrNoRows) || isMissingBucketSchema(err) {
 		return 0, nil
 	}
@@ -979,20 +964,20 @@ func (s *Store) RotateStream(ctx context.Context, queue string) (int64, error) {
 		batched bool
 	)
 	err = tx.QueryRow(ctx, `SELECT
-			(SELECT count(*) FROM `+sc+`.stream_events WHERE segment=$1),
+			(SELECT count(*) FROM `+q.sc+`.stream_events WHERE segment=$1),
 			EXISTS (
-				SELECT 1 FROM `+sc+`.stream_segments seg
+				SELECT 1 FROM `+q.sc+`.stream_segments seg
 				WHERE seg.segment=$1
 				  AND (seg.sealed_xid IS NULL OR EXISTS (
-					SELECT 1 FROM `+sc+`.stream_subscriptions s
-					LEFT JOIN `+sc+`.stream_ticks t ON t.tick_id=s.last_tick
+					SELECT 1 FROM `+q.sc+`.stream_subscriptions s
+					LEFT JOIN `+q.sc+`.stream_ticks t ON t.tick_id=s.last_tick
 					WHERE t.tick_id IS NULL
 					   OR pg_snapshot_xmin(t.snapshot) <= seg.sealed_xid
 				  ))
 			),
 			EXISTS (
-				SELECT 1 FROM `+sc+`.stream_batch_events be
-				JOIN `+sc+`.stream_events e ON e.seq=be.seq
+				SELECT 1 FROM `+q.sc+`.stream_batch_events be
+				JOIN `+q.sc+`.stream_events e ON e.seq=be.seq
 				WHERE e.segment=$1
 			)`, target).Scan(&events, &pinned, &batched)
 	if err != nil {
@@ -1002,7 +987,7 @@ func (s *Store) RotateStream(ctx context.Context, queue string) (int64, error) {
 		return 0, nil
 	}
 
-	partition := streamEventPartition(sc, target)
+	partition := streamEventPartition(q.sc, target)
 	if _, err := tx.Exec(ctx, `LOCK TABLE `+partition+` IN ACCESS EXCLUSIVE MODE NOWAIT`); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
@@ -1014,35 +999,35 @@ func (s *Store) RotateStream(ctx context.Context, queue string) (int64, error) {
 		return 0, err
 	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM `+sc+`.stream_ticks t
-		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+sc+`.stream_ticks)
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.stream_batches b
+	if _, err := tx.Exec(ctx, `DELETE FROM `+q.sc+`.stream_ticks t
+		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+q.sc+`.stream_ticks)
+		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
+		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_batches b
 		                  WHERE b.start_tick=t.tick_id OR b.end_tick=t.tick_id)
 		  AND pg_snapshot_xmin(t.snapshot) <= (
-		    SELECT sealed_xid FROM `+sc+`.stream_segments WHERE segment=$1
+		    SELECT sealed_xid FROM `+q.sc+`.stream_segments WHERE segment=$1
 		  )`, target); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE `+sc+`.stream_segments
+	if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_segments
 		SET sealed_xid=pg_current_xact_id(), sealed_at=now()
 		WHERE segment=$1`, current); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE `+sc+`.stream_segments
+	if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_segments
 		SET sealed_xid=NULL, sealed_at=NULL
 		WHERE segment=$1`, target); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE `+sc+`.stream_config
+	if _, err := tx.Exec(ctx, `UPDATE `+q.sc+`.stream_config
 		SET current_segment=$1, segment_started_at=now()`, target); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM `+sc+`.stream_ticks t
-		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+sc+`.stream_ticks)
-		  AND t.created_at < now() - (SELECT retention FROM `+sc+`.stream_config)
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
-		  AND NOT EXISTS (SELECT 1 FROM `+sc+`.stream_batches b
+	if _, err := tx.Exec(ctx, `DELETE FROM `+q.sc+`.stream_ticks t
+		WHERE t.tick_id <> (SELECT min(tick_id) FROM `+q.sc+`.stream_ticks)
+		  AND t.created_at < now() - (SELECT retention FROM `+q.sc+`.stream_config)
+		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_subscriptions s WHERE s.last_tick=t.tick_id)
+		  AND NOT EXISTS (SELECT 1 FROM `+q.sc+`.stream_batches b
 		                  WHERE b.start_tick=t.tick_id OR b.end_tick=t.tick_id)`); err != nil {
 		return 0, err
 	}
