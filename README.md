@@ -482,9 +482,14 @@ just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a runni
 just helm-kind  # install the chart on a throwaway kind cluster under restricted Pod Security
 just contract   # end-to-end S3, OJS, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
 just interop    # rclone, restic, boto3, and DuckLake
+just fault      # gateway loss, PostgreSQL restart and churn
+just ci         # complete local/CI gate set, including Docker, kind and s3t
 just load       # direct S3 load generator benchmark
 just bench      # DuckDB httpfs + DuckLake benchmark suite
 ```
+
+Docker-backed test runs use isolated binaries and logs under `.tmp/verify/`.
+They are quiet on success and retain diagnostics on failure.
 
 Further reading:
 

@@ -39,8 +39,19 @@ just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-stor
 just interop    # rclone, restic, boto3, and DuckLake
 ```
 
-`just ci` runs `hk check --all --profile ci` (which adds `govulncheck`) before
-the race, integration, fuzz, Helm and contract gates.
+`just ci` is the same complete entry point locally and in GitHub: hk (including
+`govulncheck`), integration-tagged vet, race tests, uncached race-enabled
+integration, fuzz, Helm/kind, contract, fault, interop and s3t.
+
+Docker-backed suites share `test/harness.sh`. Each run owns its database container,
+gateway binary, processes and logs under a unique `.tmp/verify/` directory. Passing
+runs print one summary and remove their scratch files. Failed runs keep their
+artifacts, print the relevant logs and preserve the failure exit code; GitHub
+uploads the retained logs. Concurrent suites never reuse a gateway binary or log.
+
+Docker must be on `PATH` with a context supported by kind. Select a different
+engine for one run with `DOCKER_CONTEXT`; rootless providers also need cgroup
+delegation. The runner does not modify host settings or skip unavailable gates.
 
 `just contract` is the required correctness gate before merging. It starts a
 disposable PostgreSQL 18 container and two local gateways, then verifies
@@ -195,12 +206,12 @@ block encoding, streaming reads and COPY loops, not inside them.
 | `internal/store/cache.go` | Cache mutations, origin metadata, fill fences and durable outbox persistence |
 | `internal/store/ojs.go` | Job persistence, claims and state transitions |
 | `internal/store/stream.go` | Stream Go wrappers over the layout-v25 `stream_*` functions in `schema.sql`: validation, sentinel mapping and result types |
-| `internal/objcache/cache.go` | Tier lifecycle, cache resolution, fills, bounded spooling and ordered mutations/outbox drain |
+| `internal/objcache/cache.go` | Shared runtime limits, immutable tier options, cache resolution, fills, bounded spooling and ordered mutations/outbox drain |
 | `internal/objcache/origin.go` | Origin contract, capabilities and production/local adapters |
-| `internal/objcache/registry.go` | Persisted configuration and one global/per-bucket replacement policy |
+| `internal/objcache/registry.go` | Persisted configuration, request borrowing and deferred retirement of global/per-bucket tiers |
 | `internal/s3/server.go` | HTTP transport, routing, bucket lifecycle, errors and metrics |
-| `internal/s3/object.go` | Native/origin adapters, object and multipart operations, listings and response streaming |
-| `internal/s3/request.go` | Parsing/header policy, conditions, body framing and checksums |
+| `internal/s3/object.go` | Request-scoped native/origin adapters, object and multipart operations, listings and response streaming |
+| `internal/s3/request.go` | Parsing/header policy, conditions and shared upload-body framing, length and checksum handling |
 | `internal/s3/xml.go` | S3 XML shapes and encoding |
 | `internal/ojs/ojs.go` | HTTP binding, validation, job operations and metrics |
 | `internal/ojs/streams.go` | Stream HTTP operations |

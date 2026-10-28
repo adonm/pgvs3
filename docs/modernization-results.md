@@ -598,6 +598,97 @@ Remaining note: native requests with an invalid bucket name return 500 instead o
 because `ns.ErrInvalidName` is not mapped on the native path. Origin-served requests
 map it to 404 `NoSuchBucket`. This predates the refactor and was left unchanged.
 
+### Explicit ownership and verification follow-up (2026-10-29)
+
+This pass keeps layout v25 and leaves `schema.sql` byte-identical. It addresses
+five maintenance boundaries rather than moving files or targeting a line count:
+
+1. `objcache.Runtime` owns the shared fill/pending limits and disk-spool budget.
+   Immutable `TierOptions` replace package configuration and post-construction
+   setters. Both persisted and fallback tiers use the gateway's runtime, with
+   settings finalized before workers start.
+2. PUT and multipart use one upload-body descriptor for effective lengths,
+   integrity readers and trailer verification. Ordinary Content-Length and the
+   existing multipart length hint keep their behavior. A parsed-HTTP regression
+   also covers trailers allocated at EOF across shallow request copies.
+3. S3 resolves and borrows a backend once per request bucket, including copy
+   sources. Replaced tiers close only after their last borrower releases them.
+   The registry owns shutdown of persisted and fallback tiers. These references
+   carry resource lifetime, not cached bucket existence; catalog checks remain.
+4. Store errors distinguish an absent namespace from a damaged existing schema.
+   Catalog probes run only after lookup errors, transactions roll back before
+   classification, and missing tables/functions are no longer silently treated as
+   empty resources or repaired by ordinary writes. One-connection integration cases
+   cover metadata, cache, queues and multipart operations.
+5. `just ci` matches the GitHub gate set. Docker-backed suites share setup helpers,
+   use isolated binaries/logs and keep explicit PostgreSQL port mappings stable
+   across restart. Failures retain artifacts and restore the caller's output
+   streams before printing diagnostics; success prints one summary. Kind also owns
+   its kubeconfig, cluster name and image tag, and creates its bucket explicitly.
+
+| Whole-repo Go | Before (`49b3f0a`) | After (`5069038`) |
+| --- | ---: | ---: |
+| Files | 48 | 48 |
+| Total lines | 35,048 | 35,479 |
+| Production lines | 20,825 | 20,993 |
+| Test lines | 14,223 | 14,486 |
+
+Production grows by 168 lines and tests by 263. The gain is explicit ownership,
+one upload contract and narrower error policy, not a code-size reduction. No
+non-directive Go comments or new Go files were added.
+
+#### Paired performance check
+
+The `49b3f0a` control and the final Go tree at `5069038` used the same PostgreSQL
+18.6 database on the Ryzen 7 7700X host
+(16 threads, 61 GiB RAM, 128 MiB PostgreSQL shared buffers), alternating before,
+after, after, before. Payloads were incompressible. The per-bucket filesystem
+origin used a one-hour validation TTL and 64 KiB aligned-range caching, configured
+on its persisted spec. Cold keys were distinct per session; pending uploads were
+drained before switching binaries. Each row averages two sessions per binary.
+
+Request counts per session were: native GET 200/400/20/8 for the first four rows;
+footer ranges 1,600; HEAD 2,000; warm origin GET 100/8,000; cold origin GET 20/4/1;
+cold/warm aligned ranges 20/800; native and write-back PUT 12 each. The cold 1 GiB
+row therefore has only two observations per binary and is a coarse check.
+
+| Workload | Before p50 | After p50 | Throughput change |
+| --- | ---: | ---: | ---: |
+| Native 10 MiB GET, 1 worker | 9.63 ms | 9.45 ms | +3.3% |
+| Native 10 MiB GET, 4 workers | 10.61 ms | 10.61 ms | +0.1% |
+| Native 100 MiB GET, 1 worker | 94.42 ms | 93.72 ms | +1.8% |
+| Native 1 GiB GET, 1 worker | 965 ms | 955 ms | +1.2% |
+| Native 8 KiB footer range, 4 workers | 0.167 ms | 0.171 ms | -2.0% |
+| Native HEAD, 4 workers | 0.097 ms | 0.095 ms | +3.1% |
+| Warm origin 10 MiB GET, 1 worker | 9.40 ms | 9.49 ms | -0.5% |
+| Warm origin 4 KiB GET, 4 workers | 0.164 ms | 0.157 ms | +4.8% |
+| Cold origin 10 MiB GET, 1 worker | 53.12 ms | 55.17 ms | -3.4% |
+| Cold origin 100 MiB GET, 1 worker | 475 ms | 486 ms | -4.4% |
+| Cold origin 1 GiB GET, 1 worker | 5,833 ms | 5,837 ms | 0.0% |
+| Cold origin 64 KiB range, 1 worker | 6.04 ms | 5.98 ms | +3.5% |
+| Warm origin 64 KiB range, 4 workers | 0.495 ms | 0.500 ms | -0.8% |
+| Native 10 MiB PUT, 1 worker | 38.98 ms | 38.48 ms | +0.7% |
+| Origin 10 MiB write-back acknowledgement, 1 worker | 52.44 ms | 52.91 ms | -1.5% |
+
+All measured latency and throughput changes are within 5%, with zero errors. This
+comparison includes the already accepted per-request catalog check on both sides;
+it does not withdraw or remeasure the earlier small-object exception.
+
+#### Verification
+
+The complete `mise exec -- just ci` passed using the host's rootful Docker context:
+hk/goimports/gofmt/go fix/tidy/vet/staticcheck/govulncheck, integration-tagged vet,
+race tests, uncached race integration (45 s), four fuzz targets, Helm lint,
+Helm/kind (69 s), contract (19 s), fault (12 s), interop including restic (17 s),
+and s3t (36 allowed tests; 12 s including fixture setup). ShellCheck and explicit
+nested-failure diagnostics probes also pass. Independent contract and interop
+runs passed concurrently with isolated fixtures.
+
+The selected rootless Podman context could not satisfy kind's cgroup check. The
+successful run selected the already available rootful Docker engine with
+`DOCKER_CONTEXT=default` and its socket for that command only; no host settings,
+default contexts or gate requirements were changed.
+
 The [live file map](../CONTRIBUTING.md#package-map) describes the final structure.
 Package/build-tag boundaries, the isolated SDK benchmark module, streaming
 algorithms and logged durability/coordination semantics are preserved.

@@ -331,6 +331,13 @@ one is printed by name) and reaper safety. A gateway refuses to start on the
 layout, relation and manifest checks; `doctor` also exits non-zero for missing
 queue stream functions.
 
+An absent namespace retains the operation's normal not-found or empty result.
+An existing namespace with a missing table or function is instead a storage/layout
+error, not an empty bucket or queue. Failure classification probes namespace
+existence only after a SQL lookup error, so normal reads gain no extra round trip.
+The existing per-request origin bucket check remains. Investigate with
+`pgvs3 doctor`; normal cache writes do not treat a partial layout as a new namespace.
+
 Before replacing a database, take a logical backup as described above. If you
 need to preserve data across a layout change, copy it out through S3/rclone or
 DuckDB and load it into the new database; do not edit `schema.sql` in place.

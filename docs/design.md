@@ -135,7 +135,17 @@ Named sections follow the request lifecycle. Foreground mutations and outbox
 flushes use `lockWrite`: local ordering, optional body validation, then a
 PostgreSQL session lock held across origin I/O. Fill ownership remains a
 renewable database lease, not a session lock. Registry replacements retain a
-working tier when opening a changed configuration fails.
+working tier when opening a changed configuration fails. One explicit runtime
+owns the fill/pending limits and spool budget shared by all tiers in a gateway;
+constructor options fix range, write-back and read-only settings before workers
+start. There are no package-wide configuration setters.
+
+Each S3 request resolves and borrows its backend once per bucket, including a
+separate source bucket for copies. Routing, catalog admission and execution use
+the same selection. Retired tiers close after their last request releases them,
+so configuration refresh cannot close an origin beneath a streaming response.
+These are resource-lifetime references, not a bucket or object cache; the
+per-request origin catalog check stays in place.
 
 Whole-object and aligned-range fills share coordination, not body buffering:
 large bodies still spool before taking a database writer connection. A waiting
