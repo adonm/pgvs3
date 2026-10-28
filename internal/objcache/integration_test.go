@@ -535,6 +535,77 @@ func TestTierValidationRunsBeforeOriginMutation(t *testing.T) {
 	}
 }
 
+func TestUnsupportedKeysRejectedBeforeCommit(t *testing.T) {
+	ctx := testCtx
+	f := newFixture(t)
+	f.tier.EnableWriteBack(true)
+	if _, err := f.tier.Upload(ctx, "bkt", "source", strings.NewReader("source"), nil, "text/plain"); err != nil {
+		t.Fatal(err)
+	}
+	multipart := func(opts store.WriteOptions) func(*testing.T, *fixture, string) error {
+		return func(t *testing.T, f *fixture, key string) error {
+			uploadID, err := f.tier.CreateUpload(ctx, "bkt", key, nil, "text/plain", "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.tier.AbortUpload(ctx, uploadID, "bkt", key)
+			w, err := f.tier.StartPart(ctx, uploadID, "bkt", key, 1, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write([]byte("part")); err != nil {
+				t.Fatal(err)
+			}
+			pub, err := w.Finish(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = f.tier.CompleteUpload(ctx, uploadID, "bkt", key, []store.ListedPart{{PartNo: 1, ETag: pub.ETag}}, opts)
+			return err
+		}
+	}
+	large := bytes.Repeat([]byte("w"), writeBackMin+1)
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, f *fixture, key string) error
+	}{
+		{"put write-through", func(t *testing.T, f *fixture, key string) error {
+			_, err := f.tier.UploadWithOptions(ctx, "bkt", key, strings.NewReader("small"), UploadOptions{})
+			return err
+		}},
+		{"put write-back", func(t *testing.T, f *fixture, key string) error {
+			_, err := f.tier.UploadWithOptions(ctx, "bkt", key, bytes.NewReader(large), UploadOptions{})
+			return err
+		}},
+		{"copy", func(t *testing.T, f *fixture, key string) error {
+			_, err := f.tier.Copy(ctx, "bkt", "source", "bkt", key, store.CopyOptions{})
+			return err
+		}},
+		{"multipart write-back", multipart(store.WriteOptions{})},
+		{"multipart write-through", multipart(store.WriteOptions{Precondition: store.Precondition{Mode: store.IfAbsent}})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "dir//" + strings.ReplaceAll(tc.name, " ", "-")
+			if err := tc.write(t, f, key); !errors.Is(err, ErrOriginKeyUnsupported) {
+				t.Fatalf("error = %v, want ErrOriginKeyUnsupported", err)
+			}
+			ck := f.tier.key("bkt", key)
+			if _, err := testStore.Meta(ctx, f.tier.writeRef(ck)); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("write-back row was committed: %v", err)
+			}
+			if _, err := testStore.Meta(ctx, f.tier.cacheRef(ck)); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("cache row was committed: %v", err)
+			}
+			if n := f.pending(t, key); n != 0 {
+				t.Fatalf("%d pending origin uploads were queued", n)
+			}
+			if _, err := f.tier.origin.Attributes(ctx, ck); !f.tier.origin.IsObjNotFoundErr(err) {
+				t.Fatalf("origin object exists: %v", err)
+			}
+		})
+	}
+}
+
 type blockingOrigin struct {
 	originHandle
 	once    sync.Once

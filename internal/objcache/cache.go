@@ -1292,6 +1292,9 @@ func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body i
 		return nil, err
 	}
 	ck := t.key(bucket, key)
+	if err := t.origin.checkKey(ck); err != nil {
+		return nil, err
+	}
 	expected := opts.ExpectedSize
 	if expected <= 0 {
 		expected = -1
@@ -1360,6 +1363,9 @@ func (t *Tier) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey st
 	if err := t.requireWrite("copy"); err != nil {
 		return nil, err
 	}
+	if err := t.origin.checkKey(t.key(dstBucket, dstKey)); err != nil {
+		return nil, err
+	}
 	srcObj, err := t.Open(ctx, srcBucket, srcKey, store.WholeObjectRange())
 	if err != nil {
 		return nil, err
@@ -1397,6 +1403,9 @@ func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string,
 		return nil, err
 	}
 	ck := t.key(bucket, key)
+	if err := t.origin.checkKey(ck); err != nil {
+		return nil, err
+	}
 	exp := time.Now().Add(t.durableRetention())
 	unlock, err := t.lockWrite(ctx, ck, nil)
 	if err != nil {

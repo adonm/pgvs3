@@ -187,6 +187,11 @@ type originHandle interface {
 	Capabilities() originCapabilities
 	Supports(originCapabilities) bool
 	IsObjNotFoundErr(error) bool
+	checkKey(string) error
+}
+
+type keyChecker interface {
+	checkKey(string) error
 }
 
 type origin struct {
@@ -298,6 +303,14 @@ func (o *origin) Iter(ctx context.Context, dir string) iter.Seq2[originObject, e
 }
 
 func (o *origin) IsObjNotFoundErr(err error) bool { return isObjectNotFound(err) }
+
+func (o *origin) checkKey(key string) error {
+	c, ok := o.driver.(keyChecker)
+	if !ok {
+		return nil
+	}
+	return c.checkKey(o.physicalKey(key))
+}
 
 func (o *origin) Close() error {
 	return o.driver.Close()
@@ -912,8 +925,8 @@ func openLocalBucket(kind, prefix, dir string, temporary bool) (*origin, error) 
 }
 
 func (b *localBucket) Upload(_ context.Context, key string, r io.Reader, _ int64, in originUpload) (originAttrs, error) {
-	if !validLocalKey(key) {
-		return originAttrs{}, fmt.Errorf("%q: %w", key, ErrOriginKeyUnsupported)
+	if err := b.checkKey(key); err != nil {
+		return originAttrs{}, err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1104,6 +1117,19 @@ func (b *localBucket) Close() error {
 		err = errors.Join(err, os.RemoveAll(name))
 	}
 	return err
+}
+
+func (b *localBucket) checkKey(key string) error {
+	if !validLocalKey(key) {
+		return fmt.Errorf("%q: %w", key, ErrOriginKeyUnsupported)
+	}
+	if parent, err := b.root.Stat(path.Dir(key)); (err == nil && !parent.IsDir()) || errors.Is(err, syscall.ENOTDIR) {
+		return fmt.Errorf("%q conflicts with an existing object: %w", key, ErrOriginKeyUnsupported)
+	}
+	if fi, err := b.root.Stat(key); err == nil && fi.IsDir() {
+		return fmt.Errorf("%q conflicts with an existing prefix: %w", key, ErrOriginKeyUnsupported)
+	}
+	return nil
 }
 
 func compareListing(a, b fs.DirEntry) int {

@@ -188,10 +188,10 @@ SELECT * FROM lake.events;
   keeps its objects in a private temporary directory under `TMPDIR`, removed on
   clean shutdown. User metadata is process-local for both. Keys that cannot be
   stored as paths are rejected: empty, `.` or `..` segments, NUL bytes, segments
-  over 255 bytes, and keys that conflict with an existing object or prefix. Writes
-  return `400 InvalidRequest`, except large write-back uploads, which are
-  acknowledged first and then dead-lettered. Reads return `404`, and `DELETE` is
-  a no-op.
+  over 255 bytes, and keys that conflict with an existing object or prefix. PUT,
+  COPY and multipart completion reject them with `400 InvalidRequest` before any
+  body is acknowledged or committed, including write-back uploads. Reads return
+  `404`, and `DELETE` is a no-op.
 - **Cache safety across workers.** Read-through fills are fenced by the
   expected origin version, so a fill that started before a newer write-through
   write cannot overwrite the newer cache row. Write-through deletes leave a
