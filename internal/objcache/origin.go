@@ -25,6 +25,7 @@ import (
 	"github.com/adonm/pgvs3/internal/s3client"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/adonm/pgvs3/internal/telemetry"
+	"golang.org/x/net/http/httpguts"
 )
 
 type Config struct {
@@ -348,9 +349,21 @@ type s3Bucket struct {
 }
 
 func newS3Bucket(c Config) (*origin, error) {
+	cfg, err := parseS3Config(c)
+	if err != nil {
+		return nil, err
+	}
+	client, err := s3client.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &origin{kind: "s3", caps: originCapabilitiesAll, prefix: newOriginPrefix(c.Prefix), driver: &s3Bucket{client: client}}, nil
+}
+
+func parseS3Config(c Config) (s3client.Config, error) {
 	var sc s3Config
 	if err := decodeConfig(c, &sc); err != nil {
-		return nil, err
+		return s3client.Config{}, err
 	}
 	pathStyle := false
 	switch strings.ToLower(sc.BucketLookupType) {
@@ -358,22 +371,13 @@ func newS3Bucket(c Config) (*origin, error) {
 		pathStyle = true
 	case "", "auto":
 	default:
-		return nil, fmt.Errorf("s3 origin: unsupported bucket_lookup_type %q", sc.BucketLookupType)
+		return s3client.Config{}, fmt.Errorf("s3 origin: unsupported bucket_lookup_type %q", sc.BucketLookupType)
 	}
 
-	prefix := newOriginPrefix(c.Prefix)
-	client, err := s3client.New(s3client.Config{
+	return s3client.Config{
 		Endpoint: sc.Endpoint, Region: sc.Region, Bucket: sc.Bucket,
 		AccessKey: sc.AccessKey, SecretKey: sc.SecretKey, SessionToken: sc.SessionToken,
 		Insecure: sc.Insecure, PathStyle: pathStyle,
-	})
-	if err != nil {
-		return nil, err
-	}
-	b := &s3Bucket{client: client}
-	return &origin{
-		kind: "s3", caps: originCapabilitiesAll, prefix: prefix,
-		driver: b,
 	}, nil
 }
 
@@ -525,17 +529,34 @@ type httpBucket struct {
 }
 
 func newHTTPBucket(c Config) (*origin, error) {
-	var hc httpConfig
-	if err := decodeConfig(c, &hc); err != nil {
+	hc, u, err := parseHTTPConfig(c)
+	if err != nil {
 		return nil, err
 	}
+	return openHTTPBucket(c, hc, u), nil
+}
+
+func parseHTTPConfig(c Config) (httpConfig, *url.URL, error) {
+	var hc httpConfig
+	if err := decodeConfig(c, &hc); err != nil {
+		return hc, nil, err
+	}
 	if hc.BaseURL == "" {
-		return nil, fmt.Errorf("http origin requires base_url")
+		return hc, nil, fmt.Errorf("http origin requires base_url")
 	}
 	u, err := url.Parse(hc.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("http origin base_url must be an absolute http(s) URL")
+		return hc, nil, fmt.Errorf("http origin base_url must be an absolute http(s) URL")
 	}
+	for name, value := range hc.Headers {
+		if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+			return hc, nil, fmt.Errorf("invalid http origin header %q", name)
+		}
+	}
+	return hc, u, nil
+}
+
+func openHTTPBucket(c Config, hc httpConfig, u *url.URL) *origin {
 	tr := s3client.NewTransport(s3client.TransportOptions{
 		Insecure:              hc.Insecure,
 		MaxIdleConns:          100,
@@ -568,7 +589,7 @@ func newHTTPBucket(c Config) (*origin, error) {
 	return &origin{
 		kind: "http", caps: caps, prefix: newOriginPrefix(c.Prefix), keyFn: keyFn,
 		driver: b,
-	}, nil
+	}
 }
 
 func (b *httpBucket) urlFor(key string) (*url.URL, error) {
@@ -890,12 +911,9 @@ type localBucket struct {
 }
 
 func newFSBucket(c Config) (*origin, error) {
-	var fc fsConfig
-	if err := decodeConfig(c, &fc); err != nil {
+	fc, err := parseFSConfig(c)
+	if err != nil {
 		return nil, err
-	}
-	if fc.Directory == "" {
-		return nil, fmt.Errorf("filesystem origin requires directory")
 	}
 	if err := os.MkdirAll(fc.Directory, 0o755); err != nil {
 		return nil, err
@@ -903,7 +921,24 @@ func newFSBucket(c Config) (*origin, error) {
 	return openLocalBucket("filesystem", c.Prefix, fc.Directory, false)
 }
 
+func parseFSConfig(c Config) (fsConfig, error) {
+	var fc fsConfig
+	if err := decodeConfig(c, &fc); err != nil {
+		return fc, err
+	}
+	if fc.Directory == "" || strings.ContainsRune(fc.Directory, 0) {
+		return fc, fmt.Errorf("filesystem origin requires a valid directory")
+	}
+	return fc, validateLocalPrefix("filesystem", c.Prefix)
+}
+
 func newTempBucket(c Config) (*origin, error) {
+	if err := decodeConfig(c, &struct{}{}); err != nil {
+		return nil, err
+	}
+	if err := validateLocalPrefix("ephemeral", c.Prefix); err != nil {
+		return nil, err
+	}
 	dir, err := os.MkdirTemp("", "pgvs3-ephemeral-")
 	if err != nil {
 		return nil, err
@@ -915,10 +950,17 @@ func newTempBucket(c Config) (*origin, error) {
 	return o, err
 }
 
-func openLocalBucket(kind, prefix, dir string, temporary bool) (*origin, error) {
+func validateLocalPrefix(kind, prefix string) error {
 	p := newOriginPrefix(prefix)
 	if p != "" && !validLocalKey(string(p)) {
-		return nil, fmt.Errorf("%s origin prefix %q cannot be stored as a path", kind, prefix)
+		return fmt.Errorf("%s origin prefix %q cannot be stored as a path", kind, prefix)
+	}
+	return nil
+}
+
+func openLocalBucket(kind, prefix, dir string, temporary bool) (*origin, error) {
+	if err := validateLocalPrefix(kind, prefix); err != nil {
+		return nil, err
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
@@ -929,7 +971,7 @@ func openLocalBucket(kind, prefix, dir string, temporary bool) (*origin, error) 
 		return nil, err
 	}
 	b := &localBucket{root: root, meta: map[string]localMeta{}, temporary: temporary}
-	return &origin{kind: kind, caps: originCapabilitiesAll, prefix: p, driver: b}, nil
+	return &origin{kind: kind, caps: originCapabilitiesAll, prefix: newOriginPrefix(prefix), driver: b}, nil
 }
 
 func (b *localBucket) Upload(_ context.Context, key string, r io.Reader, _ int64, in originUpload) (originAttrs, error) {

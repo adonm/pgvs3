@@ -2349,7 +2349,46 @@ func TestS3OriginMapping(t *testing.T) {
 }
 
 func TestSaveSpecRejectsInvalidOriginConfig(t *testing.T) {
-	if err := SaveSpec(context.Background(), nil, "", Spec{Config: `{"type":"bogus","config":{}}`}); err == nil {
-		t.Fatal("invalid origin type accepted")
+	for _, tc := range []struct {
+		name, bucket string
+		spec         Spec
+	}{
+		{name: "type", spec: Spec{Config: `{"type":"bogus"}`}},
+		{name: "ttl", spec: Spec{TTL: "not-a-duration"}},
+		{name: "retention", spec: Spec{Retention: "-1s"}},
+		{name: "fills", spec: Spec{MaxFills: -1}},
+		{name: "range", spec: Spec{RangeChunk: -1}},
+		{name: "namespace", spec: Spec{Namespace: "bad!"}},
+		{name: "bucket", bucket: "bad!"},
+		{name: "scope", spec: Spec{Scope: "bucket"}},
+		{name: "prefix", spec: Spec{Config: `{"type":"ephemeral","prefix":"../escape"}`}},
+		{name: "unknown option", spec: Spec{Config: `{"type":"ephemeral","config":{"typo":true}}`}},
+		{name: "http header", spec: Spec{Config: `{"type":"http","config":{"base_url":"http://localhost","headers":{"bad name":"value"}}}`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.spec.Config == "" {
+				tc.spec.Config = `{"type":"ephemeral"}`
+			}
+			if err := SaveSpec(context.Background(), nil, tc.bucket, tc.spec); err == nil {
+				t.Fatal("invalid spec reached persistence")
+			}
+		})
+	}
+}
+
+func TestOriginSpecValidationDoesNotOpenProviders(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "not-created")
+	t.Setenv("TMPDIR", dir)
+	for _, config := range []string{`{"type":"ephemeral"}`, fmt.Sprintf(`{"type":"filesystem","config":{"directory":%q}}`, dir)} {
+		testutil.Must(t, ValidateConfig([]byte(config)))
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("validation created a provider directory: %v", err)
+	}
+	spec, opts, err := normalizeSpec("edge", Spec{TTL: "60s", Retention: "0s", RangeChunk: 1, Config: `{"type":"ephemeral"}`})
+	testutil.Must(t, err)
+	if spec.Scope != "bucket" || spec.Bucket != "edge" || spec.Namespace != "origin-edge" || spec.TTL != "1m0s" ||
+		opts.TTL != time.Minute || opts.Retention != 24*time.Hour || opts.MaxFills != 8 || opts.RangeChunk != 64<<10 {
+		t.Fatalf("spec=%+v options=%+v", spec, opts)
 	}
 }

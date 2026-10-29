@@ -7,11 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/ns"
+	"github.com/adonm/pgvs3/internal/s3client"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
@@ -27,11 +29,41 @@ type Spec struct {
 }
 
 func NewFromSpec(log *slog.Logger, st *store.Store, runtime *Runtime, spec Spec, opts TierOptions) (*Tier, error) {
+	spec, normalized, err := normalizeSpec(spec.Bucket, spec)
+	if err != nil {
+		return nil, err
+	}
+	normalized.ReadOnly, normalized.WriteBack = opts.ReadOnly, opts.WriteBack
+	return New(log, []byte(spec.Config), st, runtime, normalized)
+}
+
+func normalizeSpec(bucket string, spec Spec) (Spec, TierOptions, error) {
+	var opts TierOptions
+	scope := "global"
+	if bucket != "" {
+		if !ns.ValidName(bucket) {
+			return spec, opts, fmt.Errorf("invalid bucket name %q", bucket)
+		}
+		scope = "bucket"
+	}
+	if (spec.Scope != "" && spec.Scope != scope) || (spec.Bucket != "" && spec.Bucket != bucket) {
+		return spec, opts, fmt.Errorf("origin scope does not match bucket %q", bucket)
+	}
+	spec.Scope, spec.Bucket = scope, bucket
+	if spec.Namespace == "" {
+		spec.Namespace = "origin"
+		if bucket != "" {
+			spec.Namespace += "-" + bucket
+		}
+	}
+	if !ns.ValidName(spec.Namespace) {
+		return spec, opts, fmt.Errorf("invalid cache namespace %q", spec.Namespace)
+	}
 	ttl := time.Minute
 	if spec.TTL != "" {
 		d, err := time.ParseDuration(spec.TTL)
 		if err != nil {
-			return nil, fmt.Errorf("invalid origin ttl %q: %w", spec.TTL, err)
+			return spec, opts, fmt.Errorf("invalid origin ttl %q: %w", spec.TTL, err)
 		}
 		ttl = d
 	}
@@ -39,13 +71,29 @@ func NewFromSpec(log *slog.Logger, st *store.Store, runtime *Runtime, spec Spec,
 	if spec.Retention != "" {
 		d, err := time.ParseDuration(spec.Retention)
 		if err != nil {
-			return nil, fmt.Errorf("invalid origin retention %q: %w", spec.Retention, err)
+			return spec, opts, fmt.Errorf("invalid origin retention %q: %w", spec.Retention, err)
 		}
 		ret = d
 	}
+	if ttl < 0 || ret < 0 || spec.MaxFills < 0 || spec.RangeChunk < 0 {
+		return spec, opts, fmt.Errorf("origin durations and limits must not be negative")
+	}
+	if ret == 0 {
+		ret = 24 * time.Hour
+	}
+	if spec.MaxFills == 0 {
+		spec.MaxFills = 8
+	}
+	if spec.RangeChunk > 0 {
+		spec.RangeChunk = min(max(spec.RangeChunk, 64<<10), maxRangeCacheSpan)
+	}
+	if err := ValidateConfig([]byte(spec.Config)); err != nil {
+		return spec, opts, fmt.Errorf("invalid origin config: %w", err)
+	}
+	spec.TTL, spec.Retention = ttl.String(), ret.String()
 	opts.Namespace, opts.TTL, opts.Retention = spec.Namespace, ttl, ret
 	opts.MaxFills, opts.RangeChunk = spec.MaxFills, spec.RangeChunk
-	return New(log, []byte(spec.Config), st, runtime, opts)
+	return spec, opts, nil
 }
 
 func ValidateConfig(config []byte) error {
@@ -53,26 +101,33 @@ func ValidateConfig(config []byte) error {
 	if err != nil {
 		return err
 	}
-	o, err := newOrigin(c)
-	if err != nil {
+	switch strings.ToLower(c.Type) {
+	case "s3":
+		cfg, err := parseS3Config(c)
+		if err != nil {
+			return err
+		}
+		return s3client.ValidateConfig(cfg)
+	case "http", "https":
+		_, _, err := parseHTTPConfig(c)
 		return err
+	case "filesystem":
+		_, err := parseFSConfig(c)
+		return err
+	case "ephemeral":
+		if err := decodeConfig(c, &struct{}{}); err != nil {
+			return err
+		}
+		return validateLocalPrefix("ephemeral", c.Prefix)
+	default:
+		return fmt.Errorf("unsupported origin type %q (s3, http, filesystem or ephemeral)", c.Type)
 	}
-	return o.Close()
 }
 
 func SaveSpec(ctx context.Context, st *store.Store, bucket string, spec Spec) error {
-	if err := ValidateConfig([]byte(spec.Config)); err != nil {
-		return fmt.Errorf("invalid origin config: %w", err)
-	}
-	if spec.Namespace == "" {
-		if bucket != "" {
-			spec.Namespace = "origin-" + bucket
-		} else {
-			spec.Namespace = "origin"
-		}
-	}
-	if !ns.ValidName(spec.Namespace) {
-		return fmt.Errorf("invalid cache namespace %q", spec.Namespace)
+	spec, _, err := normalizeSpec(bucket, spec)
+	if err != nil {
+		return err
 	}
 	if bucket == "" {
 		specs, err := ListSpecs(ctx, st)
@@ -91,18 +146,11 @@ func SaveSpec(ctx context.Context, st *store.Store, bucket string, spec Spec) er
 	targetKind := ns.Cache
 	targetName := spec.Namespace
 	if bucket != "" {
-		if !ns.ValidName(bucket) {
-			return fmt.Errorf("invalid bucket name %q", bucket)
-		}
-		spec.Scope = "bucket"
-		spec.Bucket = bucket
 		targetKind = ns.Bucket
 		targetName = bucket
 		if err := st.EnsureNamespace(ctx, ns.Bucket, bucket, nil, nil); err != nil {
 			return err
 		}
-	} else {
-		spec.Scope = "global"
 	}
 	return st.SetNamespaceAttrs(ctx, targetKind, targetName, map[string]any{"origin": spec})
 }

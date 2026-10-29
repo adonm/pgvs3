@@ -77,6 +77,22 @@ func New(cfg Config) (*Bucket, error) {
 }
 
 func newClient(cfg Config) (*client, error) {
+	c, err := prepareClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if c.http == nil {
+		c.http = newHTTPClient(cfg.Insecure)
+	}
+	return c, nil
+}
+
+func ValidateConfig(cfg Config) error {
+	_, err := prepareClient(cfg)
+	return err
+}
+
+func prepareClient(cfg Config) (*client, error) {
 	cfg.Bucket = strings.TrimSpace(cfg.Bucket)
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3: bucket is required")
@@ -103,10 +119,6 @@ func newClient(cfg Config) (*client, error) {
 		host = cfg.Bucket + "." + host
 	}
 
-	hc := cfg.HTTPClient
-	if hc == nil {
-		hc = newHTTPClient(cfg.Insecure)
-	}
 	return &client{
 		signer:       newSigner(region, cfg.AccessKey, cfg.SecretKey, cfg.SessionToken),
 		bucket:       cfg.Bucket,
@@ -114,7 +126,7 @@ func newClient(cfg Config) (*client, error) {
 		scheme:       scheme,
 		host:         host,
 		pathStyle:    pathStyle,
-		http:         hc,
+		http:         cfg.HTTPClient,
 		maxSinglePut: defaultMaxSinglePut,
 		minPartSize:  defaultMinPartSize,
 	}, nil
