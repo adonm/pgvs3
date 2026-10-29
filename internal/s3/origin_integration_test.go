@@ -348,16 +348,19 @@ func TestOriginRequiresCatalogBucket(t *testing.T) {
 	}
 
 	cases := []struct {
-		name   string
-		server string
-		bucket string
-		exists bool
+		name    string
+		server  string
+		bucket  string
+		exists  bool
+		invalid bool
 	}{
-		{"native missing", nativeHTTP.URL, missing, false},
-		{"native existing", nativeHTTP.URL, native, true},
-		{"per-bucket origin with row", nativeHTTP.URL, edge, true},
-		{"global origin with row", globalHTTP.URL, global, true},
-		{"global origin without row", globalHTTP.URL, ghost, false},
+		{"native missing", nativeHTTP.URL, missing, false, false},
+		{"native existing", nativeHTTP.URL, native, true, false},
+		{"per-bucket origin with row", nativeHTTP.URL, edge, true, false},
+		{"global origin with row", globalHTTP.URL, global, true, false},
+		{"global origin without row", globalHTTP.URL, ghost, false, false},
+		{"native invalid", nativeHTTP.URL, "bad!", false, true},
+		{"origin invalid", globalHTTP.URL, "bad!", false, true},
 	}
 	steps := []struct {
 		name, method, path string
@@ -383,6 +386,12 @@ func TestOriginRequiresCatalogBucket(t *testing.T) {
 				}
 				path := strings.ReplaceAll(st.path, "{b}", tc.bucket)
 				status, body, code := request(t, tc.server, st.method, path, st.body, header)
+				if tc.invalid {
+					if status != http.StatusBadRequest || (st.method != http.MethodHead && code != "InvalidBucketName") {
+						t.Errorf("%s: status %d code %q, want 400 InvalidBucketName", st.name, status, code)
+					}
+					continue
+				}
 				if !tc.exists {
 					if status != http.StatusNotFound || (st.method != http.MethodHead && code != "NoSuchBucket") {
 						t.Errorf("%s: status %d code %q, want 404 NoSuchBucket", st.name, status, code)
@@ -397,6 +406,25 @@ func TestOriginRequiresCatalogBucket(t *testing.T) {
 				}
 			}
 		})
+	}
+	for _, base := range []string{nativeHTTP.URL, globalHTTP.URL} {
+		for _, target := range []string{"/bad!", "/bad!/key?uploads", "/bad!/key?uploadId=missing&partNumber=1"} {
+			for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete} {
+				status, _, code := request(t, base, method, target, "", nil)
+				if status != http.StatusBadRequest || code != "InvalidBucketName" {
+					t.Fatalf("%s %s: status=%d code=%s", method, target, status, code)
+				}
+			}
+		}
+	}
+	for _, tc := range cases {
+		if !tc.exists {
+			continue
+		}
+		status, _, code := request(t, tc.server, http.MethodPut, "/"+tc.bucket+"/copy-invalid", "", map[string]string{"x-amz-copy-source": "/bad!/key"})
+		if status != http.StatusBadRequest || code != "InvalidBucketName" {
+			t.Fatalf("%s invalid copy source: status=%d code=%s", tc.name, status, code)
+		}
 	}
 
 	for _, b := range []string{missing, ghost} {

@@ -653,9 +653,6 @@ func (s *Server) requireOriginBucket(ctx context.Context, bucket string) error {
 	if s.store == nil || s.originFor(ctx, bucket) == nil {
 		return nil
 	}
-	if !ns.ValidName(bucket) {
-		return errNoSuchBucket()
-	}
 	return s.requireCatalogBucket(ctx, bucket)
 }
 
@@ -794,7 +791,7 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	}
 	srcBucket, srcKey, err := parseCopySource(r.Header.Get("x-amz-copy-source"), bucket)
 	if err != nil {
-		return errInvalidRequest("invalid x-amz-copy-source")
+		return err
 	}
 	if srcBucket != bucket {
 		if err := s.requireOriginBucket(r.Context(), srcBucket); err != nil {
@@ -876,7 +873,7 @@ func parseCopySource(v, defaultBucket string) (string, string, error) {
 	}
 	decoded, err := url.PathUnescape(v)
 	if err != nil {
-		return "", "", err
+		return "", "", errInvalidRequest("invalid x-amz-copy-source")
 	}
 	if i := strings.IndexByte(decoded, '?'); i >= 0 {
 		decoded = decoded[:i]
@@ -884,7 +881,10 @@ func parseCopySource(v, defaultBucket string) (string, string, error) {
 	decoded = strings.TrimPrefix(decoded, "/")
 	bucket, key, ok := strings.Cut(decoded, "/")
 	if !ok || key == "" {
-		return defaultBucket, decoded, nil
+		bucket, key = defaultBucket, decoded
+	}
+	if err := validateBucketName(bucket); err != nil {
+		return "", "", err
 	}
 	return bucket, key, nil
 }
@@ -925,7 +925,7 @@ func (s *Server) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, 
 	}
 	srcBucket, srcKey, err := parseCopySource(r.Header.Get("x-amz-copy-source"), bucket)
 	if err != nil {
-		return errInvalidRequest("invalid x-amz-copy-source")
+		return err
 	}
 	if srcBucket != bucket {
 		if err := s.requireOriginBucket(r.Context(), srcBucket); err != nil {

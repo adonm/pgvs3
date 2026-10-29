@@ -22,6 +22,7 @@ import (
 	"sync"
 	"unicode"
 
+	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -283,6 +284,13 @@ func awsEncode(s string, encodeSlash bool) string {
 	return b.String()
 }
 
+func validateBucketName(name string) error {
+	if !ns.ValidName(name) {
+		return errInvalidBucketName()
+	}
+	return nil
+}
+
 func (s *Server) apiError(err error) error {
 	if ae, ok := errors.AsType[*APIError](err); ok {
 		return ae
@@ -308,7 +316,7 @@ func (s *Server) apiError(err error) error {
 		return errNoSuchKey()
 	case errors.Is(err, store.ErrNoBucket):
 		return errNoSuchBucket()
-	case errors.Is(err, store.ErrInvalidBucket):
+	case errors.Is(err, store.ErrInvalidBucket), errors.Is(err, ns.ErrInvalidName):
 		return errInvalidBucketName()
 	case errors.Is(err, store.ErrNoUpload):
 		return errNoSuchUpload()

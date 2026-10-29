@@ -150,6 +150,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return errInvalidRequest("invalid object path")
 	}
+	if bucket != "" {
+		if err := validateBucketName(bucket); err != nil {
+			return err
+		}
+	}
 	if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return errAccessDenied("gateway is read-only")
 	}
@@ -225,6 +230,9 @@ func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket str
 		src = strings.TrimPrefix(strings.TrimSpace(r.URL.Query().Get("clone")), "/")
 	}
 	if src != "" {
+		if err := validateBucketName(src); err != nil {
+			return err
+		}
 		if s.originFor(r.Context(), src) != nil {
 			return errNotImplemented()
 		}
