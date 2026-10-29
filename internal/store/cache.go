@@ -11,6 +11,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/ns"
@@ -31,11 +32,15 @@ func IsDeletedOrigin(version string) bool {
 }
 
 func (s *Store) CacheTombstone(ctx context.Context, ref ns.Ref, key string, expiresAt time.Time) error {
-	_, err := s.PutInline(ctx, ObjectRef{NS: ref, Key: key}, []byte{}, WriteOptions{
+	return s.cacheTombstone(ctx, ObjectRef{NS: ref, Key: key}, expiresAt, nil)
+}
+
+func (s *Store) cacheTombstone(ctx context.Context, ref ObjectRef, expiresAt time.Time, lock *LockedObject) error {
+	_, err := s.PutInline(ctx, ref, []byte{}, WriteOptions{
 		ContentType: "application/octet-stream",
 		ExpiresAt:   &expiresAt,
-		OriginETag:  DeletedCacheVersion(NewDeletedCacheToken()).String(),
-		SkipLock:    ref.Kind == ns.WriteBack,
+		Publication: Publication{kind: publicationTombstone, origin: DeletedCacheVersion(NewDeletedCacheToken()).String()},
+		lock:        lock,
 	})
 	return err
 }
@@ -766,7 +771,41 @@ func PendingOriginToken(uploadID string) string {
 	return PendingCacheVersion(uploadID).String()
 }
 
-func (s *Store) LockCacheKey(ctx context.Context, kind ns.Kind, namespace, key string) (func(), error) {
+type LockedObject struct {
+	store    *Store
+	ref      ObjectRef
+	release  func()
+	released atomic.Bool
+}
+
+func (l *LockedObject) Release() {
+	if l != nil && l.release != nil && l.released.CompareAndSwap(false, true) {
+		l.release()
+	}
+}
+
+func (l *LockedObject) Ref() ObjectRef { return l.ref }
+
+func (l *LockedObject) PutInline(ctx context.Context, data []byte, opts WriteOptions) (*Meta, error) {
+	opts.lock = l
+	return l.store.PutInline(ctx, l.ref, data, opts)
+}
+
+func (l *LockedObject) StartObject(ctx context.Context, opts WriteOptions) (*ChunkWriter, error) {
+	opts.lock = l
+	return l.store.StartObject(ctx, l.ref, opts)
+}
+
+func (l *LockedObject) CompleteUploadPending(ctx context.Context, uploadID string, listed []ListedPart, opts WriteOptions, pending PendingCompletion) (*Completed, error) {
+	opts.lock = l
+	return l.store.CompleteUploadPending(ctx, l.ref, uploadID, listed, opts, pending)
+}
+
+func (l *LockedObject) Tombstone(ctx context.Context, expiresAt time.Time) error {
+	return l.store.cacheTombstone(ctx, l.ref, expiresAt, l)
+}
+
+func (s *Store) LockCacheKey(ctx context.Context, kind ns.Kind, namespace, key string) (*LockedObject, error) {
 	schema, err := kind.Schema(namespace)
 	if err != nil {
 		return nil, err
@@ -790,7 +829,7 @@ func (s *Store) LockCacheKey(ctx context.Context, kind ns.Kind, namespace, key s
 		}
 		conn.Release()
 	}
-	return release, nil
+	return &LockedObject{store: s, ref: ObjectRef{NS: ns.Ref{Kind: kind, Name: namespace}, Key: key}, release: release}, nil
 }
 
 type PendingUploadInfo struct {

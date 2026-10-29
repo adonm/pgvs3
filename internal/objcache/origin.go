@@ -144,7 +144,7 @@ func (a originAttrs) objectInfo() store.ObjectInfo {
 func (a originAttrs) writeOptions() store.WriteOptions {
 	return store.WriteOptions{
 		UserMetadata: a.UserMetadata, ContentType: a.ContentType, ContentEncoding: a.ContentEncoding,
-		OriginModified: a.LastModified, OriginETag: versionFor(a),
+		OriginModified: a.LastModified, Publication: store.NormalPublication(versionFor(a)),
 	}
 }
 

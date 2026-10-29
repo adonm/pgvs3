@@ -48,6 +48,50 @@ func TestDefaultOpenOptions(t *testing.T) {
 	}
 }
 
+func TestPublicationIntents(t *testing.T) {
+	s := &Store{}
+	cache := ObjectRef{NS: ns.CacheRef("cache"), Key: "key"}
+	write := ObjectRef{NS: ns.WriteBackRef("cache"), Key: "key"}
+	bucket := ObjectRef{NS: ns.BucketRef("bucket"), Key: "key"}
+	lease := FillLease{Namespace: "cache", Key: "key", Owner: "first"}
+	fill := FillPublication("v2", "v1", &lease)
+	lease.Owner = "changed"
+	if fill.lease.Owner != "first" {
+		t.Fatal("publication retained a mutable caller lease")
+	}
+	pending := WriteBackPublication(PendingOrigin{Token: PendingOriginToken("upload"), BaseMissing: true})
+	for _, tc := range []struct {
+		name   string
+		ref    ObjectRef
+		intent Publication
+		inline bool
+		valid  bool
+	}{
+		{"ordinary", bucket, NormalPublication(""), true, true},
+		{"reserved pending version", cache, NormalPublication(PendingOriginToken("x")), true, false},
+		{"reserved delete version", cache, NormalPublication(DeletedCacheVersion("x").String()), true, false},
+		{"fenced fill", cache, fill, true, true},
+		{"fill into bucket", bucket, fill, true, false},
+		{"wrong lease", cache, FillPublication("v", "v", &FillLease{Namespace: "other", Key: "key", Owner: "owner"}), true, false},
+		{"write-back", write, pending, false, true},
+		{"inline write-back", write, pending, true, false},
+		{"bucket write-back", bucket, pending, false, false},
+		{"empty token", write, WriteBackPublication(PendingOrigin{}), false, false},
+		{"contradictory base", write, WriteBackPublication(PendingOrigin{Token: PendingOriginToken("x"), BaseMissing: true, BaseETag: "v"}), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expires := time.Now().Add(time.Hour)
+			opts, err := s.prepareWrite(tc.ref, WriteOptions{Publication: tc.intent, ExpiresAt: &expires, KeepTTL: true}, tc.inline)
+			if tc.valid && err != nil || !tc.valid && !errors.Is(err, ErrInvalidPublication) {
+				t.Fatalf("valid=%t error=%v", tc.valid, err)
+			}
+			if tc.valid && tc.intent.IsPending() && (opts.ExpiresAt != nil || opts.KeepTTL) {
+				t.Fatal("pending publication can expire")
+			}
+		})
+	}
+}
+
 func TestSchemaBaselineIsSquashed(t *testing.T) {
 	if strings.Contains(schemaSQL, "goose") || strings.Contains(schemaSQL, "migrate_v10") {
 		t.Fatal("schema baseline contains migration machinery")

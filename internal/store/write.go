@@ -29,6 +29,10 @@ const RowBytes = 8120
 const MaxInlineBytes = 65536
 
 func (s *Store) PutInline(ctx context.Context, ref ObjectRef, data []byte, opts WriteOptions) (*Meta, error) {
+	opts, err := s.prepareWrite(ref, opts, true)
+	if err != nil {
+		return nil, err
+	}
 	if data == nil {
 		data = []byte{}
 	}
@@ -51,14 +55,14 @@ func (s *Store) PutInline(ctx context.Context, ref ObjectRef, data []byte, opts 
 		userMeta = []string{}
 	}
 	var expected any
-	if opts.ExpectedOrigin != "" {
-		expected = opts.ExpectedOrigin
+	if opts.Publication.expected != "" {
+		expected = opts.Publication.expected
 	}
 	result, err := withAutoCreate(ctx, s, ref.NS.Kind, ref.NS.Name, func(sc string) (string, error) {
 		var res string
 		err := s.pool.QueryRow(ctx, "SELECT "+sc+".put_inline($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
 			ref.Key, stored, int64(len(data)), sumSHA[:], etag, userMeta, opts.ContentType,
-			condText, match, "on", opts.ExpiresAt, opts.KeepTTL, opts.OriginETag, expected, opts.SkipLock,
+			condText, match, "on", opts.ExpiresAt, opts.KeepTTL, opts.Publication.origin, expected, opts.skipLock(),
 			opts.s3MetaJSON()).Scan(&res)
 		return res, err
 	})
@@ -77,7 +81,7 @@ func (s *Store) PutInline(ctx context.Context, ref ObjectRef, data []byte, opts 
 	m := Meta{
 		Size: int64(len(data)), ETag: etag, UserMetadata: userMeta,
 		ContentType: opts.ContentType, ContentEncoding: opts.ContentEncoding,
-		CreatedAt: time.Now(), OriginETag: opts.OriginETag,
+		CreatedAt: time.Now(), OriginETag: opts.Publication.origin,
 		OriginModified: opts.OriginModified,
 		SHA256:         sumSHA[:], ExpiresAt: opts.ExpiresAt, Inline: data,
 	}
@@ -134,15 +138,16 @@ type Published struct {
 }
 
 var (
-	ErrNoBucket        = errors.New("bucket does not exist")
-	ErrInvalidBucket   = errors.New("invalid bucket name")
-	ErrBucketNotEmpty  = errors.New("bucket is not empty")
-	ErrNoUpload        = errors.New("upload does not exist")
-	ErrPrecondition    = errors.New("object precondition failed")
-	ErrStaleCache      = errors.New("cache object origin version changed")
-	ErrMissingChecksum = errors.New("part lacks the upload's checksum")
-	ErrInvalidPart     = errors.New("invalid part")
-	errAborted         = errors.New("ingest aborted")
+	ErrNoBucket           = errors.New("bucket does not exist")
+	ErrInvalidBucket      = errors.New("invalid bucket name")
+	ErrBucketNotEmpty     = errors.New("bucket is not empty")
+	ErrNoUpload           = errors.New("upload does not exist")
+	ErrPrecondition       = errors.New("object precondition failed")
+	ErrStaleCache         = errors.New("cache object origin version changed")
+	ErrMissingChecksum    = errors.New("part lacks the upload's checksum")
+	ErrInvalidPart        = errors.New("invalid part")
+	errAborted            = errors.New("ingest aborted")
+	ErrInvalidPublication = errors.New("invalid publication intent or write lock")
 )
 
 type rowFramer struct {
@@ -301,6 +306,11 @@ func (s *Store) StartPart(ctx context.Context, ref ObjectRef, uploadID string, p
 }
 
 func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, error) {
+	var err error
+	t.opts, err = s.prepareWrite(ObjectRef{NS: ns.Ref{Kind: t.nsKind, Name: t.bucket}, Key: t.key}, t.opts, false)
+	if err != nil {
+		return nil, err
+	}
 	if t.opts.UserMetadata == nil {
 		t.opts.UserMetadata = []string{}
 	}
@@ -480,15 +490,18 @@ func publishUpload(ctx context.Context, tx pgx.Tx, t writerTarget, pub Published
 }
 
 func publishObject(ctx context.Context, tx pgx.Tx, t writerTarget, pub Published) error {
+	if err := t.opts.validateLock(ObjectRef{NS: ns.Ref{Kind: t.nsKind, Name: t.bucket}, Key: t.key}); err != nil {
+		return err
+	}
 	condText, match := t.opts.Precondition.SQL()
 	var expected any
-	if t.opts.ExpectedOrigin != "" {
-		expected = t.opts.ExpectedOrigin
+	if t.opts.Publication.expected != "" {
+		expected = t.opts.Publication.expected
 	}
 	var outcome string
 	err := tx.QueryRow(ctx, "SELECT "+t.schema+".publish_object($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
 		t.key, pub.FileID, pub.Size, pub.SHA256, pub.ETag, t.opts.UserMetadata, t.opts.ContentType, condText, match,
-		t.opts.ExpiresAt, t.opts.KeepTTL, t.opts.OriginETag, expected, t.opts.SkipLock,
+		t.opts.ExpiresAt, t.opts.KeepTTL, t.opts.Publication.origin, expected, t.opts.skipLock(),
 		t.opts.s3MetaJSON()).Scan(&outcome)
 	if err == nil {
 		switch outcome {
@@ -502,13 +515,10 @@ func publishObject(ctx context.Context, tx pgx.Tx, t writerTarget, pub Published
 }
 
 func publishPendingOrigin(ctx context.Context, tx pgx.Tx, t writerTarget, size int64) error {
-	po := t.opts.PendingOrigin
-	if po == nil {
+	if !t.opts.Publication.IsPending() {
 		return nil
 	}
-	if t.kind != writeObject || (t.nsKind != ns.Cache && t.nsKind != ns.WriteBack) || po.Token == "" || po.Token != t.opts.OriginETag {
-		return errors.New("invalid pending origin publication")
-	}
+	po := t.opts.Publication.pending
 	var base any
 	if po.BaseETag != "" {
 		base = po.BaseETag
@@ -599,7 +609,13 @@ type objectPublication struct {
 }
 
 func swapObjectParts(ctx context.Context, tx pgx.Tx, schema, key string, opts *WriteOptions, pub objectPublication) error {
-	if opts == nil || !opts.SkipLock {
+	if opts != nil && opts.lock != nil {
+		lockedSchema, err := opts.lock.ref.Schema()
+		if err != nil || lockedSchema != schema || opts.lock.ref.Key != key || opts.lock.released.Load() {
+			return ErrInvalidPublication
+		}
+	}
+	if opts == nil || !opts.skipLock() {
 		if err := lockObjectKey(ctx, tx, schema, key); err != nil {
 			return err
 		}
@@ -961,6 +977,10 @@ func storePartChecksums(ctx context.Context, tx pgx.Tx, schema, key string, algo
 }
 
 func (s *Store) completeUploadRef(ctx context.Context, ref ObjectRef, uploadID string, listed []ListedPart, opts WriteOptions, pending pendingUpload) (completed *Completed, err error) {
+	opts, err = s.prepareWrite(ref, opts, false)
+	if err != nil {
+		return nil, err
+	}
 	sc, err := ref.Schema()
 	if err != nil {
 		return nil, err

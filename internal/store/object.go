@@ -209,10 +209,10 @@ func (o WriteOptions) s3MetaJSON() []byte {
 		meta["checksum_value"] = o.Checksum.Value
 		meta["checksum_type"] = o.ChecksumType
 	}
-	if o.FillLease != nil {
-		meta["fill_namespace"] = o.FillLease.Namespace
-		meta["fill_key"] = o.FillLease.Key
-		meta["fill_owner"] = o.FillLease.Owner
+	if lease := o.Publication.lease; lease != nil {
+		meta["fill_namespace"] = lease.Namespace
+		meta["fill_key"] = lease.Key
+		meta["fill_owner"] = lease.Owner
 	}
 	if len(meta) == 0 {
 		return []byte("{}")
@@ -246,6 +246,86 @@ type FillLease struct {
 	Owner     string
 }
 
+type publicationKind uint8
+
+const (
+	publicationNormal publicationKind = iota
+	publicationFill
+	publicationPending
+	publicationTombstone
+)
+
+type Publication struct {
+	kind     publicationKind
+	origin   string
+	expected string
+	lease    *FillLease
+	pending  PendingOrigin
+}
+
+func NormalPublication(origin string) Publication { return Publication{origin: origin} }
+
+func FillPublication(origin, expected string, lease *FillLease) Publication {
+	p := Publication{kind: publicationFill, origin: origin, expected: expected}
+	if lease != nil {
+		copied := *lease
+		p.lease = &copied
+	}
+	return p
+}
+
+func WriteBackPublication(pending PendingOrigin) Publication {
+	return Publication{kind: publicationPending, origin: pending.Token, pending: pending}
+}
+
+func (p Publication) OriginVersion() string { return p.origin }
+
+func (p Publication) IsPending() bool { return p.kind == publicationPending }
+
+func (s *Store) prepareWrite(ref ObjectRef, o WriteOptions, inline bool) (WriteOptions, error) {
+	if err := o.validateLock(ref); err != nil {
+		return o, err
+	}
+	if o.lock != nil && o.lock.store != s {
+		return o, ErrInvalidPublication
+	}
+	p := o.Publication
+	switch p.kind {
+	case publicationNormal:
+		if !ParseCacheVersion(p.origin).IsLive() {
+			return o, ErrInvalidPublication
+		}
+	case publicationFill:
+		if ref.NS.Kind != ns.Cache || !ParseCacheVersion(p.origin).IsLive() || !ParseCacheVersion(p.expected).IsLive() ||
+			(p.lease != nil && (p.lease.Namespace != ref.NS.Name || p.lease.Key == "" || p.lease.Owner == "")) {
+			return o, ErrInvalidPublication
+		}
+	case publicationPending:
+		v := ParseCacheVersion(p.pending.Token)
+		if inline || (ref.NS.Kind != ns.Cache && ref.NS.Kind != ns.WriteBack) || !v.IsPending() || v.Token == "" ||
+			(p.pending.BaseMissing && p.pending.BaseETag != "") || o.Precondition.Mode != Unconditional {
+			return o, ErrInvalidPublication
+		}
+		o.ExpiresAt, o.KeepTTL = nil, false
+	case publicationTombstone:
+		if (ref.NS.Kind != ns.Cache && ref.NS.Kind != ns.WriteBack) || !ParseCacheVersion(p.origin).IsDeleted() || o.ExpiresAt == nil {
+			return o, ErrInvalidPublication
+		}
+	default:
+		return o, ErrInvalidPublication
+	}
+	return o, nil
+}
+
+func (o WriteOptions) validateLock(ref ObjectRef) error {
+	if o.lock != nil && (o.lock.store == nil || o.lock.release == nil || o.lock.ref != ref || o.lock.released.Load()) {
+		return ErrInvalidPublication
+	}
+	return nil
+}
+
+func (o WriteOptions) skipLock() bool { return o.lock != nil }
+
 type WriteOptions struct {
 	Precondition    Precondition
 	UserMetadata    []string
@@ -257,12 +337,8 @@ type WriteOptions struct {
 	ChecksumType   string
 	ExpiresAt      *time.Time
 	KeepTTL        bool
-	OriginETag     string
-	ExpectedOrigin string
-	PendingOrigin  *PendingOrigin
-	FillLease      *FillLease
-
-	SkipLock bool
+	Publication    Publication
+	lock           *LockedObject
 
 	ExpectedSize int64
 }

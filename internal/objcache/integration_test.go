@@ -851,7 +851,7 @@ func TestReadOnlyTier(t *testing.T) {
 		dropOnCleanup(t, ns.WriteBack, cache)
 		dropOnCleanup(t, ns.Cache, cache)
 		if _, err := testStore.PutInline(ctx, store.ObjectRef{NS: ns.WriteBackRef(cache), Key: "bkt/warm"},
-			[]byte("durable"), store.WriteOptions{ContentType: "text/plain", OriginETag: "origin-v1"}); err != nil {
+			[]byte("durable"), store.WriteOptions{ContentType: "text/plain", Publication: store.NormalPublication("origin-v1")}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1242,8 +1242,17 @@ func TestCacheResolutionLifecycle(t *testing.T) {
 						testutil.Must(t, f.tier.origin.Delete(ctx, ck))
 					}
 					ref := store.ObjectRef{NS: ns.Ref{Kind: kind, Name: f.tier.namespace}, Key: ck}
-					m, err := testStore.PutInline(ctx, ref, []byte("hello"), store.WriteOptions{OriginETag: version})
+					seedVersion := version
+					if state == "pending" || state == "deleted" {
+						seedVersion = versionFor(a)
+					}
+					m, err := testStore.PutInline(ctx, ref, []byte("hello"), store.WriteOptions{Publication: store.NormalPublication(seedVersion)})
 					testutil.Must(t, err)
+					if seedVersion != version {
+						schema, _ := ref.Schema()
+						_, err := testStore.Pool().Exec(ctx, "UPDATE "+schema+".objects SET origin_etag=$2 WHERE key=$1", ck, version)
+						testutil.Must(t, err)
+					}
 					f.tier.readOnly, f.tier.ttl = readOnly, 0
 					if state == "fresh" {
 						f.tier.ttl = time.Hour
@@ -1293,14 +1302,13 @@ func TestSpooledPublicationMetadata(t *testing.T) {
 	for _, pending := range []bool{false, true} {
 		opts := store.WriteOptions{
 			ContentType: "application/parquet", ContentEncoding: "gzip", OriginModified: modified,
-			OriginETag: "origin-version", Checksum: checksum, ChecksumType: "FULL_OBJECT",
+			Publication: store.NormalPublication("origin-version"), Checksum: checksum, ChecksumType: "FULL_OBJECT",
 		}
 		if pending {
-			opts.OriginETag = store.PendingOriginToken("metadata-test")
-			opts.PendingOrigin = &store.PendingOrigin{Token: opts.OriginETag}
+			opts.Publication = store.WriteBackPublication(store.PendingOrigin{Token: store.PendingOriginToken("metadata-test")})
 		}
 		ref := f.tier.writeRef(fmt.Sprintf("bkt/metadata-%t", pending))
-		m, err := f.tier.storeSpooled(testCtx, ref, sp, opts)
+		m, err := f.tier.storeSpooled(testCtx, ref, sp, opts, nil)
 		testutil.Must(t, err)
 		stored, err := testStore.MetaHeader(testCtx, ref)
 		testutil.Must(t, err)
@@ -1383,7 +1391,7 @@ func TestParentHeadPublicationFencedByTombstone(t *testing.T) {
 
 func TestFillRenewal(t *testing.T) {
 	f := newFixture(t)
-	f.tier.fillTTL = 300 * time.Millisecond
+	f.tier.fillTTL = 2 * time.Second
 	ck := f.tier.key("bkt", "slow-renewal")
 	if _, err := f.tier.origin.Upload(testCtx, ck, strings.NewReader("body"), 4, originUpload{}); err != nil {
 		t.Fatal(err)
@@ -1398,11 +1406,15 @@ func TestFillRenewal(t *testing.T) {
 		t.Fatal("fill not started")
 	}
 
-	select {
-	case err := <-result:
-		t.Fatalf("fill ended early: %v", err)
-	case <-time.After(900 * time.Millisecond):
-	}
+	var initialExpiry time.Time
+	testutil.Must(t, testStore.Pool().QueryRow(testCtx,
+		`SELECT expires_at FROM s3p.cache_fill_leases WHERE namespace=$1 AND key=$2`, f.tier.namespace, ck).Scan(&initialExpiry))
+	testutil.Eventually(t, 5*time.Second, "fill lease was not renewed", func() bool {
+		var renewedExpiry time.Time
+		err := testStore.Pool().QueryRow(testCtx,
+			`SELECT expires_at FROM s3p.cache_fill_leases WHERE namespace=$1 AND key=$2`, f.tier.namespace, ck).Scan(&renewedExpiry)
+		return err == nil && renewedExpiry.After(initialExpiry)
+	})
 	if got, err := testStore.Cache(f.tier.namespace).AcquireFillLease(testCtx, ck, "competitor", time.Minute); err != nil || got {
 		t.Fatalf("renewed fill lost ownership: %t %v", got, err)
 	}

@@ -265,15 +265,15 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 
 	const inlineKey = "bkt/inline"
 	if _, err := testStore.PutInline(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: inlineKey}, []byte("v1"),
-		WriteOptions{ContentType: "text/plain", OriginETag: "v1"}); err != nil {
+		WriteOptions{ContentType: "text/plain", Publication: NormalPublication("v1")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testStore.PutInline(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: "bkt/absent"}, []byte("first"),
-		WriteOptions{ContentType: "text/plain", OriginETag: "v1", ExpectedOrigin: "never-existed"}); err != nil {
+		WriteOptions{ContentType: "text/plain", Publication: FillPublication("v1", "never-existed", nil)}); err != nil {
 		t.Fatalf("conditional publish without an old row: %v", err)
 	}
 	if _, err := testStore.PutInline(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: inlineKey}, []byte("stale"),
-		WriteOptions{ContentType: "text/plain", OriginETag: "v0", ExpectedOrigin: "v0"}); !errors.Is(err, ErrStaleCache) {
+		WriteOptions{ContentType: "text/plain", Publication: FillPublication("v0", "v0", nil)}); !errors.Is(err, ErrStaleCache) {
 		t.Fatalf("stale inline publish error = %v, want ErrStaleCache", err)
 	}
 	got, ok, err := testStore.Cache(cache).Get(ctx, inlineKey)
@@ -285,7 +285,7 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 		t.Fatalf("inline origin after stale publish = %+v err=%v", m, err)
 	}
 	if _, err := testStore.PutInline(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: inlineKey}, []byte("v2"),
-		WriteOptions{ContentType: "text/plain", OriginETag: "v2", ExpectedOrigin: "v1"}); err != nil {
+		WriteOptions{ContentType: "text/plain", Publication: FillPublication("v2", "v1", nil)}); err != nil {
 		t.Fatalf("matching inline publish: %v", err)
 	}
 	got, ok, err = testStore.Cache(cache).Get(ctx, inlineKey)
@@ -299,7 +299,7 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 
 	const chunkKey = "bkt/chunked"
 	w, err := testStore.StartObject(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: chunkKey},
-		WriteOptions{ContentType: "text/plain", OriginETag: "c1"})
+		WriteOptions{ContentType: "text/plain", Publication: NormalPublication("c1")})
 	testutil.Must(t, err)
 	if _, err := w.Write([]byte("chunk-v1")); err != nil {
 		t.Fatal(err)
@@ -308,7 +308,7 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	stale, err := testStore.StartObject(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: chunkKey},
-		WriteOptions{ContentType: "text/plain", OriginETag: "c0", ExpectedOrigin: "c0"})
+		WriteOptions{ContentType: "text/plain", Publication: FillPublication("c0", "c0", nil)})
 	testutil.Must(t, err)
 	if _, err := stale.Write([]byte("stale")); err != nil {
 		t.Fatal(err)
@@ -325,7 +325,7 @@ func TestCachePublishExpectedOriginGuard(t *testing.T) {
 		t.Fatalf("chunked origin after stale publish = %+v err=%v", m, err)
 	}
 	match, err := testStore.StartObject(ctx, ObjectRef{NS: ns.CacheRef(cache), Key: chunkKey},
-		WriteOptions{ContentType: "text/plain", OriginETag: "c2", ExpectedOrigin: "c1"})
+		WriteOptions{ContentType: "text/plain", Publication: FillPublication("c2", "c1", nil)})
 	testutil.Must(t, err)
 	if _, err := match.Write([]byte("chunk-v2")); err != nil {
 		t.Fatal(err)
@@ -510,19 +510,42 @@ func TestSchemaBootstrapAndIdempotentInit(t *testing.T) {
 
 func TestCacheKeyAdvisoryLockBlocksSecondOwner(t *testing.T) {
 	ctx := testCtx
-	release, err := testStore.LockCacheKey(ctx, ns.Cache, "lock-ns", "bkt/key")
+	name := unique("lock-ns")
+	testutil.Must(t, testStore.EnsureNamespace(ctx, ns.Cache, name, nil, nil))
+	dropOnCleanup(t, ns.Cache, name)
+	release, err := testStore.LockCacheKey(ctx, ns.Cache, name, "bkt/key")
 	testutil.Must(t, err)
+	defer release.Release()
 	waitCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
-	if _, err := testStore.LockCacheKey(waitCtx, ns.Cache, "lock-ns", "bkt/key"); err == nil {
+	if _, err := testStore.LockCacheKey(waitCtx, ns.Cache, name, "bkt/key"); err == nil {
 		t.Fatal("second cache key lock unexpectedly succeeded")
 	}
-	release()
-	release2, err := testStore.LockCacheKey(ctx, ns.Cache, "lock-ns", "bkt/key")
+	if _, err := release.PutInline(ctx, []byte("owned"), WriteOptions{}); err != nil {
+		t.Fatalf("scoped writer could not reuse its lock: %v", err)
+	}
+	release.Release()
+	release.Release()
+	if _, err := release.PutInline(ctx, []byte("stale"), WriteOptions{}); !errors.Is(err, ErrInvalidPublication) {
+		t.Fatalf("released lock accepted publication: %v", err)
+	}
+	release2, err := testStore.LockCacheKey(ctx, ns.Cache, name, "bkt/key")
 	if err != nil {
 		t.Fatalf("lock after release: %v", err)
 	}
-	release2()
+	defer release2.Release()
+	w, err := release2.StartObject(ctx, WriteOptions{})
+	testutil.Must(t, err)
+	defer w.Abort()
+	_, err = w.Write([]byte("released before commit"))
+	testutil.Must(t, err)
+	release2.Release()
+	if _, err := w.Finish(nil); !errors.Is(err, ErrInvalidPublication) {
+		t.Fatalf("COPY published after losing its scoped lock: %v", err)
+	}
+	if got, ok, err := testStore.Cache(name).Get(ctx, "bkt/key"); err != nil || !ok || string(got) != "owned" {
+		t.Fatalf("rejected publication changed the object: %q %t %v", got, ok, err)
+	}
 }
 
 func TestWriteBackNamespaceIsLogged(t *testing.T) {
@@ -774,7 +797,7 @@ func TestMetadataRoundTrip(t *testing.T) {
 			src := ObjectRef{NS: ns.BucketRef(bucket), Key: fmt.Sprintf("source-%d", i)}
 			dst := ObjectRef{NS: src.NS, Key: fmt.Sprintf("copy-%d", i)}
 			expires := time.Now().Add(time.Hour)
-			if _, err := testStore.PutInline(testCtx, src, data, WriteOptions{ExpiresAt: &expires, OriginETag: "source-origin"}); err != nil {
+			if _, err := testStore.PutInline(testCtx, src, data, WriteOptions{ExpiresAt: &expires, Publication: NormalPublication("source-origin")}); err != nil {
 				t.Fatal(err)
 			}
 			copied, err := testStore.Copy(testCtx, src, dst, CopyOptions{})
@@ -1328,7 +1351,7 @@ func TestFillPublicationChecksLiveDatabaseOwner(t *testing.T) {
 	if ok, err := testStore.Cache(name).AcquireFillLease(testCtx, ref.Key, lease.Owner, time.Minute); err != nil || !ok {
 		t.Fatal(err)
 	}
-	if _, err := testStore.PutInline(testCtx, ref, []byte("original"), WriteOptions{FillLease: &lease}); err != nil {
+	if _, err := testStore.PutInline(testCtx, ref, []byte("original"), WriteOptions{Publication: FillPublication("", "", &lease)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testStore.Pool().Exec(testCtx, `UPDATE s3p.cache_fill_leases SET expires_at=now()-interval '1 second' WHERE namespace=$1`, name); err != nil {
@@ -1337,7 +1360,7 @@ func TestFillPublicationChecksLiveDatabaseOwner(t *testing.T) {
 	if ok, err := testStore.RenewFillLease(testCtx, lease, time.Minute); err != nil || ok {
 		t.Fatalf("revived expired owner: %t %v", ok, err)
 	}
-	if _, err := testStore.PutInline(testCtx, ref, []byte("stale"), WriteOptions{FillLease: &lease}); !errors.Is(err, ErrStaleCache) {
+	if _, err := testStore.PutInline(testCtx, ref, []byte("stale"), WriteOptions{Publication: FillPublication("", "", &lease)}); !errors.Is(err, ErrStaleCache) {
 		t.Fatalf("expired inline owner: %v", err)
 	}
 	if ok, err := testStore.Cache(name).AcquireFillLease(testCtx, ref.Key, "second", time.Minute); err != nil || !ok {
@@ -1347,7 +1370,7 @@ func TestFillPublicationChecksLiveDatabaseOwner(t *testing.T) {
 	for _, owner := range []string{"first", "second"} {
 		attempt := lease
 		attempt.Owner = owner
-		w, err := testStore.StartObject(testCtx, ref, WriteOptions{FillLease: &attempt})
+		w, err := testStore.StartObject(testCtx, ref, WriteOptions{Publication: FillPublication("", "", &attempt)})
 		testutil.Must(t, err)
 		data := bytes.Repeat([]byte(owner), 20<<10)
 		if _, err := w.Write(data); err != nil {
@@ -1408,7 +1431,7 @@ func TestRetiringWriteCacheRevokesOldFillsNotNewWrites(t *testing.T) {
 	})
 	write := ObjectRef{NS: ns.WriteBackRef(name), Key: "bkt/key"}
 	read := ObjectRef{NS: ns.CacheRef(name), Key: write.Key}
-	if _, err := testStore.PutInline(testCtx, write, []byte("same"), WriteOptions{OriginETag: "origin"}); err != nil {
+	if _, err := testStore.PutInline(testCtx, write, []byte("same"), WriteOptions{Publication: NormalPublication("origin")}); err != nil {
 		t.Fatal(err)
 	}
 	old, err := testStore.Meta(testCtx, write)
@@ -1419,7 +1442,7 @@ func TestRetiringWriteCacheRevokesOldFillsNotNewWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := testStore.PutInline(testCtx, write, []byte("same"), WriteOptions{OriginETag: "origin"}); err != nil {
+	if _, err := testStore.PutInline(testCtx, write, []byte("same"), WriteOptions{Publication: NormalPublication("origin")}); err != nil {
 		t.Fatal(err)
 	}
 	if retired, err := testStore.RetireOriginObject(testCtx, write, old); err != nil || retired {
@@ -1433,7 +1456,7 @@ func TestRetiringWriteCacheRevokesOldFillsNotNewWrites(t *testing.T) {
 	if _, err := testStore.Meta(testCtx, read); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("write fence remained: %v", err)
 	}
-	if _, err := testStore.PutInline(testCtx, read, []byte("stale"), WriteOptions{FillLease: &lease}); !errors.Is(err, ErrStaleCache) {
+	if _, err := testStore.PutInline(testCtx, read, []byte("stale"), WriteOptions{Publication: FillPublication("", "", &lease)}); !errors.Is(err, ErrStaleCache) {
 		t.Fatalf("revoked owner resurrected bytes: %v", err)
 	}
 }

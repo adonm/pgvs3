@@ -678,8 +678,8 @@ func (t *Tier) rangeChunk(ctx context.Context, ck, key string, v readView, off i
 		}
 		return t.storeSpooled(fillCtx, t.cacheRef(chunkKey), sp, store.WriteOptions{
 			ContentType: ct, OriginModified: lastModified,
-			OriginETag: version, ExpectedOrigin: version,
-		})
+			Publication: fillPublication(fillCtx, version, version),
+		}, nil)
 	})
 	if err != nil {
 		return nil, false, err
@@ -879,6 +879,11 @@ func contentTypeFor(key string) string {
 
 type fillLeaseContextKey struct{}
 
+func fillPublication(ctx context.Context, origin, expected string) store.Publication {
+	lease, _ := ctx.Value(fillLeaseContextKey{}).(*store.FillLease)
+	return store.FillPublication(origin, expected, lease)
+}
+
 func (t *Tier) coalesceFill(ctx context.Context, ck string, timeout time.Duration, fetch func(context.Context) (*store.Meta, error)) (*store.Meta, error) {
 	ch := t.group.DoChan("fill:"+ck, func() (any, error) {
 		unlock := t.lockKey(ck)
@@ -1019,8 +1024,8 @@ func (t *Tier) fill(ctx context.Context, ck, key string) (*store.Meta, error) {
 			return nil, fmt.Errorf("origin GET %s returned %d bytes, wanted %d", key, sp.size, attrs.Size)
 		}
 		opts := attrs.writeOptions()
-		opts.ExpectedOrigin = opts.OriginETag
-		m, err := t.storeSpooled(fillCtx, t.cacheRef(ck), sp, opts)
+		opts.Publication = fillPublication(fillCtx, versionFor(attrs), versionFor(attrs))
+		m, err := t.storeSpooled(fillCtx, t.cacheRef(ck), sp, opts, nil)
 		if errors.Is(err, store.ErrStaleCache) {
 			return t.currentFillResult(fillCtx, ck)
 		}
@@ -1174,32 +1179,40 @@ func (w *spoolWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (t *Tier) storeSpooled(ctx context.Context, ref store.ObjectRef, sp spooled, opts store.WriteOptions) (*store.Meta, error) {
-	if lease, ok := ctx.Value(fillLeaseContextKey{}).(*store.FillLease); ok {
-		opts.FillLease = lease
+func (t *Tier) storeSpooled(ctx context.Context, ref store.ObjectRef, sp spooled, opts store.WriteOptions, locked *store.LockedObject) (*store.Meta, error) {
+	if locked != nil && locked.Ref() != ref {
+		return nil, store.ErrInvalidPublication
 	}
 	retention := t.retention
 	if ref.NS.Kind == ns.WriteBack {
 		retention = t.durableRetention()
-		opts.SkipLock = true
 	}
 	exp := time.Now().Add(retention)
 	opts.ExpiresAt = &exp
-	if opts.PendingOrigin != nil {
+	if opts.Publication.IsPending() {
 
 		opts.ExpiresAt = nil
 	}
 	opts.ExpectedSize = sp.size
 	if sp.data != nil && int64(len(sp.data)) <= int64(ref.NS.Kind.InlineMax()) {
-		if opts.PendingOrigin != nil {
+		if opts.Publication.IsPending() {
 			return nil, errors.New("pending origin publication requires the chunked write path")
+		}
+		if locked != nil {
+			return locked.PutInline(ctx, sp.data, opts)
 		}
 		return t.store.PutInline(ctx, ref, sp.data, opts)
 	}
 	if _, err := sp.r.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	w, err := t.store.StartObject(ctx, ref, opts)
+	var w *store.ChunkWriter
+	var err error
+	if locked != nil {
+		w, err = locked.StartObject(ctx, opts)
+	} else {
+		w, err = t.store.StartObject(ctx, ref, opts)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1214,7 +1227,7 @@ func (t *Tier) storeSpooled(ctx context.Context, ref store.ObjectRef, sp spooled
 	m := &store.Meta{
 		Size: pub.Size, ETag: pub.ETag, UserMetadata: opts.UserMetadata,
 		ContentType: opts.ContentType, ContentEncoding: opts.ContentEncoding,
-		CreatedAt: time.Now(), OriginModified: opts.OriginModified, OriginETag: opts.OriginETag,
+		CreatedAt: time.Now(), OriginModified: opts.OriginModified, OriginETag: opts.Publication.OriginVersion(),
 		FileID: pub.FileID, SHA256: pub.SHA256, ExpiresAt: opts.ExpiresAt,
 	}
 	if opts.Checksum != nil {
@@ -1233,11 +1246,16 @@ func (t *Tier) requireWrite(operation string) error {
 	return nil
 }
 
-func (t *Tier) lockWrite(ctx context.Context, ck string, validate func() error) (func(), error) {
+type lockedWrite struct {
+	object  *store.LockedObject
+	release func()
+}
+
+func (t *Tier) lockWrite(ctx context.Context, ck string, validate func() error) (*lockedWrite, error) {
 	unlock := t.lockKey(ck)
-	var unlockDB func()
+	var locked *store.LockedObject
 	defer func() {
-		if unlockDB == nil {
+		if locked == nil {
 			unlock()
 		}
 	}()
@@ -1246,14 +1264,15 @@ func (t *Tier) lockWrite(ctx context.Context, ck string, validate func() error) 
 			return nil, err
 		}
 	}
-	unlockDB, err := t.store.LockCacheKey(ctx, ns.WriteBack, t.namespace, ck)
+	var err error
+	locked, err = t.store.LockCacheKey(ctx, ns.WriteBack, t.namespace, ck)
 	if err != nil {
 		return nil, err
 	}
-	return func() {
+	return &lockedWrite{object: locked, release: func() {
 		defer unlock()
-		unlockDB()
-	}, nil
+		locked.Release()
+	}}, nil
 }
 
 func (t *Tier) resolvePrecondition(ctx context.Context, ck string, p store.Precondition) (store.Precondition, error) {
@@ -1326,7 +1345,7 @@ func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body i
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer unlock.release()
 	resolved, err := t.resolvePrecondition(ctx, ck, opts.Precondition)
 	if err != nil {
 		return nil, err
@@ -1335,8 +1354,8 @@ func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body i
 	writeOpts := opts.writeOptions()
 	if t.writeBack && sp.size > writeBackMin && opts.Precondition.Mode == store.Unconditional {
 		token := store.PendingOriginToken("write-" + randomID())
-		writeOpts.OriginETag, writeOpts.PendingOrigin = token, &store.PendingOrigin{Token: token}
-		m, err := t.storeSpooled(ctx, t.writeRef(ck), sp, writeOpts)
+		writeOpts.Publication = store.WriteBackPublication(store.PendingOrigin{Token: token})
+		m, err := t.storeSpooled(ctx, t.writeRef(ck), sp, writeOpts, unlock.object)
 		if err == nil {
 			_ = t.fenceReadCache(ctx, ck)
 			t.wakePending()
@@ -1353,8 +1372,8 @@ func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body i
 	if err != nil {
 		return nil, err
 	}
-	writeOpts.OriginETag, writeOpts.OriginModified = versionFor(attrs), attrs.LastModified
-	m, cacheErr := t.storeSpooled(ctx, t.writeRef(ck), sp, writeOpts)
+	writeOpts.Publication, writeOpts.OriginModified = store.NormalPublication(versionFor(attrs)), attrs.LastModified
+	m, cacheErr := t.storeSpooled(ctx, t.writeRef(ck), sp, writeOpts, unlock.object)
 
 	_ = t.fenceReadCache(ctx, ck)
 	_ = t.store.Cache(t.namespace).ClearPendingUploads(context.WithoutCancel(ctx), ck)
@@ -1422,10 +1441,10 @@ func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string,
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer unlock.release()
 	if t.writeBack && opts.Precondition.Mode == store.Unconditional {
-		opts.ExpiresAt, opts.SkipLock = nil, true
-		done, err := t.store.CompleteUploadPending(ctx, t.writeRef(ck), uploadID, listed, opts, store.PendingCompletion{})
+		opts.ExpiresAt = nil
+		done, err := unlock.object.CompleteUploadPending(ctx, uploadID, listed, opts, store.PendingCompletion{})
 		if err != nil {
 			return nil, err
 		}
@@ -1460,8 +1479,8 @@ func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string,
 	}
 
 	opts.Precondition = store.Precondition{}
-	opts.ExpiresAt, opts.SkipLock = &exp, true
-	done, err := t.store.CompleteUploadPending(ctx, t.writeRef(ck), uploadID, listed, opts, store.PendingCompletion{BaseETag: baseETag, BaseMissing: baseMissing, LeaseOwner: t.workerID})
+	opts.ExpiresAt = &exp
+	done, err := unlock.object.CompleteUploadPending(ctx, uploadID, listed, opts, store.PendingCompletion{BaseETag: baseETag, BaseMissing: baseMissing, LeaseOwner: t.workerID})
 	if err != nil {
 		return nil, err
 	}
@@ -1516,12 +1535,12 @@ func (t *Tier) Delete(ctx context.Context, bucket, key string) error {
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer unlock.release()
 	if err := t.origin.Delete(ctx, ck); err != nil && !t.origin.IsObjNotFoundErr(err) {
 		return err
 	}
 	cleanupCtx := context.WithoutCancel(ctx)
-	if err := t.store.CacheTombstone(cleanupCtx, ns.WriteBackRef(t.namespace), ck, time.Now().Add(originTombstoneTTL)); err != nil {
+	if err := unlock.object.Tombstone(cleanupCtx, time.Now().Add(originTombstoneTTL)); err != nil {
 		return err
 	}
 	if err := t.fenceReadCache(ctx, ck); err != nil {
@@ -1564,7 +1583,7 @@ func (t *Tier) flushOne(ctx context.Context, p store.PendingUpload, owner string
 	if err != nil {
 		return "", err
 	}
-	defer unlock()
+	defer unlock.release()
 	return t.flushOneNoLock(ctx, p, owner)
 }
 
