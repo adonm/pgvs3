@@ -47,6 +47,7 @@ type config struct {
 	workers, pipeline, count                            int
 	duration                                            time.Duration
 	warmup, prefill, unsigned                           bool
+	uniqueReads                                         bool
 	payload                                             []byte
 }
 
@@ -97,6 +98,7 @@ func main() {
 	flag.DurationVar(&c.duration, "duration", 5*time.Second, "measurement duration")
 	flag.IntVar(&c.count, "count", 2000, "objects to prefill/read")
 	flag.BoolVar(&c.warmup, "warmup", false, "read every key once before measuring")
+	flag.BoolVar(&c.uniqueReads, "unique-reads", false, "share a read sequence across workers for distinct cold keys")
 	flag.BoolVar(&c.prefill, "prefill", true, "create objects before get/range/head/list benchmarks")
 	flag.Int64Var(&c.requests, "requests", 0, "fixed measured request count (0 uses duration)")
 	flag.BoolVar(&c.unsigned, "unsigned", false, "omit signing for trusted-network gateway comparisons")
@@ -348,7 +350,11 @@ func (s *s3run) prefill(payload []byte) {
 }
 
 func (s *s3run) objects(method, rng string, want int) factory {
+	var next atomic.Int64
 	return iterate(func(_, seq int) (int64, int64, error) {
+		if s.uniqueReads {
+			seq = int(next.Add(1) - 1)
+		}
 		return s.call(method, s.key(seq%s.count), nil, rng, want)
 	})
 }

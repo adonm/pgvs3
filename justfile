@@ -120,8 +120,9 @@ bench parts="s3,compat,tuning":
 
 # Direct gateway benchmark: small/large PUT/GET, ranges, listings and OJS queues.
 [group('bench')]
-load:
-    bash deploy/bench/load.sh
+[positional-arguments]
+load *args:
+    bash deploy/bench/load.sh "$@"
 
 # Opt-in transport comparison; SDK prototypes never enter the gateway binary.
 [group('bench')]
@@ -176,6 +177,7 @@ ci:
     mise exec -- hk check --all --profile ci
     mise exec go -- go vet -tags=integration ./...
     mise exec go -- go test -race ./...
+    mise exec python -- python -m unittest discover -s deploy/bench -p '*_test.py'
     GOFLAGS=-race just integration
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=5s ./internal/s3
     mise exec go -- go test -fuzz=FuzzChunkedBody -fuzztime=5s ./internal/s3

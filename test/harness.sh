@@ -40,8 +40,12 @@ test_finish() {
       tail -n 100 "$log" >&2
     done < <(find "$PGVS3_TEST_RUN_DIR" -name '*.log' -type f -print0)
   else
-    printf '%s ok (%ss)\n' "$test_name" "$((SECONDS - test_started))"
-    rm -rf "$PGVS3_TEST_RUN_DIR"
+    if [ "${test_keep_artifacts:-false}" = true ]; then
+      printf '%s ok (%ss); artifacts: %s\n' "$test_name" "$((SECONDS - test_started))" "$PGVS3_TEST_RUN_DIR"
+    else
+      printf '%s ok (%ss)\n' "$test_name" "$((SECONDS - test_started))"
+      rm -rf "$PGVS3_TEST_RUN_DIR"
+    fi
   fi
   exit "$status"
 }
