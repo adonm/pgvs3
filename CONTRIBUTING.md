@@ -1,13 +1,43 @@
 # Contributing
 
-pgvs3 is a stateless Go gateway over PostgreSQL 18+.
+pgvs3 is a PostgreSQL object data plane with stateless Go gateways, tuned for
+10 MiB–1 GiB Parquet objects on PostgreSQL 18+.
 
 ## Scope
 
-pgvs3 is for trusted networks. Authentication, authorization, TLS
-termination, and presigned URLs are explicit non-goals, not unfinished work.
-Do not add them without an explicit project decision; see
-[docs/design.md](docs/design.md).
+The core roles are PostgreSQL object storage and origin-backed shared caching /
+durable write-back staging through S3/HTTP. RESP2 values and OJS jobs/streams
+remain supported companions; expanding toward full Redis or queue-product
+parity is not a default priority. Preserve their documented capabilities rather
+than removing them to meet a line-count target.
+
+pgvs3 is for trusted networks. Authentication, authorization, gateway TLS and
+presigned URLs are permanent non-goals, not unfinished work. See the
+[architecture and ownership contracts](docs/design.md) and the
+[current ranked roadmap](docs/roadmap.md), not historical proposal priorities.
+
+### Change admission
+
+A proposal should answer:
+
+1. **Which core path or operating decision improves?** Name the native object,
+   origin-cache/staging or shared-cluster problem; protocol breadth alone is
+   not a benefit. Companion fixes should have a concrete client need.
+2. **Who owns the state and acknowledgement?** Keep committed gateway state in
+   PostgreSQL, pending bodies logged and non-expiring, and fills/cache hits
+   shared across gateways and read-only replicas. Origins still own committed
+   external objects; deployment policy determines promotion durability.
+3. **Does it reduce owned behavior?** Prefer an existing PostgreSQL primitive
+   or shared decision over another service, generic storage layer or special
+   case. Fewer files/lines alone do not establish simpler semantics.
+4. **What is the evidence?** Reuse the existing test layers and paired runner.
+   Compare affected paths independently within the 20% budget. Among options
+   preserving the fixed durability/multi-worker contracts, evaluate performance
+   first, then compatibility and additional semantic coverage.
+
+No new authentication, local authority, UNLOGGED substitute, sharding or
+multi-primary layer belongs in an incidental refactor. Describe trade-offs and
+scope changes explicitly before implementation.
 
 ## Toolchain
 
@@ -33,7 +63,7 @@ just lint       # hk: go fix, imports, gofmt, go mod tidy, vet, staticcheck
 just fix        # apply the same safe fixes to the working tree
 just test       # unit tests
 just race       # unit tests with race detector
-just integration # store/queue/cache integration tests against PostgreSQL 18 (testcontainers)
+just integration # store/queue/cache integration against disposable PostgreSQL 18
 just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
 just interop    # rclone, restic, boto3, and DuckLake
@@ -75,9 +105,10 @@ Keep one harness per layer. Do not add a second framework for the same job.
 | --- | --- |
 | Pure logic | Go unit tests |
 | Benchmark tooling | Python standard-library unit tests, included in `just ci` |
-| SQL, store, queues, cache | `just integration` (testcontainers) |
+| SQL, store, queues, cache | `just integration` (shared Docker harness) |
 | S3 conformance | `just s3t` (pinned Go port of `ceph/s3-tests`) |
 | Real clients and end-to-end flows | `just contract`, `just interop` |
+| Gateway loss, PostgreSQL restart and churn | `just fault` (not physical replica promotion) |
 
 `just s3-clients` is an opt-in transport benchmark in the isolated
 `test/s3clients` Go module. AWS/MinIO experiment dependencies must not upgrade
@@ -144,7 +175,8 @@ background work:
 - **Fence origin work.** Read-through fills publish against the expected origin
   version, write-through deletes leave an expiring tombstone, and multipart
   publishes keep their pending token guard. Pending uploads are claimed with
-  database leases so parallel workers cannot duplicate a flush.
+  database leases and ordered key locks. Claims/publication must remain fenced;
+  retries are at least once, not a cross-system exactly-once guarantee.
   Read-fill leases renew while fetching; publication must lock/check the live
   owner row in the same transaction. Cancelling a stale owner is not a SQL fence.
   Removing a write-cache fill fence after origin revalidation must revoke old
@@ -167,15 +199,15 @@ counts. The [cache code boundaries](docs/design.md#cache-code-boundaries)
 describe where shared orchestration belongs and which streaming fast paths
 should remain specialized.
 
-- **8,120-byte chunk payload:** keep chunk rows at 8,120 bytes with
+- **8,120-byte chunk payload:** keep full chunk payloads at 8,120 bytes with
   `toast_tuple_target = 8160` and `STORAGE EXTERNAL` so each row fits one 8 KB
   page without TOAST.
-- **Zero gateway state:** do not add in-process object or metadata caches.
-  PostgreSQL `shared_buffers` on `s3p.objects` is the single MVCC-consistent
-  cache across gateways, and DuckDB caches remote file bytes client-side.
+- **No gateway object cache:** do not add in-process object or metadata caches.
+  Logged namespace rows provide sharing; each PostgreSQL instance has its own
+  `shared_buffers`, and DuckDB may also cache remote file bytes client-side.
 - **Split pools:** keep `enable_indexscan = on` on the main pool for B-tree
   point lookups and listings, and `enable_indexscan = off` on `chunkPool` for
-  PostgreSQL 18 bitmap heap scan read-ahead on `s3p.chunks`.
+  PostgreSQL 18 bitmap heap scan read-ahead on namespace-local `chunks` tables.
 - **Cut-through streaming:** stream rows from PostgreSQL to HTTP without
   buffering whole objects in memory.
 - **Bounded maintenance:** keep background reaping bounded per pass and
@@ -235,7 +267,7 @@ other packages' integration tests use its exported pool accessor.
 | `internal/s3` | S3 + plain HTTP handlers, cache-tier proxy |
 | `internal/ojs` | OJS v1 core HTTP binding (jobs, workers, queues, manifest) |
 | `internal/resp` | RESP2 server |
-| `internal/objcache` | S3/filesystem read-through tier, origin adapter, leased outbox |
+| `internal/objcache` | Shared read/range cache, origin adapters, durable staging and leased outbox |
 | `internal/reqguard` | protocol-independent request policy checks (presigned URLs) |
 | `internal/gateway` | protocol mux and HTTP server |
 | `internal/s3client` | Apache-2.0 S3 client derived from `kelindar/s3`, with cache-origin extensions |

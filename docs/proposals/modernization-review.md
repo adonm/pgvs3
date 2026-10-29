@@ -1,5 +1,10 @@
 # Capability-by-capability modernization review
 
+> Historical analysis, not the active backlog. Priorities and status labels below
+> describe the reviewed snapshots and may be superseded. Use the
+> [current architecture](../design.md), [ranked roadmap](../roadmap.md) and
+> [implementation evidence](../modernization-results.md).
+
 Reviewed **2026-10-28**, against commit **a879472**, layout **v23**.
 
 Source paths in this historical review refer to that snapshot. Related files

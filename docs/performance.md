@@ -1,44 +1,47 @@
-# Performance Architecture
+# Object data-plane performance
 
-pgvs3 shares its PostgreSQL storage layout with
-[pgvfs](https://pgvfs.adonm.dev) and exposes it over an HTTP/S3 boundary.
-This document explains why the storage layout and query paths are shaped the
-way they are.
+The primary workload is 10 MiB–1 GiB Parquet objects.
+The layout and I/O paths below make PostgreSQL practical as the byte store for
+native buckets, shared read fills and durable origin staging. The page-oriented
+layout is also used by [pgvfs](https://pgvfs.adonm.dev).
+
+[design.md](design.md#authority-and-acknowledgement-contracts) defines ownership
+and acknowledgement; this page explains the mechanisms, not a durability or
+capacity benchmark. Use [paired acceptance](benchmarks.md#paired-acceptance) for
+per-path evidence. The [roadmap](roadmap.md) identifies the remaining replica and
+capacity proofs; historical throughput alone does not answer those questions.
 
 ## Storage layout
 
 | Mechanism | How it works |
 | --- | --- |
-| **One schema per namespace, typed by prefix** | `s3b_<name>` (durable bucket), `s3c_<name>` (WAL-logged shared cache), `s3w_<name>` (WAL-logged write-back) and `s3q_<name>` (OJS queue/stream) each own their tables, autovacuum workers and 32 TiB chunk budget. Namespaces can be snapshotted with `pg_dump -n`, cloned in-database and dropped with `DROP SCHEMA CASCADE`. |
-| **Inline small objects (≤64 KiB)** | Stored directly in `objects.inline_data` (`file_id NULL`, Zstd-compressed when compressible) with optional `expires_at`. Written in one `put_inline` call and read in one primary-key lookup without touching `chunks`. |
+| **Namespace-local relations** | `s3b_<name>` (native bucket), `s3c_<name>` (shared read cache/RESP values), `s3w_<name>` (write-back) and `s3q_<name>` (jobs/streams) have their own tables and settings. They share cluster I/O, WAL and autovacuum capacity, not dedicated workers per namespace. All are WAL-logged. |
+| **Inline small objects** | Native/write-cache objects can inline up to 64 KiB and read-cache/RESP values up to 8,120 bytes in `objects.inline_data` with `file_id NULL`. Zstd is used only when it shrinks the body. A primary-key lookup avoids `chunks`; multipart/pending paths can retain chunked body/outbox publication even when small. |
 | **PostgreSQL 18 publication** | Inline/chunked entry points share `publish_value`; `RETURNING old.file_id, old.parts` supplies overwritten-file ownership without a pre-read on unconditional writes. Preconditions, TTL, metadata, lease fencing and garbage publication remain transactional. |
 | **Shared range parent metadata** | A logged schema-local `origin_metadata` record caches size/validator/headers with validation TTL but never pretends to hold an object body. Write-back/read-cache shadowing resolves in one SQL round trip; read-only workers can use replicated metadata and cached range blocks. |
 | **Length-discriminated Zstd 8,120-byte chunk blocks** | Larger objects split into logical 8,120-byte blocks in `chunks` (the block-encoding section of `internal/store/object.go`). Each block is compressed with a reusable Zstd frame if it shrinks (`len(stored) < wantLen`) or stored raw (`len(stored) == wantLen`), so incompressible blocks never exceed the 8,160-byte page budget and logical offsets remain `no × 8,120` for `O(1)` byte-range seeking. |
-| **One-port protocol mux** | `internal/gateway` routes HTTP (`S3`, `OJS`, plain web) and RESP2 by first bytes on `:8014`; RESP batches pipelined `GET`/`SET` bursts into single-query `Cache.MGet` / `Cache.MSet` round trips against `s3c_<namespace>`. |
-| **Message queues** | `s3q_<name>.jobs` holds one explicit OJS job envelope per row with state, priority, attempt and lease columns; `s3p.job_index` routes an id back to its queue. Fetch is a single `FOR UPDATE SKIP LOCKED` claim over available, due scheduled/retryable and expired-lease rows, ordered by priority then `next_visible_at`; ack/nack/heartbeat match the lease token and the database clock so a reclaimed delivery returns `409`. Multi-queue fetch resolves missing queues against the catalog before opening one claim transaction; it deliberately avoids per-queue savepoints, so `SKIP LOCKED` scans stay on the fast plain-row-lock path instead of contending on MultiXact LWLocks (see [Notes on avoiding subtransactions](https://riverqueue.com/blog/subtransaction-free)). The queue list is capped at 64. Expiry, due promotion and exhausted leases run in maintenance, not on every poll; terminal jobs are removed after `--job-retention`. The same namespace holds an append-only stream log split into three rotating partitions with snapshot ticks, fan-out subscription cursors, batch acks, retry rows and dead letters; maintenance moves due retries and truncates a sealed partition only after consumer cursors and batches have passed its seal, so stream retention is zero-bloat. |
-| **Read-through origin cache** | `internal/objcache` wraps origin adapters (the Apache-2.0 `internal/s3client` fork of `kelindar/s3`, read-only HTTP(S), filesystem or temporary-directory `ephemeral` for local tests): `GET` revalidates against origin size/version after the TTL and downloads into the WAL-logged `s3c_<namespace>`; reads within the TTL come from PostgreSQL, and a whole-object miss uses one origin GET carrying size/version metadata instead of a separate HEAD. Ranges above 8 MiB are passed through with `GetRange` so a footer read never pulls the whole file, unless `--range-cache-chunk` is enabled, in which case aligned chunks are cached independently. Fills are capped by `--fill-concurrency`, spool to memory (≤8 MiB) or a temp file in `--spool-dir` before the PostgreSQL writer opens, and publish conditionally against the expected origin version so a slow fill cannot overwrite a newer write-through write. Cross-gateway cold fills take a short database lease (`s3p.cache_fill_leases`); waiters poll the replicated cache and only pass through to the origin after the lease wait expires, avoiding an N-worker origin stampede. For writable origins, small and conditional `PUT`/`COPY`/`DELETE` writes are synchronous write-through with checksum validation, conditions, Content-Type and user metadata. Large unconditional `PUT`/`COPY` and multipart completions are ack-first write-back: the body is committed to the WAL-logged `s3w_<namespace>` and an `s3p.pending_uploads` row atomically, the body is immediately readable, survives crash/failover, and a bounded worker retries the origin upload. The WAL-logged `s3c_` namespace holds shared read fills and RESP/cache values. DELETE writes a thirty-minute tombstone to both namespaces so an in-flight fill cannot resurrect the object. `ListObjectsV2` merges the origin walk with pending write-back cache objects and retains only one page in memory; there is no listing index or TTL-stale refresh path. |
-| **Admission control** | S3 requests, OJS requests and RESP batches are bounded by `--s3-concurrency`, `--queue-concurrency` and `--resp-concurrency`; cache fills and pending-upload workers use the process-wide `--fill-concurrency` budget. S3 overflow gets `503 SlowDown` with `Retry-After`, so a queue backlog or cache storm cannot occupy the whole `--pool-max`. |
+| **Admission control** | Protocol requests/batches and background fill/upload classes have bounded concurrency. Disk spools share a process-wide byte budget. These are resource controls, not independent PostgreSQL capacity reservations; size the whole fleet's pools and monitor waits. |
 | **No TOAST overhead** | `chunks` sets `toast_tuple_target = 8160` and `STORAGE EXTERNAL`, so PostgreSQL never detoasts or chases out-of-line pointers on read. |
-| **Immutable files** | Every write allocates a fresh `file_id` from `s3p.file_ids`; overwrites swap the pointer on `objects` and queue the old `file_id` for reaping. Chunk rows are never updated in place. |
-| **Strong ETag caching** | `file_id` backs strong ETags so DuckDB's external file cache can reuse local blocks without re-fetching. |
+| **Immutable files** | Chunked writes allocate fresh `file_id`s from `s3p.file_ids`; overwrites swap object ownership and queue retired files for reaping. Chunk rows are never updated in place. |
+| **HTTP validators** | Ordinary native ETags are content MD5s and multipart ETags are composite values, not `file_id`s. Origin versions are retained separately for revalidation/conditions. Clients can reuse cached slices using the public validator. |
 | **Split connection pools** | The main pool keeps `enable_indexscan = on` for fast B-tree lookups on `objects` and `ListObjectsV2`; a dedicated `chunkPool` sets `enable_indexscan = off` so `chunks` range reads use PostgreSQL 18 bitmap heap scans with read-ahead (`effective_io_concurrency = 32`). |
 | **Unpartitioned chunks table per bucket** | Each bucket's `chunks` is a single table (capped at 32 TiB / ~31.7 TiB of payload). Partitioning within a bucket by hash or range was slower on point reads and writes; see [partitioning.md](partitioning.md). |
 | **Aggressive autovacuum** | Tuned to `autovacuum_vacuum_scale_factor = 0.01` and `analyze_scale_factor = 0.02` so freed pages are recycled quickly after whole-file deletes. |
 
 ## Read path
 
-1. **Inline fast path (≤64 KiB):** `Meta` fetches metadata and `inline_data` in
-   a single primary-key `Index Scan` on `objects` (~6 µs in `shared_buffers`,
-   ~0.17 ms p50 over HTTP). `HEAD` queries only header columns and never
-   transfers `inline_data`.
-2. **Single-query reads (64 KiB – 64 MiB):** A single-file read up to 64 MiB
-   runs as one `chunks` range query (`file_id = $1 AND no BETWEEN $2 AND $3`).
-3. **Parallel snapshot reads (>64 MiB and multipart):** Larger spans split into
-   8 MiB pieces and fetch up to 8 pieces concurrently on separate connections
-   under one exported `REPEATABLE READ` snapshot.
+1. **Inline fast path:** metadata and `inline_data` come from one primary-key
+   lookup on `objects`, within the namespace's inline limit. `HEAD` queries only
+   header columns and never transfers `inline_data`.
+2. **Single-query chunk reads:** a single-file span up to 64 MiB runs as one
+   `chunks` range query (`file_id = $1 AND no BETWEEN $2 AND $3`).
+3. **Snapshot reads (>64 MiB and multipart):** Larger/multipart spans plan roughly
+   8 MiB pieces. Two to eight pieces run concurrently on separate connections
+   under one exported `REPEATABLE READ` snapshot; larger plans run sequentially
+   inside one repeatable-read transaction. Connections and buffering stay bounded.
 4. **Synchronous vs cut-through streaming:** Reads up to 8 MiB stream
    synchronously on the HTTP goroutine. Above 8 MiB, a background fetcher feeds
-   a bounded 32-chunk channel while `Body.WriteTo` flushes 256 KiB buffers to
+   a bounded 32-buffer channel while `Body.WriteTo` streams 256 KiB buffers to
    the socket, overlapping database I/O with network writes and backpressuring
    slow clients.
 5. **TID-to-row-number reordering:** Bitmap heap scans return pages in physical
@@ -71,27 +74,56 @@ way they are.
    validates checksums and records the ordered `file_id` array without moving
    bytes. Same-bucket `CopyObject` and whole-file `UploadPartCopy` share the
    source's immutable `file_id`s; cross-bucket `CopyObject` and
-   `s3p.clone_bucket` copy chunk rows inside PostgreSQL without streaming bytes
+   `s3p.clone_namespace` copy chunk rows inside PostgreSQL without streaming bytes
    through the gateway.
-5. **Single-query batch delete:** `DeleteObjects` locks and deletes up to 1,000
+5. **Native batch delete:** `DeleteObjects` locks and deletes up to 1,000
    keys and queues unreferenced files in two SQL statements instead of 1,000
    round trips.
+
+## Origin-backed I/O
+
+- **Read fills:** a whole-object miss uses one origin GET carrying size/version
+  metadata. Bodies spool to memory (up to 8 MiB) or scratch disk before opening
+  the PostgreSQL body writer. Renewable database leases coalesce cross-gateway
+  fills; publication checks the live owner and expected origin version. Waiters
+  can fall back to origin pass-through after their bounded wait.
+- **Warm and ranged reads:** within TTL, a hit needs no origin request. Warm GET
+  reuses its already-read metadata. Cold partial reads of objects larger than
+  8 MiB pass through unless aligned range caching is enabled; logged parent
+  metadata avoids repeated origin HEADs. Read-only gateways can consume replayed
+  metadata/blocks but never fill them.
+- **Synchronous mutations:** small/conditional PUT/COPY and deletes require
+  origin work before success. Origin mutation and cache publication remain
+  separate commits. Foreground mutations and outbox uploads deliberately retain
+  a PostgreSQL session key lock across origin I/O; read-fill downloads do not.
+- **Write-back:** by default, unconditional PUT/COPY above 8 MiB and unconditional
+  multipart completion at any size commit logged `s3w_` bytes plus an outbox row
+  before acknowledging. Pending bodies have no expiry. Measure acknowledgement
+  latency **and** backlog drain; early acknowledgement is not upload throughput
+  or a lossless-promotion promise independent of PostgreSQL policy.
+- **Listings:** merge an origin walk with pending objects, retaining one bounded
+  page in memory. There is no separate listing index or refresh generation.
+
+Read-cache fills are writes to PostgreSQL: they consume disk, WAL and replica
+replay bandwidth even when client traffic is read-only. Rebuildable origin fills
+and standalone RESP values share `s3c_`, but only the former are disposable.
+See [operations.md](operations.md#cache-tier-in-front-of-another-object-store)
+for provider limits, TTLs, tombstones, retries and spool sizing.
 
 ## Multi-gateway consistency and connection pooling
 
 - **Stateless gateways:** Gateways hold no authoritative in-process object,
   metadata, namespace, file-ID, or lease state. The namespace catalog in
-  PostgreSQL decides what exists; `shared_buffers` is the single shared cache
-  across the fleet, so committed writes are immediately visible to every other
-  **writable** gateway with no `LISTEN/NOTIFY` traffic or cache invalidation
-  window. Read-only gateways connected to standbys are subject to PostgreSQL
-  replication lag.
+  PostgreSQL decides what exists. Gateways sharing a primary read the same
+  committed rows under MVCC, without a gateway invalidation bus. Each PostgreSQL
+  instance has its own `shared_buffers`; standbys share the logged data through
+  WAL replay, subject to replication lag, not coherent distributed RAM.
 - **One maintenance leader:** a single writable gateway holds the maintenance
   advisory lock; the others skip the tick. If the leader exits, another elects
   itself on a later tick.
 - **Conditional cache publishes:** read-through fills are fenced by the
-  expected origin version, and multipart flushes carry a lease plus a token
-  guard. A stale fill or flush is discarded instead of overwriting a newer
+  expected origin version and live fill owner; outbox flushes carry a lease plus
+  a token guard. A stale fill or flush is discarded instead of overwriting a newer
   write-through row. Write-through deletes leave an expiring tombstone so a
   fill that started before the delete cannot reinsert the object.
 - **MRU connection reuse:** `pgxpool` reuses the most-recently-used idle
@@ -105,23 +137,24 @@ way they are.
 
 ## Reaping and vacuum
 
-- **Read grace window:** Deleted or overwritten files remain in `s3p.chunks` for
-  `--reap-grace` (default 10 minutes) so in-flight readers can finish without
-  holding long transactions.
+- **Read grace window:** Deleted or overwritten files remain in their namespace's
+  `chunks` table for `--reap-grace` (default 10 minutes), allowing metadata/body
+  lookups to bridge a concurrent overwrite. Multi-piece reads additionally hold
+  repeatable-read snapshots while streaming.
 - **Bounded, chained GC passes:** Every minute, one **writable** gateway
-  acquires a cluster-wide `pg_try_advisory_lock` and deletes up to 65,536 chunk
+  acquires a database-scoped `pg_try_advisory_lock` and deletes up to 65,536 chunk
   rows (~508 MiB) per pass; a saturated pass immediately chains another. If
   the leader exits, another writable gateway acquires the lock on a later tick.
-- **TTL expiry is chained too:** `expire_objects(4096)` runs repeatedly until a
-  pass comes back short, so a burst of expiring keys drains in one tick instead
-  of ~4 keys/s/bucket.
+- **Bounded TTL expiry:** `expire_objects(4096)` repeats until a batch is short or
+  the per-tick round budget is reached; expiry is not an unbounded full-table sweep.
 - **Space reuse:** Freed pages are reused by subsequent writes once autovacuum
-  marks them dead. Long-running snapshots hold back vacuum horizon; avoid
-  multi-hour open transactions on the storage database.
+  makes dead-tuple space reusable. Long-running snapshots hold back vacuum
+  horizon; avoid multi-hour open transactions on the storage database.
 
 ## Recommended DuckDB / DuckLake client settings
 
-Client settings dominate end-to-end analytics query speed:
+File/row-group layout and client caches can dominate analytics speed. These are
+benchmark starting points, not universal production defaults:
 
 ```sql
 -- Configure once per DuckLake catalog before loading data
@@ -134,5 +167,17 @@ CALL lake.set_option('target_file_size', '64MB');
 SET parquet_metadata_cache = true;
 ```
 
-DuckDB 2.0+ caches remote file slices in its own `external_file_cache` by
-default, keyed by URL and strong ETag (`file_id`).
+DuckDB 2.0+ also caches remote file slices in its own `external_file_cache` by
+default. Keep that client cache distinct from pgvs3's shared PostgreSQL rows when
+labeling a result cold or warm.
+
+## Companion paths
+
+RESP2 pipelines coalesce eligible GET/SET batches into `Cache.MGet`/`Cache.MSet`
+against logged `s3c_` values. OJS jobs use database-clock leases and `SKIP LOCKED`
+claims without per-queue subtransactions. Streams use snapshot-delimited batches
+and consumer-pinned rotation of three event partitions; retry/dead-letter state
+has its own lifecycle. See [queue-stream.md](queue-stream.md).
+
+These paths retain their targeted tests and benchmarks, but are not a reason to
+reshape the specialized object COPY/streaming loops into a universal data model.

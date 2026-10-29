@@ -1,5 +1,9 @@
 # Modernization implementation and performance comparison
 
+This is completed implementation/evidence history across v24/v25, not the active
+backlog. See [design.md](design.md) for the current contracts and
+[roadmap.md](roadmap.md) for ranked next work.
+
 Date: 2026-10-28. Control: `a879472` (layout v23). Candidate: layout **v24**.
 
 This implements the highest-value bounded changes from the

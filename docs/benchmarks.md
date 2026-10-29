@@ -1,9 +1,15 @@
 # Benchmarks
 
-For the PostgreSQL 18/layout-v24 modernization comparison, including actual
-10 MiB–1 GiB Parquet, origin-cache ranges, write-back ACKs and three S3 clients,
-see [modernization-results.md](modernization-results.md). It records failed
-initial trials, the accepted per-path gates and remaining validation limits.
+The primary workload is 10 MiB–1 GiB Parquet, in native PostgreSQL storage and
+origin-backed shared cache/staging roles. Current v24/v25 implementation evidence,
+including actual Parquet and incompressible fixtures, is recorded in
+[modernization-results.md](modernization-results.md), with rejected trials,
+accepted per-path gates and remaining validation limits.
+
+This page describes the runners and retains historical measurements. Snapshots
+from different hosts, layouts and cache states are not one current capacity claim.
+The [focused roadmap](roadmap.md) ranks physical-replica and WAL/capacity evidence
+ahead of more protocol benchmarks.
 
 Two benchmark harnesses are included in the repository:
 
@@ -22,8 +28,8 @@ local host** (Intel Core Ultra X7 358H, 62 GiB RAM) alongside an earlier
 
 ## Direct S3 gateway load (`just load`)
 
-Each test runs for 5 seconds. 4 KiB tests use 2,000 keys; 8 MiB and 64 MiB
-tests use 16 and 8 objects; `ListObjectsV2` lists 1,000 keys per page from a
+The exploratory matrix uses 5-second tests. 4 KiB tests use 2,000 keys; 8 MiB and
+64 MiB tests use 16 and 8 objects; `ListObjectsV2` lists 1,000 keys per page from a
 2,000-key bucket. Gateways hold no in-process cache; metadata and ≤64 KiB
 objects are served directly from PostgreSQL `shared_buffers`.
 
@@ -365,7 +371,8 @@ primary and standby workers share the same warm cache; acknowledged write-back
 bodies remain in `s3w_`. This snapshot reran the large-object path against a
 self-hosted pgvs3 S3 origin constrained to 20 ms one-way latency and 50 MiB/s
 per request, on the same PostgreSQL 18 host. It is a local simulation, not an
-AWS measurement.
+AWS measurement. This run used the primary; it did not exercise physical standby
+replay or promotion.
 
 | Object | Direct origin GET | Cold cache GET | Warm cache GET | Direct origin PUT | Write-back ack |
 | --- | ---: | ---: | ---: | ---: | ---: |

@@ -1,5 +1,10 @@
 # Hardening and compatibility options
 
+> Historical analysis, not the active backlog. Priorities and status labels below
+> describe the reviewed snapshots and may be superseded. Use the
+> [current architecture](../design.md), [ranked roadmap](../roadmap.md) and
+> [implementation evidence](../modernization-results.md).
+
 Source paths and line numbers in this historical note refer to the reviewed
 snapshots. See the [current file map](../../CONTRIBUTING.md#package-map).
 

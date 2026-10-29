@@ -1,31 +1,45 @@
-# Design and shape
+# Architecture: PostgreSQL as the object data plane
 
-pgvs3 is a stateless Go gateway that projects one PostgreSQL database as S3,
-OJS (OpenJobSpec v1 core), plain HTTP and RESP2 on a single port.
+pgvs3 uses one PostgreSQL data database for object bytes, metadata, shared cache
+rows and publication/coordination state. Replaceable Go gateways expose S3/HTTP
+and orchestrate optional origin I/O. PostgreSQL is not merely an index into a
+gateway-local storage system.
 
 For a quick start see [README.md](../README.md); for deployment see
 [operations.md](operations.md); for storage internals and query paths see
 [performance.md](performance.md).
 
-## Start here
+## Product focus
 
-- **What it is:** one gateway binary, one listener, one shared PostgreSQL
-  database. There is no sidecar, local object store, or invalidation bus.
-- **Supported scale:** at most **100 namespaces** (PostgreSQL schemas) per
-  database, one PostgreSQL primary plus streaming standbys, and multiple
-  gateway workers sharing that cluster.
-- **Safety model:** PostgreSQL is the coordination plane. Gateways keep no
-  authoritative local state; the catalog, advisory locks, leases, conditional
-  writes, and token guards coordinate concurrent workers.
-- **Read next:** [README.md](../README.md) for the quick start,
-  [operations.md](operations.md) for topology and backups, and
-  [performance.md](performance.md) for the storage layout.
+The primary workload is 10 MiB–1 GiB Parquet objects consumed by DuckDB and
+DuckLake on trusted networks. There are two core roles: PostgreSQL object store,
+or shared origin-backed read cache plus durable write-back staging. Both retain
+the same catalog, publication and operating-envelope rules.
+
+RESP2 values and OJS jobs/streams are bounded companions for co-located services.
+Their existing capabilities remain; parity with independent Redis or queue
+products is not the organizing goal. Sharing PostgreSQL does not make their
+application semantics interchangeable or their operations one transaction.
+
+| Owner | Responsibility |
+| --- | --- |
+| pgvs3 | Protocol semantics, byte layout/encoding, bounded streaming, publication SQL, fill/outbox protocols and their fencing checks |
+| PostgreSQL | Transactional row visibility, WAL commit/recovery, query execution, lock/sequence arbitration and physical replication |
+| External origin, when configured | Committed origin objects and version/conditional-mutation semantics; freshness outside pgvs3 remains TTL-bounded |
+| Deployment/operator | Trusted-network boundary, writable/read-only endpoints, replication/promotion policy, capacity and backups |
+
+The architectural bet is **fewer independent systems to coordinate**, not free
+object I/O or unlimited scale. Large bodies and read fills add PostgreSQL disk,
+WAL and replay work. The gateway still implements a specialized storage layout
+and distributed publication protocol; PostgreSQL supplies the primitives rather
+than making those protocols disappear. See [roadmap.md](roadmap.md) for work that
+most directly strengthens or proves this model.
 
 ## Operating envelope
 
 | Dimension | Envelope |
 | --- | --- |
-| **Namespaces** | At most **100 PostgreSQL schemas per database**, counting buckets, cache namespaces, and queues. This is a bounded single-cluster envelope, not a schema-per-tenant or sharded design. |
+| **Namespaces** | At most **100 namespaces per database**, counting bucket, read-cache, write-back and queue schemas. This is a bounded single-cluster envelope, not a schema-per-tenant or sharded design. |
 | **PostgreSQL** | One primary (writer) plus streaming standbys. A single database, not multi-primary or sharded. |
 | **Gateway workers** | Multiple stateless workers behind a load balancer. Writable workers connect to the writer endpoint; read-only workers may connect to standbys. |
 | **Reads and lag** | Writable workers read from the primary. Read-only workers on standbys serve reads subject to PostgreSQL replication lag. |
@@ -40,13 +54,16 @@ For a quick start see [README.md](../README.md); for deployment see
 **pgvs3 is designed for trusted networks. Authentication is not part of the
 design and is not a future goal.**
 
-There is no authentication, authorization, request signing, credential
+There is no inbound authentication, authorization, signature/credential
 validation, TLS termination, audit log, or per-tenant isolation. These are
 non-goals, not gaps on a roadmap. The gateway accepts header-based SigV4
 because standard S3 SDKs send it, but it does not verify the signature and does
 not use the credentials for anything. Presigned URLs are rejected because a
 time-limited, object-scoped link would otherwise become an unscoped grant on
 the entire gateway.
+
+Outbound origin credentials are separate: pgvs3 signs requests to S3 origins
+when configured. That does not authenticate clients to the gateway.
 
 The only access control is network placement. Run pgvs3 on loopback, a private
 VPC/VLAN, or behind a service mesh that enforces identity, authorization, and
@@ -70,28 +87,27 @@ API.
 ## Shape of the system
 
 ```
-clients ── S3 / OJS / HTTP / RESP2 ──┐
-                                     │  one listener :8014 per worker
-                          ┌──────────▼──────────┐
-                          │  gateway workers    │  stateless
-                          └──────┬───────┬──────┘
-                                 │       │
-                    writer endpoint│       │read endpoints
-                          ┌──────▼──┐  ┌─▼────────────┐
-                          │PostgreSQL│─▶│ PostgreSQL   │
-                          │ primary  │  │ standbys     │
-                          └──────────┘  └──────────────┘
-                              s3p catalog + one schema per namespace
+S3/HTTP clients              RESP2/OJS companions
+       \                         /
+          stateless pgvs3 fleet ------- optional origin I/O
+                   /       \                     |
+          writer endpoint  read endpoints     S3 / HTTP origin
+                 /           \
+       PostgreSQL primary --WAL--> streaming standbys
+          catalog + bytes + shared fills/staging + control rows
 ```
 
 - **One binary, one port.** S3, OJS and plain HTTP share the HTTP listener;
   RESP2 is detected from the first byte. There is no sidecar, no local object
-  store, and no per-pod cache of object bytes or metadata.
+  authority, and no per-pod cache of object bytes or metadata. Scratch spools and
+  local/test origin providers are not production copies of record.
 - **One PostgreSQL schema per namespace.** `s3b_<name>` is a durable bucket,
   `s3c_<name>` the WAL-logged shared cache namespace (origin fills and
   RESP/cache users), `s3w_<name>` a WAL-logged write-back namespace, and
-  `s3q_<name>` an OJS queue/stream namespace. Each owns its tables, indexes, autovacuum workers
-  and 32 TiB chunk budget. `DROP SCHEMA CASCADE` is the delete primitive.
+  `s3q_<name>` an OJS queue/stream namespace. These have their own relations and
+  table settings, but share cluster I/O, WAL and autovacuum capacity. Object
+  chunk relations have a 32 TiB relation limit. `DROP SCHEMA CASCADE` is the
+  namespace delete primitive.
 - **The catalog is authoritative.** `s3p.namespaces` records namespace kind,
   name, schema, quota, and attributes. Buckets are created explicitly through
   `CreateBucket` (`PUT /{bucket}`). An object write to a missing or deleted
@@ -102,21 +118,69 @@ clients ── S3 / OJS / HTTP / RESP2 ──┐
   publishes by swapping the object pointer in one transaction. Overwrites queue
   the old `file_id` for the reaper; readers use MVCC snapshots, so an in-flight
   read never observes a torn object.
-- **Small objects inline, large objects chunked.** Objects up to 64 KiB live in
-  `objects.inline_data` (Zstd when it shrinks). Larger objects use 8,120-byte
-  chunk rows, one per PostgreSQL page, with logical offsets fixed at
-  `no × 8,120` for O(1) range seeks.
-- **PostgreSQL is the shared cache and coordination plane.**
-  `shared_buffers` holds the hot metadata and bytes. Committed writes are
-  visible immediately to other writable workers; read-only workers on standbys
-  may lag. One writable gateway holds a PostgreSQL advisory lock and runs
-  reconciliation, TTL expiry and bounded garbage collection.
+- **Small objects inline, large objects chunked.** Native/write-cache objects
+  can inline up to 64 KiB; read-cache/RESP values up to 8,120 bytes. Larger
+  bodies use 8,120-byte logical blocks, with Zstd only when it shrinks. A full
+  raw chunk fits one PostgreSQL page; offsets stay fixed at `no × 8,120`.
+  Multipart/pending publication can retain chunked bodies even when small.
+- **PostgreSQL is the shared storage and coordination engine.** Committed rows
+  supply metadata and bytes to other gateways without a local invalidation bus;
+  read-only workers on standbys may lag. One writable gateway acquires the
+  database maintenance lock to run reconciliation, expiry and bounded reaping.
 - **The cache tier is optional and asymmetric.** With `--origin-config`, S3
   reads become read-through fills in the WAL-logged `s3c_` namespace, while
   writes use the WAL-logged `s3w_` namespace. `s3c_` is the shared WAL-logged
   fill and RESP/cache namespace. The origin remains the long-term
   source of truth; `s3w_` is a durable staging area for acknowledged writes
   until the outbox commits them. See [Origin cache tier](#origin-cache-tier).
+
+## Authority and acknowledgement contracts
+
+Bucket existence is always decided by the PostgreSQL catalog, including under
+a global origin. Body authority depends on the role and publication state:
+
+| Data/state | Copy of record and visibility |
+| --- | --- |
+| Native bucket object (`s3b_`) | Logged PostgreSQL body and object pointer, visible through MVCC after publication commits |
+| Origin read fill (`s3c_`) | Rebuildable view of an origin version, shared through logged rows; external updates may remain stale until validation TTL |
+| Pending origin write (`s3w_` plus `s3p.pending_uploads`) | PostgreSQL may hold the only acknowledged body until the guarded origin upload succeeds; pending data must not expire |
+| Completed origin write | Origin is the long-term body authority; PostgreSQL may retain a durable write-cache copy subject to normal retention |
+| RESP values / OJS job and stream state | PostgreSQL is the copy of record under those interfaces' own command/lease/cursor semantics |
+| Spool files, buffers, local mutexes and borrowed tier handles | Temporary resources only; none substitutes for a committed body, catalog row or database fence |
+
+`s3c_` is not universally disposable: origin fills can be rebuilt, but standalone
+RESP values cannot be recovered from an origin. `shared_buffers` caches pages in
+each PostgreSQL instance; the logged rows, not a distributed RAM cache, provide
+sharing and replication across gateway/replica fleets.
+
+| Mutation path | Before a successful response |
+| --- | --- |
+| Native PUT / COPY / multipart completion | PostgreSQL commits the new object ownership and its body references atomically |
+| Synchronous origin write | Origin mutation and durable PostgreSQL write-cache publication succeed; they are not one cross-system transaction |
+| Eligible write-back PUT / COPY / multipart completion | PostgreSQL commits body, pending token and outbox state together; origin upload may still be outstanding |
+
+WAL-logged acknowledgement inherits PostgreSQL's commit, replication and recovery
+policy. It is not a promise that any asynchronous standby can be promoted without
+losing unreplayed commits. Read-only gateways see data after WAL replay and can
+lag the primary. Cluster endpoint selection, promotion and backups are deployment
+responsibilities, not an election service implemented by pgvs3.
+
+Atomic publication prevents torn objects, not ambiguous client outcomes. A timeout
+may occur after a commit; an origin may have changed before a later cache failure.
+Use conditions or reconcile state when retries require stronger semantics. There
+is no cross-protocol transaction, no atomic PostgreSQL/origin commit, and no atomic
+DuckLake-catalog/object transaction merely because they share a cluster or database.
+
+| Failure | Boundary |
+| --- | --- |
+| Gateway loss | Committed rows remain; session locks release and durable leases become reclaimable |
+| Origin outage | Valid cache hits and pending bodies can still be read; revalidation/flush can fail and backlog/capacity must be monitored |
+| Primary loss / standby promotion | Data survival follows the PostgreSQL replication/promotion policy; reconnecting cannot restore WAL that was never replayed |
+| Database restore | Restore object bodies and pending/outbox state consistently, not just the namespace catalog; origin backups remain separate |
+
+The existing fault gate covers gateway loss, primary restart and churn. Real
+streaming-replica promotion is a separate proof obligation in the
+[focused roadmap](roadmap.md), not a test result implied by the architecture.
 
 ## Internal data shapes
 
@@ -306,8 +370,9 @@ What happens when a worker dies:
 - **Cache fill or multipart publish:** the conditional cache update fails its
   version/token check and is discarded. Readers continue to see the newer
   object or a cache miss.
-- **Client request:** the request may fail. Clients retry; atomic publish means
-  an interrupted write leaves nothing visible.
+- **Client request:** an aborted publication exposes no partial object, but a
+  client disconnect after commit can leave the outcome unknown to that client.
+  Conditions and reconciliation, not blind retries alone, resolve ambiguity.
 
 ## Read-only gateways and failover
 
@@ -340,7 +405,8 @@ During a PostgreSQL failover:
 1. The writer endpoint is repointed to the promoted standby by the cluster's
    HA mechanism (DNS, service, or proxy). Writable gateways reconnect.
 2. In-flight requests on connections to the old primary may fail. Clients
-   should retry; conditional writes and atomic publish make retries safe.
+   can retry with appropriate conditions or reconcile state; atomic publish
+   prevents torn objects, not end-to-end exactly-once execution.
 3. Maintenance leadership re-elects automatically when a writable gateway
    reaches the new primary and acquires the advisory lock.
 4. Read-only workers connected to standbys continue serving reads, subject to
@@ -361,9 +427,9 @@ queues store their data directly in PostgreSQL.
 | **Read-through miss** | Fetch from the origin, spool the body outside a database transaction, then publish into the WAL-logged `s3c_<namespace>` with the expected origin version. Durable writes use `s3w_<namespace>`. |
 | **Read hit within TTL** | Serve from PostgreSQL without contacting the origin (`X-Cache: HIT`). |
 | **TTL revalidation** | After `--cache-ttl`, compare the cached object with origin size/mtime/version; refresh the cache or refill it if the origin changed. |
-| **Write-through / write-back** | Small and conditional `PUT`/`CopyObject` writes mutate the origin and cache synchronously. Large unconditional writes commit a WAL-logged `s3w_` object plus the `s3p.pending_uploads` row atomically, acknowledge immediately, and let the outbox upload the origin; pending bodies are readable and survive crash/failover. The WAL-logged `s3c_` namespace holds both shared read fills and RESP/cache values. `DELETE`/`DeleteObjects` remain synchronous and write a thirty-minute tombstone to the origin cache and write-back namespaces. |
-| **Multipart completion** | Publish the assembled write-back object plus an `s3p.pending_uploads` row atomically. Large unconditional completions use ack-first write-back; conditional completions flush synchronously under the captured base-version precondition. |
-| **Range cache** | With `--range-cache-chunk`, cache aligned chunks of large objects independently; without it, ranges above 8 MiB pass through to the origin. |
+| **Write-through / write-back** | Small and conditional `PUT`/`CopyObject` writes mutate the origin and cache synchronously. Large unconditional writes commit a logged `s3w_` object plus the pending row atomically before acknowledging; outbox upload follows. Pending-body failover durability depends on PostgreSQL's replication policy. `DELETE` remains synchronous and leaves bounded tombstones. |
+| **Multipart completion** | Publish the assembled write-back object plus the pending row atomically. With write-back enabled, unconditional completion can acknowledge before upload regardless of size; conditional completion flushes synchronously under the captured base-version precondition. |
+| **Range cache** | Cold partial reads can pass through or populate aligned chunks according to the range-cache options; metadata is not a body. |
 | **Listings** | Serve `ListObjectsV2` by merging the origin walk with live durable write-back objects, one bounded page in memory; no listing index or refresh generation. |
 
 Origins supply object data only. Every origin-backed bucket, per-bucket or
@@ -409,10 +475,9 @@ Limits:
   key, and `ListObjectsV2` merges pending cache objects with the origin listing,
   preferring the write-back metadata for duplicate keys. A durable write-back
   object keeps its local content ETag across the pending/committed transition;
-  the origin ETag is retained for conditional origin operations. Outbox origin uploads
-  take a PostgreSQL advisory lock per key, so concurrent gateways cannot
-  reorder background copies; small synchronous writes still use the local key
-  lock only.
+  the origin ETag is retained for conditional origin operations. Foreground
+  mutations and outbox uploads share local/session-key-lock ordering, with
+  token/version checks fencing publication across gateways.
 - **Origin is authoritative for committed objects.** Losing or flushing the
   cache namespace loses acceleration for committed objects; reads refill from
   the origin.
@@ -431,8 +496,8 @@ are explicitly out of scope and return errors or are ignored by design:
 | Area | Out of scope |
 | --- | --- |
 | Trust | authentication, authorization, SigV4 validation, presigned URLs, TLS, audit, per-tenant isolation, rate limiting |
-| S3 | IAM/bucket policies, versioning, ACLs, Object Lock, tags, lifecycle, replication, event notifications, SSE-C, SSE-KMS, DSSE-KMS, multipart `FULL_OBJECT` checksums |
-| OJS | workflows, cron, SSE/WebSocket events, schema registry, dead-letter management, pause/resume, full conformance |
+| S3 | IAM/bucket policies, versioning, ACLs, Object Lock, tags, lifecycle, S3 bucket replication, event notifications, SSE-C, SSE-KMS, DSSE-KMS, multipart `FULL_OBJECT` checksums |
+| OJS | workflows, cron, SSE/WebSocket events, schema registry, job-level dead-letter APIs, pause/resume, full conformance |
 | RESP | RESP3, `MULTI`/`EXEC`/`WATCH` |
 | Scale | More than 100 namespaces per database, schema-per-tenant layouts, sharding, multi-primary PostgreSQL |
 | Layout | In-place migrations; every layout change requires a fresh database |
@@ -444,19 +509,22 @@ markers, and `versionId` on GET/DELETE remains unsupported.
 
 When a feature is not implemented, the preferred behavior is to reject it
 explicitly rather than accept and silently ignore it. Presigned URLs follow
-that rule. The remaining compatibility gaps and their options are tracked in
-[proposals/hardening-options.md](proposals/hardening-options.md).
+that rule. Historical compatibility analyses are retained in
+[proposals/hardening-options.md](proposals/hardening-options.md); they are not a
+current gap inventory. Use [roadmap.md](roadmap.md) for active priorities.
 
 ## Design principles
 
-1. **PostgreSQL is the only authority.** No local metadata cache, byte cache,
-   namespace registry, or file-ID allocator may be authoritative. A pod can die
-   at any point; PostgreSQL locks, leases, catalog rows, and sequences decide.
-2. **Safety before availability during role changes.** If a gateway cannot
-   prove it is talking to a writable primary for a mutation, it should fail the
-   request rather than risk duplicate work or stale state.
-3. **Bounded work per request and per maintenance pass.** No query or reaper
-   pass may grow with total bucket size.
+1. **PostgreSQL is the shared gateway authority.** No local metadata/byte cache,
+   namespace registry or allocator decides committed gateway state. Origins own
+   committed external objects; pending acknowledged bodies remain a PostgreSQL
+   responsibility until handoff. A pod can die without losing that authority.
+2. **Explicit mutation authority.** Respect read-only mode and database fences;
+   do not bypass them to hide a failure. Role routing and promotion policy stay
+   with the deployment, not an implicit gateway election.
+3. **Bounded streaming and maintenance.** Cap buffers, admission and batch sizes.
+   Whole-namespace administration and deep origin listing walks can scale with
+   data size; do not disguise them as constant-cost point operations.
 4. **Atomic publish.** A client either sees the old object or the new one,
    never a mixture.
 5. **Explicit rejection over silent approximation.** If pgvs3 cannot honor a

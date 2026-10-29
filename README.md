@@ -1,29 +1,31 @@
-# pgvs3 — S3 on PostgreSQL
+# pgvs3 — PostgreSQL as the object data plane
 
-pgvs3 is a small, fast storage server that speaks **S3**, **OJS
-(OpenJobSpec)**, **HTTP** and **RESP (Redis/Valkey)** over one PostgreSQL
-database, and can also run as an **accelerating cache tier in front of an
-S3-compatible or read-only HTTP(S) object store**.
+**Durable object storage and shared object caching, served through stateless
+S3/HTTP gateways.** PostgreSQL stores the bytes, not just a metadata index.
+pgvs3 uses its transactions, MVCC snapshots, WAL, replication and locks instead
+of adding separate durability, cache-coherence and coordination services.
 
-It is built for [DuckLake](https://ducklake.select/) and co-located services:
-DuckLake keeps its catalog in PostgreSQL, and with pgvs3 lake files, queues and
-cached blobs live there too — one PostgreSQL cluster to run, back up, and
-replicate.
+The primary workload is **10 MiB–1 GiB Parquet objects for DuckDB and
+[DuckLake](https://ducklake.select/)** on trusted networks. Use PostgreSQL as the
+object store, or as a shared read cache and durable write-back stage in front of
+an origin. Gateway processes are replaceable; authoritative state is not on
+their local disks.
 
-The gateway is a stateless Go process with no authoritative local state. It
-ships as a ~15 MB distroless static container built with
-[ko](https://ko.build/).
+RESP2 cache commands and OJS jobs/streams are bounded companion interfaces for
+co-located services, not a goal of replacing every Redis or queue feature.
+They share the PostgreSQL engine and operating model, not one universal data
+model or a cross-protocol transaction.
 
-> **Trusted networks only — permanently.** pgvs3 does not authenticate,
-> authorize, or encrypt connections, and does not validate S3 signatures or
+> **Trusted networks only — permanently.** pgvs3 does not authenticate or
+> authorize clients, terminate inbound TLS, or validate S3 signatures or
 > credentials. Authentication is not part of the design and is not a future
 > goal. Run it on a loopback interface, private VPC/VLAN, or behind a service
 > mesh that enforces access control and TLS, and treat `:8014` like a database
 > port. Presigned URLs are rejected because a scoped link would otherwise
 > grant unscoped access. See [docs/design.md](docs/design.md).
 
-**Status: early alpha.** Production PostgreSQL targets Aurora PostgreSQL 18.3+
-or community/self-managed PostgreSQL 18. The PostgreSQL schema is one embedded baseline
+**Status: pre-alpha.** Targets are Aurora PostgreSQL 18.3+ or
+community/self-managed PostgreSQL 18+. The PostgreSQL schema is one embedded baseline
 (`internal/store/schema.sql`), currently layout **v25**, including shared origin
 parent metadata and PostgreSQL 18 publication SQL, with no in-place upgrade path.
 A layout change requires a fresh database and a re-import; there are no stable
@@ -31,23 +33,45 @@ on-disk compatibility guarantees yet.
 
 ## Start here
 
-- **What pgvs3 is:** one stateless gateway that projects a PostgreSQL database
-  as S3, OJS (OpenJobSpec v1 core), plain HTTP, and RESP2 on a single port.
-- **Supported scale:** at most **100 namespaces** (PostgreSQL schemas) per
-  database, one PostgreSQL primary plus streaming standbys, and multiple
-  gateway workers sharing that cluster.
-- **Safety model:** PostgreSQL is the coordination plane. Gateways keep no
-  authoritative local state; the namespace catalog, advisory locks, leases,
-  conditional writes, and token guards make concurrent workers safe.
-- **Read next:** [Quick start](#quick-start) to run it,
-  [docs/design.md](docs/design.md) for the model,
-  [docs/operations.md](docs/operations.md) to deploy and operate it.
+- **Choose a role:** [PostgreSQL object store or origin-backed cache/stage](#choose-a-storage-role).
+- **Try the main workload:** [Quick start](#quick-start), then
+  [write and query Parquet with DuckDB](#use-from-duckdb-20).
+- **Read next:** [docs/design.md](docs/design.md) for the model,
+  [docs/operations.md](docs/operations.md) to deploy and operate it, and
+  [docs/roadmap.md](docs/roadmap.md) for the current priorities.
+
+## Choose a storage role
+
+| Role | Where the object bytes live | Why use it |
+| --- | --- | --- |
+| **PostgreSQL object store** | Logged bucket tables in PostgreSQL; no origin required | Keep lake objects within the PostgreSQL cluster's storage, backup and replication boundary. |
+| **Origin-backed shared cache/stage** | Committed objects at the origin; logged PostgreSQL read fills and durable pending writes | Share warm bytes and fill ownership across gateways, and acknowledge eligible writes after durable PostgreSQL publication before origin upload. |
+
+The second role is not a disposable local cache: **a pending acknowledged body
+may exist only in PostgreSQL**. Cache TTL does not expire those pending bytes.
+Both roles use the PostgreSQL bucket catalog. See the
+[authority and acknowledgement contracts](docs/design.md#authority-and-acknowledgement-contracts).
+
+### Good fit—and the trade-off
+
+- You already operate PostgreSQL and want a bounded, private object data plane
+  for analytical files and nearby services.
+- You value shared MVCC visibility and one cluster's operational machinery more
+  than independently scaling an object store and cache fleet.
+- You accept that object writes **and read-cache fills** consume PostgreSQL disk,
+  WAL, I/O and replication bandwidth. Those resources compete with other cluster
+  work; fewer services does not mean free storage or automatic cost savings.
+
+This is not a public multi-tenant S3 service, an unlimited archive, or a claim of
+full S3/Redis/OJS replacement. No sharding, multi-primary layer or local-disk
+authority is planned. Existing companion interfaces remain supported within
+their documented bounds.
 
 ## Project goals and operating envelope
 
 | Dimension | Envelope |
 | --- | --- |
-| **Namespaces** | At most **100 PostgreSQL schemas per database**, counting buckets, cache namespaces, and queues. This is a bounded single-cluster envelope, not a schema-per-tenant design. |
+| **Namespaces** | At most **100 namespaces per database**, counting bucket, read-cache, write-back and queue schemas. This is a bounded single-cluster envelope, not a schema-per-tenant design. |
 | **Gateway fleet** | Multiple stateless `pgvs3` workers behind a load balancer; all share one PostgreSQL cluster and coordinate through the database. |
 | **PostgreSQL topology** | One primary (writer) plus streaming standbys. A single PostgreSQL database, not sharded or multi-primary. |
 | **Reads** | Writable gateways read from the primary. Read-only gateways (`--read-only`) can serve reads from standbys, subject to replication lag. |
@@ -57,15 +81,6 @@ on-disk compatibility guarantees yet.
 | **Security** | Trusted network only: no authentication, authorization, TLS termination, audit log, or per-tenant isolation. |
 | **Layout** | Current layout is **v25**. There is no in-place migration path; a layout change needs a fresh database and re-import. |
 
-## Tracing
-
-Tracing is optional and disabled unless an OTLP endpoint is configured. Set
-`OTEL_EXPORTER_OTLP_ENDPOINT` (or the traces-specific endpoint), optionally
-`OTEL_SERVICE_NAME`, and `OTEL_TRACES_SAMPLER_ARG` (0..1, default 1). HTTP
-requests start server spans, PostgreSQL statements get client spans, and origin
-HTTP requests propagate the trace context. The response includes `X-Trace-Id`.
-No endpoint means the OpenTelemetry API remains a no-op.
-
 ## Quick start
 
 Requires [mise](https://mise.jdx.dev/) and Docker (or an existing PostgreSQL
@@ -73,35 +88,19 @@ Requires [mise](https://mise.jdx.dev/) and Docker (or an existing PostgreSQL
 
 ```sh
 just setup
-just hooks    # install hk pre-commit/pre-push hooks (optional but recommended)
 just dev-db   # starts PostgreSQL 18 on 127.0.0.1:5432
-go run ./cmd/pgvs3 --url 'postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmode=disable' serve
+PGVS3_URL='postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmode=disable' \
+  mise exec go -- go run ./cmd/pgvs3 serve --addr 127.0.0.1:8014
 ```
 
-Buckets are explicit: create one before writing objects, and a write to a
-missing or deleted bucket returns `NoSuchBucket` instead of recreating it. RESP
-cache namespaces and OJS queues are created on first use. The single `:8014`
-port speaks S3, OJS, plain HTTP and RESP (Redis/Valkey); the protocol is
-detected from the connection, so there is nothing to configure:
+In another terminal, create a bucket and write an object. A write to a missing
+or deleted bucket returns `NoSuchBucket` instead of recreating it:
 
 ```sh
 # CreateBucket, then S3 / plain HTTP
 curl -fsS -X PUT http://127.0.0.1:8014/lake
 curl -fsS -X PUT --data-binary @README.md http://127.0.0.1:8014/lake/README.md
 curl -fsS http://127.0.0.1:8014/lake/README.md
-
-# Redis / Valkey (RESP2)
-redis-cli -p 8014 SET greeting "hello from resp" EX 60
-curl http://127.0.0.1:8014/_cache/cache/greeting
-redis-cli -p 8014 GET s3://lake/README.md     # explicit cross-namespace read
-
-# OJS (OpenJobSpec v1 core lifecycle)
-curl -X POST http://127.0.0.1:8014/ojs/v1/jobs \
-  -H 'Content-Type: application/openjobspec+json' \
-  -d '{"type":"email.send","args":["user@example.com"],"options":{"queue":"jobs"}}'
-curl -X POST http://127.0.0.1:8014/ojs/v1/workers/fetch \
-  -H 'Content-Type: application/openjobspec+json' \
-  -d '{"queues":["jobs"],"count":1,"worker_id":"worker-1","visibility_timeout_ms":30000}'
 ```
 
 ### Use from DuckDB 2.0+
@@ -109,15 +108,28 @@ curl -X POST http://127.0.0.1:8014/ojs/v1/workers/fetch \
 ```sql
 INSTALL httpfs; LOAD httpfs;
 CREATE SECRET (
-    TYPE s3, REGION 'us-east-1', ENDPOINT '127.0.0.1:8014',
+    TYPE s3, KEY_ID 'test', SECRET 'test',
+    REGION 'us-east-1', ENDPOINT '127.0.0.1:8014',
     URL_STYLE 'path', USE_SSL false
 );
-SELECT * FROM read_text('s3://lake/README.md') LIMIT 1;
+COPY (
+    SELECT range AS id, (range % 100)::INTEGER AS group_id,
+           md5(range::VARCHAR) AS payload
+    FROM range(1000000)
+) TO 's3://lake/events.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
+
+SELECT group_id, count(*) AS rows
+FROM read_parquet('s3://lake/events.parquet')
+GROUP BY group_id ORDER BY group_id LIMIT 5;
 ```
 
-### Use with DuckLake (catalog + files in the same PostgreSQL)
+Each returned group has 10,000 rows. The dummy credentials satisfy the client;
+they do not enable authentication. This is a walkthrough, not a performance
+claim; use the [paired runner](docs/benchmarks.md#paired-acceptance) for acceptance.
 
-This assumes the `lake` bucket created in the quick start.
+### Use with DuckLake (catalog and objects on one cluster)
+
+In the same DuckDB session, using the `lake` bucket from the quick start:
 
 ```sql
 INSTALL ducklake; INSTALL postgres; LOAD ducklake; LOAD postgres;
@@ -129,155 +141,69 @@ INSERT INTO lake.events VALUES (42, DATE '2026-09-01', 1.0);
 SELECT * FROM lake.events;
 ```
 
+The catalog database here is `ducklake_catalog`; pgvs3 uses `pgvs3_bench`.
+`just dev-db` creates both. They share a PostgreSQL cluster, but DuckLake catalog
+transactions and pgvs3 object publications are **separate transactions**, not a
+distributed transaction made atomic by co-location.
+
 ## How it works
 
-- **One PostgreSQL schema per namespace, typed by prefix.** `s3b_<name>` is a
-  durable bucket, `s3c_<name>` the WAL-logged shared cache namespace (origin
-  read fills and RESP/cache users), `s3w_<name>` the WAL-logged write-back
-  namespace, and `s3q_<name>` an OJS queue/stream namespace. Each owns its tables, autovacuum
-  workers and 32 TiB chunk budget:
-  - **32 TiB capacity and independent autovacuum per bucket.**
-  - **Instant bucket deletion (`DROP SCHEMA CASCADE`):** returns disk space to
-    the OS in milliseconds with no reaper lag or vacuum bloat.
-  - **Single-bucket snapshots & clones:** dump/restore individual buckets with
-    `pg_dump -n s3b_<bucket>`, or clone a bucket inside PostgreSQL with
-    `pgvs3 clone <src> <dst>` (`PUT /{dst}` with `x-amz-copy-source: /{src}`).
-- **Length-discriminated Zstd compression.** Every inline object
-  (bucket: `≤64 KiB`, cache: one 8 KB page) and every `8,120`-byte chunk
-  block is compressed with a reusable
-  [Zstandard](https://github.com/klauspost/compress) encoder if it shrinks
-  (`len(stored) < wantLen`), or stored as raw bytes if incompressible
-  (`len(stored) == wantLen`, e.g. already-compressed Parquet). The compressed
-  form is a standard Zstd frame; raw blocks remain header-free. OJS job
-  `args`/`meta` are JSONB so their envelopes can exceed one page. Logical chunk
-  offsets remain `no × 8,120`, preserving `O(1)` byte-range seeking and the
-  exact 8,160-byte PostgreSQL page budget (`99.6%` fill, no TOAST).
-- **Four protocols, one port.** S3/OJS/HTTP share the HTTP listener; RESP2 is
-  detected from the first byte. RESP defaults to the `cache` namespace and
-  can read any durable bucket with `GET s3://<bucket>/<key>`; writes are
-  confined to cache namespaces.
-- **Accelerating cache tier (`--origin-config`).** With an S3, HTTP(S) or
-  filesystem origin, S3 `GET`/`HEAD` become read-through cache reads in
-  `s3c_<namespace>` (WAL-logged and replicated) with TTL revalidation.
-  A global origin serves only buckets that exist in the catalog: create each
-  bucket with `PUT /{bucket}` first. A missing bucket returns `404 NoSuchBucket`
-  before the origin is contacted.
-  Writable origins also receive
-  `PUT`/`COPY`/`DELETE` write-through; read-only HTTP(S) origins serve reads
-  only. Request checksums are verified and conditional writes are enforced
-  before the origin is mutated; Content-Type, Content-Encoding,
-  `x-amz-meta-*` metadata and the origin `Last-Modified` timestamp round-trip
-  through the origin. For large unconditional objects, the default
-  `--cache-write-back` path commits the body to the WAL-logged
-  `s3w_<namespace>` write-back namespace and the origin outbox row in one
-  transaction, then acknowledges before the origin upload. Pending bodies are
-   immediately readable and locally WAL-durable. Lossless failover depends on
-   the PostgreSQL replication/promotion policy; read-only replicas see them
-   after WAL replay. The bounded worker retries the origin upload. Small
-   PUT/COPY and conditional writes remain synchronous. Unconditional multipart
-   completion can acknowledge before origin upload regardless of body size;
-   conditional completion stays synchronous, with the captured origin version
-   used as an `If-Match`/`If-None-Match` precondition when available. With
-  `--range-cache-chunk`, ranges of large objects are cached as
-  aligned chunks instead of being passed through, which makes Parquet row-group
-  and PMTiles range reads repeatable. Fills are bounded (`--fill-concurrency`)
-   and spooled to memory or a temp file before touching PostgreSQL, so a slow
-   read fill never pins a database connection. Disk spools share an 8 GiB
-   process-wide payload budget (`--spool-max-bytes`); exhausted admission returns
-   `503 SlowDown` before acknowledging a write. Write-back uploads retain a
-   session key lock to preserve remote ordering. The production origins are
-  S3-compatible (`s3`) and read-only HTTP(S); `filesystem` and `ephemeral` remain
-  small local/test providers that share one on-disk implementation. `ephemeral`
-  keeps its objects in a private temporary directory under `TMPDIR`, removed on
-  clean shutdown. Both keep in-flight writes in a `.pgvs3-tmp` directory at their
-  root; that directory is hidden from listings and its name cannot be a key. User
-  metadata is process-local for both. Keys that cannot be stored as paths are
-  rejected: empty, `.` or `..` segments, NUL bytes, segments over 255 bytes, and
-  keys that conflict with an existing object or prefix. PUT,
-  COPY and multipart completion reject them with `400 InvalidRequest` before any
-  body is acknowledged or committed, including write-back uploads. Reads return
-  `404`, and `DELETE` is a no-op.
-- **Cache safety across workers.** Read-through fills are fenced by the
-  expected origin version, so a fill that started before a newer write-through
-  write cannot overwrite the newer cache row. Write-through deletes leave a
-  short-lived cache tombstone, so an in-flight fill cannot resurrect a deleted
-  object either. Multipart flushes hold database leases and publish with token
-  guards; a stale retry or fill is discarded rather than reviving an older
-  object. Acknowledged write-back objects are durable in the WAL-logged
-  `s3w_<namespace>` until the origin copy commits and normal retention applies;
-  there is no full external cache-invalidation channel. Gateways running with
-   `--read-only` serve durable `s3c_` cache and `s3w_` write-back objects,
-   never fill cache rows, and never start a worker.
-- **Shared range metadata and renewable fill ownership.** Range-only hits use
-  logged PostgreSQL parent metadata instead of an origin HEAD on every request.
-  Metadata respects `--cache-ttl`, never represents a body, and is invalidated
-  by writes/deletes/flushes. Read-only workers can consume replicated metadata
-  and range blocks. Fill leases renew during slow downloads, and publication
-  checks/locks the live database owner as well as the origin version.
-- **Immutable files, atomic publish.** Writes stream into `chunks` via
-  binary `COPY` under a new `file_id` from a database sequence and publish in
-  the same transaction. Interrupted writes leave nothing visible.
-- **Cut-through streaming reads.** Single-file reads up to 64 MiB run as one
-  query; larger and multipart objects stream in 8 MiB parallel pieces under one
-  repeatable-read snapshot so concurrent overwrites cannot corrupt an in-flight
-  read.
-- **No authoritative local state.** Gateways keep no local object or metadata
-  cache and no locally authoritative namespace, file-ID, or lease state;
-  PostgreSQL `shared_buffers` is the shared cache. Committed writes are visible
-  immediately to other writable gateways with strict MVCC consistency.
-  `--read-only` gateways on PostgreSQL streaming standbys serve local-AZ reads
-  subject to replication lag. One writable gateway holds the maintenance
-  advisory lock; if it exits, another acquires it automatically on a later
-  tick.
-- **Built-in garbage collection.** Overwritten and deleted files stay readable
-  for `--reap-grace` (default 10 minutes), then the advisory-lock leader
-  removes dead chunk rows in bounded passes. No `pg_cron` extension is needed.
+```text
+DuckDB / DuckLake / S3 and HTTP clients
+                    |
+          replaceable pgvs3 gateways ------- optional origin I/O
+                    |                              |
+          PostgreSQL data database          S3 / HTTP origin
+                    |
+              WAL replication
+                    |
+          PostgreSQL streaming standbys
+```
 
-See [docs/performance.md](docs/performance.md) for the full storage and query
-design.
+- **PostgreSQL-native byte layout.** Small objects are inline; larger objects
+  use logical 8,120-byte blocks sized for one PostgreSQL page without TOAST.
+  Each block uses Zstd only when it shrinks, avoiding expansion of compressed
+  Parquet. Byte offsets remain predictable for range reads.
+- **Immutable bytes, transactional publication.** Binary COPY ingests new file
+  IDs; one transaction publishes the object pointer and retires old ownership.
+  Readers use MVCC snapshots rather than gateway invalidation messages.
+- **Specialized I/O.** A metadata pool favors B-tree lookups; a separate chunk
+  pool uses PostgreSQL 18 bitmap read-ahead. Reads stream with bounded buffering,
+  including parallel pieces under a shared snapshot for large objects.
+- **Shared origin orchestration.** Version/lease-fenced fills, delete tombstones
+  and a durable outbox coordinate gateways through PostgreSQL. Process-local
+  buffers, admission limits and scratch files are resource controls, not copies
+  of record. A read-only gateway can consume replayed rows but does not fill or
+  flush them.
+- **Bounded lifecycle.** Catalog-controlled namespaces, explicit bucket creation,
+  one database-elected maintenance leader and bounded reaping keep the system
+  inside its single-cluster envelope.
 
-## Performance at a glance
+| Namespace | Purpose |
+| --- | --- |
+| `s3p` | Shared catalog, sequences, fill leases and pending-upload control rows |
+| `s3b_<name>` | PostgreSQL object-store buckets |
+| `s3c_<name>` | Logged read fills, range metadata/blocks and RESP/cache values |
+| `s3w_<name>` | Logged write-back bodies and durable origin-write cache |
+| `s3q_<name>` | Companion job and stream state |
 
-Measured with `just load` against PostgreSQL 18 in Docker (`shared_buffers=1GB`)
-on a 16-core host (6-vCPU VM numbers in [docs/benchmarks.md](docs/benchmarks.md)):
+For publication/acknowledgement boundaries see [design.md](docs/design.md).
+For the byte layout and query paths see [performance.md](docs/performance.md).
+For origin modes, provider limits and recovery see
+[operations.md](docs/operations.md#cache-tier-in-front-of-another-object-store).
 
-- **Latency (1 worker):** **`0.072 ms` (72 µs)** p50 for 4 KiB RESP `GET`
-  (`0.17 ms` for S3 `GET`, `0.14 ms` for `HEAD`), and **`0.18 ms`** for durable
-  4 KiB RESP `SET` (`0.81 ms` for S3 `PUT`, `synchronous_commit = on`).
-- **RESP cache throughput (4 KiB, 64 workers):** **97.0k `GET`/s** unpipelined
-  and **460.4k `GET`/s (1.76 GiB/s)** at pipeline 16; **48.2k durable `SET`/s**
-  unpipelined. The older **213.6k durable `SET`/s** pipeline-16 figure predates
-  the redcon move: redcon returns one command per 4 KiB read, so large
-  pipelined `SET`s may be processed individually rather than coalesced.
-- **S3 throughput (4 KiB):** **35.8k `GET`/s**, **26.1k `HEAD`/s**, and
-  **20.9k durable `PUT`/s**.
-- **Large-object bandwidth (64 MiB S3):** **4.17 GiB/s (4,275 MiB/s)** read
-  (16 workers) and **529 MiB/s** write (8 workers).
-- **Cache tier (64 MiB, filesystem origin, warm):** **4.0 GiB/s** read and
-  **488 MiB/s** write through the proxy.
+## Performance evidence
 
-The old SQS queue numbers are not comparable after the OJS v1 rewrite. Run
-`just load` with `-op ojs-enqueue` / `-op ojs-fetch` to measure the new path.
+The acceptance workload is 10 MiB–1 GiB objects: warm/cold GET, footer and aligned
+ranges, metadata, native publication and durable write-back acknowledgement.
+Changes are compared per path against a saved binary, with a 20% regression
+budget and the already documented small-origin-hit catalog-check exception.
 
-**Compared with AWS S3 Express One Zone (`us-east-1`):**
-
-1. **Latency:** pgvs3 is ~10× faster on loopback/LAN (`0.17 ms` vs
-   single-digit ms).
-2. **Read ceiling:** one 16-core pgvs3 node (`32.5k GET/s`) is ~6× below
-   Express's `200k GET/s` default bucket quota (`2M/s` max).
-3. **Write ceiling:** pgvs3 (`17.5k PUT/s`) is ~6× below Express's `100k PUT/s`
-   default bucket quota (`200k/s` max).
-4. **Bandwidth:** pgvs3 streams `3.45 GiB/s` from cache/NVMe (`125–1,000 MiB/s`
-   on cold EBS gp3); Express scales elastically with client network.
-5. **500 GB of 64 MiB Parquet files (1× W+R/mo):** Express is ~$57/mo vs
-   ~$100–200/mo for a dedicated pgvs3 node, or $40/mo in gp3 disk on an
-   existing PostgreSQL.
-6. **500 GB of 122M 4 KiB objects (1× W+R/mo):** Express rises to ~$199/mo due
-   to `$1.13/M` `PUT` fees; pgvs3 charges $0 per request and stays at ~$165/mo
-   dedicated or $40/mo on an existing PostgreSQL.
-
-Full tables and DuckDB `httpfs` benchmarks are in
-[docs/benchmarks.md](docs/benchmarks.md).
+Use [the paired runner](docs/benchmarks.md#paired-acceptance), not a single peak
+requests-per-second number. [Recorded comparisons](docs/modernization-results.md)
+state the host, payloads, sample counts and limits; they are local measurements,
+not cloud-service latency, cost or durability equivalence. Historical small-value
+and client benchmarks remain in [benchmarks.md](docs/benchmarks.md).
 
 ## S3 and HTTP support
 
@@ -288,14 +214,15 @@ Full tables and DuckDB `httpfs` benchmarks are in
   `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`,
   `ListMultipartUploads`), `CopyObject`, `GetObjectAttributes`, and
   `partNumber` on `GET`/`HEAD`.
-- **Zero-copy & server-side copies:** Same-bucket `CopyObject` and whole-object
+- **Native PostgreSQL copies:** Same-bucket `CopyObject` and whole-object
   `UploadPartCopy` share immutable `file_id`s without copying chunk rows;
   cross-bucket `CopyObject` and whole-bucket clones (`PUT /{dst}` with
   `x-amz-copy-source: /{src}`) copy chunk rows inside PostgreSQL without
   streaming bytes through the gateway.
-- **Instant bucket drop:** `DELETE /{bucket}?force=true` (or
+- **Whole-bucket drop:** `DELETE /{bucket}?force=true` (or
   `pgvs3 drop --force <bucket>`) drops `s3b_<bucket>` with `DROP SCHEMA CASCADE`
-  and immediately returns OS disk space.
+  rather than walking every object. Table files are unlinked after commit;
+  acquiring the required locks can still take time.
 - **Checksums:** verifies MD5, CRC32, CRC32C, CRC64NVME, SHA-1, and SHA-256 on
   upload; stores a single-object checksum for GET/HEAD/`GetObjectAttributes`
   and per-part checksums on multipart uploads.
@@ -307,6 +234,67 @@ Full tables and DuckDB `httpfs` benchmarks are in
   client or browser. Trailing slashes resolve to `index.html`, plain
   `GET /{bucket}` serves `/{bucket}/index.html` when present, and `Content-Type`
   falls back to the filename extension.
+- **S3 cache tier:** read-through and write-through/write-back
+  `GET`/`HEAD`/`PUT`/`CopyObject`/multipart uploads/`DELETE`/`DeleteObjects`/
+  `ListObjectsV2` in front of an origin (`X-Cache: HIT|MISS`), with TTL
+  revalidation, idle eviction, optional range caching, and an origin listing
+  merged with pending write-back objects. See
+  [origin modes and limits](docs/operations.md#cache-modes).
+
+## Origin-backed storage
+
+For production origins, use S3-compatible storage (reads and writes) or HTTP(S)
+(read-only by default). Persist global/per-bucket settings with `pgvs3 origin`;
+see the [S3 configuration](docs/operations.md#cache-tier-in-front-of-another-object-store).
+`filesystem` and temporary-directory `ephemeral` are local/test providers, not
+production durability backends.
+
+For a read-only HTTP data host, save this as `origin.json`:
+
+```json
+{
+  "type": "http",
+  "config": {
+    "base_url": "https://data.source.coop",
+    "strip_bucket": true,
+    "read_only": true,
+    "headers": { "User-Agent": "pgvs3" }
+  }
+}
+```
+
+With `PGVS3_URL` set to the gateway's data database, attach it to a bucket:
+
+```sh
+pgvs3 origin --url "$PGVS3_URL" --bucket edge --cache-namespace origin \
+  --range-cache-chunk 1048576 set origin.json
+```
+
+This creates the bucket catalog row and enables aligned range caching. HTTP
+origins do not support `ListObjectsV2`; use an S3 origin when listing is required.
+Provider key/metadata limits are in [operations.md](docs/operations.md#limits-and-failure-behavior).
+
+## Companion interfaces
+
+These use the same listener and PostgreSQL engine but are optional for the
+object-storage path. RESP cache namespaces and OJS queues are created on first
+use. The connection mux detects RESP2; HTTP routes distinguish S3 from OJS.
+
+```sh
+# Redis-compatible cache subset (RESP2)
+redis-cli -p 8014 SET greeting "hello from resp" EX 60
+curl -fsS http://127.0.0.1:8014/_cache/cache/greeting
+redis-cli -p 8014 GET s3://lake/README.md     # explicit cross-namespace read
+
+# OJS (OpenJobSpec v1 core lifecycle)
+curl -fsS -X POST http://127.0.0.1:8014/ojs/v1/jobs \
+  -H 'Content-Type: application/openjobspec+json' \
+  -d '{"type":"email.send","args":["user@example.com"],"options":{"queue":"jobs"}}'
+curl -fsS -X POST http://127.0.0.1:8014/ojs/v1/workers/fetch \
+  -H 'Content-Type: application/openjobspec+json' \
+  -d '{"queues":["jobs"],"count":1,"worker_id":"worker-1","visibility_timeout_ms":30000}'
+```
+
 - **OJS v1 core (OpenJobSpec):** implements the HTTP lifecycle subset:
   `POST /ojs/v1/jobs` and `/ojs/v1/jobs/batch`, `GET`/`DELETE
   /ojs/v1/jobs/{id}`, `POST /ojs/v1/workers/{fetch,ack,nack,heartbeat}`,
@@ -325,8 +313,7 @@ Full tables and DuckDB `httpfs` benchmarks are in
   maintenance updates; terminal jobs are kept
   for `--job-retention` (default `24h`). Workflows, cron, SSE/WebSocket events, schema registry, job-level
   dead-letter APIs, pause/resume and full OJS conformance are intentionally out
-  of scope. Old SQS `messages` rows are ignored by the current schema; drop the
-  queue namespace with `--force` to reclaim them.
+  of scope.
 - **Queue + stream:** every `s3q_<name>` namespace also exposes a PgQue-shaped
   append-only stream under `/ojs/v1/queues/{name}/...`: batch append,
   independent fan-out subscriptions, cooperative members, snapshot-delimited
@@ -335,14 +322,6 @@ Full tables and DuckDB `httpfs` benchmarks are in
   retention, so retention does not leave dead tuples. Jobs and streams share the
   same schema, catalog, quota, backup, `DROP SCHEMA` and maintenance pass; a
   queue can serve both. See [docs/queue-stream.md](docs/queue-stream.md).
-- **S3 cache tier:** read-through and write-through/write-back
-  `GET`/`HEAD`/`PUT`/`CopyObject`/multipart uploads/`DELETE`/`DeleteObjects`/
-  `ListObjectsV2` in front of an origin (`X-Cache: HIT|MISS`), with TTL
-  revalidation, idle eviction, optional range caching, and a direct origin
-  listing merged with pending write-back objects. Fills are version-fenced,
-  deletes leave expiring tombstones, multipart uses a leased outbox, and cache
-  publishes are token-guarded, so the tier is safe across workers. See
-  [docs/operations.md](docs/operations.md#cache-tier-in-front-of-another-object-store).
 - **RESP (Redis/Valkey) cache protocol on `:8014`:** supports `GET`, `SET`
   (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`/`GET`), `SETNX`, `SETEX`,
   `PSETEX`, `GETSET`, `GETDEL`, `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`,
@@ -357,23 +336,27 @@ Full tables and DuckDB `httpfs` benchmarks are in
   honours `NX`/`XX`/`GT`/`LT`.
   `MULTI`/`EXEC`/`WATCH` are rejected explicitly (use a pipeline; in
   `redis-py` pass `transaction=False`) because pgvs3 has no cross-command
-  snapshot, and pretending otherwise would lose updates.
-- **Out of scope (not roadmap):** authentication/authorization, SigV4
-  validation, presigned URLs, TLS termination, audit logging, per-tenant
-  isolation, IAM/bucket policies, versioning, object tags, Object Lock, ACLs,
-  lifecycle rules, replication, event notifications, SSE-C/SSE-KMS/DSSE-KMS, and
-  multipart `FULL_OBJECT` checksums. The network is the security boundary; see
-  [docs/design.md](docs/design.md).
+   snapshot, and pretending otherwise would lose updates.
+
+## Scope boundaries
+
+Authentication/authorization, SigV4 validation, presigned URLs, gateway TLS,
+audit logging and per-tenant isolation are not roadmap items. Neither are S3
+IAM/bucket policies, versioning, object tags, Object Lock, ACLs, lifecycle rules,
+S3 bucket replication, event notifications, SSE-C/SSE-KMS/DSSE-KMS or multipart
+`FULL_OBJECT` checksums. **PostgreSQL WAL replication is part of the architecture;
+S3 bucket replication is not.** See [the full boundaries](docs/design.md#scope-boundaries).
 
 ## Configuration and CLI
 
-Every flag maps to an environment variable.
+The `serve` flags below map to environment variables; administrative flags such
+as `drop --force` do not. Run `pgvs3 <command> --help` for command-specific flags.
 
 | Flag | Environment variable | Default | Description |
 | --- | --- | --- | --- |
 | `--url` | `PGVS3_URL` | `postgres://localhost/pgvs3` | PostgreSQL connection URL (writer endpoint for writable workers; standby endpoint with `--read-only`). Use `sslmode` for DB TLS. |
-| `--addr` | `PGVS3_ADDR` | `0.0.0.0:8014` | Listen address for S3, OJS, HTTP, `/healthz`, `/readyz`, and `/metrics`. |
-| `--pool-max` | `PGVS3_POOL_MAX` | `64` | Max PostgreSQL connections per gateway worker (main pool; see `--spool-dir` and the chunk pool note). |
+| `--addr` | `PGVS3_ADDR` | `0.0.0.0:8014` | Listen address for S3/HTTP/RESP2/OJS, `/healthz`, `/readyz` and `/metrics`. |
+| `--pool-max` | `PGVS3_POOL_MAX` | `64` | Main-pool connections per gateway. A separate chunk pool adds up to `min(pool-max, 64)`; size connections for the whole fleet. |
 | `--spool-dir` | `PGVS3_SPOOL_DIR` | unset | Scratch directory for cache fills larger than 8 MiB; empty uses the system temp directory. Put this on local scratch, not a small tmpfs. |
 | `--spool-max-bytes` | `PGVS3_SPOOL_MAX_BYTES` | `8589934592` (8 GiB) | Process-wide disk spool payload byte budget shared by fills, foreground writes and pending uploads. Set below available scratch capacity and above the largest object to spool. Busy admission returns 503; pending work remains logged and retries. |
 | `--db-work-mem` | `PGVS3_DB_WORK_MEM` | `16MB` | PostgreSQL `work_mem` per connection; keep conservative and raise for known heavy reads. |
@@ -390,7 +373,7 @@ Every flag maps to an environment variable.
 | `--max-conns` | `PGVS3_MAX_CONNS` | `4096` | Concurrent client connections before shedding load. |
 | `--http-read-timeout` | `PGVS3_HTTP_READ_TIMEOUT` | `30m` | Absolute HTTP read deadline including request bodies (`0` disables). |
 | `--http-write-timeout` | `PGVS3_HTTP_WRITE_TIMEOUT` | `30m` | Absolute HTTP response write deadline (`0` disables). |
-| `--origin-config` | `PGVS3_ORIGIN_CONFIG` | unset | S3/HTTP/filesystem origin JSON; enables the cache tier. |
+| `--origin-config` | `PGVS3_ORIGIN_CONFIG` | unset | Process-local fallback origin JSON; persisted `pgvs3 origin` settings are discovered across gateways. |
 | `--cache-ttl` | `PGVS3_CACHE_TTL` | `1m` | Origin revalidation interval (`0` = always revalidate). |
 | `--cache-write-back` | `PGVS3_CACHE_WRITE_BACK` | `true` | Acknowledge large unconditional writes after the WAL-logged write-back/outbox transaction; the origin upload runs asynchronously. Conditional writes stay synchronous. |
 | `--simulate-latency` | `PGVS3_SIMULATE_LATENCY` | `0` | Benchmark-only one-way HTTP delay added to S3 requests; the response side adds the same delay, so `20ms` is roughly a 40ms RTT. |
@@ -407,7 +390,7 @@ Every flag maps to an environment variable.
 
 Subcommands:
 
-- `pgvs3 serve` — run the S3/OJS/HTTP gateway (default when no subcommand is given).
+- `pgvs3 serve` — run the S3/HTTP/RESP2/OJS gateway (default when no subcommand is given).
 - `pgvs3 stat [--kind bucket|cache|queue] [--name N] [--json]` — namespace
   usage, logical vs physical size and queued garbage.
 - `pgvs3 clone [--kind bucket|cache] <src> <dst>` — clone inside PostgreSQL.
@@ -419,54 +402,33 @@ Subcommands:
   — persist or remove global or per-bucket origin cache configs inside
   PostgreSQL (gateways discover them automatically with no external files). A
   global origin serves only buckets that exist in the catalog.
-- `pgvs3 doctor` — verify PostgreSQL 18+, schema layout v25, table settings, per-queue stream functions,
-  namespace drift, the 100-namespace supported scale, and reaper safety.
+- `pgvs3 doctor` — verify PostgreSQL 18+, layout v25, table settings, exact
+  global/object/stream function contracts, namespace drift, supported scale and
+  reaper safety.
 - `pgvs3 reap [--all]` — reconcile schemas and run garbage collection immediately.
 - `pgvs3 health` — poll `/readyz` for container health checks.
 
-Build the container image with `ko` or pull the published image and OCI Helm
-chart from GHCR:
+Build the image with `ko` and package the Helm chart from this checkout:
 
 ```sh
-docker pull ghcr.io/adonm/pgvs3:v0.2.0
-helm install pgvs3 oci://ghcr.io/adonm/charts/pgvs3 --version 0.2.0
-
-just image            # local ko.local image
-just image push=true  # multi-arch ghcr.io/adonm/pgvs3 (amd64 + arm64)
-CHART_VERSION=v0.3.1 just chart push=true  # OCI chart oci://ghcr.io/adonm/charts/pgvs3
+just image  # local ko.local image
+just chart  # package under .tmp/pgvs3/
 ```
 
-## HTTP origins
-
-Read-only HTTP(S) origins are useful for static CDNs and Source Cooperative-
-style data hosts. Configure a base URL and strip the cache bucket prefix:
-
-```json
-{
-  "type": "http",
-  "config": {
-    "base_url": "https://data.source.coop",
-    "strip_bucket": true,
-    "read_only": true,
-    "headers": { "User-Agent": "pgvs3" }
-  }
-}
-```
-
-Add `--range-cache-chunk 1048576` to `pgvs3 serve` (or the matching
-`pgvs3 origin ... set` flag) to cache aligned chunks of large Parquet/PMTiles
-files. HTTP origins do not support `ListObjectsV2`; use an S3 origin when
-listing is required.
+Published artifacts use `ghcr.io/adonm/pgvs3` and
+`oci://ghcr.io/adonm/charts/pgvs3`. Pin compatible image/chart versions rather
+than assuming an older release matches `main`'s layout. Deployment and probes
+are described in [operations.md](docs/operations.md).
 
 ## Limits to keep in mind
 
 | Limit | Behavior |
 | --- | --- |
-| **Namespaces** | At most **100 schemas per database**, counting buckets, cache namespaces, and queues. More than that is outside the supported envelope; `pgvs3 doctor` reports `over_supported_scale` and exits non-zero. |
-| **Bucket capacity** | Each bucket's `chunks` table is a single PostgreSQL relation capped at 32 TiB (`MaxBlockNumber × 8 KB`, ~31.7 TiB of object payload); ~17.4 TB per object. |
+| **Namespaces** | At most **100 namespaces per database**, counting bucket, read-cache, write-back and queue schemas. `EnsureNamespace` enforces it; `doctor` also reports an over-scale database. |
+| **Bucket capacity** | Each bucket's `chunks` table has PostgreSQL's 32 TiB relation limit (~31.7 TiB of payload); ~17.4 TB per object from chunk indexing. These are format ceilings, not measured production capacity targets. |
 | **Writer model** | One DuckLake writer per bucket and many readers. Scale reads with additional DuckDB workers, writable gateway workers, and read-only gateways on PostgreSQL standbys. |
 | **Disk reclamation** | Dropping a bucket (`pgvs3 drop --force <bucket>`) returns disk space to the OS via `DROP SCHEMA CASCADE`. Inside a live bucket, deleted pages are reused after `--reap-grace` and autovacuum; returning space without dropping requires `VACUUM FULL` or `pg_repack`. |
-| **Cache authority** | The origin is the source of truth. pgvs3 has no full external invalidation channel; origin changes made outside pgvs3 may be served stale until TTL revalidation. |
+| **Cache authority** | Origins own committed external objects; PostgreSQL owns pending acknowledged bodies until handoff. External origin changes may remain stale until TTL revalidation. Never discard pending bodies as a disposable cache. |
 | **Delete tombstones** | A write-through delete leaves a thirty-minute tombstone so an in-flight fill cannot resurrect the object. An object recreated directly at the origin may remain hidden through the cache until the tombstone expires; recreating it through pgvs3 replaces it immediately. |
 
 See [docs/operations.md](docs/operations.md) for topology and backup guidance and
@@ -496,24 +458,25 @@ Further reading:
 
 - [docs/design.md](docs/design.md) — project goals, trust model, multi-worker
   safety invariants, and scope boundaries
+- [docs/roadmap.md](docs/roadmap.md) — current ranked work and acceptance criteria
 - [docs/performance.md](docs/performance.md) — storage layout, read/write paths,
   and DuckDB tuning
-- [docs/benchmarks.md](docs/benchmarks.md) — full benchmark tables and S3
-  Express One Zone comparison
+- [docs/benchmarks.md](docs/benchmarks.md) — canonical paired runner and historical
+  benchmark snapshots
 - [docs/operations.md](docs/operations.md) — deployment topology, failover,
   probes, backups, and cache-tier operations
-- [docs/partitioning.md](docs/partitioning.md) — why `s3p.chunks` is unpartitioned
-- [docs/proposals/hardening-options.md](docs/proposals/hardening-options.md) —
-  open compatibility and hardening options under review
-- [docs/proposals/high-value-improvements.md](docs/proposals/high-value-improvements.md)
-  — prioritized correctness, simplification and performance findings
-- [docs/proposals/modernization-review.md](docs/proposals/modernization-review.md)
-  — sourced capability-by-capability alternatives and modernization roadmap
-- [docs/modernization-results.md](docs/modernization-results.md) — v24 changes,
-  before/after S3/cache measurements and origin-client comparisons
+- [docs/partitioning.md](docs/partitioning.md) — why each bucket's `chunks` table
+  is unpartitioned
+- [docs/modernization-results.md](docs/modernization-results.md) — completed
+  v24/v25 work, per-path measurements and remaining evidence limits
 - [docs/queue-stream.md](docs/queue-stream.md) — the consolidated OJS
   job/stream model and PgQue feature mapping
 - [CONTRIBUTING.md](CONTRIBUTING.md) — development workflow and invariants
+
+Historical analyses, **not the active backlog**:
+[hardening options](docs/proposals/hardening-options.md),
+[improvement findings](docs/proposals/high-value-improvements.md), and
+[modernization review](docs/proposals/modernization-review.md).
 
 ## License
 

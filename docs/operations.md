@@ -1,5 +1,10 @@
 # Operations
 
+PostgreSQL stores the object bytes as well as metadata and coordination state.
+Operate native buckets as durable PostgreSQL data; with an origin, distinguish
+rebuildable read fills from pending acknowledged bodies that may exist only in
+PostgreSQL. See the [authority contracts](design.md#authority-and-acknowledgement-contracts).
+
 ## First run
 
 ```sh
@@ -57,9 +62,10 @@ fills, and the origin retry worker, and serves reads and
 PostgreSQL; a read-only gateway pointed at a primary still rejects mutations.
 
 On failover, the writer endpoint must be repointed to the promoted standby by
-your HA mechanism (DNS, service, or proxy). In-flight requests may fail and
-clients should retry. Maintenance leadership re-elects automatically when a
-writable gateway reaches the new primary. See
+your HA mechanism (DNS, service, or proxy). In-flight requests may fail with an
+ambiguous commit outcome; clients should reconcile or retry with conditions.
+Maintenance leadership re-elects automatically when a writable gateway reaches
+the new primary. See
 [Graceful shutdown, failover, and Kubernetes](#graceful-shutdown-failover-and-kubernetes).
 
 Size PostgreSQL connections for the whole fleet. Each worker opens a main pool
@@ -222,20 +228,20 @@ acquires the lock on a later tick.
 
 ## Namespaces and supported scale
 
-Every namespace is a PostgreSQL schema, typed by prefix. **At most 100 schemas
-per database are supported**, counting buckets, cache namespaces, and queues;
+Every namespace is a PostgreSQL schema, typed by prefix. **At most 100 namespaces
+per database are supported**, counting bucket, read-cache, write-back and queue schemas;
 `EnsureNamespace` enforces the limit (S3 returns `TooManyBuckets`, OJS returns
 `insufficient_storage`) instead of relying only on `doctor`.
 More than that is outside the operating envelope; `pgvs3 doctor` reports
 `over_supported_scale` and exits non-zero. This is not a schema-per-tenant
 design.
 
-| Kind | Schema | Tables | Durability |
+| Kind | Schema | Main state | Durability |
 | --- | --- | --- | --- |
 | bucket | `s3b_<name>` | objects, chunks, uploads, garbage | WAL-logged |
-| cache | `s3c_<name>` | objects, chunks, garbage | WAL-logged shared cache (origin fills and RESP); replicated |
+| cache | `s3c_<name>` | objects, chunks, origin metadata, garbage | WAL-logged origin fills and standalone RESP/cache values |
 | writeback | `s3w_<name>` | objects, chunks, uploads, garbage | WAL-logged; acknowledged write-back bodies; do not discard |
-| queue | `s3q_<name>` | jobs (+ legacy messages/dedup) | WAL-logged |
+| queue | `s3q_<name>` | jobs, segmented streams, ticks, subscriptions, batches, retry/dead-letter rows | WAL-logged |
 
 `s3p.namespaces` is the authoritative catalog. Buckets are created explicitly
 with `CreateBucket`/`PUT /{bucket}`; object writes do not create or recreate a
@@ -258,9 +264,10 @@ physical storage/WAL limits still need monitoring and capacity headroom.
 
 ## Namespace snapshots, clones, and deletion
 
-Each namespace `<name>` lives in its own schema, so a single `pg_dump -n`
-captures exactly one bucket, cache namespace or queue. This is useful for export
-and small deployments; use physical backups for whole-cluster recovery.
+Each namespace `<name>` lives in its own schema, so `pg_dump -n` can export that
+schema. This is not a complete recovery set for pending origin writes: bodies
+in `s3w_` and control rows in `s3p.pending_uploads` must be restored consistently.
+Use a whole-database dump or physical backup for that recovery boundary.
 
 - **Single-bucket snapshot and restore:**
   ```sh
@@ -296,10 +303,10 @@ All pgvs3 coordination and durable namespace state lives in PostgreSQL; there
 is no sidecar store to back up. If you use the cache tier, the origin is a
 separate system and must be backed up by its own mechanism. Production recovery
 should use the PostgreSQL cluster's physical backup and PITR mechanism. The
-read-through `s3c_` cache is WAL-logged and shared; reads refill it
-from the origin or miss. The `s3w_` write-back namespace is WAL-logged and is
-not disposable while pending outbox rows exist: it holds acknowledged bodies
-until the origin copy commits.
+origin-fill rows in `s3c_` are rebuildable, but standalone RESP/cache values in
+that same namespace are not backed by an origin. The `s3w_` write-back namespace
+is WAL-logged and not disposable while pending outbox rows exist: it holds
+acknowledged bodies until the origin copy commits.
 
 - **Physical backup / PITR (recommended for a multi-node cluster):** use
   `pg_basebackup` with continuous WAL archiving, or a managed snapshot/PITR
@@ -372,7 +379,8 @@ DuckDB and load it into the new database; do not edit `schema.sql` in place.
 - **Failover:** connect writable gateways to a writer endpoint that follows the
   current primary. When PostgreSQL promotes a standby, update the endpoint and
   let gateway pools reconnect. Requests on broken connections may fail; clients
-  should retry. Atomic publish and conditional writes make retries safe. The
+  should reconcile the outcome or retry with conditions. Atomic publication
+  prevents torn objects, not cross-system exactly-once execution. The
   maintenance advisory lock is session-scoped, so leadership re-elects
   automatically on the new primary. Read-only workers on standbys keep serving
   reads subject to replication lag.
@@ -382,6 +390,8 @@ DuckDB and load it into the new database; do not edit `schema.sql` in place.
   replication and promotion policy (or the managed service's validated durability
   model), with the associated latency/availability tradeoff. Replica visibility
   additionally depends on WAL replay. pgvs3 does not silently change that policy.
+  The current fault suite restarts a primary; physical standby/promotion proof
+  is still ranked work in [roadmap.md](roadmap.md#1-prove-physical-replica-reads-and-promotion).
 - **Kubernetes / Helm:** `deploy/charts/pgvs3` deploys a stateless multi-AZ
   `Deployment` with optional HPA (`autoscaling.enabled=true`) and
   `PodDisruptionBudget`. Hardened defaults include a nonroot read-only root
@@ -594,7 +604,7 @@ process-local fallback; it is a global origin and follows the same catalog rule)
 
 | Mode | Behavior |
 | --- | --- |
-| **Read-through** | A whole-object `GET` miss fetches body and metadata from the origin in one request, spools outside a database transaction, and publishes into the WAL-logged `s3c_<namespace>`; `HEAD` and ranged misses use a metadata probe first. A hit within `--cache-ttl` is served without contacting the origin (`X-Cache: HIT`). Read-only origins pass whole-object misses through from that same single GET. |
+| **Read-through** | A whole-object `GET` miss fetches body and metadata from the origin in one request, spools outside a database transaction, and publishes into the WAL-logged `s3c_<namespace>`; `HEAD` and ranged misses use a metadata probe first. A hit within `--cache-ttl` is served without contacting the origin (`X-Cache: HIT`). Read-only gateways pass whole-object misses through from that same single GET. |
 | **Cold-fill coalescing** | One writable gateway owns a cold key through a short `s3p.cache_fill_leases` row. Other gateways poll the replicated `s3c_` row and pass through to the origin only if the lease waiter times out. |
 | **TTL revalidation** | After `--cache-ttl`, compare the cached size and origin version/mtime. If they still match, refresh the cache entry; otherwise refill from the origin. Cold whole-object fills are single-request; post-TTL revalidation still uses a metadata probe. |
 | **Write-through / write-back** | Small or conditional writes are synchronous write-through: checksums are verified and conditions are enforced before success, and the origin is mutated before the response. Large unconditional objects (above 8 MiB) use ack-first write-back: the body is committed to the WAL-logged `s3w_<namespace>` and `s3p.pending_uploads` atomically, the object is immediately readable, and the origin upload runs through the bounded outbox worker. `--cache-write-back=false` restores synchronous behavior. |
@@ -664,10 +674,10 @@ enough free space; a memory-backed `/tmp` can exhaust quickly with concurrent
   object recreated directly at the origin may remain hidden through the cache
   until the tombstone expires; recreating it through pgvs3 replaces the
   tombstone immediately.
-- **Completion semantics.** With write-back enabled, a successful large
-  unconditional `CompleteMultipartUpload` means the cache object and outbox row
-  were committed; the origin upload continues asynchronously. Small and
-  conditional completions still require the first origin flush to succeed. A
+- **Completion semantics.** With write-back enabled, an unconditional
+  `CompleteMultipartUpload` at any size acknowledges the committed body/outbox
+  transaction; the origin upload continues asynchronously. Conditional completion
+  or disabling write-back requires the first origin flush to succeed. A
   failed synchronous flush consumes the multipart `uploadId`, so it cannot be
   replayed with the same id; poll `GET`/`HEAD` after the worker retries.
 - **Retention.** `--cache-retention` evicts committed idle entries. Pending
@@ -679,8 +689,9 @@ enough free space; a memory-backed `/tmp` can exhaust quickly with concurrent
   `pgvs3 pending list`, repair with `pgvs3 pending retry`, and alert on
   `pgvs3_pending_uploads_dead > 0`.
 - **Spooling.** Fills and single-request uploads buffer the body (memory ≤8 MiB,
-  otherwise a temp file) before opening a PostgreSQL writer, so origin latency
-  never holds pool connections.
+  otherwise a temp file) before opening a PostgreSQL body writer. Read-fill
+  downloads do not pin a connection; ordered origin mutations/outbox uploads
+  deliberately retain a session advisory-lock connection across origin I/O.
 
 Inspect pending work with:
 
@@ -696,9 +707,11 @@ Apache-2.0 `internal/s3client` fork of `kelindar/s3`) and read-only
 on-disk implementation, and `ephemeral` uses a private temporary directory under
 `TMPDIR` that is removed on clean shutdown, so it needs a writable temporary
 directory. Both keep in-flight writes in a `.pgvs3-tmp` directory at their root.
-User metadata is process-local for both, and keys that cannot be
-stored as paths are rejected as described in the README. HTTP origins are
-read-only by default and map the cache bucket path onto a base URL:
+User metadata is process-local for both. Empty, `.` or `..` path segments, NUL
+bytes, segments over 255 bytes, the reserved `.pgvs3-tmp` directory and conflicting
+object/prefix paths cannot represent keys. PUT, COPY and multipart completion
+reject such keys before acknowledgement; reads return `404` and DELETE is a no-op.
+HTTP origins are read-only by default and map the cache bucket path onto a base URL:
 
 ```json
 {

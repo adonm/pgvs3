@@ -1,5 +1,10 @@
 # High-value improvements and simplifications
 
+> Historical analysis, not the active backlog. Priorities and status labels below
+> describe the reviewed snapshots and may be superseded. Use the
+> [current architecture](../design.md), [ranked roadmap](../roadmap.md) and
+> [implementation evidence](../modernization-results.md).
+
 Status: research note, 2026-10-25, at commit `1a7e94b`. It records what exists,
 how it compares with current practice, and which changes look worth making.
 Findings are ranked by risk and effort, not by novelty.
