@@ -8,12 +8,15 @@ initial trials, the accepted per-path gates and remaining validation limits.
 Two benchmark harnesses are included in the repository:
 
 - **`just load`** runs `test/loadgen` directly against the HTTP gateway to
-  measure raw S3 + PostgreSQL throughput and latency.
+  measure raw S3 + PostgreSQL throughput and latency, or drives paired acceptance
+  through the existing `compare.py` with isolated before/after fixtures.
 - **`just bench`** runs DuckDB 2.0 and DuckLake through `httpfs` to measure
   end-to-end client performance.
 
-Both harnesses start a disposable PostgreSQL 18 container (`shared_buffers=1GB`,
-`PGVS3_POOL_MAX=128`, loopback networking). Numbers below are from a **16-core
+Both harnesses start disposable PostgreSQL 18 containers on loopback. The direct
+matrix uses `shared_buffers=1GB` and pool 128; paired runs use pool 32 per binary
+with separate fresh databases so different layouts never share a database.
+Numbers below are from a **16-core
 local host** (Intel Core Ultra X7 358H, 62 GiB RAM) alongside an earlier
 **6-vCPU / 11 GiB VM** baseline.
 
@@ -23,6 +26,48 @@ Each test runs for 5 seconds. 4 KiB tests use 2,000 keys; 8 MiB and 64 MiB
 tests use 16 and 8 objects; `ListObjectsV2` lists 1,000 keys per page from a
 2,000-key bucket. Gateways hold no in-process cache; metadata and ≤64 KiB
 objects are served directly from PostgreSQL `shared_buffers`.
+
+### Paired acceptance
+
+Save a control binary before making changes, then run the current tree against it:
+
+```sh
+mkdir -p .tmp
+mise exec go -- go build -o .tmp/pgvs3-before ./cmd/pgvs3
+# Make the change, then:
+just load --before-bin .tmp/pgvs3-before --profile native \
+  --payload /path/to/10m.parquet --payload /path/to/100m.parquet \
+  --ops head,get,range,put --workers 1,4 --repeats 5
+just load --before-bin .tmp/pgvs3-before --profile origin --cache-state cold \
+  --payload /path/to/10m.parquet --ops get,range --workers 1,4 \
+  --range-size 65536 --repeats 5
+```
+
+`--after-bin` selects a saved candidate instead of building the current tree.
+`--out` selects a fresh output path; existing outputs are never overwritten.
+Otherwise artifacts and `paired.json` remain in the unique printed `.tmp/verify/`
+directory. `--no-small` omits the default 4 KiB case. `--requests` overrides the
+size/state-aware per-sample budget; all counts and raw samples are recorded.
+
+`compare.py` is the only paired driver and still uses `test/loadgen`, not a second
+load engine. It alternates binary order, hashes frozen binaries and payloads,
+checks object/range sizes and bytes, checks persisted origin directory/namespace/
+TTL/range settings, and rejects unexpected cache paths. Cold filesystem-origin
+fixtures use distinct keys with no prior cache bodies or metadata, and validate
+the completed fills. Loadgen's opt-in `-unique-reads` shares one read sequence
+across workers; its default workload is unchanged. Cold here means cold gateway
+cache, not cleared operating-system page cache.
+
+Each case fails independently above +20% median p50 or below -20% median request
+rate, or on any request/fixture error. A valid report has `complete: true`; partial
+reports retain `complete: false`. `failed_gates` names regressions rather than
+hiding them in an aggregate. Range labels distinguish aligned chunks, whole-object
+cache ranges and pass-through. The exploratory matrix remains available without
+`--before-bin`, reports saturation errors instead of treating them as acceptance,
+and writes actual NDJSON. `PGVS3_BENCH_DURATION` shortens that matrix for fixture
+smoke tests only; use repeated paired runs for acceptance.
+
+### Historical exploratory measurements
 
 | Workload | Workers | 16-core host | p50 | p99 | 6-vCPU VM |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -74,7 +119,7 @@ Key takeaways:
   `0.28 ms` p50)** at pipeline 16 (48.2k unpipelined) with the previous LZ4
   codec. Re-run `just load` after the Zstd switch for current numbers.
 - **OJS queue benchmarks:** the SQS rows were removed with the SQS protocol in
-  the OJS v1 rewrite. Run `just load` with `-op ojs-enqueue` / `-op ojs-fetch`
+  the OJS v1 rewrite. Run `test/loadgen` with `-op ojs-enqueue` / `-op ojs-fetch`
   against a live PostgreSQL to measure the new path; no numbers are claimed
   here yet.
 - **Sub-millisecond S3 small reads & 20.9k/s durable S3 writes:** S3 4 KiB
@@ -304,7 +349,7 @@ S3 Express One Zone figures below are AWS's published service specifications and
 
 ```sh
 just contract   # run the correctness suite first
-just load       # direct S3 load matrix (.tmp/pgvs3/load.json)
+just load       # exploratory matrix (isolated .tmp/verify/ artifacts)
 just bench s3   # DuckDB 2.0 httpfs matrix (.tmp/pgvs3/bench.json)
 just bench      # full DuckDB + DuckLake compatibility and row-group tuning
 ```

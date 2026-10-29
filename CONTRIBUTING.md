@@ -74,6 +74,7 @@ Keep one harness per layer. Do not add a second framework for the same job.
 | Layer | Harness |
 | --- | --- |
 | Pure logic | Go unit tests |
+| Benchmark tooling | Python standard-library unit tests, included in `just ci` |
 | SQL, store, queues, cache | `just integration` (testcontainers) |
 | S3 conformance | `just s3t` (pinned Go port of `ceph/s3-tests`) |
 | Real clients and end-to-end flows | `just contract`, `just interop` |
@@ -117,7 +118,10 @@ between layouts.
 - A layout change requires a fresh database and re-import; do not add a
   compatibility shim or a legacy decoder for pre-release databases.
 - Keep `layoutManifest` in `internal/store/store.go` in sync with the global
-  catalog relations and functions.
+  catalog relations and functions. Keep the object/stream function contracts in
+  sync too: startup and doctor check exact input signatures, result types,
+  set cardinality and returned column names/types/order in one catalog query.
+  These checks do not run on object requests.
 - Run `just test`, `just integration`, and the contract suite against a fresh
   database before merging. The tests intentionally do not exercise upgrades.
 
@@ -191,7 +195,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 ## Package map
 
 Group related operations by capability, not one function/type per file. There
-are 48 Go files, including tests and the five-file `internal/s3client`. Use the
+are 49 Go files, including tests and the five-file `internal/s3client`. Use the
 named sections within each implementation rather than adding a file for every
 helper. Package boundaries, integration build tags and isolated benchmark
 dependencies stay separate. Shared orchestration belongs above specialized
@@ -201,9 +205,9 @@ block encoding, streaming reads and COPY loops, not inside them.
 | --- | --- |
 | `internal/store/store.go` | Connections, embedded schema, namespace lifecycle, transactions, quotas and maintenance |
 | `internal/store/handles.go` | Cache and queue namespace handles; each validates its name and resolves its schema once |
-| `internal/store/object.go` | Object contracts, metadata, reads and block encoding |
+| `internal/store/object.go` | Object/publication contracts, metadata, reads and block encoding |
 | `internal/store/write.go` | Inline/COPY publication, multipart lifecycle and server-side copies |
-| `internal/store/cache.go` | Cache mutations, origin metadata, fill fences and durable outbox persistence |
+| `internal/store/cache.go` | Cache mutations, scoped locked writers, origin metadata, fill fences and durable outbox persistence |
 | `internal/store/ojs.go` | Job persistence, claims and state transitions |
 | `internal/store/stream.go` | Stream Go wrappers over the layout-v25 `stream_*` functions in `schema.sql`: validation, sentinel mapping and result types |
 | `internal/objcache/cache.go` | Shared runtime limits, immutable tier options, cache resolution, fills, bounded spooling and ordered mutations/outbox drain |

@@ -179,6 +179,16 @@ in an aggregate average. See [benchmarks.md](benchmarks.md).
   Header reads omit inline bytes, ordinary reads decode them, and server-side
   COPY keeps their stored encoding. Do not add another partial metadata decoder
   when adding a field.
+- Publication authority is separate from metadata: `NormalPublication`,
+  `FillPublication` and `WriteBackPublication` select ordinary, fenced-fill and
+  durable pending intent. Fill leases are copied, pending bodies cannot expire,
+  and reserved pending/deleted cache tokens are not ordinary origin versions.
+  Session-locked writes go through a store-owned `LockedObject`; callers cannot
+  set a lock-skipping boolean. Released or mismatched scopes fail before publication.
+- Global, object and stream SQL function manifests specify exact signatures and
+  results, including composite/table columns. Startup and doctor compare them
+  with PostgreSQL's catalogs. Scanners and SQL may change together only with the
+  layout decision; no contract checks are added to the streaming loop.
 - `store/cache.go` owns origin metadata, fill fences, durable outbox persistence
   and the optimistic snapshot/transform/publish loop
   for GETSET, APPEND, SETRANGE and INCR. Transforms receive owned bytes and can

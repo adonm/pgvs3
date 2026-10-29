@@ -594,9 +594,9 @@ Gates on `430ebf4`, with the host Docker CLI: gofmt, vet with and without
 (0 failing), s3t (36 of 36), `hk check --all --profile ci`, and `deploy/bench/stack.sh`
 in `contract`, `fault` and `interop` modes (all exit 0, with restic passing).
 
-Remaining note: native requests with an invalid bucket name return 500 instead of 400
-because `ns.ErrInvalidName` is not mapped on the native path. Origin-served requests
-map it to 404 `NoSuchBucket`. This predates the refactor and was left unchanged.
+At the end of that round, native invalid bucket names could still return 500 while
+origin-served requests returned 404. The contracts/validation follow-up below
+resolves this inconsistency with `400 InvalidBucketName` on both paths.
 
 ### Explicit ownership and verification follow-up (2026-10-29)
 
@@ -688,6 +688,108 @@ The selected rootless Podman context could not satisfy kind's cgroup check. The
 successful run selected the already available rootful Docker engine with
 `DOCKER_CONTEXT=default` and its socket for that command only; no host settings,
 default contexts or gate requirements were changed.
+
+### Function, publication and benchmark contracts (2026-10-29)
+
+The next pass keeps layout v25 and leaves `schema.sql` byte-identical to `7f533ae`.
+It completes five further maintainability changes:
+
+1. **Exact Go/PostgreSQL contracts:** manifests cover 11 global, seven object and
+   13 stream functions. One catalog query checks input signatures, result types,
+   set cardinality and returned column names/types/order at startup and in doctor.
+   Regression cases include missing functions, wrong overloads and wrong results.
+   No checks are added to object requests.
+2. **Canonical paired benchmarks:** `load.sh` reuses the shared fixture harness,
+   with frozen before/after binaries and separate databases. `compare.py` remains
+   the sole paired driver over the existing Go loadgen. It verifies payload hashes,
+   object/range sizes and bytes, persisted origin settings, cache preconditions and
+   completed fills. Results record binary/payload hashes, explicit cache paths,
+   raw samples and independent latency/rate gates. Interrupted reports remain
+   `complete: false`; fresh outputs never overwrite earlier evidence. The existing
+   exploratory S3/RESP/OJS matrix remains, now with isolated scratch and NDJSON.
+3. **Explicit publication authority:** immutable normal/fill/write-back intents
+   replace the loose origin/fill/pending fields in `WriteOptions`. Fill leases are
+   copied, pending bodies cannot expire, and ordinary versions cannot impersonate
+   reserved pending/deleted state. Lock skipping is private to store-owned scoped
+   writers; released/mismatched scopes fail before publication. Existing SQL,
+   streaming loops, shared fills and outbox fencing remain.
+4. **Complete persisted-spec validation:** SaveSpec and NewFromSpec share duration,
+   limit, namespace and scope normalization. Provider validation is separate from
+   opening resources. Malformed options and HTTP headers fail before catalog
+   changes, while external availability/permission errors remain runtime errors.
+5. **Consistent malformed-name errors:** destination and copy-source bucket names
+   are checked before backend selection. Native and origin-backed operations now
+   agree on `400 InvalidBucketName`; valid missing buckets retain `404 NoSuchBucket`.
+
+The original 300 ms wall-clock renewal test failed once under CI scheduling. It now
+waits for an observed database expiry extension rather than sleeping across several
+short TTLs. The competitor and stale-publication assertions are retained; the
+production lease duration is unchanged. Loadgen also gains opt-in `-unique-reads`,
+tested with uneven worker progress, so concurrent cold samples really use distinct
+keys without changing its default workload.
+
+| Whole-repo Go | Before (`7f533ae`) | After (`1ff9994`) |
+| --- | ---: | ---: |
+| Files | 48 | 49 |
+| Total lines | 35,479 | 36,051 |
+| Production lines | 20,993 | 21,357 |
+| Test lines | 14,486 | 14,694 |
+
+The extra Go file tests loadgen; Python's standard-library tests cover benchmark
+guards and run in CI. This is an explicit-contract and reproducibility pass, not
+a claim of fewer lines. No non-directive Go comments were added.
+
+#### Canonical acceptance results
+
+The saved `7f533ae` control was compared with the final Go tree using the new runner,
+not an ad hoc script. Environment: Ryzen 7 7700X, 16 threads, 61 GiB RAM, loopback,
+PostgreSQL 18.6 with 1 GiB shared buffers and pool 32 per gateway. Origin cases use
+separate per-bucket filesystem roots with one-hour TTL and persisted 64 KiB range
+chunks. Payloads are incompressible. Cold means an empty gateway cache, not an
+emptied operating-system page cache. Outboxes drain between samples.
+
+All 51 large-object cases passed their independent +20% p50 / -20% request-rate
+gates, with 306 raw sample runs and zero request errors. Each case has three
+alternating paired repetitions. Counts are recorded in the reports: short metadata
+and range samples use 100 or 300 requests; GET budgets depend on size/state; PUT
+samples use seven requests unless explicitly overridden. The 1 GiB GET warm samples
+use four requests and the cold/PUT samples use one, so the latter are coarse checks.
+
+| Profile | Cases | Largest p50 increase | Largest rate reduction |
+| --- | ---: | ---: | ---: |
+| Native 10/100 MiB HEAD, GET, 8 KiB range, PUT; workers 1/4 | 16 | 11.0% | 8.3% |
+| Native 1 GiB GET; workers 1/4 | 2 | 1.9% | 1.0% |
+| Warm origin 10/100 MiB HEAD, GET, 64 KiB range, PUT; workers 1/4 | 16 | 11.1% | 8.3% |
+| Cold origin 10/100 MiB HEAD, GET, 64 KiB range; workers 1/4 | 12 | 9.5% | 5.0% |
+| Warm origin 1 GiB GET; workers 1/4 | 2 | 1.1% | 2.6% |
+| Cold origin 1 GiB GET; worker 1 | 1 | none (-1.9%) | none (+1.9%) |
+| Native 1 GiB PUT; worker 1 | 1 | 4.7% | 4.4% |
+| Origin 1 GiB write-back acknowledgement; worker 1 | 1 | none (-3.6%) | none (+3.8%) |
+
+Representative p50s: native 10 MiB GET c1 9.894→9.917 ms; native 100 MiB GET c1
+79.437→79.581 ms; native 1 GiB GET c1 850.082→866.048 ms; cold origin 100 MiB GET
+c1 386.469→383.615 ms; cold origin 1 GiB GET 4,646→4,559 ms. Native 1 GiB PUT was
+2,090→2,188 ms and origin write-back acknowledgement 3,129→3,016 ms.
+
+Separate 4 KiB native/warm/cold probes also passed. The largest small warm-range
+movement was 0.161→0.186 ms (+15.5%), still inside budget and not hidden by the
+large-object results. Both binaries retain the already accepted catalog lookup.
+
+The server restart interrupted the first native 1 GiB PUT comparison after one
+sample. Its incomplete report was kept; only that incomplete case and the not-yet
+started origin PUT case were run afterward, with fresh reports. Completed CI and
+read/fill/range work was not repeated.
+
+#### Verification
+
+The complete `mise exec -- just ci` passed against the rootful Docker context:
+format/import/modernizer/tidy/vet/staticcheck/vulnerability checks, integration-tagged
+vet, race-enabled Go tests, five Python tooling tests, uncached race integration
+(45 s), four fuzz targets, Helm lint and kind (78 s), contract (20 s), fault (12 s),
+interop including restic (16 s), and s3t (21 s including setup; 36 allowed tests).
+ShellCheck passed. The preserved exploratory matrix completed a 100 ms fixture
+smoke across S3/RESP/OJS/origin modes; high-concurrency saturation errors were
+reported explicitly and were not treated as acceptance results.
 
 The [live file map](../CONTRIBUTING.md#package-map) describes the final structure.
 Package/build-tag boundaries, the isolated SDK benchmark module, streaming

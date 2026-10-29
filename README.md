@@ -484,7 +484,8 @@ just contract   # end-to-end S3, OJS, boto3, DuckDB 2.0, DuckLake, duckdb-object
 just interop    # rclone, restic, boto3, and DuckLake
 just fault      # gateway loss, PostgreSQL restart and churn
 just ci         # complete local/CI gate set, including Docker, kind and s3t
-just load       # direct S3 load generator benchmark
+just load       # exploratory S3/RESP/OJS matrix in an isolated run directory
+just load --before-bin /path/to/control --profile origin --cache-state cold --ops get,range
 just bench      # DuckDB httpfs + DuckLake benchmark suite
 ```
 

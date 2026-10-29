@@ -20,6 +20,10 @@ Bucket creation is explicit. A write to a missing or deleted bucket returns
 bucket existence, including for buckets served by an origin. RESP cache
 namespaces and OJS queues are created on first use.
 
+Malformed bucket names return `400 InvalidBucketName` before backend selection,
+including names in copy sources. This is distinct from a well-formed missing
+bucket's `404 NoSuchBucket`, and is the same for native and origin-backed requests.
+
 ## Deployment topology
 
 The supported production shape is one PostgreSQL primary (writer) plus
@@ -329,7 +333,9 @@ the layout version, required relations and functions, per-namespace table
 settings, catalog/schema agreement, the stream functions of every queue (each missing
 one is printed by name) and reaper safety. A gateway refuses to start on the
 layout, relation and manifest checks; `doctor` also exits non-zero for missing
-queue stream functions.
+queue stream functions. Required functions are checked by exact argument signature,
+return type, set cardinality and returned column names/types/order, not just name.
+Wrong overloads and result shapes are reported as function-contract drift.
 
 An absent namespace retains the operation's normal not-found or empty result.
 An existing namespace with a missing table or function is instead a storage/layout
@@ -563,6 +569,14 @@ pgvs3 origin --url "$PGVS3_URL" --bucket edge clear
 ```
 
 Origin configuration is JSON only.
+
+The complete spec is normalized and structurally validated before catalog changes:
+scope, bucket/cache names, durations, limits, provider options and HTTP headers.
+Zero TTL still means revalidate every request; zero retention/fill count selects
+the documented defaults. Negative durations/limits and unknown provider options
+are rejected. Validation does not create origin directories or open providers;
+filesystem availability/permissions and remote reachability are checked when the
+gateway actually opens or uses the origin.
 
 A global origin serves only buckets that exist in the catalog. Create each
 bucket with `PUT /{bucket}` before using it; on an origin-served bucket that
