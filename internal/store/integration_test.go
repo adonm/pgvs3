@@ -2439,20 +2439,40 @@ func TestStreamStatAndSizeIncludeSegments(t *testing.T) {
 
 func ptrInt64(v int64) *int64 { return &v }
 
-func TestDiagnoseNamesMissingStreamFunction(t *testing.T) {
-	ctx := testCtx
-	q := unique("stream-diagnose")
-	dropOnCleanup(t, ns.Queue, q)
-	testutil.Must(t, testStore.queue(q).Ensure(ctx, nil))
-	sc, err := ns.Queue.Schema(q)
-	testutil.Must(t, err)
-	if _, err := testStore.pool.Exec(ctx, "DROP FUNCTION "+quoteIdent(sc)+".stream_ack(int8)"); err != nil {
-		t.Fatal(err)
-	}
-	d, err := testStore.Diagnose(ctx)
-	testutil.Must(t, err)
-	if want := sc + ".stream_ack"; !slices.Contains(d.MissingQueueFuncs, want) {
-		t.Fatalf("missing queue functions = %v, want %s", d.MissingQueueFuncs, want)
+func TestFunctionContractsRejectDrift(t *testing.T) {
+	for _, tc := range []struct {
+		name, signature, replacement, reason string
+	}{
+		{"missing", "stream_ack(bigint)", "", "missing"},
+		{"wrong overload", "stream_ack(bigint)", "stream_ack(text) RETURNS bigint LANGUAGE sql AS 'SELECT 0::bigint'", "missing"},
+		{"wrong return", "stream_ack(bigint)", "stream_ack(bigint) RETURNS text LANGUAGE sql AS 'SELECT ''wrong''::text'", "return type"},
+		{"wrong columns", "stream_batch(bigint)", "stream_batch(bigint) RETURNS TABLE(wrong bigint,other text) LANGUAGE sql AS 'SELECT 0::bigint,''wrong''::text'", "return columns"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := unique("stream-contract")
+			dropOnCleanup(t, ns.Queue, q)
+			testutil.Must(t, testStore.queue(q).Ensure(testCtx, nil))
+			sc, _ := ns.Queue.Schema(q)
+			_, err := testStore.pool.Exec(testCtx, "DROP FUNCTION "+quoteIdent(sc)+"."+tc.signature)
+			testutil.Must(t, err)
+			if tc.replacement != "" {
+				_, err = testStore.pool.Exec(testCtx, "CREATE FUNCTION "+quoteIdent(sc)+"."+tc.replacement)
+				testutil.Must(t, err)
+			}
+			d, err := testStore.Diagnose(testCtx)
+			testutil.Must(t, err)
+			if !slices.ContainsFunc(d.FunctionIssues, func(issue string) bool {
+				return strings.HasPrefix(issue, sc+"."+tc.signature+": ") && strings.Contains(issue, tc.reason)
+			}) {
+				t.Fatalf("function issues=%v", d.FunctionIssues)
+			}
+			if tc.reason == "missing" && !slices.Contains(d.MissingQueueFuncs, sc+".stream_ack") {
+				t.Fatalf("missing queue functions=%v", d.MissingQueueFuncs)
+			}
+			if err := testStore.EnsureMaintenance(testCtx); !errors.Is(err, ErrNamespaceLayout) {
+				t.Fatalf("startup accepted function drift: %v", err)
+			}
+		})
 	}
 }
 

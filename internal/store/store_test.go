@@ -64,12 +64,12 @@ func TestSchemaBaselineIsSquashed(t *testing.T) {
 		}
 	}
 	for _, function := range layoutManifest.functions {
-		name := strings.TrimPrefix(function, "s3p.")
+		name := function.signature
 		if i := strings.IndexByte(name, '('); i >= 0 {
 			name = name[:i]
 		}
 		if !strings.Contains(schemaSQL, "FUNCTION s3p."+name+"(") {
-			t.Errorf("schema baseline is missing function %s", function)
+			t.Errorf("schema baseline is missing function %s", function.signature)
 		}
 	}
 }

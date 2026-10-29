@@ -367,16 +367,17 @@ func (s *Store) EnsureMaintenance(ctx context.Context) error {
 			return fmt.Errorf("required layout relation %s is missing", rel)
 		}
 	}
-	for _, fn := range layoutManifest.functions {
-		var exists bool
-		if err := conn.QueryRow(ctx, "SELECT to_regprocedure($1) IS NOT NULL", fn).Scan(&exists); err != nil {
-			return err
-		}
-		if !exists {
-			return fmt.Errorf("required layout function %s is missing", fn)
-		}
+	if err := s.checkNamespaceTables(ctx, conn); err != nil {
+		return err
 	}
-	return s.checkNamespaceTables(ctx, conn)
+	issues, err := functionContractIssues(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if len(issues) > 0 {
+		return fmt.Errorf("%w: %s", ErrNamespaceLayout, issues[0])
+	}
+	return nil
 }
 
 func (s *Store) Ready(ctx context.Context) error {
@@ -499,24 +500,24 @@ const schemaLockKey = int64(0x70677673)
 
 var layoutManifest = struct {
 	relations []string
-	functions []string
+	functions []functionContract
 }{
 	relations: []string{
 		"s3p.layout", "s3p.namespaces", "s3p.file_ids", "s3p.job_index",
 		"s3p.pending_uploads", "s3p.cache_fill_leases",
 	},
-	functions: []string{
-		"s3p.namespace_schema(text,text)",
-		"s3p.ensure_namespace(text,text,bigint,jsonb)",
-		"s3p.ensure_object_schema(text,text)",
-		"s3p.ensure_queue_schema(text)",
-		"s3p.tune_queue_schema(text)",
-		"s3p.drop_namespace(text,text,boolean)",
-		"s3p.clone_namespace(text,text,text)",
-		"s3p.adopt_namespace(text,text)",
-		"s3p.adopt_namespaces(text)",
-		"s3p.reconcile_namespaces()",
-		"s3p.upgrade_queue_schemas()",
+	functions: []functionContract{
+		{signature: "namespace_schema(text,text)", result: "text"},
+		{signature: "ensure_namespace(text,text,bigint,jsonb)", result: "text"},
+		{signature: "ensure_object_schema(text,text)", result: "void"},
+		{signature: "ensure_queue_schema(text)", result: "void"},
+		{signature: "tune_queue_schema(text)", result: "void"},
+		{signature: "drop_namespace(text,text,boolean)", result: "text"},
+		{signature: "clone_namespace(text,text,text)", result: "text"},
+		{signature: "adopt_namespace(text,text)", result: "text"},
+		{signature: "adopt_namespaces(text)", result: "integer"},
+		{signature: "reconcile_namespaces()", result: "integer"},
+		{signature: "upgrade_queue_schemas()", result: "integer"},
 	},
 }
 
@@ -1627,6 +1628,7 @@ type Diagnosis struct {
 	OrphanSchemas     int64    `json:"orphan_schemas"`
 	MissingSchemas    int64    `json:"missing_schemas"`
 	MissingQueueFuncs []string `json:"missing_queue_functions,omitempty"`
+	FunctionIssues    []string `json:"function_contract_issues,omitempty"`
 }
 
 func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
@@ -1650,7 +1652,7 @@ func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 	if err := s.diagnoseSchemas(ctx, &d); err != nil {
 		return d, err
 	}
-	if err := s.diagnoseStreamFunctions(ctx, &d); err != nil {
+	if err := s.diagnoseFunctionContracts(ctx, &d); err != nil {
 		return d, err
 	}
 	size, err := s.databaseSize(ctx)
@@ -1751,27 +1753,110 @@ func (s *Store) diagnoseSchemas(ctx context.Context, d *Diagnosis) error {
 		Scan(&d.OrphanSchemas, &d.MissingSchemas)
 }
 
-var queueStreamFunctions = []string{
-	"stream_new_tick", "stream_latest_tick", "stream_append", "stream_subscribe",
-	"stream_batch", "stream_receive", "stream_ack", "stream_nack",
-	"stream_process_retries", "stream_prune_ticks", "stream_rotate",
-	"stream_replay_dead_letter", "stream_replay_dead_letters",
+type functionContract struct {
+	signature string
+	result    string
+	set       bool
+	columns   string
 }
 
-func (s *Store) diagnoseStreamFunctions(ctx context.Context, d *Diagnosis) error {
-	rows, err := s.pool.Query(ctx, `SELECT n.schema_name || '.' || f.name
-		FROM s3p.namespaces n
-		CROSS JOIN unnest($1::text[]) AS f(name)
-		WHERE n.kind = 'queue'
-		  AND NOT EXISTS (
-		    SELECT 1 FROM pg_proc p
-		    JOIN pg_namespace ns ON ns.oid = p.pronamespace
-		    WHERE ns.nspname = n.schema_name AND p.proname = f.name)
-		ORDER BY 1`, queueStreamFunctions)
-	if err != nil {
-		return err
+const streamBatchColumns = "batch_id bigint,consumer text,member text,start_tick bigint,end_tick bigint,batch_created_at timestamp with time zone,seq bigint,event_id text,type text,payload jsonb,headers jsonb,retry_count integer,created_at timestamp with time zone"
+
+var objectFunctions = []functionContract{
+	{signature: "queue_garbage(bigint[])", result: "void"},
+	{signature: "publish_value(text,bigint,bytea,bigint,bytea,text,text[],text,text,text,timestamp with time zone,boolean,text,text,boolean,jsonb)", result: "text"},
+	{signature: "publish_object(text,bigint,bigint,bytea,text,text[],text,text,text,timestamp with time zone,boolean,text,text,boolean,jsonb)", result: "text"},
+	{signature: "put_inline(text,bytea,bigint,bytea,text,text[],text,text,text,text,timestamp with time zone,boolean,text,text,boolean,jsonb)", result: "text"},
+	{signature: "expire_objects(integer)", result: "integer"},
+	{signature: "commit_part(text,integer,bigint,bigint,bytea,bytea,text)", result: "void"},
+	{signature: "expire_uploads(interval,integer)", result: "integer"},
+}
+
+var streamFunctions = []functionContract{
+	{signature: "stream_new_tick()", result: "bigint"},
+	{signature: "stream_latest_tick()", result: "bigint"},
+	{signature: "stream_append(text[],text[],text[],text[])", result: "@.stream_events", set: true,
+		columns: "seq bigint,segment smallint,event_id text,txid xid8,type text,payload jsonb,headers jsonb,retry_count integer,created_at timestamp with time zone"},
+	{signature: "stream_subscribe(text,bigint)", result: "@.stream_subscriptions",
+		columns: "consumer text,last_tick bigint,next_tick bigint,created_at timestamp with time zone,updated_at timestamp with time zone"},
+	{signature: "stream_batch(bigint)", result: "record", set: true, columns: streamBatchColumns},
+	{signature: "stream_receive(text,text,integer)", result: "record", set: true, columns: streamBatchColumns},
+	{signature: "stream_ack(bigint)", result: "bigint"},
+	{signature: "stream_nack(bigint,text,double precision,text)", result: "text"},
+	{signature: "stream_process_retries(integer)", result: "bigint"},
+	{signature: "stream_prune_ticks(integer)", result: "bigint"},
+	{signature: "stream_rotate()", result: "bigint"},
+	{signature: "stream_replay_dead_letter(bigint)", result: "text"},
+	{signature: "stream_replay_dead_letters()", result: "bigint"},
+}
+
+type functionIssue struct {
+	schema, scope, signature, reason string
+}
+
+func (i functionIssue) String() string { return i.schema + "." + i.signature + ": " + i.reason }
+
+type rowsQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+func functionContractIssues(ctx context.Context, db rowsQuerier) ([]functionIssue, error) {
+	var scopes, signatures, results, columns []string
+	var sets []bool
+	for _, group := range []struct {
+		scope string
+		items []functionContract
+	}{{"global", layoutManifest.functions}, {"object", objectFunctions}, {"queue", streamFunctions}} {
+		for _, f := range group.items {
+			scopes = append(scopes, group.scope)
+			signatures = append(signatures, f.signature)
+			results = append(results, f.result)
+			sets = append(sets, f.set)
+			columns = append(columns, f.columns)
+		}
 	}
-	d.MissingQueueFuncs, err = pgx.CollectRows(rows, pgx.RowTo[string])
+	rows, err := db.Query(ctx, `WITH targets AS (
+		SELECT 'global'::text AS scope, 's3p'::text AS schema_name
+		UNION ALL SELECT CASE WHEN kind='queue' THEN 'queue' ELSE 'object' END, schema_name FROM s3p.namespaces
+	), contracts AS (
+		SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::boolean[],$5::text[])
+		AS f(scope,signature,result,is_set,columns)
+	), checked AS (
+		SELECT t.schema_name, f.scope, f.signature,
+		CASE WHEN p.oid IS NULL THEN 'missing'
+		WHEN p.prorettype IS DISTINCT FROM to_regtype(replace(f.result,'@',quote_ident(t.schema_name)))
+		  OR p.proretset IS DISTINCT FROM f.is_set THEN 'return type differs from ' || f.result
+		WHEN f.columns IS DISTINCT FROM COALESCE(
+		  CASE WHEN p.prorettype='record'::regtype THEN
+		    (SELECT string_agg(p.proargnames[i] || ' ' || format_type(p.proallargtypes[i],NULL),',' ORDER BY i)
+		     FROM generate_subscripts(p.proallargtypes,1) AS i WHERE p.proargmodes[i] IN ('o','t'))
+		  ELSE (SELECT string_agg(a.attname || ' ' || format_type(a.atttypid,a.atttypmod),',' ORDER BY a.attnum)
+		    FROM pg_type ty JOIN pg_attribute a ON a.attrelid=ty.typrelid
+		    WHERE ty.oid=p.prorettype AND a.attnum>0 AND NOT a.attisdropped) END,'')
+		THEN 'return columns differ from ' || f.columns END AS reason
+		FROM targets t JOIN contracts f USING (scope)
+		LEFT JOIN pg_proc p ON p.oid=to_regprocedure(format('%I.%s',t.schema_name,f.signature))
+	) SELECT schema_name,scope,signature,reason FROM checked WHERE reason IS NOT NULL ORDER BY 1,3`,
+		scopes, signatures, results, sets, columns)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (functionIssue, error) {
+		var issue functionIssue
+		err := row.Scan(&issue.schema, &issue.scope, &issue.signature, &issue.reason)
+		return issue, err
+	})
+}
+
+func (s *Store) diagnoseFunctionContracts(ctx context.Context, d *Diagnosis) error {
+	issues, err := functionContractIssues(ctx, s.pool)
+	for _, issue := range issues {
+		d.FunctionIssues = append(d.FunctionIssues, issue.String())
+		if issue.scope == "queue" && issue.reason == "missing" {
+			name, _, _ := strings.Cut(issue.signature, "(")
+			d.MissingQueueFuncs = append(d.MissingQueueFuncs, issue.schema+"."+name)
+		}
+	}
 	return err
 }
 

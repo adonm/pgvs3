@@ -279,15 +279,16 @@ func prepareStore(ctx context.Context, st *store.Store, cfg serveConfig, log *sl
 			log.Error("checking storage layout", "err", err)
 			return noop, err
 		}
-		return noop, nil
-	}
-	if err := st.Init(ctx); err != nil {
+	} else if err := st.Init(ctx); err != nil {
 		log.Error("initializing schema", "err", err)
 		return noop, err
 	}
 	if err := st.EnsureMaintenance(ctx); err != nil {
 		log.Error("verifying maintenance schema", "err", err)
 		return noop, err
+	}
+	if cfg.readOnly {
+		return noop, nil
 	}
 	return startMaintenance(ctx, st, cfg.reapGrace, log), nil
 }
@@ -727,12 +728,12 @@ func doctor(args []string) int {
 			d.ServerVersion, d.AuroraVersion, d.Layout, d.Namespaces, d.OverScale, d.Buckets, d.Queues, d.Caches,
 			d.ChunksConfigured, d.Objects, d.GarbageFiles, d.GarbageReferenced,
 			d.OrphanSchemas, d.MissingSchemas, d.DatabaseBytes>>20)
-		for _, fn := range d.MissingQueueFuncs {
-			fmt.Fprintf(os.Stderr, "missing stream function %s\n", fn)
+		for _, issue := range d.FunctionIssues {
+			fmt.Fprintf(os.Stderr, "function contract: %s\n", issue)
 		}
 		if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured ||
 			d.OrphanSchemas > 0 || d.MissingSchemas > 0 || d.GarbageReferenced > 0 || d.OverScale ||
-			len(d.MissingQueueFuncs) > 0 {
+			len(d.FunctionIssues) > 0 {
 			return 1
 		}
 		if err := st.EnsureMaintenance(ctx); err != nil {
