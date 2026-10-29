@@ -241,6 +241,7 @@ func serve(args []string) int {
 	}
 	origins := objcache.NewRegistry(st, log, runtime, objcache.TierOptions{ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack})
 	origins.SetDefault(origin)
+	origins.Start(ctx)
 	g := newGateway(ctx, st, cfg, origins, log)
 	defer g.Close()
 	startPprof(cfg.pprofAddr, log)

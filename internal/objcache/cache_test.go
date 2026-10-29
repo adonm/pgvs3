@@ -553,8 +553,8 @@ func TestSpoolBudgetSharedAndReleased(t *testing.T) {
 		}
 		cleanup()
 		cleanup()
-		if budget.used.Load() != 0 {
-			t.Fatal("reservation leaked")
+		if budget.used.Load() != 0 || budget.peak.Load() != int64(len(data)) {
+			t.Fatalf("used=%d peak=%d", budget.used.Load(), budget.peak.Load())
 		}
 		files, err := os.ReadDir(dir)
 		if err != nil || len(files) != 0 {
@@ -2346,6 +2346,28 @@ func TestS3OriginMapping(t *testing.T) {
 	if after != before {
 		t.Fatalf("listing issued %d HEADs", after-before)
 	}
+}
+
+func TestRegistryRefreshLifetime(t *testing.T) {
+	r := NewRegistry(nil, nil, NewRuntime(RuntimeOptions{}), TierOptions{})
+	ctx := t.Context()
+	r.Start(ctx)
+	done := r.done
+	r.Start(ctx)
+	if r.done != done {
+		t.Fatal("duplicate registry refresh worker")
+	}
+	r.Close()
+	select {
+	case <-done:
+	default:
+		t.Fatal("registry close did not join refresh worker")
+	}
+	r.Start(ctx)
+	if r.done != done {
+		t.Fatal("closed registry restarted refresh worker")
+	}
+	r.Close()
 }
 
 func TestSaveSpecRejectsInvalidOriginConfig(t *testing.T) {

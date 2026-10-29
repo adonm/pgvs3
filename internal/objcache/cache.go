@@ -1054,6 +1054,7 @@ type spoolBudget struct {
 	limit    int64
 	dir      string
 	used     atomic.Int64
+	peak     atomic.Int64
 	rejected atomic.Uint64
 }
 
@@ -1062,8 +1063,8 @@ func newSpoolBudget(limit int64, dir string) *spoolBudget {
 }
 
 func (r *Runtime) WriteMetrics(w io.Writer) {
-	fmt.Fprintf(w, "pgvs3_spool_bytes %d\npgvs3_spool_limit_bytes %d\npgvs3_spool_rejections_total %d\n",
-		r.spool.used.Load(), r.spool.limit, r.spool.rejected.Load())
+	fmt.Fprintf(w, "pgvs3_spool_bytes %d\npgvs3_spool_peak_bytes %d\npgvs3_spool_limit_bytes %d\npgvs3_spool_rejections_total %d\n",
+		r.spool.used.Load(), r.spool.peak.Load(), r.spool.limit, r.spool.rejected.Load())
 }
 
 func (r *Runtime) spoolStream(ctx context.Context, body io.Reader, expected int64) (spooled, func(), error) {
@@ -1098,7 +1099,12 @@ func spoolWithBudget(ctx context.Context, r io.Reader, expected int64, budget *s
 			budget.rejected.Add(1)
 			return ErrSpoolBusy
 		}
-		budget.used.Add(want - reserved)
+		used := budget.used.Add(want - reserved)
+		for peak := budget.peak.Load(); used > peak; peak = budget.peak.Load() {
+			if budget.peak.CompareAndSwap(peak, used) {
+				break
+			}
+		}
 		reserved = want
 		return nil
 	}
@@ -1107,8 +1113,8 @@ func spoolWithBudget(ctx context.Context, r io.Reader, expected int64, budget *s
 	}
 	tmp, err := os.CreateTemp(budget.dir, "pgvs3-fill-*")
 	if err != nil {
-		budget.sem.Release(reserved)
 		budget.used.Add(-reserved)
+		budget.sem.Release(reserved)
 		return spooled{}, nil, err
 	}
 	var once sync.Once
@@ -1116,8 +1122,8 @@ func spoolWithBudget(ctx context.Context, r io.Reader, expected int64, budget *s
 		once.Do(func() {
 			_ = tmp.Close()
 			_ = os.Remove(tmp.Name())
-			budget.sem.Release(reserved)
 			budget.used.Add(-reserved)
+			budget.sem.Release(reserved)
 		})
 	}
 	if _, err := tmp.Write(head); err != nil {

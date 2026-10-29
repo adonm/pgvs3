@@ -203,6 +203,8 @@ type Registry struct {
 	checked     atomic.Int64
 	tiers       map[string]*registeredTier
 	closed      bool
+	cancel      context.CancelFunc
+	done        chan struct{}
 }
 
 type registeredTier struct {
@@ -220,6 +222,31 @@ func NewRegistry(st *store.Store, log *slog.Logger, runtime *Runtime, opts TierO
 		options: opts,
 		tiers:   map[string]*registeredTier{},
 	}
+}
+
+func (r *Registry) Start(ctx context.Context) {
+	r.mu.Lock()
+	if r.cancel != nil || r.closed {
+		r.mu.Unlock()
+		return
+	}
+	ctx, r.cancel = context.WithCancel(ctx)
+	r.done = make(chan struct{})
+	done := r.done
+	r.mu.Unlock()
+	go func() {
+		defer close(done)
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for {
+			r.refreshIfStale(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
 }
 
 func (r *Registry) WriteMetrics(w io.Writer) { r.runtime.WriteMetrics(w) }
@@ -300,7 +327,12 @@ func (r *Registry) Close() {
 		retired = append(retired, entry)
 	}
 	r.defaultTier, r.tiers = nil, nil
+	cancel, done := r.cancel, r.done
 	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
 	for _, entry := range retired {
 		r.retire(entry)
 	}
