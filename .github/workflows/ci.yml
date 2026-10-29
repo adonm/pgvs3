@@ -20,7 +20,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: verification-logs
-          path: .tmp/verify/**/*.log
+          path: |
+            .tmp/verify/**/*.log
+            .tmp/verify/**/analytics.json
+            .tmp/verify/**/replication.json
           include-hidden-files: true
 
   publish:

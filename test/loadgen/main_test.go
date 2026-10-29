@@ -40,3 +40,39 @@ func TestUniqueReadSequenceAcrossWorkers(t *testing.T) {
 		})
 	}
 }
+
+func TestOverwriteReusesOneKeyPerWorker(t *testing.T) {
+	for _, overwrite := range []bool{false, true} {
+		t.Run(fmt.Sprint(overwrite), func(t *testing.T) {
+			paths := make(chan string, 6)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths <- r.URL.Path
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			s := &s3run{bucket: "bench", prefix: "objects", count: 2, size: 4, overwrite: overwrite, base: server.URL, client: server.Client()}
+			factory := s.put([]byte("body"))
+			seen := map[string]bool{}
+			for id := range 2 {
+				w, err := factory(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for range 3 {
+					if _, _, err := w.step(); err != nil {
+						t.Fatal(err)
+					}
+					seen[<-paths] = true
+				}
+			}
+			want := 6
+			if overwrite {
+				want = 2
+			}
+			if len(seen) != want {
+				t.Fatalf("paths=%v want=%d", seen, want)
+			}
+		})
+	}
+}

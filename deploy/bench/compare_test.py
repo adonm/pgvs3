@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from compare import Fixtures, cache_path, summarize, validate_record
+from compare import Fixtures, cache_path, summarize, summarize_capacity, validate_record
+from capacity import Capacity, lsn_bytes, metric_delta, metrics
 
 
 class Response(io.BytesIO):
@@ -35,6 +36,23 @@ class CompareTests(unittest.TestCase):
             cases, failed = summarize(rows)
             self.assertEqual(len(cases), 1)
             self.assertEqual(bool(failed), bool(changes))
+
+    def test_capacity_summary_cannot_claim_a_before_after_gate(self):
+        rows = [self.record(label="after", p50_ms=value) for value in (100, 101, 99)]
+        summary = summarize_capacity(rows)
+        self.assertEqual(summary[0]["p50_ms"], 100)
+        self.assertNotIn("p50_ratio", summary[0])
+        self.assertNotIn("throughput_ratio", summary[0])
+
+    def test_origin_put_isolation_refuses_pending_or_unrelated_data(self):
+        fixture = Fixtures(SimpleNamespace(bucket='bench', origin_namespace='origin', origin_directories=None), {}, {}, None)
+        for results in (['1'], ['0', '1']):
+            statements = []
+            values = iter(results)
+            fixture.sql = lambda side, statement: statements.append(statement) or next(values)
+            with self.subTest(results=results), self.assertRaises(RuntimeError):
+                fixture.reset_origin_put('after', 'owned')
+            self.assertTrue(all('TRUNCATE' not in statement for statement in statements))
 
     def test_wrong_size_or_bytes_cannot_validate_a_fixture(self):
         args = SimpleNamespace(bucket="bench", range_size=8192, origin_directories=None, seed_endpoint=None)
@@ -69,6 +87,49 @@ class CompareTests(unittest.TestCase):
         fixture.sql = lambda side, statement: "1"
         with self.assertRaises(RuntimeError):
             fixture.confirm_cold_fill("before", 10 << 20, "prefix", 4, "range")
+
+    def test_capacity_positions_and_counter_resets(self):
+        self.assertEqual(lsn_bytes("1/00000000") - lsn_bytes("0/FFFFFFFF"), 1)
+        before = metrics("pgvs3_pg_pool_acquire_count_total 2\npgvs3_spool_bytes 99\nother_metric 10\n")
+        after = metrics("pgvs3_pg_pool_acquire_count_total 5\npgvs3_spool_bytes 0\n")
+        self.assertEqual(metric_delta(before, after), {"pgvs3_pg_pool_acquire_count_total": 3})
+        with self.assertRaises(RuntimeError):
+            metric_delta(after, before)
+
+    def test_resource_observer_errors_or_wal_reversal_cannot_pass(self):
+        capacity = Capacity(None, {})
+        def state(lsn):
+            return {"insert_lsn": lsn, "metrics": {}}
+        observer = SimpleNamespace(errors=[], peaks={}, samples=2)
+        result = capacity.result(state("0/1"), state("0/2"), state("0/3"), observer, 0.1, None)
+        self.assertEqual(result["wal_insert_bytes"], 2)
+        with self.assertRaises(RuntimeError):
+            capacity.result(state("0/3"), state("0/2"), state("0/1"), observer, 0.1, None)
+        observer.errors = ["unavailable"]
+        with self.assertRaises(RuntimeError):
+            capacity.result(state("0/1"), state("0/2"), state("0/3"), observer, 0.1, None)
+
+    def test_resource_fixture_requires_real_recovery_and_safe_cleanup(self):
+        capacity = Capacity(SimpleNamespace(quote=str), {"before": "standby"})
+        for replica in ({"in_recovery": False, "replay_lsn": "0/1"}, {"in_recovery": True, "replay_lsn": None}):
+            capacity.query = lambda *args: json.dumps(replica)
+            with self.subTest(replica=replica), self.assertRaises(RuntimeError):
+                capacity.replica("before")
+        capacity.snapshot = lambda side: {"pending": {"rows": 1}}
+        with self.assertRaises(RuntimeError):
+            capacity.lifecycle("before", "prefix")
+
+    def test_capacity_preparation_is_explicit_and_replay_gated(self):
+        calls = []
+        fixture = SimpleNamespace(args=SimpleNamespace(maintenance_timeout=600),
+                                  sql=lambda side, statement, **kw: calls.append((side, statement)) or "0/123")
+        capacity = Capacity(fixture, {"before": "standby"})
+        capacity.catch_up = lambda side, lsn: calls.append((side, lsn))
+        capacity.query = lambda database, statement, **kw: calls.append((database, statement))
+        record = capacity.prepare("before")
+        self.assertEqual(calls, [("before", "CHECKPOINT"), ("before", "SELECT pg_current_wal_flush_lsn()"),
+                                 ("before", "0/123"), ("standby", "CHECKPOINT")])
+        self.assertGreaterEqual(record["seconds"], 0)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,9 @@ Two benchmark harnesses are included in the repository:
 
 Both harnesses start disposable PostgreSQL 18 containers on loopback. The direct
 matrix uses `shared_buffers=1GB` and pool 128; paired runs use pool 32 per binary
-with separate fresh databases so different layouts never share a database.
+with separate fresh PostgreSQL clusters so WAL/resource observations cannot mix
+the two sides. Different layouts never share a database. Each optional physical
+standby also has 1 GiB shared buffers.
 Numbers below are from a **16-core
 local host** (Intel Core Ultra X7 358H, 62 GiB RAM) alongside an earlier
 **6-vCPU / 11 GiB VM** baseline.
@@ -72,6 +74,97 @@ cache ranges and pass-through. The exploratory matrix remains available without
 `--before-bin`, reports saturation errors instead of treating them as acceptance,
 and writes actual NDJSON. `PGVS3_BENCH_DURATION` shortens that matrix for fixture
 smoke tests only; use repeated paired runs for acceptance.
+
+### Capacity evidence
+
+Use **disposable isolated clusters only**. Resource mode deletes its fixture keys,
+advances their committed-cache expiry deadlines, reaps and vacuums after each case.
+It refuses pending bodies at cleanup and never advances a pending body's expiry.
+
+Generate reproducible inputs with the existing DuckDB tool, without a gateway:
+
+```sh
+mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 \
+  python deploy/bench/duck_bench.py --parts fixtures --out .tmp/capacity/fixtures.json
+```
+
+This produces approximately 10/100/1,024 MiB Snappy Parquet and exact-size binary
+fixtures under `.tmp/capacity/payloads/`. Actual sizes, generation SQL, seeds and
+SHA-256 hashes are recorded. Binary fixtures repeat a seeded 1 MiB block: they are
+incompressible at pgvs3's 8,120-byte block size, not unique random streams across
+the entire file. `--fixture-mib` selects smaller smoke inputs; existing files are
+never overwritten.
+
+```sh
+just load --capacity --after-bin .tmp/pgvs3-candidate --profile origin \
+  --payload .tmp/capacity/payloads/parquet-100MiB.parquet --no-small \
+  --ops get,range,put,overwrite --workers 1,4 --range-size 65536 \
+  --replication async --checkpoint-writes --repeats 5
+```
+
+- `--capacity` uses one candidate endpoint/cluster and the existing loadgen to
+  capture resource costs. It sets `mode: capacity`,
+  `performance_gates_evaluated: false` and `failed_gates: null`; completion means
+  the fixtures/observations passed, **not** a before/after performance claim.
+  Use ordinary uninstrumented paired runs for the regression gate. Separate
+  clusters on one host still contend for the same physical disk.
+- `--resources` enables snapshots and observations on separate primary clusters.
+  `--replication async|sync` adds a real physical standby per side and enables
+  resources. `sync` selects one named synchronous standby; it does not mean
+  `remote_apply`. Recovery state, system identifiers and replay positions are
+  validated. Standbys use `hot_standby_feedback=on`; feedback/snapshots can hold
+  back primary vacuum. No production replication policy is changed.
+- `overwrite` uses loadgen's opt-in `-overwrite`: each worker reuses one prefilled
+  key, retaining retired files for the lifecycle measurement. Ordinary PUT keeps
+  its distinct-key behavior. Use `--cache-state cold --ops get,range` for empty
+  origin-cache fills; otherwise reads are explicitly warmed and verified.
+- `--checkpoint-writes` prepares publication/cold-fill samples with a primary
+  checkpoint, replay barrier and standby restartpoint outside timed work. The
+  duration is recorded, not hidden as free work. Use a one-request sample budget
+  for 1 GiB resource cohorts and retain several paired repetitions; larger bursts
+  are a separate sustained-churn experiment, not a peak-throughput comparison.
+- `--isolate-origin-put` is a separate **paired PUT-only** filesystem fixture.
+  After drain and byte verification it deletes only that sample's origin keys;
+  before the next sample it truncates the otherwise empty owned cache tables.
+  It refuses pending bodies, incomplete multipart uploads or unrelated keys and
+  cannot be combined with resource mode. This isolates fresh publication ACKs;
+  it is not a retention/reaping or sustained-upload-throughput measurement.
+- Each raw run records pre-run, post-loadgen and post-drain snapshots: logical
+  object-row bytes, heap/index/total relation bytes, pending state, WAL insertion
+  positions, checkpoint statistics, gateway metrics and standby replay. The
+  post-loadgen snapshot is **not the exact instant of the last HTTP ACK**.
+  Acknowledgement latency remains loadgen's per-request measurement; after-loadgen
+  drain is reported separately, not hidden inside ACK throughput.
+- Lifecycle snapshots show delete, injected committed-row expiry, reaping and
+  vacuum separately. Ordinary vacuum makes space reusable but need not shrink
+  relation files. The logical count includes expired rows until reaped.
+  Cleanup verifies the reaper actually drained rather than merely losing the
+  maintenance-leader race, records reaping/vacuum time, and uses the explicit
+  `--maintenance-timeout` deadline (default ten minutes).
+- WAL bytes are isolated-cluster LSN advancement, including headers/padding,
+  checkpoint/full-page-image and background work—not a per-table WAL counter.
+  Observer `pg_settings` describe its psql session and cluster defaults, not the
+  gateway's connection-local `SET` policy.
+- Gateway gauges use a 100 ms poll interval plus probe time, so their observed
+  peaks are lower bounds. Cross-node WAL position gaps include probe skew; they
+  are not simultaneous end-to-end lag measurements. `pgvs3_spool_peak_bytes`
+  is exact reserved-payload high water since
+  that gateway started, not a resettable per-case peak. Pool counter deltas also
+  include metrics observations. Replay catch-up time includes SQL/polling overhead.
+- Resource collection can perturb short measurements. Keep the same observations
+  on both sides, retain raw records, and use uninstrumented paired runs to resolve
+  performance-gate failures. Do not silently discard a failed resource comparison.
+
+The paired driver defaults to a five-minute S3 request timeout for large fixtures;
+`--request-timeout` changes it. Standalone loadgen keeps its one-minute default
+and exposes `-timeout`. A client deadline failure remains an error, not a retry
+or a successful sample; loadgen stdout/stderr are retained in the failure.
+
+`resource_schema: 1` and `complete: true` identify finished observations. Only a
+paired report with `performance_gates_evaluated: true` and empty `failed_gates`
+also establishes its measured regression gate. Full configuration and binary/
+payload hashes remain in the report. See [data-plane-results.md](data-plane-results.md)
+for recorded results and deployment-sizing limits.
 
 ### Historical exploratory measurements
 

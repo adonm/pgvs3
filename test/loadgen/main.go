@@ -46,8 +46,10 @@ type config struct {
 	size, rangeSize, rangeOffset, requests              int64
 	workers, pipeline, count                            int
 	duration                                            time.Duration
+	httpTimeout                                         time.Duration
 	warmup, prefill, unsigned                           bool
 	uniqueReads                                         bool
+	overwrite                                           bool
 	payload                                             []byte
 }
 
@@ -96,9 +98,11 @@ func main() {
 	flag.IntVar(&c.workers, "workers", 16, "concurrent workers")
 	flag.IntVar(&c.pipeline, "pipeline", 1, "RESP pipeline depth for resp-set/resp-get")
 	flag.DurationVar(&c.duration, "duration", 5*time.Second, "measurement duration")
+	flag.DurationVar(&c.httpTimeout, "timeout", time.Minute, "S3 HTTP request timeout")
 	flag.IntVar(&c.count, "count", 2000, "objects to prefill/read")
 	flag.BoolVar(&c.warmup, "warmup", false, "read every key once before measuring")
 	flag.BoolVar(&c.uniqueReads, "unique-reads", false, "share a read sequence across workers for distinct cold keys")
+	flag.BoolVar(&c.overwrite, "overwrite", false, "reuse one prefilled object key per PUT worker")
 	flag.BoolVar(&c.prefill, "prefill", true, "create objects before get/range/head/list benchmarks")
 	flag.Int64Var(&c.requests, "requests", 0, "fixed measured request count (0 uses duration)")
 	flag.BoolVar(&c.unsigned, "unsigned", false, "omit signing for trusted-network gateway comparisons")
@@ -107,7 +111,7 @@ func main() {
 	flag.StringVar(&c.prefix, "prefix", "", "key prefix (a unique one is generated if empty)")
 	flag.StringVar(&c.queue, "queue", "benchq", "OJS queue name for ojs-enqueue/ojs-fetch")
 	flag.Parse()
-	if c.requests < 0 || c.count <= 0 || c.workers <= 0 || c.size < 0 || c.rangeOffset < 0 || c.rangeSize <= 0 {
+	if c.requests < 0 || c.count <= 0 || c.workers <= 0 || c.size < 0 || c.rangeOffset < 0 || c.rangeSize <= 0 || c.httpTimeout <= 0 {
 		fmt.Fprintln(os.Stderr, "request count, object count, workers, size and range must be valid")
 		os.Exit(2)
 	}
@@ -244,7 +248,7 @@ type s3run struct {
 }
 
 func runS3(c config) {
-	s := &s3run{config: c, base: strings.TrimRight(c.endpoint, "/"), client: newClient(60*time.Second, c.workers, true)}
+	s := &s3run{config: c, base: strings.TrimRight(c.endpoint, "/"), client: newClient(c.httpTimeout, c.workers, true)}
 	if !c.unsigned {
 		s.sig = s3client.NewSigner("us-east-1", c.access, c.secret, "")
 	}
@@ -361,7 +365,11 @@ func (s *s3run) objects(method, rng string, want int) factory {
 
 func (s *s3run) put(body []byte) factory {
 	return iterate(func(id, seq int) (int64, int64, error) {
-		ops, _, err := s.call(http.MethodPut, fmt.Sprintf("%s/%s/%s/w%d-%d", s.base, s.bucket, s.prefix, id, seq), body, "", http.StatusOK)
+		key := fmt.Sprintf("%s/%s/%s/w%d-%d", s.base, s.bucket, s.prefix, id, seq)
+		if s.overwrite {
+			key = s.key(id % s.count)
+		}
+		ops, _, err := s.call(http.MethodPut, key, body, "", http.StatusOK)
 		return ops, ops * s.size, err
 	})
 }

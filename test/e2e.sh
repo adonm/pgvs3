@@ -580,27 +580,10 @@ stat_out=$("$PGVS3_TEST_BIN" stat --url "$PGVS3_TEST_DB_URL" --kind cache --name
 echo "$stat_out" | grep -Eq 'chunks=[1-9]' || fail "pgvs3 stat chunks: $stat_out"
 "$PGVS3_TEST_BIN" origin --url "$PGVS3_TEST_DB_URL" --bucket edge clear | grep -q "origin_cleared=edge" || fail "pgvs3 origin clear"
 
-# --- DuckDB 2.0: httpfs, Parquet, DuckLake --------------------------------
+# --- Maintained README Parquet/DuckLake scenario in both storage roles -------
 export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY \
        E2E_SECRET=$PGVS3_SECRET_KEY E2E_PG_PORT=$PGVS3_TEST_PG_PORT
-mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python - <<'PY'
-import os, duckdb
-c=duckdb.connect()
-c.execute("INSTALL httpfs; LOAD httpfs;")
-c.execute("INSTALL ducklake; INSTALL postgres; LOAD ducklake; LOAD postgres;")
-b=os.environ["E2E_BUCKET"]; run=os.environ["E2E_RUN"]; ep=os.environ["E2E_ENDPOINT"]
-c.execute(f"""CREATE SECRET s3s (TYPE S3, KEY_ID '{os.environ['E2E_KEY']}',
- SECRET '{os.environ['E2E_SECRET']}', REGION 'us-east-1', ENDPOINT '{ep[7:]}',
- URL_STYLE 'path', USE_SSL false)""")
-c.execute(f"COPY (SELECT range AS i FROM range(10000)) TO 's3://{b}/{run}/duck.parquet' (FORMAT PARQUET)")
-assert c.execute(f"SELECT count(*), sum(i) FROM 's3://{b}/{run}/duck.parquet'").fetchone()==(10000, 49995000)
-c.execute(f"""CREATE SECRET (TYPE POSTGRES, HOST '127.0.0.1', PORT {os.environ['E2E_PG_PORT']},
- DATABASE 'ducklake_catalog', USER 'postgres', PASSWORD 'postgres')""")
-c.execute(f"ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 's3://{b}/{run}/lake/')")
-c.execute(f"CREATE TABLE lake.t_{run.replace('-','_')}(i INTEGER)")
-c.execute(f"INSERT INTO lake.t_{run.replace('-','_')} SELECT range FROM range(1000)")
-assert c.execute(f"SELECT count(*) FROM lake.t_{run.replace('-','_')}").fetchone()[0]==1000
-PY
+mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py analytics
 
 # --- duckdb-object-storage (1.5.6) on the same gateway ---------------------
 mise exec uv -- uv run --quiet --no-project --with duckdb==1.5.6 python - <<'PY'

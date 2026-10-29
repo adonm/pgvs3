@@ -8,8 +8,9 @@ layout is also used by [pgvfs](https://pgvfs.adonm.dev).
 [design.md](design.md#authority-and-acknowledgement-contracts) defines ownership
 and acknowledgement; this page explains the mechanisms, not a durability or
 capacity benchmark. Use [paired acceptance](benchmarks.md#paired-acceptance) for
-per-path evidence. The [roadmap](roadmap.md) identifies the remaining replica and
-capacity proofs; historical throughput alone does not answer those questions.
+per-path evidence and the [data-plane proof/capacity ledger](data-plane-results.md)
+for replica, recovery and resource measurements. The [roadmap](roadmap.md) keeps
+the remaining deployment-specific limits explicit.
 
 ## Storage layout
 

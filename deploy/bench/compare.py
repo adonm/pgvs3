@@ -19,9 +19,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.error import HTTPError
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+
+from capacity import Capacity, Observer, host_info
 
 
 def quote(value):
@@ -73,10 +76,20 @@ def summarize(raw):
     return cases, failed
 
 
+def summarize_capacity(raw):
+    result = []
+    for size, op, workers in sorted({(row['size'], row['op'], row['workers']) for row in raw}):
+        rows = [row for row in raw if (row['size'], row['op'], row['workers']) == (size, op, workers)]
+        result.append({'size': size, 'op': op, 'workers': workers,
+                       'p50_ms': statistics.median(row['p50_ms'] for row in rows),
+                       'requests_per_s': statistics.median(row['requests_per_s'] for row in rows)})
+    return result
+
+
 def cache_path(args, op, size):
     if not (args.origin_directories or args.seed_endpoint):
         return "native"
-    if op == "put":
+    if op in ("put", "overwrite"):
         return "origin-write"
     if op == "head" and args.cache_state == "cold":
         return "metadata-probe"
@@ -90,14 +103,16 @@ def cache_path(args, op, size):
 
 
 class Fixtures:
+    quote = staticmethod(quote)
+
     def __init__(self, args, endpoints, databases, run):
         self.args, self.endpoints, self.databases, self.run = args, endpoints, databases, run
         self.directories = dict(zip(endpoints, map(Path, args.origin_directories or [])))
 
-    def sql(self, side, statement):
+    def sql(self, side, statement, timeout=120):
         if not self.databases[side]:
             return ""
-        result = subprocess.run([self.args.psql, self.databases[side], "-XAt", "-v", "ON_ERROR_STOP=1", "-c", statement], check=True, capture_output=True, text=True)
+        result = subprocess.run([self.args.psql, self.databases[side], "-XAt", "-v", "ON_ERROR_STOP=1", "-c", statement], check=True, capture_output=True, text=True, timeout=timeout)
         return result.stdout.strip()
 
     def configure(self):
@@ -111,6 +126,25 @@ class Fixtures:
             if config["type"] != "filesystem" or config.get("prefix", "") != "" or Path(config["config"]["directory"]).resolve() != directory.resolve() or \
                     spec["namespace"] != self.args.origin_namespace or spec.get("range_chunk", 0) != expected_range or spec.get("ttl") in (None, "", "0s"):
                 raise RuntimeError(f"{side} persisted origin spec does not match requested fixture: {spec}")
+            probe = directory / self.args.bucket / "__pgvs3_fixture_probe__"
+            probe.parent.mkdir(parents=True, exist_ok=True)
+            with probe.open("xb") as target:
+                target.write(b"probe")
+            deadline = time.monotonic() + 30
+            try:
+                while True:
+                    try:
+                        request = urllib.request.Request(self.endpoints[side] + "/" + self.args.bucket + "/" + probe.name, method="HEAD")
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            if int(response.headers["Content-Length"]) != 5:
+                                raise RuntimeError("origin fixture probe returned different bytes")
+                        break
+                    except HTTPError as error:
+                        if error.code != 404 or time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.05)
+            finally:
+                probe.unlink()
 
     def seed(self, side, size, payload, prefix, count):
         if side in self.directories:
@@ -186,18 +220,43 @@ class Fixtures:
         self.verify(side, size, payload, prefix, "get", False, key=key, bucket=bucket)
 
     def drain(self, side):
+        started = time.monotonic()
         if not self.directories:
-            return
+            return 0.0
         deadline = time.monotonic() + 120
         while self.sql(side, "SELECT count(*) FROM s3p.pending_uploads WHERE namespace=" + quote(self.args.origin_namespace)) != "0":
             if time.monotonic() > deadline:
                 raise RuntimeError("outbox did not drain before the next paired sample")
             time.sleep(0.1)
+        return time.monotonic() - started
+
+    def reset_origin_put(self, side, prefix):
+        if self.sql(side, "SELECT count(*) FROM s3p.pending_uploads") != "0":
+            raise RuntimeError("refusing origin PUT isolation while acknowledged bodies are pending")
+        allowed = self.args.bucket + "/" + prefix + "/"
+        probe = self.args.bucket + "/__pgvs3_fixture_probe__"
+        for schema in ("s3c_" + self.args.origin_namespace, "s3w_" + self.args.origin_namespace):
+            for table in ("objects", "origin_metadata"):
+                unrelated = self.sql(side, f"SELECT count(*) FROM {identifier(schema)}.{table} WHERE left(key,length({quote(allowed)}))<>{quote(allowed)} AND key<>{quote(probe)}")
+                if unrelated != "0":
+                    raise RuntimeError("origin PUT isolation requires an otherwise empty owned cache namespace")
+            if self.sql(side, f"SELECT count(*) FROM {identifier(schema)}.uploads") != "0":
+                raise RuntimeError("refusing to reset a namespace containing multipart uploads")
+        for schema in ("s3c_" + self.args.origin_namespace, "s3w_" + self.args.origin_namespace):
+            tables = self.sql(side, f"SELECT json_agg(c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname={quote(schema)} AND c.relkind='r' AND c.relname<>'meta'")
+            self.sql(side, "TRUNCATE " + ",".join(identifier(schema) + "." + identifier(name) for name in json.loads(tables)))
+
+    def remove_origin_put(self, side, prefix):
+        match = self.args.bucket + "/" + prefix + "/"
+        keys = json.loads(self.sql(side, f"SELECT coalesce(json_agg(key),'[]') FROM {identifier('s3w_' + self.args.origin_namespace)}.objects WHERE left(key,length({quote(match)}))={quote(match)}"))
+        for key in keys:
+            with urllib.request.urlopen(urllib.request.Request(self.endpoints[side] + "/" + urllib.parse.quote(key, safe="/"), method="DELETE"), timeout=120) as response:
+                response.read()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--before", required=True)
+    parser.add_argument("--before")
     parser.add_argument("--after", required=True)
     parser.add_argument("--loadgen", required=True)
     parser.add_argument("--before-binary", help="optional frozen control binary for provenance hashing")
@@ -216,11 +275,19 @@ def main():
     parser.add_argument("--prefix", default="comparison")
     parser.add_argument("--bucket", default="bench")
     parser.add_argument("--cache-state", choices=("warm", "cold"), default="warm")
-    parser.add_argument("--origin-directories", nargs=2, metavar=("BEFORE", "AFTER"))
+    parser.add_argument("--origin-directories", nargs="+", metavar="DIRECTORY")
     parser.add_argument("--origin-namespace", default="benchmark-origin")
     parser.add_argument("--range-chunk", type=int, default=0)
     parser.add_argument("--range-size", type=int, default=8192)
     parser.add_argument("--no-small", action="store_true", help="omit the default 4 KiB case")
+    parser.add_argument("--resources", action="store_true", help="observe isolated-cluster WAL/storage, gateway metrics and post-case delete/reap/vacuum")
+    parser.add_argument("--replica-before", help="physical standby for the isolated control cluster")
+    parser.add_argument("--replica-after", help="physical standby for the isolated candidate cluster")
+    parser.add_argument("--checkpoint-writes", action="store_true", help="prepare publication/cold-fill samples with matched primary/standby checkpoints outside timing")
+    parser.add_argument("--maintenance-timeout", type=float, default=600, help="resource cleanup deadline in seconds")
+    parser.add_argument("--capacity", action="store_true", help="capture candidate resources without a control or performance comparison")
+    parser.add_argument("--request-timeout", default="5m", help="loadgen S3 HTTP request timeout")
+    parser.add_argument("--isolate-origin-put", action="store_true", help="paired PUT-only fixture: drain/verify/delete owned origin keys and truncate the otherwise empty cache between samples")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     if args.repeats < 3:
@@ -229,11 +296,33 @@ def main():
         parser.error("--short-requests must be at least two")
     if args.requests < 0:
         parser.error("--requests must not be negative")
-    if bool(args.postgres_before) != bool(args.postgres_after):
+    if not args.capacity and not args.before:
+        parser.error("paired comparison requires --before")
+    if args.capacity:
+        args.resources = True
+        if args.before or args.before_binary or args.postgres_before or args.replica_before:
+            parser.error("--capacity accepts one candidate endpoint/cluster, not a control")
+        if not args.after_binary or not args.postgres_after:
+            parser.error("--capacity requires a frozen candidate binary and disposable database")
+    if not args.capacity and bool(args.postgres_before) != bool(args.postgres_after):
         parser.error("provide both disposable database URLs, or neither")
-    if bool(args.before_binary) != bool(args.after_binary):
+    if not math.isfinite(args.maintenance_timeout) or args.maintenance_timeout <= 0 or (args.checkpoint_writes and not args.postgres_after):
+        parser.error("maintenance timeout must be positive and checkpoint preparation requires database URLs")
+    if not args.capacity and bool(args.before_binary) != bool(args.after_binary):
         parser.error("provide both provenance binaries, or neither")
-    if args.origin_directories and not args.postgres_before:
+    if not args.capacity and bool(args.replica_before) != bool(args.replica_after):
+        parser.error("provide both physical standby URLs, or neither")
+    if args.replica_before and not args.resources:
+        parser.error("replica observations require --resources")
+    if args.resources and not args.capacity and (not args.postgres_before or not args.before_binary or args.isolate_writes):
+        parser.error("--resources requires both database URLs and frozen binaries, without --isolate-writes")
+    if args.capacity and args.isolate_writes:
+        parser.error("--capacity lifecycle measurement cannot use --isolate-writes")
+    if args.isolate_origin_put and (args.resources or not args.origin_directories or set(args.ops.split(',')) != {'put'}):
+        parser.error("origin PUT isolation is only for paired filesystem-origin PUT comparisons without resource collection")
+    if args.isolate_writes and "overwrite" in args.ops.split(","):
+        parser.error("overwrite must reuse its prefilled bucket; omit --isolate-writes")
+    if args.origin_directories and not args.postgres_after:
         parser.error("origin fixtures require both disposable database URLs")
     if args.cache_state == "cold" and not args.origin_directories:
         parser.error("cold comparisons require explicit filesystem origin fixtures")
@@ -241,6 +330,8 @@ def main():
         parser.error("isolated native write buckets cannot use a per-bucket origin fixture")
     if args.origin_directories and args.seed_endpoint:
         parser.error("choose filesystem fixtures or a seed endpoint, not both")
+    if args.origin_directories and len(args.origin_directories) != (1 if args.capacity else 2):
+        parser.error("origin fixture count must match measured endpoints")
     if args.range_chunk < 0 or args.range_size <= 0:
         parser.error("range sizes must be positive and range chunk must not be negative")
     if not re.fullmatch(r"[a-zA-Z0-9._-]+", args.prefix) or any(not re.fullmatch(r"[a-z0-9._-]{1,58}", n) for n in (args.bucket, args.origin_namespace)):
@@ -249,7 +340,7 @@ def main():
         worker_counts = [int(w) for w in args.workers.split(",")]
     except ValueError:
         parser.error("workers must be comma-separated integers")
-    if not set(args.ops.split(",")) <= {"get", "head", "range", "put"} or any(w < 1 for w in worker_counts):
+    if not set(args.ops.split(",")) <= {"get", "head", "range", "put", "overwrite"} or any(w < 1 for w in worker_counts):
         parser.error("unsupported operations or worker counts")
     if args.requests and args.requests < max(worker_counts):
         parser.error("--requests must cover every worker")
@@ -258,8 +349,8 @@ def main():
         parser.error("output already exists; choose a fresh --out path")
     out.parent.mkdir(parents=True, exist_ok=True)
     raw = []
-    endpoints = {"before": args.before, "after": args.after}
-    databases = {"before": args.postgres_before, "after": args.postgres_after}
+    endpoints = {"after": args.after} if args.capacity else {"before": args.before, "after": args.after}
+    databases = {"after": args.postgres_after} if args.capacity else {"before": args.postgres_before, "after": args.postgres_after}
     fixture_dir = Path(tempfile.mkdtemp(prefix="fixtures-", dir=out.parent))
     small = fixture_dir / "4k.bin"
     small.write_bytes(os.urandom(4096))
@@ -269,46 +360,69 @@ def main():
     if len({size for size, _ in payloads}) != len(payloads):
         parser.error("payload sizes must be distinct; use --no-small for a custom 4 KiB payload")
     payload_hashes = {str(p): digest(p) for _, p in payloads}
-    binaries = {"before": args.before_binary, "after": args.after_binary} if args.before_binary else {}
+    binaries = {"after": args.after_binary} if args.capacity else {"before": args.before_binary, "after": args.after_binary} if args.before_binary else {}
     metadata = {"arguments": vars(args), "payload_sha256": payload_hashes,
-                "binary_sha256": {side: digest(path) for side, path in binaries.items()}}
+                "binary_sha256": {side: digest(path) for side, path in binaries.items()}, "host": host_info(),
+                "mode": "capacity" if args.capacity else "paired", "performance_gates_evaluated": not args.capacity}
 
     def run(endpoint, size, payload, prefix, op, workers, requests, prefill=False, bucket=None, count=1, unique=False):
         bucket = bucket or args.bucket
+        actual_op = "put" if op == "overwrite" else op
         command = [args.loadgen, "-endpoint", endpoint, "-bucket", bucket,
-                   "-unsigned", "-op", op, "-workers", str(workers),
+                   "-unsigned", "-op", actual_op, "-workers", str(workers),
                    "-size", str(size), "-count", str(count), "-prefix", prefix,
-                   "-requests", str(requests), f"-prefill={str(prefill).lower()}"]
-        if payload and (prefill or op == "put"):
+                   "-requests", str(requests), f"-prefill={str(prefill).lower()}", "-timeout", args.request_timeout]
+        if payload and (prefill or op in ("put", "overwrite")):
             command += ["-payload-file", payload]
+        if op == "overwrite":
+            command += ["-overwrite"]
         if op == "range":
             command += ["-range-size", str(min(size, args.range_size)),
                         "-range-offset", str(max(0, size - args.range_size))]
         if unique:
             command += ["-unique-reads"]
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(f"loadgen failed ({result.returncode}): {result.stdout}\n{result.stderr}")
         record = json.loads(result.stdout)
-        validate_record(record, size, op, workers, count, requests, args.range_size)
+        validate_record(record, size, actual_op, workers, count, requests, args.range_size)
+        record["op"] = op
         return record
 
     fixtures = Fixtures(args, endpoints, databases, run)
+    capacity = Capacity(fixtures, {"before": args.replica_before, "after": args.replica_after}) if args.resources else None
+    lifecycle = []
     out.write_text(json.dumps(metadata | {"complete": False, "runs": []}, indent=2) + "\n")
     fixtures.configure()
+    if capacity:
+        metadata["resource_schema"] = 1
+        controls = {label: fixtures.sql(label, "SELECT system_identifier FROM pg_control_system()") for label in endpoints}
+        if len(set(controls.values())) != len(endpoints):
+            raise RuntimeError("resource accounting requires separate isolated PostgreSQL clusters, not two databases in one cluster")
+        metadata["postgresql"] = {label: {"system_identifier": controls[label], "settings": capacity.settings(label), "replica": capacity.replica(label),
+                                          "settings_scope": "observer psql session and cluster defaults; gateway SET policy is separate"} for label in endpoints}
+        for label, info in metadata["postgresql"].items():
+            if info["replica"] and info["replica"].get("system_identifier") != controls[label]:
+                raise RuntimeError(f"{label} standby is not a physical replica of its measured primary")
     for size, payload in payloads:
         for op in args.ops.split(","):
             for workers in worker_counts:
                 prefix = f"{args.prefix}-{fixture_dir.name}-{size}-{op}-{workers}"
+                write = op in ("put", "overwrite")
                 requests = max(workers, 3 if size >= 256 << 20 else 7)
                 if op == "get" and size <= 128 << 20:
                     # A handful of concurrent short GETs mostly measures
                     # connection/plan startup, not steady-state throughput.
                     requests = max(requests, min(128, max(7, (1 << 30) // size)))
                 if op in ("head", "range") or size == 4096:
-                    requests = args.short_requests if op != "put" else args.short_requests // 2
+                    requests = args.short_requests if not write else args.short_requests // 2
                 if args.cache_state == "cold" and op == "get" and size > 4096:
                     requests = min(requests, max(workers, 3, (256 << 20) // size))
                 requests = max(workers, args.requests or requests)
-                if op != "put" and args.cache_state == "warm":
+                if op == "overwrite":
+                    for label in endpoints:
+                        fixtures.seed(label, size, payload, prefix, workers)
+                if not write and args.cache_state == "warm":
                     for label in endpoints:
                         fixtures.seed(label, size, payload, prefix, 1)
                         warmup_op = "range" if op == "range" and args.range_chunk and size > 8 << 20 else "get"
@@ -318,44 +432,75 @@ def main():
                             schema = identifier("s3b_" + args.bucket)
                             fixtures.sql(label, f"ANALYZE {schema}.objects; ANALYZE {schema}.chunks (file_id, no);")
                 for repeat in range(args.repeats):
-                    order = ["before", "after"] if repeat % 2 == 0 else ["after", "before"]
+                    order = ["after"] if args.capacity else ["before", "after"] if repeat % 2 == 0 else ["after", "before"]
                     for label in order:
                         bucket = args.bucket
-                        sample_prefix = f"{prefix}-{repeat}-{label}" if args.cache_state == "cold" or op == "put" else prefix
-                        count = requests if args.cache_state == "cold" and op != "put" else 1
-                        if op != "put" and args.cache_state == "cold":
+                        sample_prefix = f"{prefix}/{repeat}-{label}" if (args.cache_state == "cold" and not write) or op == "put" else prefix
+                        count = workers if op == "overwrite" else requests if args.cache_state == "cold" and not write else 1
+                        if not write and args.cache_state == "cold":
                             fixtures.seed(label, size, payload, sample_prefix, count)
                             if fixtures.cached(label, sample_prefix) != 0:
                                 raise RuntimeError("cold fixture contains cached objects or metadata")
-                        if op == "put" and args.isolate_writes:
+                        if write and args.isolate_writes:
                             bucket = f"wcmp-{size}-{workers}-{repeat}"
                             fixtures.sql(label, "CHECKPOINT;")
+                        if args.isolate_origin_put:
+                            fixtures.reset_origin_put(label, prefix)
+                            fixtures.sql(label, "CHECKPOINT;")
+                        preparation = None
+                        if args.checkpoint_writes and (write or args.cache_state == "cold"):
+                            if capacity:
+                                preparation = capacity.prepare(label)
+                            else:
+                                fixtures.sql(label, "CHECKPOINT;")
                         try:
-                            record = run(endpoints[label], size, payload, sample_prefix, op, workers, requests, bucket=bucket, count=count, unique=args.cache_state == "cold")
-                            fixtures.drain(label)
-                            if args.cache_state == "cold" and op != "put":
+                            before = capacity.snapshot(label) if capacity else None
+                            if capacity:
+                                with Observer(capacity, label) as observer:
+                                    record = run(endpoints[label], size, payload, sample_prefix, op, workers, requests, bucket=bucket, count=count, unique=args.cache_state == "cold")
+                                    acknowledged = capacity.snapshot(label)
+                                    drain_seconds = fixtures.drain(label)
+                                    after = capacity.snapshot(label)
+                                    catchup = capacity.catch_up(label, after["insert_lsn"])
+                                record["resources"] = capacity.result(before, acknowledged, after, observer, drain_seconds, catchup)
+                            else:
+                                record = run(endpoints[label], size, payload, sample_prefix, op, workers, requests, bucket=bucket, count=count, unique=args.cache_state == "cold")
+                                fixtures.drain(label)
+                            if args.cache_state == "cold" and not write:
                                 fixtures.confirm_cold_fill(label, size, sample_prefix, count, op)
-                            if op == "put":
+                            if write:
                                 fixtures.verify_put(label, size, payload, sample_prefix, bucket=bucket)
+                                if args.isolate_origin_put:
+                                    fixtures.remove_origin_put(label, sample_prefix)
                             else:
                                 fixtures.verify(label, size, payload, sample_prefix, op, args.cache_state == "warm")
                         finally:
-                            if bucket != "bench":
+                            if bucket != args.bucket:
                                 request = urllib.request.Request(f"{endpoints[label]}/{bucket}?force=true", method="DELETE")
                                 with urllib.request.urlopen(request, timeout=120) as response:
                                     response.read()
                         record.update(label=label, repeat=repeat, payload=payload, cache_state=args.cache_state, cache_path=cache_path(args, op, size), prefix=sample_prefix)
+                        if preparation is not None:
+                            record["preparation"] = preparation
                         raw.append(record)
-                        out.write_text(json.dumps(metadata | {"complete": False, "runs": raw}, indent=2) + "\n")
+                        out.write_text(json.dumps(metadata | {"complete": False, "runs": raw, "lifecycle": lifecycle}, indent=2) + "\n")
                 before = [r["p50_ms"] for r in raw if r["label"] == "before" and r["size"] == size and r["op"] == op and r["workers"] == workers]
                 after = [r["p50_ms"] for r in raw if r["label"] == "after" and r["size"] == size and r["op"] == op and r["workers"] == workers]
-                baseline, candidate = statistics.median(before), statistics.median(after)
-                print(f"{size:>11} {op:>5} c={workers}: {baseline:.3f} -> {candidate:.3f} ms ({candidate / baseline - 1:+.1%})", flush=True)
+                candidate = statistics.median(after)
+                if args.capacity:
+                    print(f"{size:>11} {op:>5} c={workers}: {candidate:.3f} ms (capacity observation; no performance comparison)", flush=True)
+                else:
+                    baseline = statistics.median(before)
+                    print(f"{size:>11} {op:>5} c={workers}: {baseline:.3f} -> {candidate:.3f} ms ({candidate / baseline - 1:+.1%})", flush=True)
+                if capacity:
+                    for label in endpoints:
+                        lifecycle.append({"label": label, "size": size, "op": op, "workers": workers, "states": capacity.lifecycle(label, prefix)})
+                        out.write_text(json.dumps(metadata | {"complete": False, "runs": raw, "lifecycle": lifecycle}, indent=2) + "\n")
 
-    cases, failed = summarize(raw)
+    cases, failed = (summarize_capacity(raw), None) if args.capacity else summarize(raw)
     if any(digest(p) != payload_hashes[str(p)] for _, p in payloads):
         raise RuntimeError("payload changed during the comparison")
-    final = metadata | {"complete": True, "runs": raw, "cases": cases, "failed_gates": failed}
+    final = metadata | {"complete": True, "runs": raw, "cases": cases, "failed_gates": failed, "lifecycle": lifecycle}
     out.write_text(json.dumps(final, indent=2) + "\n")
     if failed:
         print(f"{len(failed)} cases require investigation; see {out}", file=sys.stderr)

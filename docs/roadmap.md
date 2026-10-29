@@ -1,18 +1,22 @@
 # Focused roadmap
 
-Updated 2026-10-29 against the layout-v25 code at `8532344`.
+Updated 2026-10-29. The three priorities below are implemented on layout v25;
+[data-plane-results.md](data-plane-results.md) records the proof and measurements.
 
 **Make the PostgreSQL object data plane easy to explain, demonstrate and
 operate.** The primary workload is 10 MiB–1 GiB Parquet through S3/HTTP, in two
 roles: native PostgreSQL storage and origin-backed shared cache/durable staging.
 RESP2 and OJS remain bounded companions, not separate product roadmaps.
 
-This is the current ranked plan, not a claim that the work below is complete.
+This is the current focus and evidence map, not an expansion of protocol scope.
 [design.md](design.md) defines the architecture;
 [CONTRIBUTING.md](../CONTRIBUTING.md#change-admission) defines the feature filter.
 Historical proposals are research, not the active backlog.
 
-## Evidence already in place
+## Starting point
+
+Before this pass, the following evidence existed. The gaps in the right column
+motivated the now-delivered work below; they are not all current limitations.
 
 | Existing evidence | What it does not establish |
 | --- | --- |
@@ -27,18 +31,23 @@ The completed work and its limits are recorded in
 [modernization-results.md](modernization-results.md). Do not repeat the completed
 contract/benchmark consolidation as a new refactor merely to change file counts.
 
-## Ranked next work
+## Delivered high-value work
 
-| Rank | Work | Why it comes next |
+| Priority | Delivered work | Evidence |
 | --- | --- | --- |
-| **1** | Prove physical-replica reads and promotion | Replicated bytes and replaceable gateways are the central distinction; this is the largest unproven operating-model claim. |
-| **2** | Maintain one two-role Parquet/DuckLake scenario | Show the product's purpose before its protocol inventory, using runnable evidence rather than another feature list. |
-| **3** | Publish the core workload's capacity budget | Explain when storing bytes in PostgreSQL is a good trade, including WAL, replay and co-location costs—not just peak throughput. |
+| **1** | Physical-replica reads, promotion and pending restore | `just fault`: real synchronous/asynchronous standbys, replay barriers, preserved bytes, controlled unreceived-WAL loss, and a consistent whole-database restore |
+| **2** | One maintained two-role Parquet/DuckLake scenario | `just analytics`, also part of `just contract`: actual README SQL, cross-gateway queries, shared hits, pending publication and outbox drain |
+| **3** | Core workload capacity ledger | Existing paired runner with `--resources` / `--replication`, reproducible Parquet/binary fixtures, and recorded storage/WAL/replay/spool/lifecycle evidence |
 
 ### 1. Prove physical-replica reads and promotion
 
 Extend the existing Docker/fault harness, not a second HA framework. Keep
 promotion and endpoint management outside pgvs3.
+
+**Delivered:** `test/harness.sh` creates the physical replicas; the fault scenario
+in `test/data_plane.py` exercises them. The restore drill exposed and closed an
+idle-recovery gap: persisted tiers now open on an explicitly owned background
+refresh, allowing restored outboxes to resume without an S3 request.
 
 **Acceptance:**
 
@@ -64,12 +73,19 @@ promotion and endpoint management outside pgvs3.
 
 Community PostgreSQL proof does not establish Aurora's storage/failover behavior;
 managed-service validation remains a separately labeled deployment exercise.
+The test fences the old primary/writer fleet and injects lease expiry afterward.
+Its whole-database logical restore is not a physical archive/PITR proof.
 
 ### 2. Maintain one two-role Parquet/DuckLake scenario
 
 Use `test/e2e.sh`, `deploy/bench/stack.sh` and the existing DuckDB tooling. The
 README walkthrough is the entry point; bind its queries/expected outputs to the
 contract rather than maintaining a disconnected demo harness.
+
+**Delivered:** one million-row Parquet scenario in `test/data_plane.py` runs the
+README blocks, queries through another gateway with DuckDB caches disabled,
+counts origin requests and verifies DuckLake after reconnecting. The standalone
+command retains an `analytics.json` record; the full contract reuses the same code.
 
 **Acceptance:**
 
@@ -96,6 +112,13 @@ single maintained explanatory scenario across both roles, not duplicate coverage
 Extend the canonical paired runner's evidence, not the number of load engines.
 Use the replica fixture from item 1 for replay measurements.
 
+**Delivered:** `deploy/bench/capacity.py` observes the existing loadgen rather than
+generating another workload. Explicit single-endpoint capacity capture, isolated
+paired clusters, replay/system-identifier checks,
+raw sample records, per-path gates and delete/expiry/reap/vacuum snapshots make
+the scope explicit. See [the method](benchmarks.md#capacity-evidence) and
+[recorded results](data-plane-results.md).
+
 **Acceptance:**
 
 - For native publication, cold whole/range fills, warm hits, overwrite/delete
@@ -116,6 +139,14 @@ Use the replica fixture from item 1 for replay measurements.
   links to the measurements. Do not infer cost or durability equivalence with a
   cloud object service from loopback timings or disk price alone.
 
+## Remaining proof limits
+
+Validate the actual deployment's managed-service failover, physical backup/WAL
+archive/PITR tooling, production working sets and tail latency. Brief local
+measurements do not establish sustainable maximum capacity, co-location isolation
+or cost equivalence with a cloud object store. These are deployment/evidence
+limits, not reasons to add an HA controller or more protocols.
+
 ## What not to prioritize
 
 - Full S3/Redis/OJS parity, another protocol, or removing existing companions.
@@ -124,8 +155,8 @@ Use the replica fixture from item 1 for replay measurements.
 - Replacing the page layout, streaming engine or S3 client merely to reduce line
   counts. Reopen such experiments only for a named maintenance burden or measured
   bottleneck, with preserved capabilities and independent 20% performance gates.
-- Broad restructuring before the replica, example and capacity evidence closes
-  the core questions. Targeted client fixes and invariant repairs remain valid.
+- Broad restructuring without a named maintenance burden or measured bottleneck.
+  Targeted client fixes and invariant repairs remain valid.
 
 Every implementation keeps acknowledged bodies WAL-logged, shared fills/hits
 available across gateways and read-only replicas, and the trusted-network model.

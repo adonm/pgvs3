@@ -86,6 +86,11 @@ their documented bounds.
 Requires [mise](https://mise.jdx.dev/) and Docker (or an existing PostgreSQL
 18+ instance).
 
+For a disposable walkthrough instead of a persistent dev database, run
+`just analytics`. It executes the SQL below in both storage roles, checks
+cross-gateway queries/shared hits and shows a PostgreSQL-only pending body reach
+the origin. It needs no RESP/OJS setup and retains an `analytics.json` report.
+
 ```sh
 just setup
 just dev-db   # starts PostgreSQL 18 on 127.0.0.1:5432
@@ -136,6 +141,7 @@ INSTALL ducklake; INSTALL postgres; LOAD ducklake; LOAD postgres;
 CREATE SECRET (TYPE POSTGRES, HOST '127.0.0.1', PORT 5432,
                DATABASE 'ducklake_catalog', USER 'postgres', PASSWORD 'postgres');
 ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 's3://lake/ducklake/');
+CALL lake.set_option('data_inlining_row_limit', 0);
 CREATE TABLE lake.events (site_id INTEGER, day DATE, value DOUBLE);
 INSERT INTO lake.events VALUES (42, DATE '2026-09-01', 1.0);
 SELECT * FROM lake.events;
@@ -198,6 +204,10 @@ The acceptance workload is 10 MiB–1 GiB objects: warm/cold GET, footer and ali
 ranges, metadata, native publication and durable write-back acknowledgement.
 Changes are compared per path against a saved binary, with a 20% regression
 budget and the already documented small-origin-hit catalog-check exception.
+
+`just load --capacity --replication async` records storage/WAL, actual standby
+replay and gateway resource observations without claiming a performance comparison.
+See [capacity evidence](docs/benchmarks.md#capacity-evidence) for scope and caveats.
 
 Use [the paired runner](docs/benchmarks.md#paired-acceptance), not a single peak
 requests-per-second number. [Recorded comparisons](docs/modernization-results.md)
@@ -427,7 +437,7 @@ are described in [operations.md](docs/operations.md).
 | **Namespaces** | At most **100 namespaces per database**, counting bucket, read-cache, write-back and queue schemas. `EnsureNamespace` enforces it; `doctor` also reports an over-scale database. |
 | **Bucket capacity** | Each bucket's `chunks` table has PostgreSQL's 32 TiB relation limit (~31.7 TiB of payload); ~17.4 TB per object from chunk indexing. These are format ceilings, not measured production capacity targets. |
 | **Writer model** | One DuckLake writer per bucket and many readers. Scale reads with additional DuckDB workers, writable gateway workers, and read-only gateways on PostgreSQL standbys. |
-| **Disk reclamation** | Dropping a bucket (`pgvs3 drop --force <bucket>`) returns disk space to the OS via `DROP SCHEMA CASCADE`. Inside a live bucket, deleted pages are reused after `--reap-grace` and autovacuum; returning space without dropping requires `VACUUM FULL` or `pg_repack`. |
+| **Disk reclamation** | Dropping a bucket unlinks its relations. In a live bucket, reaping/vacuum make dead space reusable; ordinary vacuum may truncate an empty tail but does not guarantee compaction. Use `VACUUM FULL` or `pg_repack` when compaction is required. |
 | **Cache authority** | Origins own committed external objects; PostgreSQL owns pending acknowledged bodies until handoff. External origin changes may remain stale until TTL revalidation. Never discard pending bodies as a disposable cache. |
 | **Delete tombstones** | A write-through delete leaves a thirty-minute tombstone so an in-flight fill cannot resurrect the object. An object recreated directly at the origin may remain hidden through the cache until the tombstone expires; recreating it through pgvs3 replaces it immediately. |
 
@@ -443,8 +453,9 @@ just integration # store/queue/cache tests against PostgreSQL 18 and a self-host
 just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just helm-kind  # install the chart on a throwaway kind cluster under restricted Pod Security
 just contract   # end-to-end S3, OJS, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
+just analytics  # maintained README walkthrough, native + origin-backed, disposable
 just interop    # rclone, restic, boto3, and DuckLake
-just fault      # gateway loss, PostgreSQL restart and churn
+just fault      # gateway/primary loss, real replicas, promotion and pending restore
 just ci         # complete local/CI gate set, including Docker, kind and s3t
 just load       # exploratory S3/RESP/OJS matrix in an isolated run directory
 just load --before-bin /path/to/control --profile origin --cache-state cold --ops get,range
@@ -459,6 +470,8 @@ Further reading:
 - [docs/design.md](docs/design.md) — project goals, trust model, multi-worker
   safety invariants, and scope boundaries
 - [docs/roadmap.md](docs/roadmap.md) — current ranked work and acceptance criteria
+- [docs/data-plane-results.md](docs/data-plane-results.md) — replica/recovery proof,
+  the maintained analytical scenario and capacity ledger
 - [docs/performance.md](docs/performance.md) — storage layout, read/write paths,
   and DuckDB tuning
 - [docs/benchmarks.md](docs/benchmarks.md) — canonical paired runner and historical

@@ -3,8 +3,9 @@ set -euo pipefail
 # shellcheck source=test/harness.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../test/harness.sh"
 mode=${1:-contract}
-case "$mode" in contract | fault | interop | s3t | bench) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
+case "$mode" in contract | analytics | fault | interop | s3t | bench) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
 test_run "$mode"
+[ "$mode" != analytics ] || test_keep_artifacts=true
 
 shared_buffers=1GB
 [ "$mode" = fault ] && shared_buffers=256MB
@@ -44,12 +45,36 @@ export PGVS3_TEST_ENDPOINT_B="http://127.0.0.1:$port_b"
 export PGVS3_TEST_PID_A="${test_pids[0]}"
 export PGVS3_TEST_PID_B="${test_pids[1]}"
 
+if [ "$mode" = contract ] || [ "$mode" = analytics ] || [ "$mode" = fault ]; then
+  primary_container=$PGVS3_TEST_PG_CONTAINER primary_port=$PGVS3_TEST_PG_PORT primary_url=$PGVS3_TEST_DATABASE_URL
+  test_postgres 128MB origin
+  export PGVS3_TEST_ORIGIN_DB_URL=$PGVS3_TEST_DATABASE_URL
+  origin_port=$(test_port)
+  test_start_gateway origin "$PGVS3_TEST_ORIGIN_DB_URL" "$origin_port" --pool-max 8 --log-level warn
+  export PGVS3_TEST_ORIGIN_ENDPOINT="http://127.0.0.1:$origin_port"
+  PGVS3_TEST_PG_CONTAINER=$primary_container PGVS3_TEST_PG_PORT=$primary_port PGVS3_TEST_DATABASE_URL=$primary_url
+fi
+
 case "$mode" in
 contract)
   bash test/e2e.sh
   ;;
+analytics)
+  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py analytics
+  ;;
 fault)
   bash test/fault.sh
+  test_standby "$PGVS3_TEST_PG_CONTAINER" sync
+  export PGVS3_TEST_SYNC_URL="postgres://postgres:postgres@127.0.0.1:$PGVS3_TEST_STANDBY_PORT/pgvs3?sslmode=disable"
+  export PGVS3_TEST_SYNC_APP=$PGVS3_TEST_STANDBY_APP
+  test_standby "$PGVS3_TEST_PG_CONTAINER" async
+  export PGVS3_TEST_ASYNC_URL="postgres://postgres:postgres@127.0.0.1:$PGVS3_TEST_STANDBY_PORT/pgvs3?sslmode=disable"
+  test_postgres 128MB restore
+  export PGVS3_TEST_RESTORE_CONTAINER=$PGVS3_TEST_PG_CONTAINER
+  export PGVS3_TEST_RESTORE_URL="postgres://postgres:postgres@127.0.0.1:$PGVS3_TEST_PG_PORT/pgvs3_restored?sslmode=disable"
+  docker exec "$PGVS3_TEST_PG_CONTAINER" createdb -U postgres pgvs3_restored
+  PGVS3_TEST_PG_CONTAINER=$primary_container PGVS3_TEST_PG_PORT=$primary_port PGVS3_TEST_DATABASE_URL=$primary_url
+  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py replication
   ;;
 interop)
   bash test/interop.sh
@@ -64,3 +89,4 @@ bench)
     python deploy/bench/duck_bench.py --parts "${2:-s3,compat,tuning}" --out .tmp/pgvs3/bench.json
   ;;
 esac > "$PGVS3_TEST_RUN_DIR/suite.log" 2>&1
+if [ "$mode" = analytics ]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi

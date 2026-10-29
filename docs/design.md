@@ -178,9 +178,12 @@ DuckLake-catalog/object transaction merely because they share a cluster or datab
 | Primary loss / standby promotion | Data survival follows the PostgreSQL replication/promotion policy; reconnecting cannot restore WAL that was never replayed |
 | Database restore | Restore object bodies and pending/outbox state consistently, not just the namespace catalog; origin backups remain separate |
 
-The existing fault gate covers gateway loss, primary restart and churn. Real
-streaming-replica promotion is a separate proof obligation in the
-[focused roadmap](roadmap.md), not a test result implied by the architecture.
+`just fault` covers gateway loss, primary restart/churn and real PostgreSQL 18
+physical replicas. It checks replay-gated native/cache/range/multipart reads,
+policy-qualified promotion, a deliberately unreceived asynchronous commit and
+consistent restoration of pending bodies/outbox state. This is bounded local
+evidence, not an Aurora or arbitrary network-partition guarantee; see
+[data-plane-results.md](data-plane-results.md).
 
 ## Internal data shapes
 
@@ -203,6 +206,11 @@ working tier when opening a changed configuration fails. One explicit runtime
 owns the fill/pending limits and spool budget shared by all tiers in a gateway;
 constructor options fix range, write-back and read-only settings before workers
 start. There are no package-wide configuration setters.
+
+`Registry.Start` owns a cancellable one-second refresh loop, joined by `Close`.
+It opens persisted tiers and resumes their outboxes without waiting for an S3
+request; read-only tiers still never fill or flush. Request borrowing and the
+per-request origin bucket catalog check remain unchanged.
 
 Each S3 request resolves and borrows its backend once per bucket, including a
 separate source bucket for copies. Routing, catalog admission and execution use
@@ -402,14 +410,16 @@ standby, so deploy writable and read-only workers with the correct endpoints.
 
 During a PostgreSQL failover:
 
-1. The writer endpoint is repointed to the promoted standby by the cluster's
+1. The deployment fences the old primary and old writable gateway fleet. Session
+   advisory locks do not coordinate two independently writable PostgreSQL timelines.
+2. The writer endpoint is repointed to the promoted standby by the cluster's
    HA mechanism (DNS, service, or proxy). Writable gateways reconnect.
-2. In-flight requests on connections to the old primary may fail. Clients
+3. In-flight requests on connections to the old primary may fail. Clients
    can retry with appropriate conditions or reconcile state; atomic publish
    prevents torn objects, not end-to-end exactly-once execution.
-3. Maintenance leadership re-elects automatically when a writable gateway
+4. Maintenance leadership re-elects automatically when a writable gateway
    reaches the new primary and acquires the advisory lock.
-4. Read-only workers connected to standbys continue serving reads, subject to
+5. Read-only workers connected to standbys continue serving reads, subject to
    replication lag and their own reconnection.
 
 A gateway pointed at the wrong role is still safe: a writable gateway pointed

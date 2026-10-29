@@ -66,6 +66,7 @@ just race       # unit tests with race detector
 just integration # store/queue/cache integration against disposable PostgreSQL 18
 just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
+just analytics  # same README SQL and two-role scenario used by the contract
 just interop    # rclone, restic, boto3, and DuckLake
 ```
 
@@ -108,7 +109,7 @@ Keep one harness per layer. Do not add a second framework for the same job.
 | SQL, store, queues, cache | `just integration` (shared Docker harness) |
 | S3 conformance | `just s3t` (pinned Go port of `ceph/s3-tests`) |
 | Real clients and end-to-end flows | `just contract`, `just interop` |
-| Gateway loss, PostgreSQL restart and churn | `just fault` (not physical replica promotion) |
+| Gateway/primary loss, physical replica replay/promotion, pending restore | `just fault` (same Docker harness) |
 
 `just s3-clients` is an opt-in transport benchmark in the isolated
 `test/s3clients` Go module. AWS/MinIO experiment dependencies must not upgrade
@@ -124,6 +125,14 @@ Grow coverage by adding node IDs to `test/s3t-allow.txt` when the pinned `s3t`
 version already has the test, or by contributing the port upstream. The pinned
 commit lives in `test/s3t.sh`; bump it deliberately and re-run the allow-list.
 A new test harness must replace an existing layer, not add a parallel one.
+
+`test/data_plane.py` is the shared scenario for the existing contract/fault
+entry points, not another conformance framework. It uses the README's actual
+SQL, disables DuckDB client caches, and counts requests through a controllable
+S3-origin fixture. Physical-standby checks gate on recovery state and replay LSNs;
+the old primary/writer fleet is fenced before promotion. The recovery drill uses
+a consistent whole-database logical dump, not a PITR claim. Passing fault runs
+remain quiet; `test_keep_artifacts=true just fault` retains the evidence JSON.
 
 Format code before committing:
 

@@ -12,8 +12,11 @@ Parts:
   tuning  DuckLake Parquet row group size / file size vs load and query time.
 """
 import argparse
+import hashlib
 import json
 import os
+from pathlib import Path
+import random
 import statistics
 import sys
 import threading
@@ -279,6 +282,38 @@ def tuning(args, run: str) -> dict:
     return {"results": results}
 
 
+def fixtures(args, run):
+    folder = Path(args.out).parent / "payloads"
+    paths = [folder / f"{kind}-{mib}MiB.{extension}" for mib in args.fixture_mib
+             for kind, extension in (("parquet", "parquet"), ("incompressible", "bin"))]
+    if any(mib <= 0 for mib in args.fixture_mib) or len(set(paths)) != len(paths) or any(path.exists() for path in paths):
+        raise ValueError("choose positive distinct fixture sizes and a fresh output directory")
+    folder.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute("SET threads=1; SET memory_limit='256MB'")
+    result = []
+    for mib in args.fixture_mib:
+        rows = mib * 23700
+        parquet = folder / f"parquet-{mib}MiB.parquet"
+        query = f"SELECT i,md5(i::VARCHAR) AS id,hash(i)::DOUBLE/18446744073709551615.0 AS value FROM range({rows}) t(i)"
+        con.execute(f"COPY ({query}) TO {sql_str(str(parquet))} (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880)")
+        binary = folder / f"incompressible-{mib}MiB.bin"
+        seed = 20261029 + mib
+        block = random.Random(seed).randbytes(MIB)
+        with binary.open("xb") as output:
+            for _ in range(mib):
+                output.write(block)
+        for kind, path in (("parquet", parquet), ("incompressible", binary)):
+            with path.open("rb") as source:
+                sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+            result.append({"kind": kind, "path": str(path), "target_mib": mib, "bytes": path.stat().st_size, "sha256": sha256,
+                           "generation": {"sql": query, "compression": "snappy", "row_group_rows": 122880} if kind == "parquet" else
+                                         {"seed": seed, "repeated_block_bytes": MIB, "note": "incompressible within pgvs3's 8120-byte blocks, not a globally unique random stream"}})
+            print(f"fixture {path}: {path.stat().st_size} bytes", flush=True)
+    con.close()
+    return {"files": result}
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--parts", default="s3,compat,tuning")
@@ -291,9 +326,10 @@ def main() -> int:
     p.add_argument("--row-groups", type=lambda s: [int(x) for x in s.split(",")],
                    default=[30_720, 122_880, 491_520, 1_966_080])
     p.add_argument("--passes", type=int, default=3)
+    p.add_argument("--fixture-mib", type=lambda s: [int(x) for x in s.split(",")], default=[10, 100, 1024])
     args = p.parse_args()
     run = "r" + uuid.uuid4().hex[:12]
-    parts = {"s3": s3, "compat": compat, "tuning": tuning}
+    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures}
     record = {"duckdb": duckdb.__version__, "cores": os.cpu_count(), "run": run}
     for part in args.parts.split(","):
         print(f"=== {part} ===", flush=True)

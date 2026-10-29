@@ -94,7 +94,10 @@ The chart requests 10 GiB of ephemeral storage and limits it to 12 GiB, includin
 logs/other scratch, with a 10 GiB disk `emptyDir`. Adjust the request, limit,
 `tmpDir.sizeLimit` and `spoolMaxBytes` together. An `emptyDir` limit alone does
 not reserve capacity on a node. Alert on `pgvs3_spool_bytes`,
-`pgvs3_spool_limit_bytes` and `pgvs3_spool_rejections_total`.
+`pgvs3_spool_peak_bytes`, `pgvs3_spool_limit_bytes` and
+`pgvs3_spool_rejections_total`. The peak is reserved disk-spool payload since
+gateway startup, not current usage, RSS or filesystem overhead. It does not reset
+when a request completes.
 
 Every connection applies the configured `work_mem` (default `16MB`), a
 five-minute statement timeout, a five-second lock timeout, a one-minute
@@ -102,6 +105,38 @@ idle-in-transaction timeout, and a finite connection lifetime with jitter.
 Long streaming reads use the chunk pool without a statement timeout; upload
 transactions explicitly disable it while `COPY` runs. Tune the database limits
 with `--db-*` flags only after measuring the actual workload.
+
+## Choosing and sizing a storage role
+
+| Decision | Native PostgreSQL objects | Origin-backed cache/staging |
+| --- | --- | --- |
+| Copy of record | PostgreSQL body and publication rows | Origin for committed external objects; PostgreSQL for pending acknowledged writes |
+| PostgreSQL body writes | Every native publication | Cold read fills/range blocks, durable staging, retained write-cache copies and their metadata |
+| Warm reads | PostgreSQL rows/pages | PostgreSQL rows/pages while validation/retention permits; client caches are separate |
+| Recovery set | Data database plus coordinated application/DuckLake catalog recovery | Same, plus origin recovery/reconciliation; never restore pending metadata without its body/outbox |
+| Best reason to choose it | Keep object bytes within the PostgreSQL operating boundary | Share acceleration and durable staging while the origin retains long-term storage |
+| Main cost to measure | Logged ingest, indexes, overwrite/reap/vacuum and replication | Those same costs on fills/staging, plus origin I/O and backlog drain |
+
+Use [the recorded capacity ledger](data-plane-results.md) and
+[resource runner](benchmarks.md#capacity-evidence), not disk price or a relation
+ceiling alone. Budget for:
+
+- Live body **physical** footprint, indexes/metadata, concurrent unpublished
+  writes and retired files retained by grace windows or long snapshots.
+  Standby feedback can also hold back the vacuum horizon; logical deletion is
+  not evidence that relation files or filesystem bytes were reclaimed.
+- Origin-cache working set/range retention and the maximum credible pending
+  backlog. Fast acknowledgement does not bound the time until the origin drains.
+- WAL generation, replication slots, archive retention and standby recovery.
+  `max_wal_size` is not a hard disk cap; a stalled slot can retain additional WAL.
+- Each gateway's main **and** chunk pool, plus rollouts and other cluster clients.
+  More gateways do not create independent PostgreSQL CPU, disk or autovacuum capacity.
+- Scratch per gateway: spool payload high water plus filesystem/log/buffer
+  overhead. PostgreSQL disk capacity and local scratch are different budgets.
+
+Apply headroom for co-located workloads and validate the actual storage/HA
+environment. Local loopback throughput and a brief replay barrier are not a
+production tail-latency or maximum-dataset-size promise.
 
 ## Amazon Aurora PostgreSQL
 
@@ -322,6 +357,14 @@ acknowledged bodies until the origin copy commits.
   verify a known object before shifting traffic. A restored database must match
   the current layout; there is no in-place migration.
 
+The fault gate restores a consistent whole-database logical dump containing
+native objects, pending single/multipart bodies and their outbox rows. Its
+recovery origin is an isolated bucket for pending bodies, so the drill cannot overwrite live origin
+objects. This does not validate physical backup/WAL archive/PITR tooling. Test
+those mechanisms in the deployment that operates them, and coordinate DuckLake
+catalog recovery with its object data. Co-location does not make the application
+commits atomic.
+
 ## Schema initialization and layout changes
 
 The schema is a single embedded baseline, `internal/store/schema.sql`. A
@@ -377,7 +420,9 @@ DuckDB and load it into the new database; do not edit `schema.sql` in place.
   [design.md](design.md#read-only-gateways-and-failover)
   for the full capability table.
 - **Failover:** connect writable gateways to a writer endpoint that follows the
-  current primary. When PostgreSQL promotes a standby, update the endpoint and
+  current primary. Fence the old primary and old writable gateway fleet before
+  promotion; session locks are not fencing across independent timelines.
+  When PostgreSQL promotes an eligible standby, update the endpoint and
   let gateway pools reconnect. Requests on broken connections may fail; clients
   should reconcile the outcome or retry with conditions. Atomic publication
   prevents torn objects, not cross-system exactly-once execution. The
@@ -390,8 +435,11 @@ DuckDB and load it into the new database; do not edit `schema.sql` in place.
   replication and promotion policy (or the managed service's validated durability
   model), with the associated latency/availability tradeoff. Replica visibility
   additionally depends on WAL replay. pgvs3 does not silently change that policy.
-  The current fault suite restarts a primary; physical standby/promotion proof
-  is still ranked work in [roadmap.md](roadmap.md#1-prove-physical-replica-reads-and-promotion).
+  `just fault` now verifies real physical-standby reads and promotion under an
+  explicit synchronous policy, and demonstrates the expected loss of an
+  unreceived commit when promoting a deliberately disconnected asynchronous
+  standby. It injects lease expiry after fencing the old fleet; it is not an
+  automatic HA controller or proof of arbitrary network partitions.
 - **Kubernetes / Helm:** `deploy/charts/pgvs3` deploys a stateless multi-AZ
   `Deployment` with optional HPA (`autoscaling.enabled=true`) and
   `PodDisruptionBudget`. Hardened defaults include a nonroot read-only root
@@ -597,8 +645,9 @@ need no extra step. This is a behaviour change: a global origin used to serve an
 bucket name.
 
 Every running gateway discovers new or updated origin configs from PostgreSQL
-within ~1 second (`--origin-config` on `pgvs3 serve` is still accepted as a
-process-local fallback; it is a global origin and follows the same catalog rule).
+on a bounded one-second background refresh, including while idle. Restored
+outboxes resume without an S3 request. `--origin-config` on `pgvs3 serve` remains a
+process-local global fallback and follows the same catalog rule.
 
 ### Cache modes
 

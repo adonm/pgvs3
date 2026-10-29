@@ -108,6 +108,11 @@ vet:
 contract:
     bash deploy/bench/stack.sh contract
 
+# Maintained README Parquet/DuckLake walkthrough in native and origin-backed roles.
+[group('dev')]
+analytics:
+    bash deploy/bench/stack.sh analytics
+
 # DuckLake compatibility: writer on one gateway, reader on the other.
 [group('test')]
 ducklake:
