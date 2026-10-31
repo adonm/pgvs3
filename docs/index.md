@@ -30,6 +30,211 @@ cache-coherence and coordination services.
 
 ---
 
+## Interactive Scaling, Partitioning & Resource Estimator
+
+Adjust your collection size, wide-column payload width, spatial hotspot skew, and gateway fleet below to compare **Naive (`SELECT *` + Equal-Area Grid)** against **Fixed Hash (`bucket(32, id)`)** and **24-Bit Hierarchical Hilbert (`SORTED BY (hilbert_id, ts)` + Late Materialization)**:
+
+```{=html}
+<div class="pgvs3-sim" id="pgvs3-estimator">
+  <div class="pgvs3-sim-grid">
+    <div class="pgvs3-sim-ctrl">
+      <label for="sim-rows">Dataset Rows <span class="val" id="val-rows">1,000M (1.0B)</span></label>
+      <input type="range" id="sim-rows" min="10" max="5000" step="10" value="1000">
+    </div>
+    <div class="pgvs3-sim-ctrl">
+      <label for="sim-narrow">Narrow Filter/Key Columns <span class="val" id="val-narrow">48 B/row</span></label>
+      <input type="range" id="sim-narrow" min="16" max="256" step="8" value="48">
+    </div>
+    <div class="pgvs3-sim-ctrl">
+      <label for="sim-wide">Wide Payload / Embedding <span class="val" id="val-wide">2,048 B/row</span></label>
+      <input type="range" id="sim-wide" min="0" max="8192" step="128" value="2048">
+    </div>
+    <div class="pgvs3-sim-ctrl">
+      <label for="sim-skew">Hotspot Skew (Rows in 1% Area) <span class="val" id="val-skew">90%</span></label>
+      <input type="range" id="sim-skew" min="10" max="95" step="5" value="90">
+    </div>
+    <div class="pgvs3-sim-ctrl">
+      <label for="sim-gw">Gateways × pool-max <span class="val" id="val-gw">4 × 32</span></label>
+      <input type="range" id="sim-gw" min="1" max="12" step="1" value="4">
+    </div>
+    <div class="pgvs3-sim-ctrl">
+      <label for="sim-outage">Origin Outage Buffer (@25 MiB/s) <span class="val" id="val-outage">15 min</span></label>
+      <input type="range" id="sim-outage" min="0" max="60" step="5" value="15">
+    </div>
+  </div>
+
+  <div class="pgvs3-sim-kpis">
+    <div class="pgvs3-kpi bad" id="kpi-ram-box">
+      <div class="k-label">Writer Row-Group RAM / Thread</div>
+      <div class="k-val" id="kpi-ram">246 MiB → 32 MiB</div>
+      <div class="k-sub" id="kpi-ram-sub">122,880 rows vs byte-bounded 32MB</div>
+    </div>
+    <div class="pgvs3-kpi good">
+      <div class="k-label">Selective 2D Query I/O (0.1% Match)</div>
+      <div class="k-val" id="kpi-io">142 GiB → 1.1 GiB</div>
+      <div class="k-sub" id="kpi-io-sub">Hilbert pruning + late materialization</div>
+    </div>
+    <div class="pgvs3-kpi good">
+      <div class="k-label">Hotspot Partition Skew (64 Buckets)</div>
+      <div class="k-val" id="kpi-files">90% in 1 → Even 256MB</div>
+      <div class="k-sub" id="kpi-files-sub">Equal-byte Hilbert files avoid tiny ocean files</div>
+    </div>
+    <div class="pgvs3-kpi warn" id="kpi-conn-box">
+      <div class="k-label">PostgreSQL Fleet Connections</div>
+      <div class="k-val" id="kpi-conn">292 conns</div>
+      <div class="k-sub" id="kpi-conn-sub">main + chunk pools + 36 app/scanner/admin</div>
+    </div>
+    <div class="pgvs3-kpi">
+      <div class="k-label">PG Storage + Outbox Stage</div>
+      <div class="k-val" id="kpi-disk">842 GiB + 22 GiB</div>
+      <div class="k-sub" id="kpi-disk-sub">ZSTD chunks (8,120B pages) + s3w_ buffer</div>
+    </div>
+  </div>
+
+  <div class="pgvs3-bars">
+    <div class="pgvs3-bar-row">
+      <div class="pgvs3-bar-hdr">
+        <span><strong>Naive:</strong> <code>SELECT *</code> + Equal-Area Grid + <code>SORTED BY (lat, lon)</code> (no lon pruning)</span>
+        <span id="bar-naive-txt" style="color:#f87171;font-family:monospace;">142.0 GiB scanned</span>
+      </div>
+      <div class="pgvs3-bar-track">
+        <div class="pgvs3-bar-fill" id="bar-naive" style="width:100%;background:#ef4444;"></div>
+      </div>
+    </div>
+    <div class="pgvs3-bar-row">
+      <div class="pgvs3-bar-hdr">
+        <span><strong>Column Projection Only:</strong> Narrow + Wide fetched for entire lat stripe</span>
+        <span id="bar-proj-txt" style="color:#fbbf24;font-family:monospace;">28.4 GiB scanned</span>
+      </div>
+      <div class="pgvs3-bar-track">
+        <div class="pgvs3-bar-fill" id="bar-proj" style="width:24%;background:#f59e0b;"></div>
+      </div>
+    </div>
+    <div class="pgvs3-bar-row">
+      <div class="pgvs3-bar-hdr">
+        <span><strong>pgvs3 + DuckLake Recommended:</strong> 24-Bit Hilbert <code>SORTED BY (hilbert_id, ts)</code> + Late Materialization</span>
+        <span id="bar-hilb-txt" style="color:#34d399;font-family:monospace;">1.1 GiB scanned (129× less I/O)</span>
+      </div>
+      <div class="pgvs3-bar-track">
+        <div class="pgvs3-bar-fill" id="bar-hilb" style="width:3%;background:#10b981;"></div>
+      </div>
+    </div>
+  </div>
+
+  <pre class="pgvs3-sql-out" id="sim-sql"></pre>
+</div>
+
+<script>
+(function() {
+  const el = id => document.getElementById(id);
+  const inputs = ['sim-rows', 'sim-narrow', 'sim-wide', 'sim-skew', 'sim-gw', 'sim-outage'];
+  if (!el('sim-rows')) return;
+
+  function fmtGiB(bytes) {
+    const gib = bytes / (1024 ** 3);
+    if (gib >= 100) return gib.toFixed(0) + ' GiB';
+    if (gib >= 1) return gib.toFixed(1) + ' GiB';
+    const mib = bytes / (1024 ** 2);
+    return Math.max(0.1, mib).toFixed(1) + ' MiB';
+  }
+
+  function update() {
+    const rowsM = Number(el('sim-rows').value);
+    const rows = rowsM * 1e6;
+    const narrowB = Number(el('sim-narrow').value);
+    const wideB = Number(el('sim-wide').value);
+    const skewPct = Number(el('sim-skew').value);
+    const gw = Number(el('sim-gw').value);
+    const outageMin = Number(el('sim-outage').value);
+
+    const totalRowB = narrowB + wideB;
+    el('val-rows').textContent = rowsM >= 1000 ? (rowsM / 1000).toFixed(1) + 'B rows' : rowsM + 'M rows';
+    el('val-narrow').textContent = narrowB + ' B/row';
+    el('val-wide').textContent = wideB + ' B/row';
+    el('val-skew').textContent = skewPct + '%';
+    el('val-gw').textContent = gw + ' × 32';
+    el('val-outage').textContent = outageMin + ' min';
+
+    // 1. Writer RAM per thread for 122,880 rows vs byte-bounded
+    const defaultRgMiB = Math.round((122880 * totalRowB) / (1024 * 1024));
+    const boundedRgMiB = wideB >= 512 ? 32 : Math.min(64, Math.max(8, defaultRgMiB));
+    el('kpi-ram').textContent = defaultRgMiB + ' MiB → ' + boundedRgMiB + ' MiB';
+    el('kpi-ram-box').className = 'pgvs3-kpi ' + (defaultRgMiB > 128 ? 'bad' : 'good');
+    el('kpi-ram-sub').textContent = defaultRgMiB > 128
+      ? 'Set parquet_row_group_size_bytes = \'' + boundedRgMiB + 'MB\''
+      : 'Default 122,880 rows fits comfortably';
+
+    // 2. Compressed storage (approx 0.42x on narrow + 0.55x on wide with ZSTD level 9)
+    const compNarrow = rows * narrowB * 0.42;
+    const compWide = rows * wideB * 0.55;
+    const totalCompBytes = compNarrow + compWide;
+
+    // 3. Selective 2D bbox + time query (0.1% true match inside hotspot):
+    // Naive (lat, lon) sort scans ~12% of lat stripe across all columns (because lon is unpruned in hotspot)
+    const stripeFrac = 0.08 + (skewPct / 100) * 0.14;
+    const naiveScanBytes = totalCompBytes * stripeFrac;
+    const projScanBytes = (compNarrow * stripeFrac) + (compWide * 0.025);
+    // Hilbert 24-bit quantile row groups scan ~0.8% of narrow column chunks + 0.15% of wide chunks via late materialization
+    const hilbScanBytes = (compNarrow * 0.008) + (compWide * 0.0015);
+    const speedup = Math.max(1, Math.round(naiveScanBytes / Math.max(1, hilbScanBytes)));
+
+    el('kpi-io').textContent = fmtGiB(naiveScanBytes) + ' → ' + fmtGiB(hilbScanBytes);
+    el('kpi-io-sub').textContent = speedup + '× less network & decompression I/O';
+
+    el('bar-naive-txt').textContent = fmtGiB(naiveScanBytes) + ' scanned';
+    el('bar-proj-txt').textContent = fmtGiB(projScanBytes) + ' scanned';
+    el('bar-hilb-txt').textContent = fmtGiB(hilbScanBytes) + ' scanned (' + speedup + '× less I/O)';
+    el('bar-proj').style.width = Math.max(4, Math.min(95, (projScanBytes / Math.max(1, naiveScanBytes)) * 100)).toFixed(1) + '%';
+    el('bar-hilb').style.width = Math.max(2, Math.min(90, (hilbScanBytes / Math.max(1, naiveScanBytes)) * 100)).toFixed(1) + '%';
+
+    // 4. File / partition balance
+    const targetFileCount = Math.max(1, Math.ceil(totalCompBytes / (256 * 1024 * 1024)));
+    el('kpi-files').textContent = skewPct + '% in 1 → ' + targetFileCount + '×256MB';
+    el('kpi-files-sub').textContent = '0 empty ocean files; hotspot splits into equal-byte RGs';
+
+    // 5. Connections
+    const poolMax = 32;
+    const gwConns = ( gw + 1 ) * (poolMax + Math.min(poolMax, 64)); // includes +1 rollout surge gateway
+    const totalConns = gwConns + 36;
+    const recMaxConns = Math.max(256, Math.ceil((totalConns + 32) / 64) * 64);
+    el('kpi-conn').textContent = totalConns + ' / ' + recMaxConns + ' max';
+    el('kpi-conn-box').className = 'pgvs3-kpi ' + (totalConns > 240 ? 'warn' : 'good');
+    el('kpi-conn-sub').textContent = gw + ' (+1 surge) gateways × 64 + 36 app/scanner/admin';
+
+    // 6. Storage + Outbox buffer
+    const outboxBytes = outageMin * 60 * 25 * 1024 * 1024;
+    el('kpi-disk').textContent = fmtGiB(totalCompBytes) + ' + ' + fmtGiB(outboxBytes);
+    el('kpi-disk-sub').textContent = 'Compressed s3b_ chunks + ' + outageMin + 'm s3w_ outage stage';
+
+    // 7. Live SQL & Config snippet
+    const rgSetting = wideB >= 512
+      ? "CALL lake.set_option('parquet_row_group_size_bytes', '" + boundedRgMiB + "MB', table_name => 'events');\nCALL lake.set_option('skip_stats_columns', ['wide_payload'], table_name => 'events');"
+      : "CALL lake.set_option('parquet_row_group_size', 122880, table_name => 'events');";
+
+    el('sim-sql').textContent =
+`-- Tailored for ${el('val-rows').textContent} (${narrowB}B narrow + ${wideB}B wide, ${skewPct}% spatial hotspot skew):
+CREATE TABLE lake.events (
+    id BIGINT, customer_id INTEGER, ts TIMESTAMPTZ,
+    lat DOUBLE, lon DOUBLE, hilbert_id BIGINT${wideB > 0 ? ", wide_payload VARCHAR" : ""}
+)
+-- Omit equal-area spatial PARTITIONED BY under ${skewPct}% skew; let 256MB files & ${boundedRgMiB}MB row groups slice hilbert_id by quantiles:
+SORTED BY (hilbert_id, ts);
+
+CALL lake.set_option('parquet_compression', 'zstd', table_name => 'events');
+CALL lake.set_option('parquet_compression_level', 9, table_name => 'events');
+CALL lake.set_option('target_file_size', '256MB', table_name => 'events');
+${rgSetting}
+-- PostgreSQL connection budget: set max_connections >= ${recMaxConns} for ${gw} gateways (--pool-max ${poolMax}) + 1 rollout surge pod.`;
+  }
+
+  inputs.forEach(id => el(id).addEventListener('input', update));
+  update();
+})();
+</script>
+```
+
+---
+
 ## Visual Atlas of Data Layouts & Movements
 
 ### 1. 8,120-Byte Page Layout & Cut-Through Streaming I/O

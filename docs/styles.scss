@@ -17,3 +17,135 @@ p > img[src$=".svg"] {
 table {
   font-size: 0.93rem;
 }
+
+.pgvs3-sim {
+  background: #0f172a;
+  color: #f8fafc;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  padding: 1.4rem;
+  margin: 1.5rem 0;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+}
+
+.pgvs3-sim-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.2rem;
+}
+
+.pgvs3-sim-ctrl {
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+}
+
+.pgvs3-sim-ctrl label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #cbd5e1;
+  margin-bottom: 0.35rem;
+}
+
+.pgvs3-sim-ctrl label span.val {
+  color: #38bdf8;
+  font-family: $font-family-monospace;
+}
+
+.pgvs3-sim-ctrl input[type="range"] {
+  width: 100%;
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+.pgvs3-sim-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.85rem;
+  margin-bottom: 1.2rem;
+}
+
+.pgvs3-kpi {
+  background: #1e293b;
+  border-left: 4px solid #38bdf8;
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+}
+
+.pgvs3-kpi.good { border-left-color: #10b981; }
+.pgvs3-kpi.warn { border-left-color: #f59e0b; }
+.pgvs3-kpi.bad  { border-left-color: #ef4444; }
+
+.pgvs3-kpi .k-label {
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #94a3b8;
+}
+
+.pgvs3-kpi .k-val {
+  font-size: 1.25rem;
+  font-weight: 700;
+  font-family: $font-family-monospace;
+  color: #f8fafc;
+  margin: 0.2rem 0;
+}
+
+.pgvs3-kpi .k-sub {
+  font-size: 0.78rem;
+  color: #cbd5e1;
+}
+
+.pgvs3-bars {
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 0.9rem 1rem;
+  margin-bottom: 1rem;
+}
+
+.pgvs3-bar-row {
+  margin-bottom: 0.65rem;
+}
+
+.pgvs3-bar-row:last-child {
+  margin-bottom: 0;
+}
+
+.pgvs3-bar-hdr {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.82rem;
+  margin-bottom: 0.25rem;
+  color: #e2e8f0;
+}
+
+.pgvs3-bar-track {
+  background: #090d16;
+  height: 14px;
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.pgvs3-bar-fill {
+  height: 100%;
+  border-radius: 7px;
+  transition: width 0.2s ease;
+}
+
+.pgvs3-sql-out {
+  background: #090d16;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  font-family: $font-family-monospace;
+  font-size: 0.8rem;
+  color: #a7f3d0;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 0;
+}

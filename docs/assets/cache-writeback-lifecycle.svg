@@ -1,142 +1,119 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 590" role="img" aria-labelledby="cache-title cache-desc">
-  <title id="cache-title">Shared Origin Cache, Coalesced Cold Fills and Ack-First Write-Back Outbox</title>
-  <desc id="cache-desc">Animated diagram showing three origin-backed flows: coalesced cold fills into s3c_, aligned range caching for Parquet column chunks, and ack-first durable write-back into s3w_ and s3p.pending_uploads with background outbox drain.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 450" role="img" aria-labelledby="cache-title cache-desc">
+  <title id="cache-title">Shared Origin Cache and Ack-First Write-Back Outbox Swimlanes</title>
+  <desc id="cache-desc">Three clean horizontal swimlanes showing Coalesced Cold Fill, Aligned Parquet Range Cache, and Ack-First Durable Write-Back Outbox.</desc>
   <defs>
-    <linearGradient id="bg3" x1="0" y1="0" x2="1" y2="1">
+    <linearGradient id="bg-c" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#0b1120"/>
       <stop offset="100%" stop-color="#172033"/>
     </linearGradient>
-    <marker id="m-cyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="mc" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
     </marker>
-    <marker id="m-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="mg" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
     </marker>
-    <marker id="m-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="ma" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/>
     </marker>
   </defs>
   <style>
-    .bg { fill: url(#bg3); }
-    .lane { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10; }
-    .step { fill: #0f172a; stroke: #475569; stroke-width: 1.3; rx: 8; }
-    .step-warn { fill: #1c1917; stroke: #f59e0b; stroke-width: 1.8; rx: 8; }
-    .step-hit { fill: #064e3b; stroke: #10b981; stroke-width: 1.6; rx: 8; }
-    .title { fill: #f8fafc; font: 700 17px 'Inter', system-ui, sans-serif; }
-    .h2 { fill: #e2e8f0; font: 700 13.5px 'Inter', system-ui, sans-serif; }
-    .txt { fill: #cbd5e1; font: 500 11.2px 'Inter', system-ui, sans-serif; }
-    .mono { fill: #7dd3fc; font: 600 10.8px 'JetBrains Mono', monospace; }
-    .f-cyan { stroke: #38bdf8; stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: run 1.4s linear infinite; }
-    .f-green { stroke: #34d399; stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: run 1.4s linear infinite; }
-    .f-amber { stroke: #fbbf24; stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: run 1.6s linear infinite; }
-    @keyframes run { to { stroke-dashoffset: -28; } }
+    .bg { fill: url(#bg-c); }
+    .swim { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10; }
+    .node { fill: #0f172a; stroke: #475569; stroke-width: 1.4; rx: 8; }
+    .node-hit { fill: #064e3b; stroke: #10b981; stroke-width: 1.6; rx: 8; }
+    .node-stage { fill: #1c1917; stroke: #f59e0b; stroke-width: 1.8; rx: 8; }
+    .title { fill: #f8fafc; font: 700 16px 'Inter', system-ui, sans-serif; }
+    .lane-title { fill: #e2e8f0; font: 700 12.5px 'Inter', system-ui, sans-serif; }
+    .h4 { fill: #f8fafc; font: 700 12px 'Inter', system-ui, sans-serif; }
+    .sub { fill: #94a3b8; font: 500 10.8px 'Inter', system-ui, sans-serif; }
+    .mono { fill: #7dd3fc; font: 600 10.5px 'JetBrains Mono', monospace; }
+    .fc { stroke: #38bdf8; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: mv 1.3s linear infinite; }
+    .fg { stroke: #34d399; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: mv 1.3s linear infinite; }
+    .fa { stroke: #fbbf24; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: mv 1.5s linear infinite; }
+    @keyframes mv { to { stroke-dashoffset: -28; } }
     @media (prefers-reduced-motion: reduce) {
-      .f-cyan, .f-green, .f-amber { animation: none; }
+      .fc, .fg, .fa { animation: none; }
     }
   </style>
 
-  <rect width="1080" height="590" class="bg" rx="14"/>
-  <text x="28" y="34" class="title">Origin-Backed Shared Cache (s3c_) &amp; Durable Write-Back Stage (s3w_) Movements</text>
-  <text x="28" y="54" class="txt">Rebuildable read fills vs non-expiring pending acknowledged bodies · Version-fenced publication · Cross-gateway &amp; standby hits</text>
+  <rect width="1040" height="450" class="bg" rx="14"/>
+  <text x="28" y="34" class="title">Origin Cache (s3c_) &amp; Durable Write-Back Stage (s3w_) Swimlanes</text>
 
-  <!-- Lane 1: Coalesced Cold Fill & Cross-Gateway Shared Hit -->
-  <rect x="28" y="72" width="1024" height="154" class="lane"/>
-  <text x="44" y="94" class="h2" fill="#38bdf8">Flow 1 — Cold Whole-Object Miss, Lease-Coalesced Fill &amp; Shared Cross-Gateway Hit</text>
+  <!-- Swimlane 1: Cold Fill -->
+  <rect x="28" y="52" width="984" height="116" class="swim"/>
+  <text x="44" y="74" class="lane-title" fill="#38bdf8">1. Coalesced Cold Fill → Replicated Cross-Gateway HIT</text>
 
-  <rect x="44" y="108" width="215" height="102" class="step"/>
-  <text x="56" y="127" class="mono" fill="#38bdf8">1. Cold Miss on Gateway A</text>
-  <text x="56" y="145" class="txt">• Acquires s3p.cache_fill_leases</text>
-  <text x="56" y="161" class="txt">  (2m renewable owner token)</text>
-  <text x="56" y="177" class="txt">• Concurrent Gateway B waiters</text>
-  <text x="56" y="193" class="txt">  poll replicated s3c_ row</text>
+  <rect x="44" y="86" width="210" height="68" class="node"/>
+  <text x="56" y="108" class="h4">1. Lease Ownership</text>
+  <text x="56" y="125" class="mono">s3p.cache_fill_leases</text>
+  <text x="56" y="141" class="sub">1 gateway fetches; peers wait</text>
 
-  <rect x="292" y="108" width="235" height="102" class="step"/>
-  <text x="304" y="127" class="mono" fill="#fbbf24">2. Single-GET Spool (No DB Tx)</text>
-  <text x="304" y="145" class="txt">• 1 origin GET fetches body+ETag</text>
-  <text x="304" y="161" class="txt">• ≤8 MiB in RAM; &gt;8 MiB spools to</text>
-  <text x="304" y="177" class="txt">  --spool-dir (8 GiB byte guard)</text>
-  <text x="304" y="193" class="txt">• Zero DB conn held during download</text>
+  <rect x="288" y="86" width="210" height="68" class="node"/>
+  <text x="300" y="108" class="h4">2. Spool Outside DB Tx</text>
+  <text x="300" y="125" class="mono">--spool-dir (&gt;8 MiB)</text>
+  <text x="300" y="141" class="sub">0 DB conns held on download</text>
 
-  <rect x="560" y="108" width="225" height="102" class="step"/>
-  <text x="572" y="127" class="mono" fill="#c084fc">3. Fenced Publish to s3c_&lt;ns&gt;</text>
-  <text x="572" y="145" class="txt">• Binary COPY 8,120 B chunks</text>
-  <text x="572" y="161" class="txt">• Verifies live fill-lease owner</text>
-  <text x="572" y="177" class="txt">  &amp; expected origin version</text>
-  <text x="572" y="193" class="txt">• Cannot overwrite newer write</text>
+  <rect x="532" y="86" width="210" height="68" class="node"/>
+  <text x="544" y="108" class="h4">3. Version-Fenced Publish</text>
+  <text x="544" y="125" class="mono">s3c_&lt;ns&gt;.chunks (WAL)</text>
+  <text x="544" y="141" class="sub">Checks live owner + ETag</text>
 
-  <rect x="818" y="108" width="218" height="102" class="step-hit"/>
-  <text x="830" y="127" class="mono" fill="#6ee7b7">4. Shared HIT on Gateway B &amp; RO</text>
-  <text x="830" y="145" class="txt">• Gateway B &amp; standby readers</text>
-  <text x="830" y="161" class="txt">  serve X-Cache: HIT within TTL</text>
-  <text x="830" y="177" class="txt">• 0 upstream origin requests</text>
-  <text x="830" y="193" class="mono" fill="#a7f3d0">Post-TTL: HEAD revalidates ETag</text>
+  <rect x="776" y="86" width="220" height="68" class="node-hit"/>
+  <text x="788" y="108" class="h4" fill="#6ee7b7">4. Fleet &amp; Standby HIT</text>
+  <text x="788" y="125" class="mono" fill="#a7f3d0">X-Cache: HIT (0 Origin GETs)</text>
+  <text x="788" y="141" class="sub">Post-TTL: HEAD revalidates</text>
 
-  <path d="M 259 159 L 286 159" class="f-cyan" marker-end="url(#m-cyan)"/>
-  <path d="M 527 159 L 554 159" class="f-amber" marker-end="url(#m-amber)"/>
-  <path d="M 785 159 L 812 159" class="f-green" marker-end="url(#m-green)"/>
+  <path d="M 254 120 L 282 120" class="fc" marker-end="url(#mc)"/>
+  <path d="M 498 120 L 526 120" class="fa" marker-end="url(#ma)"/>
+  <path d="M 742 120 L 770 120" class="fg" marker-end="url(#mg)"/>
 
-  <!-- Lane 2: Aligned Range Cache for Parquet -->
-  <rect x="28" y="242" width="1024" height="142" class="lane"/>
-  <text x="44" y="264" class="h2" fill="#34d399">Flow 2 — Aligned Range Cache (--range-cache-chunk 1048576) for 10 MiB–1 GiB Parquet</text>
+  <!-- Swimlane 2: Aligned Range Cache -->
+  <rect x="28" y="184" width="984" height="116" class="swim"/>
+  <text x="44" y="206" class="lane-title" fill="#34d399">2. Aligned Parquet Range Cache (--range-cache-chunk 1048576)</text>
 
-  <rect x="44" y="278" width="300" height="90" class="step"/>
-  <text x="56" y="297" class="mono" fill="#38bdf8">1. DuckDB Footer &amp; Column-Chunk Range GET</text>
-  <text x="56" y="315" class="txt">• DuckDB reads Parquet footer + projected columns</text>
-  <text x="56" y="331" class="txt">• Unreferenced wide columns are never requested</text>
-  <text x="56" y="347" class="mono" fill="#93c5fd">Range: bytes=start-end</text>
+  <rect x="44" y="218" width="290" height="68" class="node"/>
+  <text x="56" y="240" class="h4">1. DuckDB Footer &amp; Column Range</text>
+  <text x="56" y="257" class="mono">Range: bytes=start-end</text>
+  <text x="56" y="273" class="sub">Skips unprojected wide columns</text>
 
-  <rect x="378" y="278" width="315" height="90" class="step"/>
-  <text x="390" y="297" class="mono" fill="#fbbf24">2. Logged origin_metadata + Aligned Blocks</text>
-  <text x="390" y="315" class="txt">• Caches parent size/ETag/headers in origin_metadata</text>
-  <text x="390" y="331" class="txt">• Stores aligned range chunks in s3c_&lt;ns&gt;</text>
-  <text x="390" y="347" class="txt">• Never mistakes range metadata for a full body</text>
+  <rect x="372" y="218" width="290" height="68" class="node"/>
+  <text x="384" y="240" class="h4">2. Parent Validator + Range Chunks</text>
+  <text x="384" y="257" class="mono">origin_metadata + s3c_ blocks</text>
+  <text x="384" y="273" class="sub">1 MiB aligned slices cached in PG</text>
 
-  <rect x="726" y="278" width="310" height="90" class="step-hit"/>
-  <text x="738" y="297" class="mono" fill="#6ee7b7">3. Warm Range HIT Across Fleet &amp; Standbys</text>
-  <text x="738" y="315" class="txt">• Returns 206 Partial Content (X-Cache: HIT when</text>
-  <text x="738" y="331" class="txt">  all covered aligned blocks are present &amp; fresh)</text>
-  <text x="738" y="347" class="mono" fill="#a7f3d0">Read-only gateways use replayed range blocks</text>
+  <rect x="700" y="218" width="296" height="68" class="node-hit"/>
+  <text x="712" y="240" class="h4" fill="#6ee7b7">3. 206 Partial Content HIT</text>
+  <text x="712" y="257" class="mono" fill="#a7f3d0">Shared across gateways &amp; standbys</text>
+  <text x="712" y="273" class="sub">Reused by subsequent selective scans</text>
 
-  <path d="M 344 323 L 372 323" class="f-cyan" marker-end="url(#m-cyan)"/>
-  <path d="M 693 323 L 720 323" class="f-green" marker-end="url(#m-green)"/>
+  <path d="M 334 252 L 366 252" class="fc" marker-end="url(#mc)"/>
+  <path d="M 662 252 L 694 252" class="fg" marker-end="url(#mg)"/>
 
-  <!-- Lane 3: Ack-First Write-Back & Leased Outbox Drain -->
-  <rect x="28" y="400" width="1024" height="164" class="lane"/>
-  <text x="44" y="422" class="h2" fill="#fbbf24">Flow 3 — Ack-First Durable Write-Back (&gt;8 MiB Unconditional PUT / Multipart) &amp; Leased Outbox Drain</text>
+  <!-- Swimlane 3: Ack-First Write-Back -->
+  <rect x="28" y="316" width="984" height="116" class="swim"/>
+  <text x="44" y="338" class="lane-title" fill="#fbbf24">3. Ack-First Durable Write-Back (&gt;8 MiB PUT / Multipart) → Leased Outbox Drain</text>
 
-  <rect x="44" y="436" width="230" height="112" class="step-warn"/>
-  <text x="56" y="455" class="mono" fill="#fbbf24">1. Atomic Stage in PostgreSQL</text>
-  <text x="56" y="473" class="txt">• Commits body to WAL-logged</text>
-  <text x="56" y="489" class="txt">  s3w_&lt;ns&gt; + s3p.pending_uploads</text>
-  <text x="56" y="505" class="txt">• expires_at IS NULL (never expires</text>
-  <text x="56" y="521" class="txt">  while pending!)</text>
-  <text x="56" y="537" class="mono" fill="#f87171">PG IS SOLE COPY OF RECORD</text>
+  <rect x="44" y="350" width="210" height="68" class="node-stage"/>
+  <text x="56" y="372" class="h4" fill="#fbbf24">1. Atomic PG Commit</text>
+  <text x="56" y="389" class="mono" fill="#fde68a">s3w_ + pending_uploads</text>
+  <text x="56" y="405" class="sub">expires_at IS NULL (Sole Copy!)</text>
 
-  <rect x="304" y="436" width="220" height="112" class="step-hit"/>
-  <text x="316" y="455" class="mono" fill="#6ee7b7">2. Immediate 200 OK + Read HIT</text>
-  <text x="316" y="473" class="txt">• Client receives fast local ACK</text>
-  <text x="316" y="489" class="txt">• Immediately readable on all</text>
-  <text x="316" y="505" class="txt">  gateways &amp; standbys from s3w_</text>
-  <text x="316" y="521" class="txt">• Public content ETag stays stable</text>
-  <text x="316" y="537" class="mono" fill="#a7f3d0">Local wake hint + 1s DB poll</text>
+  <rect x="288" y="350" width="210" height="68" class="node-hit"/>
+  <text x="300" y="372" class="h4" fill="#6ee7b7">2. Fast 200 OK &amp; Read HIT</text>
+  <text x="300" y="389" class="mono" fill="#a7f3d0">Immediate MVCC visibility</text>
+  <text x="300" y="405" class="sub">Stable public content ETag</text>
 
-  <rect x="554" y="436" width="235" height="112" class="step"/>
-  <text x="566" y="455" class="mono" fill="#38bdf8">3. Leased Outbox Upload</text>
-  <text x="566" y="473" class="txt">• Claims pending_uploads (5m lease)</text>
-  <text x="566" y="489" class="txt">• Holds PG session advisory key</text>
-  <text x="566" y="505" class="txt">  lock to serialize per-key order</text>
-  <text x="566" y="521" class="txt">• Uploads with base ETag condition</text>
-  <text x="566" y="537" class="mono" fill="#93c5fd">Retries transient errors w/ backoff</text>
+  <rect x="532" y="350" width="210" height="68" class="node"/>
+  <text x="544" y="372" class="h4">3. Advisory-Locked Upload</text>
+  <text x="544" y="389" class="mono">5m lease + PG key lock</text>
+  <text x="544" y="405" class="sub">Serializes per-key origin order</text>
 
-  <rect x="819" y="436" width="217" height="112" class="step"/>
-  <text x="831" y="455" class="mono" fill="#c084fc">4. Token-Guarded Handoff</text>
-  <text x="831" y="473" class="txt">• Verifies outbox token matches</text>
-  <text x="831" y="489" class="txt">  current object generation</text>
-  <text x="831" y="505" class="txt">• Removes pending row &amp; enables</text>
-  <text x="831" y="521" class="txt">  normal --cache-retention (24h)</text>
-  <text x="831" y="537" class="mono" fill="#34d399">Origin is now Copy of Record</text>
+  <rect x="776" y="350" width="220" height="68" class="node"/>
+  <text x="788" y="372" class="h4" fill="#c084fc">4. Token-Fenced Handoff</text>
+  <text x="788" y="389" class="mono">Origin now Copy of Record</text>
+  <text x="788" y="405" class="sub">Enables normal 24h retention</text>
 
-  <path d="M 274 492 L 298 492" class="f-green" marker-end="url(#m-green)"/>
-  <path d="M 524 492 L 548 492" class="f-cyan" marker-end="url(#m-cyan)"/>
-  <path d="M 789 492 L 813 492" class="f-amber" marker-end="url(#m-amber)"/>
+  <path d="M 254 384 L 282 384" class="fg" marker-end="url(#mg)"/>
+  <path d="M 498 384 L 526 384" class="fc" marker-end="url(#mc)"/>
+  <path d="M 742 384 L 770 384" class="fa" marker-end="url(#ma)"/>
 </svg>
