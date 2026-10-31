@@ -169,6 +169,18 @@ synchronous-commit limit and separate gateway admission results.
 S3 bursts now use a [bounded admission wait](docs/operations.md#admission-control)
 before falling back to overload 503s; scratch-byte admission remains fail-fast.
 
+### SlateDB-backed DuckDB object storage
+
+`just object-storage` compares the pinned `duckdb_object_storage` 0.2.0 community
+extension on DuckDB 2.0 with DuckLake, including default/lean cache and thread
+budgets and separately measured sealed-data reads. Start with
+`just object-storage --object-storage-mib 10,100 --passes 3`.
+See [setup, measurement and endpoint-role limits](docs/object-storage.md).
+The [measured results](docs/object-storage-results.md) separate the useful
+read-mostly sealing optimization from the lean configuration's retained misses.
+SQL read-only ObjFS clients still write managed retention checkpoints, so they
+must use a writable object endpoint; gateway read-only protections remain intact.
+
 ## How it works
 
 ```text

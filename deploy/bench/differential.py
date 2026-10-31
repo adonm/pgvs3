@@ -484,10 +484,29 @@ class Cohort:
         self.output = Path(job["folder"]) / "result.json"
         self.record = {"complete": False, "profile": job["profile"], "target_mib": job["mib"], "pass": job["pass"],
                        "input": job["input"], "events": [], "storage": [], "remote_reads": {}}
-        self.storage = Storage(job)
-        self.con, setup_seconds = connection(job)
+        self.storage = self.storage_observer()
+        self.con, setup_seconds = self.open_connection()
         self.record["client_setup_seconds"] = setup_seconds
         self.flush()
+
+    def storage_observer(self):
+        return Storage(self.job)
+
+    def open_connection(self):
+        return connection(self.job)
+
+    def attach_statement(self):
+        return attach_sql(self.job)
+
+    def call_worker(self, job, action):
+        return worker_call(job, action)
+
+    def durability(self):
+        return {"ducklake": "PostgreSQL catalog + pgvs3 objects", "snapshot": "synchronous snapshot export",
+                "sync": "synchronous WAL shipping"}[self.job["profile"]]
+
+    def after_reads(self, stage):
+        pass
 
     def flush(self):
         save(self.output, self.record)
@@ -513,8 +532,7 @@ class Cohort:
             event["snapshot_id"] = publication[0]
         if mutation:
             event["remote_ack_seconds"] = time.perf_counter() - start
-            event["durability"] = {"ducklake": "PostgreSQL catalog + pgvs3 objects", "snapshot": "synchronous snapshot export",
-                                    "sync": "synchronous WAL shipping"}[self.job["profile"]]
+            event["durability"] = self.durability()
         event["gateway"] = delta(before, gateway_metrics(endpoint))
         self.record["events"].append(event)
         self.flush()
@@ -535,7 +553,7 @@ class Cohort:
         results = {}
         for query in ("scan", "range") if stage != "dropped" else ("sentinel",):
             reader = self.job | {"folder": str(Path(self.job["folder"]) / f"reader-{stage}-{query}"), "stage": stage, "query": query}
-            results[query] = worker_call(reader, "read")
+            results[query] = self.call_worker(reader, "read")
         self.record["remote_reads"][stage] = results
         self.flush()
 
@@ -575,7 +593,7 @@ class Cohort:
     def run(self):
         job = self.job
         self.capture("empty_bucket", attached=False)
-        self.execute("writer_attach", attach_sql(job))
+        self.execute("writer_attach", self.attach_statement())
         if job["profile"] == "ducklake":
             self.con.execute("CALL lake.set_option('data_inlining_row_limit',0)")
         for iteration in range(job["ddl_iterations"]):
@@ -590,6 +608,7 @@ class Cohort:
         self.capture("loaded")
         checked(list(self.con.execute(f"SELECT {DIGEST} FROM lake.events").fetchone()), job["expected"]["loaded"]["scan"], "writer load")
         self.remote("loaded")
+        self.after_reads("loaded")
         self.execute("ddl_loaded_add", "ALTER TABLE lake.events ADD COLUMN note BIGINT DEFAULT 7", True)
         self.execute("ddl_loaded_rename", "ALTER TABLE lake.events RENAME COLUMN note TO revision", True)
         rows = job["rows"]
@@ -622,14 +641,14 @@ class Cohort:
         return self.record
 
 
-def read_worker(job):
-    con, setup_seconds = connection(job, reader=True)
+def read_worker(job, connect_client=connection, attach_client=attach_sql, stats=differential_stats, stats_key="differential"):
+    con, setup_seconds = connect_client(job, reader=True)
     endpoint = os.environ["PGVS3_TEST_ENDPOINT_B"]
     result = {"complete": False, "client_setup_seconds": setup_seconds, "writer_repository_available": False,
               "queries": [], "external_file_cache": False, "remote_disk_cache_bytes": 0}
     before = gateway_metrics(endpoint)
     start = time.perf_counter()
-    con.execute(attach_sql(job, reader=True))
+    con.execute(attach_client(job, reader=True))
     result["attach_seconds"] = time.perf_counter() - start
     result["attach_gateway"] = delta(before, gateway_metrics(endpoint))
     successful_requests(result["attach_gateway"])
@@ -667,7 +686,7 @@ def read_worker(job):
         checked(actual, (7, 7, 0), "remote schema default")
         result["revision_check_outside_timing"] = list(actual)
     if job["profile"] != "ducklake":
-        result["differential"] = differential_stats(con)
+        result[stats_key] = stats(con)
     con.execute("DETACH lake")
     con.close()
     result["client"] = inventory(Path(job["folder"]) / "client")
@@ -688,7 +707,7 @@ def reference(con, source, rows, commits):
     return result
 
 
-def summarize(cohorts, failures=()):
+def summarize(cohorts, failures=(), profiles=PROFILES):
     timings = {}
     unavailable = {(failure["target_mib"], failure["profile"]) for failure in failures}
     for cohort in cohorts:
@@ -705,18 +724,18 @@ def summarize(cohorts, failures=()):
                     timings.setdefault((cohort["target_mib"], stage + "_" + query + "_" + sample["state"], cohort["profile"]), []).append(sample["seconds"])
     cases = []
     for size, operation in sorted({(key[0], key[1]) for key in timings}):
-        missing = [profile for profile in PROFILES if (size, operation, profile) not in timings]
+        missing = [profile for profile in profiles if (size, operation, profile) not in timings]
         if any((size, profile) not in unavailable for profile in missing):
             raise RuntimeError(f"Missing a comparable profile for {size}/{operation}")
-        medians = {profile: statistics.median(timings[size, operation, profile]) if profile not in missing else None for profile in PROFILES}
+        medians = {profile: statistics.median(timings[size, operation, profile]) if profile not in missing else None for profile in profiles}
         if any(not math.isfinite(value) or value <= 0 for values in
-               (timings.get((size, operation, profile), []) for profile in PROFILES) for value in values):
+               (timings.get((size, operation, profile), []) for profile in profiles) for value in values):
             raise RuntimeError("Invalid timing sample")
         cases.append({"target_mib": size, "operation": operation, "median_seconds": medians,
-                      "samples": {profile: len(timings.get((size, operation, profile), [])) for profile in PROFILES},
+                       "samples": {profile: len(timings.get((size, operation, profile), [])) for profile in profiles},
                       "unavailable_profiles": missing,
-                      "relative_to_ducklake": {profile: medians[profile] / medians["ducklake"] if medians[profile] is not None else None for profile in PROFILES[1:]},
-                      "within_20pct_latency_budget": {profile: medians[profile] is not None and medians[profile] <= medians["ducklake"] * 1.2 for profile in PROFILES[1:]}})
+                      "relative_to_ducklake": {profile: medians[profile] / medians["ducklake"] if medians[profile] is not None else None for profile in profiles[1:]},
+                      "within_20pct_latency_budget": {profile: medians[profile] is not None and medians[profile] <= medians["ducklake"] * 1.2 for profile in profiles[1:]}})
     return cases
 
 

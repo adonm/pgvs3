@@ -22,6 +22,11 @@ Two benchmark harnesses are included in the repository:
   is the shortcut. See [provisioning and comparison contracts](differential.md).
   [Recorded findings](differential-results.md) separate client performance from
   gateway retry avoidance and retain unsupported workloads explicitly.
+  `just object-storage` uses the same cohort workflow for the signed SlateDB
+  ObjFS client; [its method](object-storage.md) keeps cache/thread tuning,
+  live-writer reads, sealing costs and read-only endpoint limits distinct.
+  [ObjFS results](object-storage-results.md) retain both the sealing benefit and
+  the lean profile's per-path budget misses rather than declaring an aggregate win.
 
 Both harnesses start disposable PostgreSQL 18 containers on loopback. The direct
 matrix uses `shared_buffers=1GB` and pool 128; paired runs use pool 32 per binary

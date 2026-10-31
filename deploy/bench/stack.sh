@@ -7,11 +7,11 @@ case "$mode" in contract | analytics | fault | interop | s3t | bench) ;; *) echo
 test_run "$mode"
 [ "$mode" != analytics ] || test_keep_artifacts=true
 parts=${2:-s3,compat,tuning}
-if [[ ",$parts," = *,differential,* ]]; then test_keep_artifacts=true; fi
+if [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then test_keep_artifacts=true; fi
 
 shared_buffers=1GB
 [ "$mode" = fault ] && shared_buffers=256MB
-if [ "$mode" = bench ] && [[ ",$parts," = *,differential,* ]]; then
+if [ "$mode" = bench ] && [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then
   test_postgres "$shared_buffers" "" -c max_wal_size=4GB
 else
   test_postgres "$shared_buffers"
@@ -50,6 +50,12 @@ export PGVS3_TEST_ENDPOINT_A="http://127.0.0.1:$port_a"
 export PGVS3_TEST_ENDPOINT_B="http://127.0.0.1:$port_b"
 export PGVS3_TEST_PID_A="${test_pids[0]}"
 export PGVS3_TEST_PID_B="${test_pids[1]}"
+
+if [ "$mode" = bench ] && [[ ",$parts," = *,object-storage,* ]]; then
+  ro_port=$(test_port)
+  test_start_gateway objfs-ro "$PGVS3_TEST_DB_URL" "$ro_port" --read-only --pool-max 8 --log-level warn
+  export PGVS3_TEST_ENDPOINT_RO="http://127.0.0.1:$ro_port"
+fi
 
 if [ "$mode" = contract ] || [ "$mode" = analytics ] || [ "$mode" = fault ]; then
   primary_container=$PGVS3_TEST_PG_CONTAINER primary_port=$PGVS3_TEST_PG_PORT primary_url=$PGVS3_TEST_DATABASE_URL
@@ -100,8 +106,9 @@ bench)
   if [ "$#" -ge 2 ]; then shift 2; else shift; fi
   out=.tmp/pgvs3/bench.json
   if [[ ",$parts," = *,differential,* ]]; then out="$PGVS3_TEST_RUN_DIR/differential.json"; fi
+  if [[ ",$parts," = *,object-storage,* ]]; then out="$PGVS3_TEST_RUN_DIR/object-storage.json"; fi
   mise exec uv -- uv run --quiet --no-project --with "duckdb==${DUCKDB_PY:-2.0.0}" \
     python deploy/bench/duck_bench.py --parts "$parts" --out "$out" "$@"
   ;;
 esac > "$PGVS3_TEST_RUN_DIR/suite.log" 2>&1
-if [ "$mode" = analytics ] || [[ ",$parts," = *,differential,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi
+if [ "$mode" = analytics ] || [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi

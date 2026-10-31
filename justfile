@@ -136,6 +136,18 @@ differential-setup *args:
 differential *args:
     bash deploy/bench/stack.sh bench differential "$@"
 
+# Cache the signed, checksum-pinned SlateDB object-storage extension for DuckDB 2.0.
+[group('dev')]
+[positional-arguments]
+object-storage-setup *args:
+    mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python deploy/bench/object_storage.py setup "$@"
+
+# Compare ObjFS defaults and bounded cache/thread budgets with DuckLake.
+[group('bench')]
+[positional-arguments]
+object-storage *args:
+    bash deploy/bench/stack.sh bench object-storage "$@"
+
 # Direct gateway benchmark: small/large PUT/GET, ranges, listings and OJS queues.
 [group('bench')]
 [positional-arguments]

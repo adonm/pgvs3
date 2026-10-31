@@ -123,6 +123,13 @@ CI, while the real-client/recovery/reclamation experiment is explicit. See
 [differential.md](docs/differential.md) for durable-ACK comparison rules, retained
 negative fencing evidence and upstream artifact expiry.
 
+`just object-storage` reuses that analytical cohort workflow for the pinned
+SlateDB client and measures default/lean budgets and live/sealed readers. Its
+small remote-WAL process-death proof is reused by the required contract on
+DuckDB 2.0, replacing the older 1.5.6 same-process toy. See
+[object-storage.md](docs/object-storage.md); SQL read-only clients needing object
+checkpoint writes must not bypass gateway read-only restrictions.
+
 S3 compatibility is **`s3t` only**. The Python `ceph/s3-tests`/tox/pytest path
 was removed deliberately: it required a separate Python toolchain, duplicated
 the Go integration layer, and was slow and Ceph-specific. Do not reintroduce

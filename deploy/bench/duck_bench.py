@@ -11,6 +11,7 @@ Parts:
   compat  DuckLake lifecycle on pgvs3: writer on gateway A, reader on B.
   tuning  DuckLake Parquet row group size / file size vs load and query time.
   differential  opt-in Differential snapshot/sync-WAL comparison with DuckLake.
+  object-storage  SlateDB ObjFS default/lean profiles and sealed-read comparison.
 """
 import argparse
 import hashlib
@@ -294,6 +295,11 @@ def differential(args, run):
     return benchmark(args, run)
 
 
+def object_storage(args, run):
+    from object_storage import run as benchmark
+    return benchmark(args, run)
+
+
 def fixtures(args, run):
     folder = Path(args.out).parent / "payloads"
     paths = [folder / f"{kind}-{mib}MiB.{extension}" for mib in args.fixture_mib
@@ -344,19 +350,26 @@ def main() -> int:
     p.add_argument("--differential-ddl-iterations", type=int, default=5)
     p.add_argument("--differential-small-commits", type=int, default=5)
     p.add_argument("--differential-timeout", type=int, default=1800)
+    p.add_argument("--object-storage-extension", default=os.environ.get("PGVS3_OBJECT_STORAGE_EXTENSION"))
+    p.add_argument("--object-storage-mib", type=lambda s: [int(x) for x in s.split(",")], default=[10, 100, 1024])
+    p.add_argument("--object-storage-ddl-iterations", type=int, default=5)
+    p.add_argument("--object-storage-small-commits", type=int, default=5)
+    p.add_argument("--object-storage-proof-rows", type=int, default=237000)
+    p.add_argument("--object-storage-settle", type=float, default=1)
+    p.add_argument("--object-storage-timeout", type=int, default=1800)
     args = p.parse_args()
     run = "r" + uuid.uuid4().hex[:12]
-    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures, "differential": differential}
+    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures, "differential": differential, "object-storage": object_storage}
     record = {"duckdb": duckdb.__version__, "cores": os.cpu_count(), "run": run}
-    if "differential" in args.parts.split(",") and Path(args.out).exists():
-        p.error("Differential evidence must use a fresh --out path; existing trials are never overwritten")
+    if set(args.parts.split(",")) & {"differential", "object-storage"} and Path(args.out).exists():
+        p.error("Native-client evidence must use a fresh --out path; existing trials are never overwritten")
     for part in args.parts.split(","):
         print(f"=== {part} ===", flush=True)
         record[part] = parts[part](args, run)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(record, f, indent=1)
-    print(json.dumps({k: v for k, v in record.items() if k not in ("tuning", "differential")}, indent=1))
+    print(json.dumps({k: v for k, v in record.items() if k not in ("tuning", "differential", "object-storage")}, indent=1))
     print(f"wrote {args.out}")
     return 1 if record.get("compat", {}).get("failed") or record.get("differential", {}).get("failures") else 0
 

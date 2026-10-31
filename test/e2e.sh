@@ -585,26 +585,5 @@ export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY
        E2E_SECRET=$PGVS3_SECRET_KEY E2E_PG_PORT=$PGVS3_TEST_PG_PORT
 mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py analytics
 
-# --- duckdb-object-storage (1.5.6) on the same gateway ---------------------
-mise exec uv -- uv run --quiet --no-project --with duckdb==1.5.6 python - <<'PY'
-import os, duckdb
-c=duckdb.connect()
-c.execute("INSTALL cache_httpfs FROM community; LOAD cache_httpfs;")
-c.execute("INSTALL duckdb_object_storage FROM community; LOAD duckdb_object_storage;")
-b=os.environ["E2E_BUCKET"]; run=os.environ["E2E_RUN"]; ep=os.environ["E2E_ENDPOINT"][7:]
-c.execute(f"""CREATE OR REPLACE SECRET objfs_s3 (TYPE S3, PROVIDER CONFIG,
- KEY_ID '{os.environ['E2E_KEY']}', SECRET '{os.environ['E2E_SECRET']}',
- REGION 'us-east-1', ENDPOINT '{ep}', USE_SSL false, URL_STYLE 'path',
- SCOPE 's3://{b}/{run}/objfs')""")
-c.execute("SET duckdb_objfs_backend='s3'")
-c.execute(f"SET duckdb_objfs_bucket='{b}'")
-c.execute(f"SET duckdb_objfs_root='{run}/objfs'")
-c.execute("ATTACH 'duckdb_objfs://contract.db' AS o")
-c.execute("CREATE TABLE o.items(i INTEGER, s VARCHAR)")
-c.execute("INSERT INTO o.items VALUES (1,'one'),(2,'two'),(3,'three')")
-c.execute("CHECKPOINT o")
-assert c.execute("SELECT count(*), sum(i) FROM o.items").fetchone()==(3,6)
-c.execute("DETACH o")
-c.execute("ATTACH 'duckdb_objfs://contract.db' AS o (READ_ONLY)")
-assert c.execute("SELECT count(*) FROM o.items").fetchone()[0]==3
-PY
+# --- Signed ObjFS 0.2.0: no-checkpoint process death and fresh remote recovery ---
+mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python deploy/bench/object_storage.py contract
