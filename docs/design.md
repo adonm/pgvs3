@@ -50,7 +50,7 @@ most directly strengthens or proves this model.
 | **PostgreSQL** | One primary (writer) plus streaming standbys. A single database, not multi-primary or sharded. |
 | **Gateway workers** | Multiple stateless workers behind a load balancer. Writable workers connect to the writer endpoint; read-only workers may connect to standbys. |
 | **Reads and lag** | Writable workers read from the primary. Read-only workers on standbys serve reads subject to PostgreSQL replication lag. |
-| **Writes** | Only through writable workers connected to the primary. DuckLake keeps one writer per bucket; many gateway workers share the database, but the lake writer remains single. |
+| **Writes** | Only through writable workers connected to the primary. The locally qualified DuckLake workflow uses one coordinated writer per dataset prefix/catalog; upstream PostgreSQL-catalog DuckLake supports multi-client concurrency. Gateway workers are not a lake writer/failover coordinator. |
 | **Backups** | Physical base backup plus WAL archiving/PITR for production; logical `pg_dump` for export or small deployments. Origin data is backed up separately. See [operations.md](operations.md#backup-and-restore). |
 | **Security** | Trusted network only. Authentication, authorization, TLS termination, audit logging, and per-tenant isolation are permanent non-goals. |
 | **Layout** | Current layout is **v25** (logged parent metadata for range caching, renewable owner-fenced fills, and consolidated PostgreSQL 18 publication SQL, retaining the v23 logged `s3c_`/`s3w_` split and segmented streams). There is no in-place migration path; a layout change requires a fresh database and a re-import. |

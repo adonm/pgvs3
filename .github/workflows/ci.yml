@@ -24,6 +24,8 @@ jobs:
             .tmp/verify/**/*.log
             .tmp/verify/**/analytics.json
             .tmp/verify/**/replication.json
+            .tmp/verify/**/guides.json
+            .tmp/verify/**/canary/**
           include-hidden-files: true
 
   publish:

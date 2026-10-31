@@ -3,15 +3,17 @@ set -euo pipefail
 # shellcheck source=test/harness.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../test/harness.sh"
 mode=${1:-contract}
-case "$mode" in contract | analytics | fault | interop | s3t | bench) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
+case "$mode" in contract | analytics | guides | fault | interop | s3t | bench) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
 test_run "$mode"
-[ "$mode" != analytics ] || test_keep_artifacts=true
+if [ "$mode" = analytics ] || [ "$mode" = guides ]; then test_keep_artifacts=true; fi
 parts=${2:-s3,compat,tuning}
 if [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then test_keep_artifacts=true; fi
 
 shared_buffers=1GB
 [ "$mode" = fault ] && shared_buffers=256MB
-if [ "$mode" = bench ] && [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then
+if [ "$mode" = guides ] || [ "$mode" = contract ]; then
+  test_postgres "$shared_buffers" "" -c shared_preload_libraries=pg_stat_statements
+elif [ "$mode" = bench ] && [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then
   test_postgres "$shared_buffers" "" -c max_wal_size=4GB
 else
   test_postgres "$shared_buffers"
@@ -57,7 +59,7 @@ if [ "$mode" = bench ] && [[ ",$parts," = *,object-storage,* ]]; then
   export PGVS3_TEST_ENDPOINT_RO="http://127.0.0.1:$ro_port"
 fi
 
-if [ "$mode" = contract ] || [ "$mode" = analytics ] || [ "$mode" = fault ]; then
+if [ "$mode" = contract ] || [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = fault ]; then
   primary_container=$PGVS3_TEST_PG_CONTAINER primary_port=$PGVS3_TEST_PG_PORT primary_url=$PGVS3_TEST_DATABASE_URL
   test_postgres 128MB origin
   export PGVS3_TEST_ORIGIN_DB_URL=$PGVS3_TEST_DATABASE_URL
@@ -73,6 +75,9 @@ contract)
   ;;
 analytics)
   mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py analytics
+  ;;
+guides)
+  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py guides
   ;;
 fault)
   bash test/fault.sh
@@ -111,4 +116,4 @@ bench)
     python deploy/bench/duck_bench.py --parts "$parts" --out "$out" "$@"
   ;;
 esac > "$PGVS3_TEST_RUN_DIR/suite.log" 2>&1
-if [ "$mode" = analytics ] || [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi
+if [ "$mode" = analytics ] || [ "$mode" = guides ] || [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi

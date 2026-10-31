@@ -113,6 +113,11 @@ contract:
 analytics:
     bash deploy/bench/stack.sh analytics
 
+# Bound SQL/API workload recipes and failure windows in the existing disposable fixture.
+[group('test')]
+guides:
+    bash deploy/bench/stack.sh guides
+
 # DuckLake compatibility: writer on one gateway, reader on the other.
 [group('test')]
 ducklake:

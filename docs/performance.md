@@ -152,25 +152,23 @@ for provider limits, TTLs, tombstones, retries and spool sizing.
   makes dead-tuple space reusable. Long-running snapshots hold back vacuum
   horizon; avoid multi-hour open transactions on the storage database.
 
-## Recommended DuckDB / DuckLake client settings
+## Tuning DuckDB / DuckLake clients
 
-File/row-group layout and client caches can dominate analytics speed. These are
-benchmark starting points, not universal production defaults:
+File layout, projection and client caches can dominate analytics speed. Use the
+[executable extraction/configuration recipe](guides/analytics.md) and
+`just bench tuning`, not a universal 8,192-row/64 MB preset. Small row groups can
+help selective pruning but hurt scan/compression/request overhead; file targets
+are not exact physical sizes. Persisted catalog options affect future writes,
+and tiny DuckLake inserts can be inlined in the catalog rather than creating
+objects. The guide tests both configuration syntax and inlining/flush behavior;
+it does not declare that candidate the fastest layout.
 
-```sql
--- Configure once per DuckLake catalog before loading data
-CALL lake.set_option('parquet_compression', 'zstd');
-CALL lake.set_option('parquet_version', 2);
-CALL lake.set_option('parquet_row_group_size', 8192);
-CALL lake.set_option('target_file_size', '64MB');
-
--- Safe because lake files are immutable
-SET parquet_metadata_cache = true;
-```
-
-DuckDB 2.0+ also caches remote file slices in its own `external_file_cache` by
-default. Keep that client cache distinct from pgvs3's shared PostgreSQL rows when
-labeling a result cold or warm.
+DuckDB 2.0 Parquet uses async I/O. Inspect `async_threads`, read-ahead and HTTP
+pool capacity as well as execution `threads`, and budget aggregate client
+pressure against gateway/cluster limits. Its remote-file and Parquet metadata
+caches are client-private, not pgvs3 shared PostgreSQL rows. Disable both when
+attributing shared hits; use fresh processes for a genuinely fresh native-client
+cache. See [measurement labels](guides/observe-recover.md#measure-without-mislabeling).
 
 ## Companion paths
 

@@ -587,3 +587,6 @@ mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/dat
 
 # --- Signed ObjFS 0.2.0: no-checkpoint process death and fresh remote recovery ---
 mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python deploy/bench/object_storage.py contract
+
+# Workload guides are executable snippets, using this same disposable fixture.
+mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py guides

@@ -478,5 +478,361 @@ def analytics():
     print("DuckLake: native and origin-backed tables reopened through gateway B; catalog/object commits remain separate", flush=True)
 
 
+def guides():
+    import duckdb
+    from documentation import GUIDES, check_links, snippets
+
+    assert RUN.resolve().parent == (ROOT / ".tmp/verify").resolve(), "guide mutations require the disposable harness"
+    assert urlsplit(DATABASE).hostname == "127.0.0.1"
+    assert not (RUN / "guides.json").exists(), "never overwrite an earlier guide trial"
+    blocks = snippets()
+    evidence = {"complete": False, "checks": [], "snippets": {}, "links": check_links(),
+                "postgres": sql("SHOW server_version"), "duckdb": duckdb.__version__,
+                "scope": "functional snippets/failure windows, not performance acceptance or production isolation",
+                "gateway_sha256": hashlib.sha256(Path(BIN).read_bytes()).hexdigest(),
+                "documents": {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                              for path in GUIDES.glob("*.md") if path.name != "validation.md"},
+                "tools": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+                          for name in ("test/data_plane.py", "test/documentation.py", "test/harness.sh", "test/e2e.sh",
+                                       "test/loadgen/main.go", "deploy/bench/capacity.py", "deploy/bench/stack.sh", "justfile")}}
+    env = dict(os.environ, PGVS3_URL=DATABASE, PGVS3_ENDPOINT=A, PGVS3_ORIGIN_ENDPOINT=ORIGIN,
+               PSQL=PSQL, PATH=str(RUN) + os.pathsep + os.environ["PATH"], PGVS3_GUIDE_DURATION="2s")
+
+    def save():
+        (RUN / "guides.json").write_text(json.dumps(evidence, indent=2, default=str) + "\n")
+
+    def record(name, **values):
+        evidence["checks"].append({"name": name, **values})
+        save()
+        print(f"guides: {name}", flush=True)
+
+    def source(name, language):
+        block = blocks[name]
+        assert block["language"] == language, name
+        row = evidence["snippets"].setdefault(name, {key: block[key] for key in ("path", "language", "sha256")} | {"uses": 0})
+        row["uses"] += 1
+        save()
+        return block["source"]
+
+    def pg(name, database=DATABASE):
+        output = sql(source(name, "sql"), database)
+        (RUN / f"guide-{name}-{evidence['snippets'][name]['uses']}.log").write_text(output + "\n")
+        return output
+
+    def script(name, language="sh", endpoint=A, want=0):
+        code = source(name, language)
+        argv = ["bash", "-euc", code] if language == "sh" else [sys.executable, "-c", code]
+        result = subprocess.run(argv, cwd=RUN, env=env | {"PGVS3_ENDPOINT": endpoint},
+                                capture_output=True, text=True, timeout=90)
+        log = RUN / f"guide-{name}-{evidence['snippets'][name]['uses']}.log"
+        log.write_text(result.stdout + result.stderr)
+        assert result.returncode == want, (name, result.returncode, f"see {log}")
+        return result.stdout
+
+    def api(endpoint, path, body=None, want=200, method=None):
+        method = method or ("GET" if body is None else "POST")
+        _, data = request(endpoint, "/ojs/v1" + path, method,
+                          None if body is None else json.dumps(body).encode(),
+                          {"Content-Type": "application/openjobspec+json"}, want=want)
+        return json.loads(data) if data else None
+
+    def keys(prefix):
+        _, data = request(B, "/guide-analytics?list-type=2&prefix=" + quote(prefix))
+        return sorted(node.text for node in ET.fromstring(data).findall("{*}Contents/{*}Key"))
+
+    def catalog_url():
+        return urlsplit(DATABASE)._replace(path="/ducklake_catalog").geturl()
+
+    def candidate_sql(code, endpoint):
+        return code.replace("ENDPOINT '127.0.0.1:8014'", f"ENDPOINT '{endpoint[7:]}'").replace(
+            "PORT 5432", f"PORT {os.environ['PGVS3_TEST_PG_PORT']}").replace("DATABASE 'pgvs3_bench'", "DATABASE 'pgvs3'")
+
+    save()
+    try:
+        assert sql("SELECT to_regnamespace('guide_app') IS NULL") == "t", "refuse existing application demo data"
+        assert sql("SELECT count(*) FROM s3p.namespaces WHERE name LIKE 'guide-%'") == "0", "refuse existing demo namespaces"
+        sql("CREATE EXTENSION pg_stat_statements")
+        pg("app-fixture")
+        query = source("oltp-plan", "sql").split("\n", 1)[1]
+        before_rows = sql(query)
+        before = json.loads(pg("oltp-plan"))[0]
+        pg("oltp-index")
+        after = json.loads(pg("oltp-plan"))[0]
+        assert sql(query) == before_rows
+        assert [int(line.split("|", 1)[0]) for line in before_rows.splitlines()] == list(range(990042, 800041, -10000))
+        assert "orders_customer_recent" in json.dumps(after)
+        buffers = lambda result: sum(result["Plan"].get(key, 0) for key in ("Shared Hit Blocks", "Shared Read Blocks"))
+        assert buffers(after) < buffers(before)
+        settings = "SELECT json_build_object('work_mem',current_setting('work_mem'),'parallel',current_setting('max_parallel_workers_per_gather'));"
+        scoped = sql(settings + source("local-budgets", "sql") + settings).splitlines()
+        assert scoped[0] == scoped[-1] and "1000000|4999500000" in scoped
+        record("OLTP index and transaction-local budgets", rows=20, index="orders_customer_recent",
+               control_buffers=buffers(before), candidate_buffers=buffers(after),
+               control_plan=before, candidate_plan=after, settings_restored=json.loads(scoped[-1]))
+
+        request(A, "/guide-analytics", "PUT", b"")
+        with duckdb.connect() as writer:
+            writer.execute(candidate_sql(source("extract-setup", "sql"), A))
+            writer.execute(source("extract-copy", "sql"))
+            evidence["extensions"] = writer.execute("SELECT extension_name,extension_version FROM duckdb_extensions() WHERE loaded ORDER BY 1").fetchall()
+        _, body = request(B, "/guide-analytics/orders/snapshot-v1.parquet")
+        assert 10 << 20 <= len(body) <= 1 << 30, len(body)
+        reader, _ = duckdb_session(B, "guide-analytics")
+        try:
+            assert reader.execute(source("extract-check", "sql")).fetchone() == (1000000, 499999500000, 4999500000)
+            assert reader.execute("SELECT sum(length(payload)) FROM read_parquet('s3://guide-analytics/orders/snapshot-v1.parquet')").fetchone() == (32000000,)
+        finally:
+            reader.close()
+        script("extract-manifest")
+        script("extract-manifest", want=22)
+        manifest = json.loads(request(B, "/guide-analytics/current.json")[1])
+        assert manifest["generation"] == "v1" and manifest["rows"] == 1000000
+        sql("UPDATE guide_app.orders SET amount_cents=amount_cents+1 WHERE id=42; DELETE FROM guide_app.orders WHERE id=43")
+        reader, _ = duckdb_session(B, "guide-analytics")
+        try:
+            assert reader.execute(source("extract-check", "sql")).fetchone() == (1000000, 499999500000, 4999500000)
+        finally:
+            reader.close()
+        assert sql("SELECT count(*),sum(amount_cents) FROM guide_app.orders") == "999999|4999499958"
+        record("PostgreSQL extract, immutable generation and conditional discovery", rows=1000000, bytes=len(body),
+               sha256=hashlib.sha256(body).hexdigest(), manifest_repeat_status=412,
+               source_update_and_delete="old extract unchanged; not CDC", client_caches="external file + Parquet metadata disabled")
+
+        probe = RUN / "probe.sql"
+        probe.write_text(source("oltp-canary", "sql"))
+        container = os.environ["PGVS3_TEST_PG_CONTAINER"]
+        subprocess.run(["docker", "exec", container, "mkdir", "/tmp/guide-canary"], check=True)
+        subprocess.run(["docker", "cp", str(probe), container + ":/tmp/guide-canary/probe.sql"], check=True)
+        subprocess.run(["mise", "exec", "go", "--", "go", "build", "-o", str(RUN / "loadgen"), "./test/loadgen"],
+                       cwd=ROOT, check=True, capture_output=True, timeout=120)
+        evidence["loadgen_sha256"] = hashlib.sha256((RUN / "loadgen").read_bytes()).hexdigest()
+        evidence["pgbench"] = subprocess.check_output(["docker", "exec", container, "pgbench", "--version"], text=True, timeout=10).strip()
+        (RUN / "orders.parquet").write_bytes(body)
+        (RUN / "canary").mkdir()
+        canaries = {}
+        for label in ("control", "mixed"):
+            args = ["docker", "exec", container, "pgbench", "-U", "postgres", "-d", "pgvs3", "-n", "-M", "prepared",
+                    "-c", "2", "-j", "2", "-T", "2", "-l", "--log-prefix", "/tmp/guide-canary/" + label,
+                    "-f", "/tmp/guide-canary/probe.sql"]
+            with (RUN / ("guide-pgbench-" + label + ".log")).open("w") as output:
+                process = subprocess.Popen(args, stdout=output, stderr=subprocess.STDOUT)
+                try:
+                    if label == "mixed":
+                        assert process.poll() is None
+                        measured = json.loads(script("mixed-object-load"))
+                        assert measured["errors"] == 0 and measured["requests"] > 0
+                    assert process.wait(timeout=30) == 0
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=10)
+                    copied = subprocess.run(["docker", "cp", container + ":/tmp/guide-canary/.", str(RUN / "canary")], capture_output=True)
+                    assert copied.returncode == 0, "retain raw pgbench logs, including failed trials"
+        for label in ("control", "mixed"):
+            rows = [line.split() for path in (RUN / "canary").glob(label + ".*") for line in path.read_text().splitlines()]
+            assert len(rows) > 20 and all(len(row) >= 6 and row[2].isdigit() for row in rows)
+            canaries[label] = {"logged_transactions": len(rows), "failed_or_skipped": 0, "latency_unit": "microseconds, column 3"}
+        record("same-cluster pgbench + existing object loadgen canary", pgbench=canaries, object_load=measured,
+               duration_seconds=2, performance_gates_evaluated=False,
+               scope="tooling/concurrency smoke on one fixture; not application tail-latency isolation")
+
+        lake_source = candidate_sql(source("lake-options", "sql"), A)
+        writer, _ = duckdb_session(A, "guide-analytics")
+        try:
+            options = writer.execute(lake_source).fetchall()
+            configured = {row[0]: row[2] for row in options}
+            assert {key: configured[key] for key in ("parquet_compression", "parquet_row_group_size", "target_file_size", "data_inlining_row_limit")} == {
+                "parquet_compression": "zstd", "parquet_row_group_size": "122880", "target_file_size": "256000000", "data_inlining_row_limit": "10"}
+            evidence["extensions"] = []
+            for name, version, path in writer.execute("SELECT extension_name,extension_version,install_path FROM duckdb_extensions() WHERE loaded ORDER BY 1").fetchall():
+                artifact = {"name": name, "version": version}
+                if path and Path(path).is_file():
+                    with Path(path).open("rb") as library:
+                        artifact["sha256"] = hashlib.file_digest(library, "sha256").hexdigest()
+                evidence["extensions"].append(artifact)
+            parquet = keys("ducklake/")
+            assert parquet
+            layout = writer.execute("SELECT DISTINCT compression,row_group_num_rows FROM parquet_metadata(?)", ["s3://guide-analytics/" + parquet[0]]).fetchall()
+            assert all(codec == "ZSTD" and 0 < rows <= 122880 for codec, rows in layout), layout
+            inline = source("lake-inlining", "sql")
+            create, flush = inline.split("CALL ducklake_flush_inlined_data", 1)
+            before_keys = keys("ducklake/")
+            assert writer.execute(create).fetchall() == [(42,)]
+            assert keys("ducklake/") == before_keys, "tiny insert should be catalog-only"
+            writer.execute("CALL ducklake_flush_inlined_data" + flush)
+            assert len(keys("ducklake/")) > len(before_keys)
+            assert writer.execute("SELECT * FROM lake.inline_probe").fetchall() == [(42,)]
+        finally:
+            writer.close()
+        reader, _ = duckdb_session(B, "guide-analytics")
+        try:
+            reader.execute(candidate_sql(lake_source.split("CALL lake.set_option", 1)[0], B))
+            assert reader.execute("SELECT count(*),sum(id),sum(length(payload)) FROM lake.orders").fetchone() == (1000000, 499999500000, 32000000)
+            assert reader.execute("SELECT * FROM lake.inline_probe").fetchall() == [(42,)]
+        finally:
+            reader.close()
+        record("DuckLake candidate syntax, inlining/flush and catalog reopen", options=options,
+               parquet_codec_row_groups=layout, inlining="no new object until explicit flush", table_rows=1000000)
+
+        with OriginProxy() as proxy:
+            script("cache-origin-seed")
+            config = json.loads(source("cache-origin-config", "json"))
+            config["config"]["endpoint"] = proxy.endpoint
+            (RUN / "origin.json").write_text(json.dumps(config))
+            script("cache-origin-attach")
+            request(ORIGIN, "/upstream/guide-edge/probe", "PUT", b"guide probe")
+            for endpoint in (A, B):
+                def visible():
+                    try:
+                        return request(endpoint, "/guide-edge/probe")[1] == b"guide probe"
+                    except AssertionError:
+                        return False
+                eventually("guide origin discovery", visible)
+            assert script("cache-read").rstrip().endswith("version-one")
+            reads = proxy.reads("guide-edge", "version.txt")
+            warm = script("cache-read", endpoint=B)
+            assert "x-cache: hit" in warm.lower() and warm.rstrip().endswith("version-one")
+            assert proxy.reads("guide-edge", "version.txt") == reads
+            request(ORIGIN, "/upstream/guide-edge/ranges.parquet", "PUT", body)
+            span = (len(body) - 65536, len(body) - 1)
+            check_body(A, "/guide-edge/ranges.parquet", body, span=span)
+            range_reads = proxy.reads("guide-edge", "ranges.parquet")
+            check_body(B, "/guide-edge/ranges.parquet", body, span=span, cache="HIT")
+            assert proxy.reads("guide-edge", "ranges.parquet") == range_reads
+            with gateway("guide-read-only", DATABASE, read_only=True) as read_only:
+                check_body(read_only, "/guide-edge/version.txt", b"version-one", cache="HIT")
+                assert proxy.reads("guide-edge", "version.txt") == reads
+                request(read_only, "/guide-analytics/rejected", "PUT", b"no", want=403)
+                api(read_only, "/workers/fetch", {"queues": ["guide-jobs"]}, want=403)
+            script("cache-external-change")
+            assert script("cache-read", endpoint=B).rstrip().endswith("version-one")
+            script("cache-revalidate")
+            eventually("guide TTL=0 revalidation", lambda: script("cache-read", endpoint=B).rstrip().endswith("version-two"))
+            record("shared hits, read-only guard and mutable-origin freshness", whole_hit_extra_origin_reads=0,
+                   range_hit_extra_origin_reads=0, stale_inside_ttl=True, revalidated="version-two",
+                   read_only_scope="explicit read-only gateway on primary; physical standby proof is just fault")
+
+            proxy.writes_blocked = True
+            headers, _ = request(A, "/guide-edge/pending.parquet", "PUT", body)
+            assert pending("guide-origin") == 1
+            request(ORIGIN, "/upstream/guide-edge/pending.parquet", want=404)
+            check_body(B, "/guide-edge/pending.parquet", body, cache="HIT", etag=headers["ETag"])
+            assert sql("SELECT expires_at IS NULL FROM \"s3w_guide-origin\".objects WHERE key='guide-edge/pending.parquet'") == "t"
+            assert "guide-origin|1|" in pg("pending-diagnostics")
+            script("demo-cleanup-namespaces", want=1)
+            assert pending("guide-origin") == 1 and "guide-analytics" in sql("SELECT name FROM s3p.namespaces")
+            sys.path.insert(0, str(ROOT / "deploy/bench"))
+            from capacity import Capacity
+            fixtures = SimpleNamespace(args=SimpleNamespace(psql=PSQL), endpoints={"after": A}, sql=lambda side, statement: sql(statement))
+            snapshot = Capacity(fixtures, {}).snapshot("after")
+            assert snapshot["pending"]["rows"] == 1 and snapshot["metrics"]["pgvs3_pending_uploads_bytes"] == len(body)
+            proxy.writes_blocked = False
+            eventually("guide pending body drain", lambda: pending("guide-origin") == 0)
+            check_body(ORIGIN, "/upstream/guide-edge/pending.parquet", body)
+            check_body(B, "/guide-edge/pending.parquet", body, etag=headers["ETag"])
+            record("origin outage, pending-body protection and verified drain", pending_body_nonexpiring=True,
+                   cleanup_refused_pending=True, bytes=len(body), public_etag=headers["ETag"], capacity_while_pending=snapshot)
+
+        pg("outbox-schema")
+        intent = source("outbox-commit", "sql")
+        sql(intent.replace("COMMIT;", "ROLLBACK;"))
+        event_id = "018f0000-0000-7000-8000-000000000042"
+        assert sql("SELECT paid FROM guide_app.orders WHERE id=42") == "f"
+        assert sql("SELECT count(*) FROM guide_app.outbox") == "0"
+        api(A, "/jobs/" + event_id, want=404)
+        sql(intent)
+        assert sql("SELECT paid FROM guide_app.orders WHERE id=42") == "t"
+        api(B, "/jobs/" + event_id, want=404)
+        job = json.loads(sql("SELECT job FROM guide_app.outbox"))
+        api(A, "/jobs", job, want=201)
+        output = json.loads(script("outbox-relay", "python", endpoint=B))
+        assert output["published"] == event_id
+        assert sql("SELECT published_at IS NOT NULL FROM guide_app.outbox") == "t"
+        api(A, "/jobs", {"type": "invalid.args", "args": {}, "queue": "guide-jobs"}, want=400)
+        claim = json.loads(source("job-fetch", "json"))
+        first = api(A, "/workers/fetch", claim)["jobs"]
+        assert len(first) == 1 and first[0]["id"] == event_id
+        pg("job-effect")
+        api(A, "/workers/heartbeat", {"worker_id": "guide-worker", "active_jobs": [event_id],
+                                    "lease_tokens": {event_id: first[0]["lease_token"]}, "visibility_timeout_ms": 1})
+        time.sleep(0.02)
+        second = api(B, "/workers/fetch", claim)["jobs"][0]
+        assert second["id"] == event_id and second["lease_token"] != first[0]["lease_token"] and second["attempt"] == 2
+        stale = api(A, "/workers/ack", {"job_id": event_id, "lease_token": first[0]["lease_token"]}, want=409)
+        assert stale["error"]["code"] == "stale_lease"
+        pg("job-effect")
+        assert sql("SELECT fulfillment_count FROM guide_app.orders WHERE id=42") == "1"
+        api(B, "/workers/ack", {"job_id": event_id, "lease_token": second["lease_token"], "result": {"applied": True}})
+        record("outbox rollback, ambiguous enqueue and effect-before-ACK redelivery", enqueue_reconciliation="POST 409 + GET envelope match",
+               old_lease_status=409, effect_count=1, receipt_count=1, args_object_status=400)
+
+        collision = job | {"id": "018f0000-0000-7000-8000-000000000099", "args": [{"version": 1, "order_id": 99}]}
+        encoded = json.dumps(collision).replace("'", "''")
+        sql(f"INSERT INTO guide_app.outbox(event_id,job) VALUES ('{collision['id']}','{encoded}'::jsonb)")
+        api(A, "/jobs", collision | {"args": [{"version": 99, "order_id": 99}]}, want=201)
+        script("outbox-relay", "python", want=1)
+        assert sql(f"SELECT published_at IS NULL FROM guide_app.outbox WHERE event_id='{collision['id']}'") == "t"
+        api(A, "/jobs/" + collision["id"], method="DELETE")
+        record("relay rejects a mismatched retained UUID", published=False, failure="payload mismatch, not idempotent enqueue success")
+
+        due = api(A, "/jobs", {"type": "guide.scheduled", "args": [], "queue": "guide-jobs", "run_at": "+200ms"}, want=201)["job"]
+        assert due["state"] == "scheduled"
+        start = time.monotonic()
+        scheduled = api(B, "/workers/fetch", claim)["jobs"][0]
+        scheduled_seconds = time.monotonic() - start
+        assert scheduled["id"] == due["id"] and scheduled_seconds < 5
+        api(B, "/workers/nack", {"job_id": scheduled["id"], "lease_token": scheduled["lease_token"], "error": {"retryable": True}})
+        retried = api(A, "/workers/fetch", claim)["jobs"][0]
+        assert retried["id"] == scheduled["id"] and retried["attempt"] == 2
+        api(A, "/workers/ack", {"job_id": retried["id"], "lease_token": retried["lease_token"]})
+        sql(f"UPDATE \"s3q_guide-jobs\".jobs SET completed_at=now()-interval '25 hours' WHERE id='{event_id}' AND state='completed'")
+        def pruned():
+            command("reap", "--url", DATABASE, "--all")
+            return sql(f"SELECT count(*) FROM s3p.job_index WHERE id='{event_id}'") == "0"
+        eventually("guide terminal retention after maintenance-lock contention", pruned)
+        api(A, "/jobs/" + event_id, want=404)
+        api(B, "/jobs", job, want=201)
+        reused = api(A, "/workers/fetch", claim)["jobs"][0]
+        assert reused["id"] == event_id
+        pg("job-effect")
+        assert sql("SELECT fulfillment_count,(SELECT count(*) FROM guide_app.receipts) FROM guide_app.orders WHERE id=42") == "1|1"
+        api(A, "/workers/ack", {"job_id": event_id, "lease_token": reused["lease_token"]})
+        record("lazy scheduled/retry claims and retention-bounded ID reuse", scheduled_without_forced_maintenance=True,
+               scheduled_fetch_seconds=scheduled_seconds,
+               retry_attempt=2, prune_policy="normal 24h retention; fixture advances only its own terminal row's completed_at by 25h",
+               reused_id_status=201, effect_count_after_reuse=1)
+        stream = json.loads(script("stream-roundtrip", "python"))
+        assert stream == {"processed": 2, "redelivered_same_batch": True}
+        assert api(B, "/queues/guide-events/receive", {"consumer": "audit", "max": 100})["count"] == 0
+        record("snapshot stream ceiling, redelivery and ACK", too_small_status=413, **stream)
+
+        script("health-diagnostics")
+        for name in ("settings-diagnostics", "activity-diagnostics", "statements-diagnostics", "storage-diagnostics", "replication-diagnostics"):
+            pg(name)
+        metrics = request(A, "/metrics")[1].decode()
+        for name in ("pgvs3_pg_pool_empty_acquire_wait_seconds_total", "pgvs3_pg_pool_empty_acquire_count_total",
+                     "pgvs3_chunk_pool_empty_acquire_wait_seconds_total", "pgvs3_s3_admission_waiting_requests",
+                     "pgvs3_pending_uploads_bytes", "pgvs3_pending_uploads_oldest_seconds", "pgvs3_spool_peak_bytes"):
+            assert re.search(r"^" + name + r" [0-9.eE+-]+$", metrics, re.M), name
+        help_result = subprocess.run([BIN, "serve", "--help"], capture_output=True, text=True, timeout=30)
+        assert help_result.returncode == 2 and "s3-queue-wait" in help_result.stderr and "default 1s" in help_result.stderr
+        record("PostgreSQL 18 diagnostics, optional pg_stat_statements and actual metric/flag names", metrics_checked=7)
+        script("demo-cleanup-namespaces")
+        pg("demo-cleanup-catalog", catalog_url())
+        pg("demo-cleanup-app")
+        assert sql("SELECT to_regnamespace('guide_app') IS NULL") == "t"
+        assert sql("SELECT count(*) FROM s3p.namespaces WHERE name LIKE 'guide-%'") == "0"
+        assert blocks.keys() == evidence["snippets"].keys(), blocks.keys() - evidence["snippets"].keys()
+        record("guarded owned-demo cleanup", namespace_deletions="only named guide-* / guide_app / guide_lake demo data", snippets=len(blocks))
+        evidence["complete"] = True
+        save()
+        print(f"guides: {len(blocks)} bound snippets, {len(evidence['checks'])} scenario checks passed; evidence: {RUN / 'guides.json'}", flush=True)
+    except BaseException as error:
+        message = re.sub(r"postgres(?:ql)?://[^/\s]+@", "postgres://<redacted>@", str(error))
+        evidence["error"] = {"type": type(error).__name__, "message": message}
+        save()
+        raise
+
+
 if __name__ == "__main__":
-    {"analytics": analytics, "replication": replication}[sys.argv[1]]()
+    {"analytics": analytics, "replication": replication, "guides": guides}[sys.argv[1]]()

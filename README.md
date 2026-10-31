@@ -33,6 +33,9 @@ on-disk compatibility guarantees yet.
 
 ## Start here
 
+- **Optimize a workload:** [task-oriented guides](docs/guides/README.md) for OLTP
+  protection, analytical publication, cache freshness, jobs and recovery. Run
+  `just guides` to execute their SQL/API examples in a disposable stack.
 - **Choose a role:** [PostgreSQL object store or origin-backed cache/stage](#choose-a-storage-role).
 - **Try the main workload:** [Quick start](#quick-start), then
   [write and query Parquet with DuckDB](#use-from-duckdb-20).
@@ -75,7 +78,7 @@ their documented bounds.
 | **Gateway fleet** | Multiple stateless `pgvs3` workers behind a load balancer; all share one PostgreSQL cluster and coordinate through the database. |
 | **PostgreSQL topology** | One primary (writer) plus streaming standbys. A single PostgreSQL database, not sharded or multi-primary. |
 | **Reads** | Writable gateways read from the primary. Read-only gateways (`--read-only`) can serve reads from standbys, subject to replication lag. |
-| **Writes** | Sent to writable gateways connected to the writer endpoint. DuckLake still has one writer per bucket. |
+| **Writes** | Sent to writable gateways connected to the writer endpoint. The qualified DuckLake workflow uses one coordinated writer per dataset prefix/catalog; this is not an upstream DuckLake concurrency limit. |
 | **Coordination** | `s3p.namespaces` catalog, advisory locks, database leases, conditional/version-fenced writes, and database sequences. No local process state is authoritative. |
 | **Backups** | Physical base backup plus WAL archiving/PITR for production clusters; logical `pg_dump` for export or small deployments. Origin data, when using the cache tier, is backed up separately. |
 | **Security** | Trusted network only: no authentication, authorization, TLS termination, audit log, or per-tenant isolation. |
@@ -398,7 +401,7 @@ as `drop --force` do not. Run `pgvs3 <command> --help` for command-specific flag
 | `--pool-max` | `PGVS3_POOL_MAX` | `64` | Main-pool connections per gateway. A separate chunk pool adds up to `min(pool-max, 64)`; size connections for the whole fleet. |
 | `--spool-dir` | `PGVS3_SPOOL_DIR` | unset | Scratch directory for cache fills larger than 8 MiB; empty uses the system temp directory. Put this on local scratch, not a small tmpfs. |
 | `--spool-max-bytes` | `PGVS3_SPOOL_MAX_BYTES` | `8589934592` (8 GiB) | Process-wide disk spool payload byte budget shared by fills, foreground writes and pending uploads. Set below available scratch capacity and above the largest object to spool. Busy admission returns 503; pending work remains logged and retries. |
-| `--db-work-mem` | `PGVS3_DB_WORK_MEM` | `16MB` | PostgreSQL `work_mem` per connection; keep conservative and raise for known heavy reads. |
+| `--db-work-mem` | `PGVS3_DB_WORK_MEM` | `16MB` | Session `work_mem` base per sort/hash operation, not a per-connection memory ceiling; raise only after measuring under concurrency. |
 | `--db-statement-timeout` | `PGVS3_DB_STATEMENT_TIMEOUT` | `5m` | PostgreSQL statement timeout; `0` disables. |
 | `--db-lock-timeout` | `PGVS3_DB_LOCK_TIMEOUT` | `5s` | PostgreSQL lock timeout; `0` disables. |
 | `--db-idle-tx-timeout` | `PGVS3_DB_IDLE_TX_TIMEOUT` | `1m` | PostgreSQL idle-in-transaction timeout; `0` disables. |
@@ -422,7 +425,8 @@ as `drop --force` do not. Run `pgvs3 <command> --help` for command-specific flag
 | `--cache-namespace` | `PGVS3_CACHE_NAMESPACE` | `origin` | Cache namespace holding origin objects. |
 | `--fill-concurrency` | `PGVS3_FILL_CONCURRENCY` | `8` | Process-wide concurrent origin cache fills and pending-upload workers. |
 | `--range-cache-chunk` | `PGVS3_RANGE_CACHE_CHUNK` | `0` | Cache aligned ranges of large objects at this byte size; 0 disables. |
-| `--s3-concurrency` | `PGVS3_S3_CONCURRENCY` | `32` | Concurrent in-flight S3 requests; excess requests get `503 SlowDown` with `Retry-After`. |
+| `--s3-concurrency` | `PGVS3_S3_CONCURRENCY` | `32` | Active S3 requests per gateway; brief excess waits in a bounded queue of at most twice this limit, then `503 SlowDown` with `Retry-After: 1`. |
+| `--s3-queue-wait` | `PGVS3_S3_QUEUE_WAIT` | `1s` | Maximum S3 admission wait; `0` rejects excess immediately. Not durable job admission; disk-spool byte admission remains fail-fast. |
 | `--queue-concurrency` | `PGVS3_QUEUE_CONCURRENCY` | `16` | Concurrent in-flight OJS requests. |
 | `--resp-concurrency` | `PGVS3_RESP_CONCURRENCY` | `32` | Concurrent in-flight RESP batches. |
 | `--job-retention` | `PGVS3_JOB_RETENTION` | `24h` | Keep completed, cancelled and discarded OJS jobs this long before maintenance removes them (`0` = forever). |
@@ -465,7 +469,7 @@ are described in [operations.md](docs/operations.md).
 | --- | --- |
 | **Namespaces** | At most **100 namespaces per database**, counting bucket, read-cache, write-back and queue schemas. `EnsureNamespace` enforces it; `doctor` also reports an over-scale database. |
 | **Bucket capacity** | Each bucket's `chunks` table has PostgreSQL's 32 TiB relation limit (~31.7 TiB of payload); ~17.4 TB per object from chunk indexing. These are format ceilings, not measured production capacity targets. |
-| **Writer model** | One DuckLake writer per bucket and many readers. Scale reads with additional DuckDB workers, writable gateway workers, and read-only gateways on PostgreSQL standbys. |
+| **Writer model** | Locally qualified DuckLake: one coordinated writer per dataset prefix/catalog, many readers. Upstream supports multi-client concurrency; additional writer/failover policies need qualification. [Storage-format choices](docs/guides/analytics.md#choose-an-analytical-storage-format). |
 | **Disk reclamation** | Dropping a bucket unlinks its relations. In a live bucket, reaping/vacuum make dead space reusable; ordinary vacuum may truncate an empty tail but does not guarantee compaction. Use `VACUUM FULL` or `pg_repack` when compaction is required. |
 | **Cache authority** | Origins own committed external objects; PostgreSQL owns pending acknowledged bodies until handoff. External origin changes may remain stale until TTL revalidation. Never discard pending bodies as a disposable cache. |
 | **Delete tombstones** | A write-through delete leaves a thirty-minute tombstone so an in-flight fill cannot resurrect the object. An object recreated directly at the origin may remain hidden through the cache until the tombstone expires; recreating it through pgvs3 replaces it immediately. |
@@ -483,6 +487,7 @@ just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a runni
 just helm-kind  # install the chart on a throwaway kind cluster under restricted Pod Security
 just contract   # end-to-end S3, OJS, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
 just analytics  # maintained README walkthrough, native + origin-backed, disposable
+just guides     # executable workload guides: SQL plans/export, cache, outbox/jobs/streams, diagnostics
 just interop    # rclone, restic, boto3, and DuckLake
 just fault      # gateway/primary loss, real replicas, promotion and pending restore
 just ci         # complete local/CI gate set, including Docker, kind and s3t
@@ -496,6 +501,8 @@ They are quiet on success and retain diagnostics on failure.
 
 Further reading:
 
+- [docs/guides/README.md](docs/guides/README.md) — decision-oriented workload
+  recipes, dated primary sources and executable validation/failure cases
 - [docs/design.md](docs/design.md) — project goals, trust model, multi-worker
   safety invariants, and scope boundaries
 - [docs/roadmap.md](docs/roadmap.md) — current ranked work and acceptance criteria

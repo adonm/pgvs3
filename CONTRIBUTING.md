@@ -67,6 +67,7 @@ just integration # store/queue/cache integration against disposable PostgreSQL 1
 just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
 just analytics  # same README SQL and two-role scenario used by the contract
+just guides     # bound workload-guide snippets and failure-window scenarios
 just interop    # rclone, restic, boto3, and DuckLake
 ```
 
@@ -76,7 +77,8 @@ integration, fuzz, Helm/kind, contract, fault, interop and s3t.
 
 Docker-backed suites share `test/harness.sh`. Each run owns its database container,
 gateway binary, processes and logs under a unique `.tmp/verify/` directory. Passing
-runs print one summary and remove their scratch files. Failed runs keep their
+runs print one summary and normally remove scratch files (guides/analytics retain
+their evidence). Failed runs keep their
 artifacts, print the relevant logs and preserve the failure exit code; GitHub
 uploads the retained logs. Concurrent suites never reuse a gateway binary or log.
 
@@ -109,6 +111,7 @@ Keep one harness per layer. Do not add a second framework for the same job.
 | SQL, store, queues, cache | `just integration` (shared Docker harness) |
 | S3 conformance | `just s3t` (pinned Go port of `ceph/s3-tests`) |
 | Real clients and end-to-end flows | `just contract`, `just interop` |
+| Executable workload guidance | `just guides`, also included in `just contract` using the same data-plane harness |
 | Gateway/primary loss, physical replica replay/promotion, pending restore | `just fault` (same Docker harness) |
 
 `just s3-clients` is an opt-in transport benchmark in the isolated
@@ -147,6 +150,17 @@ S3-origin fixture. Physical-standby checks gate on recovery state and replay LSN
 the old primary/writer fleet is fenced before promotion. The recovery drill uses
 a consistent whole-database logical dump, not a PITR claim. Passing fault runs
 remain quiet; `test_keep_artifacts=true just fault` retains the evidence JSON.
+
+The [workload guides](docs/guides/README.md) bind named SQL/JSON/shell/Python
+snippets to that same scenario runner; `just guides` retains `guides.json`, query
+plans and negative-case evidence. The disposable guide/contract PostgreSQL
+fixture alone preloads optional `pg_stat_statements` for diagnostic examples;
+the gateway still requires no extension. All verification markers must be used,
+and standard-library CI tests check maintained local links, fences and snippet
+syntax. Change the docs and their expected outcomes together, then run the
+guide gate; do not maintain a separate copy of a recipe in a test.
+GitHub's existing failure-artifact upload includes `guides.json`, query/script
+logs and raw pgbench canary logs; research page archives stay local/ignored.
 
 Format code before committing:
 

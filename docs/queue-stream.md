@@ -13,6 +13,12 @@ Both views share the namespace catalog, configuration, quota, autovacuum,
 maintenance pass, `DROP SCHEMA` deletion, and backup boundary. A queue may be
 used as a job queue, a stream, or both; the tables do not interfere.
 
+For runnable producer/worker recipes and failure handling, see
+[jobs, application outboxes and streams](guides/jobs.md). Sharing PostgreSQL
+does not make application SQL + HTTP enqueue/append/ACK atomic. Stable IDs,
+leases, effect receipts and retention are distinct boundaries, not exactly-once
+execution or a supported direct-SQL mutation API.
+
 ## Why one namespace, two views
 
 PgQue's useful idea is not "replace jobs with events". It is that an append-only

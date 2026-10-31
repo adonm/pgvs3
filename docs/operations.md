@@ -4,6 +4,8 @@ PostgreSQL stores the object bytes as well as metadata and coordination state.
 Operate native buckets as durable PostgreSQL data; with an origin, distinguish
 rebuildable read fills from pending acknowledged bodies that may exist only in
 PostgreSQL. See the [authority contracts](design.md#authority-and-acknowledgement-contracts).
+For a task-oriented path with tested examples, use the
+[workload guides](guides/README.md); this page is the deployment/API reference.
 
 ## First run
 
@@ -75,6 +77,13 @@ headroom for rollouts and other clients:
 ```
 max_connections > sum(worker PGVS3_POOL_MAX + min(PGVS3_POOL_MAX, 64)) + operational headroom
 ```
+
+Also count application, DuckDB scanner and catalog pools, HA/monitoring clients,
+reserved PostgreSQL slots and rollout surge workers. This is a connection
+envelope, not memory/CPU isolation. Runtime connections need direct or
+session-compatible pooling because pgvs3 holds session advisory locks; a
+transaction-pooling recommendation for ordinary application SQL does not apply.
+See [fleet sizing and OLTP protection](guides/postgres.md).
 
 Large cache fills spool above 8 MiB to `--spool-dir` (or the system temp
 directory when unset). Point that at local scratch with enough free space;
@@ -533,14 +542,23 @@ schema CHECK constraint for forward compatibility). Enqueue creates a UUIDv7 if
 the client omits `id`; `scheduled_at`/`run_at` in the future creates a
 `scheduled` job. Fetch leases `available`, due `scheduled`/`retryable`, and
 expired-lease rows in one `FOR UPDATE SKIP LOCKED` claim ordered by `priority`
-descending then claim time. Expiry, due promotion and exhausted leases are
-handled by maintenance rather than by every fetch/poll. Completed, cancelled
+descending then claim time. Due work and expired non-exhausted leases are
+eligible **in the claim itself**, without a per-fetch maintenance sweep or a
+required due-promotion pass. Expired jobs are excluded from claims; maintenance
+removes them and discards exhausted expired leases. Completed, cancelled
 and discarded jobs are removed by maintenance after `--job-retention` (default
 `24h`; `0` keeps them forever).
 `nack` with `retryable:false` discards immediately; retryable jobs advance
 `attempt` and `${initial_interval_ms} × coefficient^(attempt-1)` (capped by
 `max_interval_ms`) until `max_attempts`, then become `discarded`. The fetch
 endpoint long-polls up to two seconds when the queue exists but is empty.
+`args` must be a JSON array. A repeated caller UUID in its original queue returns
+`409 conflict`, not payload-matched idempotent success. Keep ID/queue immutable:
+cross-queue ID reuse can surface a global-index storage error instead. After
+retention/deletion the ID may be reused.
+Application SQL and OJS HTTP enqueue/ACK are separate transactions. Use the
+[outbox, reconciliation and idempotent-effect recipe](guides/jobs.md) when bridging
+those boundaries; never mutate generated job tables from application SQL.
 
 Queues are `s3q_<name>` namespaces. The current schema creates the OJS `jobs`
 table, the shared `meta`/config, and the stream log (`stream_events` with three
@@ -834,5 +852,7 @@ The shared HTTP server has a 30-minute read/write deadline by default; OJS uses
 tighter per-request deadlines for its small bodies and responses. Large S3
 transfers can tune `--http-read-timeout` / `--http-write-timeout`. `--max-conns`
 now holds its slot until the connection closes. Together these limits keep an
-OJS backlog or cache storm from occupying all `--pool-max` connections; raise
-them only together with the pool and PostgreSQL `max_connections`.
+unbounded number of client operations from starting backend work, but **do not
+reserve connections or PostgreSQL resources for OLTP**. OJS, S3, RESP, background
+work and chunk reads can still compete for the pools and cluster. Inspect pool
+waits and [application budgets](guides/postgres.md) before raising concurrency.
