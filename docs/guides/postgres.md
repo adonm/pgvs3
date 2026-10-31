@@ -95,6 +95,35 @@ This ordinary index build is for the demo. On a live application table, plan a
 retrying. Do not add indexes to pgvs3's generated relations or disable scans
 globally: its metadata and chunk pools intentionally use different plans.
 
+## Model OLTP schemas for wide columns and billion-row lifecycle
+
+When a PostgreSQL table grows toward a billion rows or carries wide attributes
+(`TEXT`, `JSONB`, `BYTEA`, embeddings), physical tuple layout dominates buffer-hit
+ratios and vacuum cost:
+
+- **Separate hot narrow state from wide payloads (TOAST boundary):** PostgreSQL
+  pages are 8 KiB and TOAST compresses or moves attributes out-of-line once a
+  tuple crosses roughly 2 KiB (`TOAST_TUPLE_THRESHOLD`). Unchanged out-of-line
+  TOAST values are not rewritten on `UPDATE`, *but* `SELECT *`, wide inline attributes
+  or frequent updates to wide `JSONB` columns still dirty heap/TOAST pages and
+  amplify WAL. Keep frequently updated status/counters and B-tree filter keys in
+  a narrow table, split rarely read wide columns into a 1:1 companion table by
+  primary key, and store multi-MiB blobs or batch extracts in pgvs3 buckets.
+- **Use coarse declarative `RANGE` partitions for retention, not fine cells:**
+  Partition large time-series or append-mostly OLTP tables by a coarse time unit
+  (month, week or day) so expired history can be removed with
+  `ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY` and `DROP TABLE` instead of
+  a bulk `DELETE` + `VACUUM` storm. Keep the partition count in the tens or low
+  hundreds (at most a few thousand): excessive partitions inflate query planning
+  CPU and per-session catalog memory across every connection.
+- **Match the index type to physical correlation:** Use composite B-trees (with
+  `INCLUDE` covering columns) for selective point/prefix lookups, `BRIN`
+  (`timestamptz_minmax_ops` or `box_inclusion_ops`) when rows are physically
+  appended in time/space order and you want a tiny lossy block-range index, or
+  `GiST`/`SP-GiST` when selective 2D spatial lookups must run directly in OLTP.
+  Remember that unique/primary-key constraints on a partitioned PostgreSQL table
+  must include all partition-key columns (and cannot use expression partition keys).
+
 ## Bound a known analytical SQL transaction
 
 Prefer per-transaction changes over a cluster-wide memory increase. In a

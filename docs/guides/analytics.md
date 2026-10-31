@@ -183,6 +183,149 @@ helps your actual small-commit workload. Persistent `set_option` settings affect
 future writes; undo by restoring the saved scoped values, not merely `RESET`ting
 an unrelated session option.
 
+## Schema, wide-column, spatiotemporal and write-for-read modeling
+
+When scaling DuckLake and Parquet on pgvs3 to **billion-row collections**, **wide
+columns**, **spatiotemporal relations**, or **batch-write / fast-read** workloads,
+physical layout determines whether queries scan kilobytes or terabytes.
+
+### 1. Schema and type discipline
+
+- **Use the narrowest native types (`BIGINT`, `INTEGER`, `SMALLINT`, `TIMESTAMPTZ`,
+  `DOUBLE`):** Never store numeric IDs or timestamps as `VARCHAR`. DuckDB bitpacks
+  integers on disk, but in-memory execution vectors, hash tables and sort buffers
+  allocate according to the declared SQL type. Narrow types cut RAM, spill I/O
+  and join CPU.
+- **Prefer ordered integers, timestamps or `UUIDv7` over random `UUIDv4`:**
+  DuckDB and DuckLake rely on file- and row-group-level **zone maps** (`min`/`max`
+  bounds). Random `UUIDv4` values span `[0000…, ffff…]` in every row group, making
+  zone-map pruning useless. Monotonic integers or timestamps (or `UUIDv7` paired
+  with a timestamp filter) keep row-group bounds disjoint.
+- **Encode low-cardinality strings as `ENUM` or integer-keyed dimension tables:**
+  Parquet dictionary-encodes strings on disk, but repeated joins and `GROUP BY`
+  on integer keys execute faster and use less hash memory.
+- **Omit `PRIMARY KEY` / `UNIQUE` constraints on analytical tables:** In native
+  DuckDB tables, constraints build ART indexes that slow bulk loads by 2–4×,
+  consume non-evictable buffer memory, and are not used by joins or aggregations.
+  Enforce uniqueness in the OLTP source or batch deduplication step instead.
+
+### 2. Billion-row collections with wide columns
+
+| Bottleneck on wide tables | Mechanism | Concrete fix |
+| --- | --- | --- |
+| **Row-group memory explosion** | `parquet_row_group_size` defaults to `122880` *rows*. At 8 KiB/row across wide columns, one row group is ~960 MiB uncompressed in writer RAM. | Set `parquet_row_group_size_bytes` (e.g. `'32MB'` to `'128MB'`) or reduce `parquet_row_group_size` (e.g. `16384`–`32768`) on wide tables. |
+| **PostgreSQL catalog bloat** | DuckLake records per-file, per-column `min`/`max` stats in `ducklake_file_column_stats`. Hundreds of wide `VARCHAR`/JSON/blob columns across thousands of files bloat the catalog. | Call `lake.set_option('skip_stats_columns', ['wide_col', ...], table_name => '...')` so min/max bounds are only stored for filter/join columns. |
+| **Unnecessary byte transfers** | `SELECT *` fetches and decompresses every column chunk in matching row groups. | Project only required columns. For top-K or selective lookups needing wide payloads, filter/rank on narrow keys first, then join back by key (**late materialization**). |
+| **Compaction rewrite cost** | Updating or compacting a table rewrites wide blobs alongside narrow metrics. | Split immutable multi-KiB/MiB blobs into a companion table (joined by `id`) or store large blobs as direct pgvs3 objects referenced by key/ETag. |
+
+### 3. Consistent spatiotemporal and multi-dimensional partitioning
+
+Partitioning and sorting solve different problems—confusing them causes small-file
+storms:
+
+- **Keep `PARTITIONED BY` coarse (1D temporal lifecycle):** Partitioning splits
+  each write into separate physical Parquet files per partition key. In DuckLake
+  1.1+, use UTC order-preserving epoch transforms such as `PARTITIONED BY (epoch_day(ts))`
+  or `epoch_month(ts)`—**never** bare `month(ts)` or `day(ts)`, which fold
+  January 2025 and January 2026 into the same partition (`1`). Size the temporal
+  unit so each active partition accumulates at least `64 MiB–512 MiB` of data;
+  never partition directly by fine spatial cells or high-cardinality IDs.
+- **Cluster 2D space + time with `SORTED BY (spatial_cell_id, ts)`:** Sorting by
+  raw `(lat, lon)` orders `lat` but leaves `lon` spanning the entire globe inside
+  every `lat` stripe, so 2D bounding-box queries cannot prune row groups on `lon`.
+  Instead, compute a deterministic 2D locality-preserving cell ID—such as a
+  bit-interleaved Morton (Z-order) key, Hilbert index, H3/S2 cell ID, or quantized
+  grid key—and sort by `(cell_id, ts)` while retaining explicit `lat`/`lon` (or
+  bounding-box `min_x, max_x, min_y, max_y`) columns.
+- **Query with both the coordinate box and the cell range:** File/row-group zone
+  maps prune on `ts`, `cell_id`, `lat` and `lon` before exact geometry predicates
+  run on the surviving rows.
+
+### 4. Trade slow/batch transactions for maximum query performance
+
+When you can batch writes (minutes/hours) to maximize read speed:
+
+1. **Ingest in batches and sort + compress heavily:** Accumulate batches rather
+   than committing tiny files. Either insert pre-sorted batches (`SORTED BY (...)`
+   with `parquet_compression = 'zstd'` and `parquet_compression_level = 9` to `19`),
+   or set `sort_on_insert = false` during fast micro-batch ingest and let the
+   batch compaction step sort the merged output.
+2. **Compact and rewrite before serving:** Run `ducklake_flush_inlined_data`,
+   `ducklake_merge_adjacent_files` (which merges small files into sorted
+   `target_file_size` Parquet files without losing snapshot history), and
+   `ducklake_rewrite_data_files` with a low `delete_threshold` so readers pay
+   **zero** merge-on-read positional-delete overhead.
+3. **Pre-compute rollups or seal a native database when joins dominate:** Parquet
+   lacks DuckDB's internal HyperLogLog cardinality statistics. For complex
+   multi-table joins, either materialize batch rollup/denormalized tables in
+   DuckLake, or build a read-mostly native DuckDB database on [ObjFS](../object-storage-results.md)
+   and **cleanly close the writer** (`CHECKPOINT` + `writer.close()`), which
+   flushes SlateDB memtables and cut 1 GiB fresh selective reads **6×** (313 ms →
+   52.6 ms) and full scans **2.2×** (1,026 ms → 476 ms) in our benchmark.
+
+Run this executable spatiotemporal + wide-column + batch-compaction recipe in the
+same DuckLake session:
+
+<!-- verify:lake-spatiotemporal -->
+```sql
+CREATE TABLE lake.spatiotemporal (
+    id BIGINT,
+    ts TIMESTAMPTZ,
+    lat DOUBLE,
+    lon DOUBLE,
+    cell_id BIGINT,
+    wide_payload VARCHAR
+)
+PARTITIONED BY (epoch_day(ts))
+SORTED BY (cell_id, ts);
+
+CALL lake.set_option('skip_stats_columns', ['wide_payload'], table_name => 'spatiotemporal');
+CALL lake.set_option('parquet_row_group_size_bytes', '2MB', table_name => 'spatiotemporal');
+CALL lake.set_option('parquet_compression', 'zstd', table_name => 'spatiotemporal');
+CALL lake.set_option('parquet_compression_level', 9, table_name => 'spatiotemporal');
+
+INSERT INTO lake.spatiotemporal
+SELECT i,
+       TIMESTAMPTZ '2026-10-01 00:00:00+00' + (i % 2) * INTERVAL '1 day' + (i % 3600) * INTERVAL '1 second',
+       (i % 100) * 0.01,
+       ((i // 100) % 100) * 0.01,
+       ((i % 100) // 10) * 10 + (((i // 100) % 100) // 10),
+       repeat(md5(i::VARCHAR), 8)
+FROM range(20000) AS t(i);
+
+INSERT INTO lake.spatiotemporal
+SELECT i + 20000,
+       TIMESTAMPTZ '2026-10-01 00:00:00+00' + (i % 2) * INTERVAL '1 day' + (i % 3600) * INTERVAL '1 second',
+       (i % 100) * 0.01,
+       ((i // 100) % 100) * 0.01,
+       ((i % 100) // 10) * 10 + (((i // 100) % 100) // 10),
+       repeat(md5((i + 20000)::VARCHAR), 8)
+FROM range(20000) AS t(i);
+
+CALL ducklake_merge_adjacent_files('lake', 'spatiotemporal');
+DELETE FROM lake.spatiotemporal WHERE id < 5000;
+CALL ducklake_rewrite_data_files('lake', 'spatiotemporal', delete_threshold => 0.1);
+
+WITH matched AS (
+    SELECT id, cell_id
+    FROM lake.spatiotemporal
+    WHERE ts >= TIMESTAMPTZ '2026-10-01 00:00:00+00'
+      AND ts < TIMESTAMPTZ '2026-10-02 00:00:00+00'
+      AND cell_id = 12
+      AND lat BETWEEN 0.10 AND 0.19
+      AND lon BETWEEN 0.20 AND 0.29
+)
+SELECT count(*) AS rows, min(m.cell_id) AS min_cell, max(length(s.wide_payload)) AS payload_bytes
+FROM matched AS m
+JOIN lake.spatiotemporal AS s USING (id);
+```
+
+**Expected:** `150 | 12 | 256`. The two inserts are partitioned by UTC epoch day,
+sorted by `(cell_id, ts)`, compacted from two files per day into one sorted file
+per day, and rewritten after the delete so readers scan clean ZSTD files. The
+catalog omits `min_value`/`max_value` strings for `wide_payload`, and the query
+demonstrates late materialization on the matched IDs.
+
 DuckLake maintenance (merge/rewrite, expire snapshots, clean old/orphan files),
 pgvs3 reaping and PostgreSQL vacuum are **three distinct stages**. `DROP TABLE`
 is not remote space reclamation. Use the installed extension's maintenance

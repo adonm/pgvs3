@@ -662,17 +662,22 @@ def guides():
             writer.execute("CALL ducklake_flush_inlined_data" + flush)
             assert len(keys("ducklake/")) > len(before_keys)
             assert writer.execute("SELECT * FROM lake.inline_probe").fetchall() == [(42,)]
+            spatio_sql = source("lake-spatiotemporal", "sql")
+            assert writer.execute(spatio_sql).fetchall() == [(150, 12, 256)]
         finally:
             writer.close()
+        assert sql("SELECT count(*) FILTER (WHERE min_value IS NOT NULL OR max_value IS NOT NULL) FROM guide_lake.ducklake_file_column_stats s JOIN guide_lake.ducklake_column c USING (table_id, column_id) WHERE c.column_name='wide_payload'", catalog_url()) == "0"
         reader, _ = duckdb_session(B, "guide-analytics")
         try:
             reader.execute(candidate_sql(lake_source.split("CALL lake.set_option", 1)[0], B))
             assert reader.execute("SELECT count(*),sum(id),sum(length(payload)) FROM lake.orders").fetchone() == (1000000, 499999500000, 32000000)
             assert reader.execute("SELECT * FROM lake.inline_probe").fetchall() == [(42,)]
+            assert reader.execute("WITH matched AS (" + spatio_sql.split("WITH matched AS (", 1)[1]).fetchone() == (150, 12, 256)
         finally:
             reader.close()
-        record("DuckLake candidate syntax, inlining/flush and catalog reopen", options=options,
-               parquet_codec_row_groups=layout, inlining="no new object until explicit flush", table_rows=1000000)
+        record("DuckLake candidate syntax, spatiotemporal/wide-column compaction and catalog reopen", options=options,
+               parquet_codec_row_groups=layout, inlining="no new object until explicit flush",
+               spatiotemporal_late_materialization=[150, 12, 256], wide_payload_minmax_stats_skipped=True, table_rows=1000000)
 
         with OriginProxy() as proxy:
             script("cache-origin-seed")
