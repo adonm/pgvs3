@@ -12,7 +12,7 @@ The [focused roadmap](roadmap.md) ranks physical-replica and WAL/capacity eviden
 ahead of more protocol benchmarks.
 
 For workload selection, freshness, OLTP budgets and executable SQL/API recipes,
-use the [workload guides](guides/README.md). `just guides` validates those recipes
+use the [workload guides](guides/index.md). `just guides` validates those recipes
 in the existing fixture; it is not a third benchmark or performance acceptance.
 
 Two benchmark harnesses are included in the repository:

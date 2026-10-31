@@ -1,12 +1,14 @@
 # Publish analytical snapshots, not repeated OLTP scans
 
-[Guide index](README.md) · Before: [demo source tables](postgres.md) · Next: [cache](cache.md)
+[Guide index](index.md) · Before: [demo source tables](postgres.md) · Next: [cache](cache.md)
 
 **Goal:** extract a deliberate source snapshot once, then run repeated scans on
 Parquet/DuckLake with a measured freshness budget. PostgreSQL remains the OLTP
 system; DuckDB executes the analytical SQL; pgvs3 stores or caches the object
 bytes. This is application-managed materialization, **not built-in CDC**.
 [Research basis](sources.md#analytics-and-object-storage).
+
+![DuckLake Fixed Hash Buckets, 24-Bit Hierarchical Hilbert Curve and Density-Adaptive Row Groups](../assets/spatiotemporal-hilbert-layout.svg)
 
 ## Choose an analytical storage format
 

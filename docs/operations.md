@@ -5,7 +5,7 @@ Operate native buckets as durable PostgreSQL data; with an origin, distinguish
 rebuildable read fills from pending acknowledged bodies that may exist only in
 PostgreSQL. See the [authority contracts](design.md#authority-and-acknowledgement-contracts).
 For a task-oriented path with tested examples, use the
-[workload guides](guides/README.md); this page is the deployment/API reference.
+[workload guides](guides/index.md); this page is the deployment/API reference.
 
 ## First run
 
@@ -619,6 +619,8 @@ development and benchmarks, not production admission control; the normal S3
 limit is `--s3-concurrency`.
 
 ## Cache tier in front of another object store
+
+![Shared Origin Cache, Coalesced Cold Fills and Ack-First Write-Back Outbox](assets/cache-writeback-lifecycle.svg)
 
 Origin configurations live inside PostgreSQL (`s3p.namespaces.attrs["origin"]`
 and `<schema>.meta.attrs`), so gateways remain stateless and need no local

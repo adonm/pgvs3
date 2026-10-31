@@ -1,0 +1,109 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - "*.md"
+    - "guides/*.md"
+    - "proposals/*.md"
+
+website:
+  title: "pgvs3"
+  site-url: https://adonm.github.io/pgvs3
+  description: "PostgreSQL 18 as the high-performance object data plane, shared S3 cache, analytical storage layer and companion queue/stream engine"
+  repo-url: https://github.com/adonm/pgvs3
+  repo-actions: [source, issue]
+  page-navigation: true
+  bread-crumbs: true
+  navbar:
+    background: dark
+    search: true
+    left:
+      - text: "Overview & Atlas"
+        href: index.md
+      - text: "Workload Guides"
+        href: guides/index.md
+      - text: "Architecture & Layout"
+        href: design.md
+      - text: "Operations"
+        href: operations.md
+      - text: "Benchmarks & Evidence"
+        href: benchmarks.md
+    right:
+      - icon: github
+        href: https://github.com/adonm/pgvs3
+        aria-label: GitHub
+  sidebar:
+    style: "docked"
+    search: true
+    collapse-level: 2
+    contents:
+      - text: "Home & Visual Atlas"
+        href: index.md
+      - section: "Workload & Schema Guides"
+        contents:
+          - text: "Decision Tree & Resource Trade-offs"
+            href: guides/index.md
+          - text: "1. Protect OLTP & Partitioning"
+            href: guides/postgres.md
+          - text: "2. DuckLake, Wide Columns & Hilbert"
+            href: guides/analytics.md
+          - text: "3. Shared Cache & Write-Back Staging"
+            href: guides/cache.md
+          - text: "4. Jobs, Outboxes & Streams"
+            href: guides/jobs.md
+          - text: "5. Observe, Diagnose & Recover"
+            href: guides/observe-recover.md
+          - text: "Primary Research Ledger (44 Sources)"
+            href: guides/sources.md
+          - text: "Executable Validation Evidence"
+            href: guides/validation.md
+      - section: "Architecture & Data Layout"
+        contents:
+          - text: "System Architecture & Authority"
+            href: design.md
+          - text: "8 KiB Page Layout & I/O Paths"
+            href: performance.md
+          - text: "Why Chunks Are Unpartitioned"
+            href: partitioning.md
+          - text: "Queue & Stream Model (OJS + PgQue)"
+            href: queue-stream.md
+      - section: "Operations & Production"
+        contents:
+          - text: "Deployment, Pools, Cache & CLI"
+            href: operations.md
+          - text: "Roadmap & Priorities"
+            href: roadmap.md
+      - section: "Benchmarks & Qualification"
+        contents:
+          - text: "Paired Runner & Capacity Method"
+            href: benchmarks.md
+          - text: "Replica Proof & Capacity Ledger"
+            href: data-plane-results.md
+          - text: "v24/v25 Modernization Results"
+            href: modernization-results.md
+          - text: "SlateDB ObjFS Method"
+            href: object-storage.md
+          - text: "SlateDB ObjFS Results (27 Cohorts)"
+            href: object-storage-results.md
+          - text: "DuckDB Differential Method"
+            href: differential.md
+          - text: "DuckDB Differential Results"
+            href: differential-results.md
+      - section: "Historical Design Proposals"
+        contents:
+          - text: "Modernization Review"
+            href: proposals/modernization-review.md
+          - text: "High-Value Improvements"
+            href: proposals/high-value-improvements.md
+          - text: "Hardening Options"
+            href: proposals/hardening-options.md
+
+format:
+  html:
+    theme:
+      light: [cosmo, styles.scss]
+      dark: [darkly, styles.scss]
+    toc: true
+    toc-depth: 3
+    code-copy: true
+    smooth-scroll: true

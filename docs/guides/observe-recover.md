@@ -1,6 +1,6 @@
 # Measure, diagnose and recover
 
-[Guide index](README.md) · [Topology/flag reference](../operations.md)
+[Guide index](index.md) · [Topology/flag reference](../operations.md)
 
 **Goal:** find the constrained layer before turning a knob, and recover the
 complete acknowledgement boundary rather than only its metadata. The SQL below

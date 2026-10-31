@@ -118,6 +118,28 @@ analytics:
 guides:
     bash deploy/bench/stack.sh guides
 
+# Render the consolidated Quarto documentation site and animated SVG atlas into docs/_site.
+[group('dev')]
+docs:
+    mise exec github:quarto-dev/quarto-cli -- quarto render docs
+    touch docs/_site/.nojekyll
+
+# Render and publish the Quarto site to the gh-pages branch.
+[group('dev')]
+docs-publish: docs
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rev=$(git rev-parse --short HEAD)
+    remote=$(git remote get-url origin)
+    rm -rf .tmp/gh-pages
+    cp -a docs/_site .tmp/gh-pages
+    touch .tmp/gh-pages/.nojekyll
+    git -C .tmp/gh-pages init -b gh-pages
+    git -C .tmp/gh-pages add -A
+    git -C .tmp/gh-pages commit -q -m "docs: publish Quarto site ($rev)"
+    git -C .tmp/gh-pages push -f "$remote" gh-pages
+    rm -rf .tmp/gh-pages
+
 # DuckLake compatibility: writer on one gateway, reader on the other.
 [group('test')]
 ducklake:

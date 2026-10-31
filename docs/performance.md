@@ -12,6 +12,8 @@ per-path evidence and the [data-plane proof/capacity ledger](data-plane-results.
 for replica, recovery and resource measurements. The [roadmap](roadmap.md) keeps
 the remaining deployment-specific limits explicit.
 
+![PostgreSQL 8 KiB Page Layout, Binary COPY Ingest and Cut-Through Streaming Read Path](assets/page-layout-io.svg)
+
 ## Storage layout
 
 | Mechanism | How it works |

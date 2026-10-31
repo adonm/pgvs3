@@ -11,7 +11,7 @@ Findings are ranked by risk and effort, not by novelty.
 
 Source paths and line numbers below refer to the reviewed snapshot. Current
 ownership after consolidation is listed in
-[CONTRIBUTING.md](../../CONTRIBUTING.md#package-map).
+[CONTRIBUTING.md](https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#package-map).
 
 Implementation note (2026-10-26): the OJS queue fixes recommended here are
 implemented in layout v14 and carried into v18: fetch uses one lazy claim over

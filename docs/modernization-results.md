@@ -795,6 +795,6 @@ ShellCheck passed. The preserved exploratory matrix completed a 100 ms fixture
 smoke across S3/RESP/OJS/origin modes; high-concurrency saturation errors were
 reported explicitly and were not treated as acceptance results.
 
-The [live file map](../CONTRIBUTING.md#package-map) describes the final structure.
+The [live file map](https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#package-map) describes the final structure.
 Package/build-tag boundaries, the isolated SDK benchmark module, streaming
 algorithms and logged durability/coordination semantics are preserved.

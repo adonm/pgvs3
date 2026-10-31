@@ -5,10 +5,12 @@ import hashlib
 from pathlib import Path
 import re
 from urllib.parse import unquote, urlsplit
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
 GUIDES = ROOT / "docs/guides"
+ASSETS = ROOT / "docs/assets"
 
 
 def snippets():
@@ -76,7 +78,19 @@ def check_links():
                 errors.append(f"{source.relative_to(ROOT)}:{line}: missing path/anchor {match.group(1)}")
     if errors:
         raise ValueError("\n".join(errors))
-    return {"documents": len(paths), "local_links": count, "snippets": len(snippets())}
+    svgs = sorted(ASSETS.glob("*.svg"))
+    if len(svgs) < 5:
+        raise ValueError("Expected at least 5 SVG diagrams in docs/assets")
+    for svg in svgs:
+        ET.parse(svg)
+        body = svg.read_text()
+        if "@keyframes" not in body or "prefers-reduced-motion" not in body:
+            raise ValueError(f"SVG {svg.relative_to(ROOT)} must include CSS animation and prefers-reduced-motion support")
+    quarto_cfg = (ROOT / "docs/_quarto.yml").read_text()
+    for href in re.findall(r"href:\s*([^\s#]+\.md)", quarto_cfg):
+        if not (ROOT / "docs" / href).exists():
+            raise ValueError(f"Missing Quarto href target: docs/{href}")
+    return {"documents": len(paths), "local_links": count, "snippets": len(snippets()), "svgs": len(svgs)}
 
 
 if __name__ == "__main__":

@@ -5,9 +5,11 @@ rows and publication/coordination state. Replaceable Go gateways expose S3/HTTP
 and orchestrate optional origin I/O. PostgreSQL is not merely an index into a
 gateway-local storage system.
 
-For a quick start see [README.md](../README.md); for deployment see
+For a quick start see [index.md](index.md#quick-start); for deployment see
 [operations.md](operations.md); for storage internals and query paths see
 [performance.md](performance.md).
+
+![pgvs3 Data-Plane Architecture and Authority Flow](assets/architecture-flow.svg)
 
 ## Product focus
 
@@ -507,7 +509,7 @@ paths.
 
 ## Scope boundaries
 
-Supported behavior is documented in [README.md](../README.md). The following
+Supported behavior is documented in [index.md](index.md). The following
 are explicitly out of scope and return errors or are ignored by design:
 
 | Area | Out of scope |

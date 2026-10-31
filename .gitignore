@@ -1,4 +1,6 @@
 /.tmp/
+/docs/_site/
+/docs/.quarto/
 *.db
 *.db-journal
 *.db-wal

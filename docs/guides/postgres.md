@@ -1,6 +1,6 @@
 # Protect OLTP while adding pgvs3
 
-[Guide index](README.md) · Next: [analytical snapshots](analytics.md)
+[Guide index](index.md) · Next: [analytical snapshots](analytics.md)
 
 **Goal:** keep short SQL transactions responsive while object ingest, cache fills,
 refreshes and jobs share the cluster. First fix expensive application queries;

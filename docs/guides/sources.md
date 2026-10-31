@@ -1,6 +1,6 @@
 # Research and applicability ledger
 
-[Guide index](README.md) · [Local validation](validation.md)
+[Guide index](index.md) · [Local validation](validation.md)
 
 Primary documentation reviewed **2026-10-31**. These are design/quality
 references, **not systems benchmarked by this documentation change**. Links to

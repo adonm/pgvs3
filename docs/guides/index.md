@@ -6,6 +6,8 @@ make arbitrary application SQL faster, implement CDC or turn PostgreSQL into a
 distributed columnar engine. Start with the path that removes your bottleneck,
 not with every interface enabled.
 
+![pgvs3 Data-Plane Architecture and Authority Flow](../assets/architecture-flow.svg)
+
 ## Decision tree: choose the model and path
 
 ```text
@@ -40,7 +42,7 @@ What is the primary access and mutation contract?
 | Reliably hand committed application work to HTTP workers | [Jobs, outboxes and streams](jobs.md) | Rollbacks enqueue nothing; retries and worker crashes do not duplicate the demonstrated SQL effect. |
 | Diagnose latency, capacity or recovery trouble | [Observe and recover](observe-recover.md) | Identify the constrained resource, preserve acknowledged data and verify recovery before routing traffic. |
 
-For setup use the [quick start](../../README.md#quick-start). For flags/API and
+For setup use the [quick start](../index.md#quick-start). For flags/API and
 topology details use [operations](../operations.md), not a copied deployment
 preset. [Sources](sources.md) records the research behind these decisions;
 [validation](validation.md) separates executable evidence from deployment advice.

@@ -11,6 +11,7 @@ kind = "0.33.0"
 kubectl = "1.37.1"
 rclone = "1.75.2"
 restic = "0.19.1"
+"github:quarto-dev/quarto-cli" = "1.10.20"
 
 # Git hooks and Go quality tools. `mise install` provisions them for hk.
 hk = "2.8.1"

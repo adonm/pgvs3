@@ -19,6 +19,8 @@ does not make application SQL + HTTP enqueue/append/ACK atomic. Stable IDs,
 leases, effect receipts and retention are distinct boundaries, not exactly-once
 execution or a supported direct-SQL mutation API.
 
+![Transactional SQL Outbox, OJS Lease Token State Machine and 3-Segment TRUNCATE Stream Rotation](assets/outbox-jobs-streams.svg)
+
 ## Why one namespace, two views
 
 PgQue's useful idea is not "replace jobs with events". It is that an append-only

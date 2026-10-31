@@ -1,11 +1,13 @@
 # Share object bytes without confusing freshness or authority
 
-[Guide index](README.md) · Before: [analytics](analytics.md) · Next: [jobs](jobs.md)
+[Guide index](index.md) · Before: [analytics](analytics.md) · Next: [jobs](jobs.md)
 
 **Goal:** remove repeated origin byte transfers across workers while keeping the
 copy of record and allowed staleness explicit. pgvs3 is an object-byte cache and
 durable write stage, not an automatic query-result cache or refresh engine.
 [Research basis](sources.md#caches-are-not-interchangeable).
+
+![Shared Origin Cache, Coalesced Cold Fills and Ack-First Write-Back Outbox](../assets/cache-writeback-lifecycle.svg)
 
 ## Select the contract before a TTL
 

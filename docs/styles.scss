@@ -1,0 +1,19 @@
+/*-- scss:defaults --*/
+$font-family-sans-serif: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+$font-family-monospace: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+/*-- scss:rules --*/
+.quarto-figure svg,
+p > img[src$=".svg"] {
+  width: 100%;
+  max-width: 1040px;
+  height: auto;
+  display: block;
+  margin: 1.25rem auto;
+  border-radius: 10px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
+}
+
+table {
+  font-size: 0.93rem;
+}

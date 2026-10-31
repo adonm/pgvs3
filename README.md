@@ -33,7 +33,9 @@ on-disk compatibility guarantees yet.
 
 ## Start here
 
-- **Optimize a workload:** [task-oriented guides](docs/guides/README.md) for OLTP
+- **Published documentation & visual atlas:** [https://adonm.github.io/pgvs3/](https://adonm.github.io/pgvs3/)
+  ([local Quarto source](docs/index.md); build with `just docs`).
+- **Optimize a workload:** [task-oriented guides](docs/guides/index.md) for OLTP
   protection, analytical publication, cache freshness, jobs and recovery. Run
   `just guides` to execute their SQL/API examples in a disposable stack.
 - **Choose a role:** [PostgreSQL object store or origin-backed cache/stage](#choose-a-storage-role).
@@ -501,7 +503,9 @@ They are quiet on success and retain diagnostics on failure.
 
 Further reading:
 
-- [docs/guides/README.md](docs/guides/README.md) — decision-oriented workload
+- [docs/index.md](docs/index.md) — consolidated Quarto site home and animated
+  visual data-plane atlas ([published site](https://adonm.github.io/pgvs3/))
+- [docs/guides/index.md](docs/guides/index.md) — decision-oriented workload
   recipes, dated primary sources and executable validation/failure cases
 - [docs/design.md](docs/design.md) — project goals, trust model, multi-worker
   safety invariants, and scope boundaries

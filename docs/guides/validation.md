@@ -1,6 +1,6 @@
 # Guide validation
 
-[Guide index](README.md) · [Research ledger](sources.md)
+[Guide index](index.md) · [Research ledger](sources.md)
 
 `just guides` is the disposable executable specification for the named snippets
 on these pages. It uses `test/data_plane.py` and `deploy/bench/stack.sh`, the same
@@ -39,10 +39,13 @@ SQL or dependencies were changed.
 ```text
 $ just guides
 guides: 35 bound snippets, 12 scenario checks passed
-guides ok (35s); artifacts: .tmp/verify/guides.YSR72E
+guides ok (35s); artifacts: .tmp/verify/guides.YWTtwr
+
+$ just docs
+Output created: _site/index.html
 
 $ python3 test/documentation.py
-{'documents': 23, 'local_links': 172, 'snippets': 35}
+{'documents': 24, 'local_links': 199, 'snippets': 35, 'svgs': 5}
 
 $ mise exec python -- python -m unittest discover -s deploy/bench -p '*_test.py'
 Ran 24 tests
@@ -59,9 +62,13 @@ OK
 | Jobs | Rollback/no job, lost enqueue reconciliation, mismatched envelope refusal, effect-before-ACK redelivery and stale-token 409. Receipt/effect count stays one even after retained ID removal/reuse. | Permanent uniqueness or exactly-once external work. Retention age is advanced only on one owned fixture row. |
 | Streams | Ceiling 413, same active batch on repeat, ACK then empty receive. | Pagination, job leases on batches or a hard retention/disk cap. |
 
-Canonical report: `.tmp/verify/guides.YSR72E/guides.json`, SHA-256
-`cc57880f7f178d0f7b8ea2111964c06b2dc67aacd18b98b43ac4422046099339`
-(superseding `.tmp/verify/guides.c8g6AD/guides.json`, SHA-256
+Canonical report: `.tmp/verify/guides.YWTtwr/guides.json`, SHA-256
+`45d1c5f70f09c227da6300be5f4b7a09db7a5d337cf2ee469722461852af1123`
+(superseding `.tmp/verify/guides.Roi71e/guides.json`, SHA-256
+`fd4f7d697b8f8f5f85afc2d7a057983326b3e958df0d99f1d489f22c78b0ed8b`,
+`.tmp/verify/guides.YSR72E/guides.json`, SHA-256
+`cc57880f7f178d0f7b8ea2111964c06b2dc67aacd18b98b43ac4422046099339`,
+`.tmp/verify/guides.c8g6AD/guides.json`, SHA-256
 `4f5fd634f3755b6eec59524de47c86873b32d610c713f72398b4d39b35d7b6cd`,
 `.tmp/verify/guides.VLXXPz/guides.json`, SHA-256
 `333b97c06044baac9fa7f5dc904d9fb9c44191ab61dea1d3e8a51b70b8871ad7`, and
@@ -85,7 +92,7 @@ The frozen-source CI run retained integration (44 s), Helm/kind (72 s),
 contract (50 s), fault (91 s), interop (16 s) and s3t (13 s) artifacts. Its embedded
 guide report, `.tmp/verify/contract.E4QASf/guides.json` (SHA-256
 `76a9f5cf74317b49cc1c38e928da81313537ec97a127072611f06a94ffd709ce`), and the
-updated 35-snippet standalone run `.tmp/verify/guides.YSR72E/guides.json` both
+updated 35-snippet standalone run `.tmp/verify/guides.YWTtwr/guides.json` both
 completed with matching source hashes. Full CI transcript:
 `.tmp/guidance-20261031/ci-frozen.log`, SHA-256
 `32c0e44297bde13dac56934b321f8521625a1292b9ba626c49b079bb5a8fc0bf`.

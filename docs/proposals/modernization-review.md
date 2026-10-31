@@ -9,7 +9,7 @@ Reviewed **2026-10-28**, against commit **a879472**, layout **v23**.
 
 Source paths in this historical review refer to that snapshot. Related files
 were subsequently consolidated; see the current file map in
-[CONTRIBUTING.md](../../CONTRIBUTING.md#package-map).
+[CONTRIBUTING.md](https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#package-map).
 
 The capability map below records the pre-implementation review. The subsequent
 implementation uses layout **v24** (the current baseline is **v25**): shared range parent metadata, one-round-trip

@@ -1,12 +1,14 @@
 # Reliable jobs, application outboxes and streams
 
-[Guide index](README.md) · Before: [demo application](postgres.md) · Next: [operations](observe-recover.md)
+[Guide index](index.md) · Before: [demo application](postgres.md) · Next: [operations](observe-recover.md)
 
 **Goal:** bridge a committed application change to OJS without pretending HTTP
 participates in its SQL transaction. Expect retries; make effects idempotent.
 If you need enqueue/completion **inside the caller's SQL transaction**, a library
 with an explicit transaction API (for example River) is a better fit than
 writing pgvs3's internal tables. [Research and differences](sources.md#jobs-and-transaction-boundaries).
+
+![Transactional SQL Outbox, OJS Lease Token State Machine and 3-Segment TRUNCATE Stream Rotation](../assets/outbox-jobs-streams.svg)
 
 ## Choose jobs or streams
 

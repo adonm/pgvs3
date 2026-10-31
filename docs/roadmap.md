@@ -10,7 +10,7 @@ RESP2 and OJS remain bounded companions, not separate product roadmaps.
 
 This is the current focus and evidence map, not an expansion of protocol scope.
 [design.md](design.md) defines the architecture;
-[CONTRIBUTING.md](../CONTRIBUTING.md#change-admission) defines the feature filter.
+[CONTRIBUTING.md](https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#change-admission) defines the feature filter.
 Historical proposals are research, not the active backlog.
 
 ## Starting point

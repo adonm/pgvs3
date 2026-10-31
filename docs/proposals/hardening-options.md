@@ -6,7 +6,7 @@
 > [implementation evidence](../modernization-results.md).
 
 Source paths and line numbers in this historical note refer to the reviewed
-snapshots. See the [current file map](../../CONTRIBUTING.md#package-map).
+snapshots. See the [current file map](https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#package-map).
 
 > Implementation note (2026-10-24): `thanos-io/objstore` has been replaced by a
 > small internal S3/filesystem origin adapter. References to objstore below are

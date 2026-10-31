@@ -151,9 +151,11 @@ the old primary/writer fleet is fenced before promotion. The recovery drill uses
 a consistent whole-database logical dump, not a PITR claim. Passing fault runs
 remain quiet; `test_keep_artifacts=true just fault` retains the evidence JSON.
 
-The [workload guides](docs/guides/README.md) bind named SQL/JSON/shell/Python
+The [workload guides](docs/guides/index.md) bind named SQL/JSON/shell/Python
 snippets to that same scenario runner; `just guides` retains `guides.json`, query
-plans and negative-case evidence. The disposable guide/contract PostgreSQL
+plans and negative-case evidence. `just docs` renders the consolidated Quarto
+documentation site (`docs/_quarto.yml`) and its SVG diagrams into `docs/_site/`.
+The disposable guide/contract PostgreSQL
 fixture alone preloads optional `pg_stat_statements` for diagnostic examples;
 the gateway still requires no extension. All verification markers must be used,
 and standard-library CI tests check maintained local links, fences and snippet
