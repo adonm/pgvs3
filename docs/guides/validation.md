@@ -39,7 +39,7 @@ SQL or dependencies were changed.
 ```text
 $ just guides
 guides: 35 bound snippets, 12 scenario checks passed
-guides ok (36s); artifacts: .tmp/verify/guides.c8g6AD
+guides ok (35s); artifacts: .tmp/verify/guides.YSR72E
 
 $ python3 test/documentation.py
 {'documents': 23, 'local_links': 172, 'snippets': 35}
@@ -54,14 +54,16 @@ OK
 | OLTP access path | Identical 20 IDs; plan root buffer visits 12,436 → 23; candidate uses `orders_customer_recent`. `SET LOCAL` restores `work_mem=4MB` and `max_parallel_workers_per_gather=2`. | Universal index benefit or production p99. Buffers are plan observations, not a throughput ratio. |
 | Extraction | 1,000,000 rows, 23,217,273-byte Parquet; ID/cents/payload aggregates match on B. Source UPDATE/DELETE does not alter the old export. Repeated manifest create is 412. | CDC, cross-system transactions or a bounded age after an undetected failed refresh. |
 | Same-cluster canary | Control and mixed logged SQL transactions, zero failed/skipped; concurrent object GETs, zero errors. | Performance acceptance: two-second runs are explicitly `performance_gates_evaluated:false`. Raw logs remain; the count difference is not a tuning conclusion. |
-| DuckLake layout & fixed-bucket compaction | Persisted candidate options read back; actual ZSTD row groups of 122,880 and 16,960 rows. Fixed 64-cell `PARTITIONED BY (hilbert_bucket)` + `SORTED BY (hilbert_fine, ts)` across 2026 and 2027 batches stays at 64 buckets, merges batches per bucket, rewrites deleted slice, suppresses `min_value`/`max_value` in `ducklake_file_column_stats` for `wide_payload`, and returns `576 | 13 | 256 | 64 | 71` (including the 32-bucket hash table) on A and B via catalog macro `lake.hilbert64`. Tiny insert is catalog-only until flush. | That 256 MB file target or this layout is fastest for every query shape. |
+| DuckLake layout, skewed-hotspot 24-bit Hilbert sort & hash-32 compaction | Persisted candidate options read back; actual ZSTD row groups of 122,880 and 16,960 rows. 90%-skewed NYC hotspot across 2026/2027 sorted by 24-bit hierarchical `hilbert_id` (`lake.hilbert64` catalog macro) merges two batches into one ZSTD file, rewrites deleted slice, suppresses `min_value`/`max_value` in `ducklake_file_column_stats` for `wide_payload`, and returns `3240 | 256 | 72` (including the 32-bucket hash table) on A and B. Tiny insert is catalog-only until flush. | That 256 MB file target or this layout is fastest for every query shape. |
 | Cache/staging | Warm whole/range reads on B add zero origin reads; v1 remains inside TTL, then v2 revalidates. Pending bytes are non-expiring/readable, cleanup refuses them, and origin drain preserves bytes/ETag. | A generic SWR policy, independent capacity or lossless async promotion. |
 | Jobs | Rollback/no job, lost enqueue reconciliation, mismatched envelope refusal, effect-before-ACK redelivery and stale-token 409. Receipt/effect count stays one even after retained ID removal/reuse. | Permanent uniqueness or exactly-once external work. Retention age is advanced only on one owned fixture row. |
 | Streams | Ceiling 413, same active batch on repeat, ACK then empty receive. | Pagination, job leases on batches or a hard retention/disk cap. |
 
-Canonical report: `.tmp/verify/guides.c8g6AD/guides.json`, SHA-256
-`4f5fd634f3755b6eec59524de47c86873b32d610c713f72398b4d39b35d7b6cd`
-(superseding `.tmp/verify/guides.VLXXPz/guides.json`, SHA-256
+Canonical report: `.tmp/verify/guides.YSR72E/guides.json`, SHA-256
+`cc57880f7f178d0f7b8ea2111964c06b2dc67aacd18b98b43ac4422046099339`
+(superseding `.tmp/verify/guides.c8g6AD/guides.json`, SHA-256
+`4f5fd634f3755b6eec59524de47c86873b32d610c713f72398b4d39b35d7b6cd`,
+`.tmp/verify/guides.VLXXPz/guides.json`, SHA-256
 `333b97c06044baac9fa7f5dc904d9fb9c44191ab61dea1d3e8a51b70b8871ad7`, and
 the 34-snippet `.tmp/verify/guides.sUjCDv/guides.json`, SHA-256
 `bdf47490d977c7cbc14c69309b617d06fc5d5a5d6ad0b7abe543f713bf517788`, which
@@ -83,7 +85,7 @@ The frozen-source CI run retained integration (44 s), Helm/kind (72 s),
 contract (50 s), fault (91 s), interop (16 s) and s3t (13 s) artifacts. Its embedded
 guide report, `.tmp/verify/contract.E4QASf/guides.json` (SHA-256
 `76a9f5cf74317b49cc1c38e928da81313537ec97a127072611f06a94ffd709ce`), and the
-updated 35-snippet standalone run `.tmp/verify/guides.c8g6AD/guides.json` both
+updated 35-snippet standalone run `.tmp/verify/guides.YSR72E/guides.json` both
 completed with matching source hashes. Full CI transcript:
 `.tmp/guidance-20261031/ci-frozen.log`, SHA-256
 `32c0e44297bde13dac56934b321f8521625a1292b9ba626c49b079bb5a8fc0bf`.
@@ -105,7 +107,12 @@ vendor binaries or vendor performance tests.
 - `.tmp/verify/guides.GPIO9D`: expected count for `events_hash32` after deleting
   `id < 4096` was written as `72` instead of `71` (`4096 = 8 × 500 + 96`, removing
   9 of the 80 rows for `customer_id = 42`). Fixed the documented expected value
-  and assertion to `71`; failed evidence remains.
+  and assertion; failed evidence remains.
+- `.tmp/verify/guides.BYo7Gd`: a CTE-based `CREATE MACRO lake.spread16` worked in
+  a local DuckDB catalog but failed binder resolution when serialized into a
+  PostgreSQL DuckLake catalog (`ducklake:postgres:`). Replaced it with the
+  pure-scalar `list_extract` macro `lake.hilbert64` applied at 4 hierarchical
+  levels (24-bit = $4,096 \times 4,096$ grid); failed evidence remains.
 - Later successful 32-snippet trials and the expanded 34-snippet canary trial
   remain alongside the canonical run; none replaces or overwrites a failure.
 

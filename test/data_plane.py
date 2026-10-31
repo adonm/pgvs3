@@ -663,7 +663,7 @@ def guides():
             assert len(keys("ducklake/")) > len(before_keys)
             assert writer.execute("SELECT * FROM lake.inline_probe").fetchall() == [(42,)]
             spatio_sql = source("lake-spatiotemporal", "sql")
-            assert writer.execute(spatio_sql).fetchall() == [(576, 13, 256, 64, 71)]
+            assert writer.execute(spatio_sql).fetchall() == [(3240, 256, 72)]
         finally:
             writer.close()
         assert sql("SELECT count(*) FILTER (WHERE min_value IS NOT NULL OR max_value IS NOT NULL) FROM guide_lake.ducklake_file_column_stats s JOIN guide_lake.ducklake_column c USING (table_id, column_id) WHERE c.column_name='wide_payload'", catalog_url()) == "0"
@@ -672,12 +672,12 @@ def guides():
             reader.execute(candidate_sql(lake_source.split("CALL lake.set_option", 1)[0], B))
             assert reader.execute("SELECT count(*),sum(id),sum(length(payload)) FROM lake.orders").fetchone() == (1000000, 499999500000, 32000000)
             assert reader.execute("SELECT * FROM lake.inline_probe").fetchall() == [(42,)]
-            assert reader.execute("WITH matched AS (" + spatio_sql.split("WITH matched AS (", 1)[1]).fetchone() == (576, 13, 256, 64, 71)
+            assert reader.execute("WITH matched AS (" + spatio_sql.split("WITH matched AS (", 1)[1]).fetchone() == (3240, 256, 72)
         finally:
             reader.close()
-        record("DuckLake candidate syntax, fixed-64 Hilbert / hash-32 compaction and catalog reopen", options=options,
+        record("DuckLake candidate syntax, skewed-hotspot 32-bit curve sort / hash-32 compaction and catalog reopen", options=options,
                parquet_codec_row_groups=layout, inlining="no new object until explicit flush",
-               fixed_hilbert_and_hash32=[576, 13, 256, 64, 71], wide_payload_minmax_stats_skipped=True, table_rows=1000000)
+               skewed_curve_and_hash32=[3240, 256, 72], wide_payload_minmax_stats_skipped=True, table_rows=1000000)
 
         with OriginProxy() as proxy:
             script("cache-origin-seed")

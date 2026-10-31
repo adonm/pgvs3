@@ -15,13 +15,14 @@ What is the primary access and mutation contract?
 │       ├── Wide columns (>2 KiB TOAST / blobs)?
 │       │   └── Split hot narrow row from cold payload table, or store multi-MiB blobs in pgvs3
 │       ├── Need 32–64 zero-maintenance partitions across 10M–1B+ rows?
-│       │   └── Fixed HASH(id/tenant_id) or fixed 64-cell Hilbert/Morton prefix (create once, never cron-DDL)
+│       │   └── Fixed HASH(id/tenant_id), or 32–64 quantile RANGE bounds on 1D Hilbert/Morton curve_id (avoids hotspot skew)
 │       └── Only use time RANGE partitions if you must DROP/DETACH whole expired months
 ├── Analytical scans, aggregations, or billion-row history (minutes-to-hours freshness)
 │   └── Extract to Parquet / DuckLake on pgvs3 (docs/guides/analytics.md)
 │       ├── Single-table/snapshot export? ──► Immutable Parquet + conditional manifest
 │       ├── Entity / tenant / ID filters? ──► Fixed PARTITIONED BY (bucket(32..64, id)) + SORTED BY (ts, id)
-│       ├── 2D/spatiotemporal filters? ──► Fixed 64-cell Hilbert prefix PARTITIONED BY (hilbert_bucket) + SORTED BY (hilbert_fine, ts)
+│       ├── 2D/spatiotemporal filters (including skewed hotspots)?
+│       │   └── High-res 32/64-bit Hilbert/Morton SORTED BY (curve_id, ts) (row groups & target_file_size auto-split dense hotspots by row/byte quantiles!)
 │       ├── Billion rows + wide columns? ──► Byte-bounded row groups, skip_stats_columns, late materialization
 │       └── Willing to pay slow/batch writes for peak read speed?
 │           └── Batch sorted ZSTD writes + merge/rewrite compaction (or sealed ObjFS/DuckDB for heavy joins)

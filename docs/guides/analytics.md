@@ -247,19 +247,32 @@ partition maintenance**:
   DuckLake hashes `customer_id` into 32 fixed Murmur3 buckets (`0..31`). Equality
   and `IN` filters on `customer_id` prune 31/32 of the partitions immediately, and
   `SORTED BY (ts, id)` prunes files and row groups by time *within* each bucket.
-- **Strategy B — Fixed 64-Cell 2D Hilbert Curve (`PARTITIONED BY (hilbert_bucket)` + `SORTED BY (hilbert_fine, ts)`):**
-  Hash buckets only prune equality/`IN`, not 2D bounding boxes (`lat BETWEEN … AND lon BETWEEN …`).
-  And sorting by raw `(lat, lon)` orders `lat` while leaving `lon` spanning the
-  entire domain inside every `lat` stripe. Instead, map normalized 2D grid
-  coordinates `(gx, gy)` onto a **Hilbert curve**:
-  - **Coarse 6-bit prefix (`hilbert_bucket` $\in [0..63]$):** an $8 \times 8 = 64$-cell
-    order-3 Hilbert lookup gives **64 fixed partitions forever**, where every step
-    `b -> b + 1` is physically adjacent in 2D space.
-  - **Fine hierarchical Hilbert key (`hilbert_fine`) + `ts`:** `SORTED BY (hilbert_fine, ts)`
-    clusters both 2D space and time inside each of the 64 fixed buckets.
-  - **Query with both the coarse bucket(s) and coordinate box:** DuckLake prunes
-    to the 1–4 touched buckets out of 64, and row-group zone maps prune on
-    `hilbert_fine`, `lat`, `lon` and `ts`.
+- **Strategy B — High-Resolution 2D Hilbert / Morton `SORTED BY (curve_id, ts)` (Density-Adaptive Spatial Pruning):**
+  What happens when spatial density is heavily skewed (e.g., 90% of points in
+  NYC/Tokyo and 10% across oceans/rural areas)?
+  - **The equal-area partition trap:** If you partition by 64 *equal-area* coarse
+    grid cells (`PARTITIONED BY (coarse_cell)`), 1 urban partition gets 90% of all
+    bytes while 50 sparse partitions create tiny `<1 MiB` files on every insert.
+    And if your spatial key is too coarse (e.g. $64 \times 64$), millions of urban
+    rows share the exact same cell ID and cannot prune inside the city.
+  - **Why high-resolution `SORTED BY (curve_id, ts)` is automatically density-adaptive:**
+    Map coordinates to a **high-resolution** 1D space-filling integer—such as a
+    32-bit or 64-bit Hilbert or Morton (`Z-order`) key across a $65,536 \times 65,536$
+    ($4.3 \times 10^9$-cell) grid—and use `SORTED BY (curve_id, ts)` **without**
+    equal-area spatial `PARTITIONED BY`. Because Parquet row groups (`122,880` rows
+    or `parquet_row_group_size_bytes`) and DuckLake files (`target_file_size = '256MB'`)
+    slice the sorted stream by **row/byte count (empirical quantiles)** rather
+    than geographic area:
+    - Sparse rural/ocean regions automatically pack into **one** row group/file
+      (zero tiny-file waste).
+    - Dense urban hotspots automatically split into **many** row groups and files,
+      each covering a tiny neighborhood with razor-sharp `min(lat)..max(lat)` and
+      `min(lon)..max(lon)` zone maps!
+  - **When you also want 32–64 fixed `PARTITIONED BY` buckets on skewed spatial data:**
+    Either partition by an orthogonal entity key (`PARTITIONED BY (bucket(32, tenant_id))`
+    + `SORTED BY (curve_id, ts)`), or partition `curve_id` by **empirical quantiles**
+    (31 or 63 cutpoints from `quantile_disc(curve_id, ...)`) so every bucket holds
+    $\approx 1/32$ or $1/64$ of the rows.
 - **When to still use time partitions (`epoch_day` / `epoch_month`):** Only when
   your dominant operation is dropping whole expired time windows by partition or
   strictly isolating each day's ingest files from older history.
@@ -286,8 +299,8 @@ When you can batch writes (minutes/hours) to maximize read speed:
    flushes SlateDB memtables and cut 1 GiB fresh selective reads **6×** (313 ms →
    52.6 ms) and full scans **2.2×** (1,026 ms → 476 ms) in our benchmark.
 
-Run this executable fixed-64 Hilbert + fixed-32 hash + wide-column + batch-compaction
-recipe in the same DuckLake session:
+Run this executable skewed-hotspot 24-bit hierarchical Hilbert sort + fixed-32
+hash + wide-column + batch-compaction recipe in the same DuckLake session:
 
 <!-- verify:lake-spatiotemporal -->
 ```sql
@@ -301,7 +314,7 @@ CREATE MACRO lake.hilbert64(rx, ry) AS (
         59, 56, 55, 52, 33, 34, 39, 38,
         60, 61, 50, 51, 46, 45, 40, 41,
         63, 62, 49, 48, 47, 44, 43, 42
-    ], ((rx::INTEGER & 7) * 8 + (ry::INTEGER & 7)) + 1)::SMALLINT
+    ], ((rx::INTEGER & 7) * 8 + (ry::INTEGER & 7)) + 1)::BIGINT
 );
 
 CREATE TABLE lake.spatiotemporal (
@@ -310,50 +323,64 @@ CREATE TABLE lake.spatiotemporal (
     ts TIMESTAMPTZ,
     lat DOUBLE,
     lon DOUBLE,
-    hilbert_bucket SMALLINT,
-    hilbert_fine INTEGER,
+    hilbert_id BIGINT,
     wide_payload VARCHAR
 )
-PARTITIONED BY (hilbert_bucket)
-SORTED BY (hilbert_fine, ts);
+SORTED BY (hilbert_id, ts);
 
 CALL lake.set_option('skip_stats_columns', ['wide_payload'], table_name => 'spatiotemporal');
-CALL lake.set_option('parquet_row_group_size_bytes', '2MB', table_name => 'spatiotemporal');
+CALL lake.set_option('parquet_row_group_size_bytes', '1MB', table_name => 'spatiotemporal');
 CALL lake.set_option('parquet_compression', 'zstd', table_name => 'spatiotemporal');
 CALL lake.set_option('parquet_compression_level', 9, table_name => 'spatiotemporal');
 
 INSERT INTO lake.spatiotemporal
-WITH raw AS (
+WITH grid AS (
     SELECT i AS id, (i % 500)::INTEGER AS customer_id,
            TIMESTAMPTZ '2026-10-01 00:00:00+00' + i * INTERVAL '1 minute' AS ts,
-           (i % 64) / 64.0 AS lat, ((i // 64) % 64) / 64.0 AS lon,
-           (i % 64)::INTEGER AS gx, ((i // 64) % 64)::INTEGER AS gy,
+           CASE WHEN i % 10 < 9 THEN 40.70 + (i % 1000) * 0.0001 ELSE 25.0 + (i % 10000) * 0.0025 END AS lat,
+           CASE WHEN i % 10 < 9 THEN -74.02 + ((i // 1000) % 100) * 0.0001 ELSE -125.0 + ((i // 1000) % 100) * 0.055 END AS lon,
            repeat(md5(i::VARCHAR), 8) AS wide_payload
     FROM range(20000) AS t(i)
+),
+quantized AS (
+    SELECT *,
+           ((lat - 25.0) / 25.0 * 4095)::INTEGER AS gx,
+           ((lon + 125.0) / 55.0 * 4095)::INTEGER AS gy
+    FROM grid
 )
 SELECT id, customer_id, ts, lat, lon,
-       lake.hilbert64(gx >> 3, gy >> 3) AS hilbert_bucket,
-       (lake.hilbert64(gx >> 3, gy >> 3)::INTEGER << 6) | lake.hilbert64(gx & 7, gy & 7)::INTEGER AS hilbert_fine,
+       (lake.hilbert64(gx >> 9, gy >> 9) << 18)
+       | (lake.hilbert64(gx >> 6, gy >> 6) << 12)
+       | (lake.hilbert64(gx >> 3, gy >> 3) << 6)
+       | lake.hilbert64(gx, gy) AS hilbert_id,
        wide_payload
-FROM raw;
+FROM quantized;
 
 INSERT INTO lake.spatiotemporal
-WITH raw AS (
+WITH grid AS (
     SELECT i + 20000 AS id, (i % 500)::INTEGER AS customer_id,
            TIMESTAMPTZ '2027-03-01 00:00:00+00' + i * INTERVAL '1 minute' AS ts,
-           (i % 64) / 64.0 AS lat, ((i // 64) % 64) / 64.0 AS lon,
-           (i % 64)::INTEGER AS gx, ((i // 64) % 64)::INTEGER AS gy,
+           CASE WHEN i % 10 < 9 THEN 40.70 + (i % 1000) * 0.0001 ELSE 25.0 + (i % 10000) * 0.0025 END AS lat,
+           CASE WHEN i % 10 < 9 THEN -74.02 + ((i // 1000) % 100) * 0.0001 ELSE -125.0 + ((i // 1000) % 100) * 0.055 END AS lon,
            repeat(md5((i + 20000)::VARCHAR), 8) AS wide_payload
     FROM range(20000) AS t(i)
+),
+quantized AS (
+    SELECT *,
+           ((lat - 25.0) / 25.0 * 4095)::INTEGER AS gx,
+           ((lon + 125.0) / 55.0 * 4095)::INTEGER AS gy
+    FROM grid
 )
 SELECT id, customer_id, ts, lat, lon,
-       lake.hilbert64(gx >> 3, gy >> 3) AS hilbert_bucket,
-       (lake.hilbert64(gx >> 3, gy >> 3)::INTEGER << 6) | lake.hilbert64(gx & 7, gy & 7)::INTEGER AS hilbert_fine,
+       (lake.hilbert64(gx >> 9, gy >> 9) << 18)
+       | (lake.hilbert64(gx >> 6, gy >> 6) << 12)
+       | (lake.hilbert64(gx >> 3, gy >> 3) << 6)
+       | lake.hilbert64(gx, gy) AS hilbert_id,
        wide_payload
-FROM raw;
+FROM quantized;
 
 CALL ducklake_merge_adjacent_files('lake', 'spatiotemporal');
-DELETE FROM lake.spatiotemporal WHERE id < 4096;
+DELETE FROM lake.spatiotemporal WHERE id < 4000;
 CALL ducklake_rewrite_data_files('lake', 'spatiotemporal', delete_threshold => 0.05);
 
 CREATE TABLE lake.events_hash32 (
@@ -366,30 +393,28 @@ INSERT INTO lake.events_hash32
 SELECT customer_id, id, ts FROM lake.spatiotemporal;
 
 WITH matched AS (
-    SELECT id, hilbert_bucket
+    SELECT id, hilbert_id
     FROM lake.spatiotemporal
-    WHERE hilbert_bucket = lake.hilbert64(1, 2)
-      AND lat BETWEEN 0.125 AND 0.249
-      AND lon BETWEEN 0.250 AND 0.374
+    WHERE (hilbert_id >> 18) = lake.hilbert64(5, 7)
+      AND lat BETWEEN 40.7100 AND 40.7199
+      AND lon BETWEEN -74.0200 AND -74.0100
       AND ts >= TIMESTAMPTZ '2026-10-01 00:00:00+00'
 )
 SELECT count(*) AS rows,
-       min(m.hilbert_bucket) AS bucket,
        max(length(s.wide_payload)) AS payload_bytes,
-       (SELECT count(DISTINCT hilbert_bucket) FROM lake.spatiotemporal) AS fixed_buckets,
        (SELECT count(*) FROM lake.events_hash32 WHERE customer_id = 42) AS customer_rows
 FROM matched AS m
 JOIN lake.spatiotemporal AS s USING (id);
 ```
 
-**Expected:** `576 | 13 | 256 | 64 | 71`. Even though the two batch inserts span
-different years (`2026` and `2027`), the table maintains **exactly 64 fixed
-Hilbert partitions** (`0..63`), persists `lake.hilbert64` in the PostgreSQL
-DuckLake catalog so every reader session shares the exact same mapping, merges
-the two batches inside each bucket into one sorted ZSTD file per bucket, rewrites
-the deleted slice so readers pay zero delete-file overhead, suppresses
+**Expected:** `3240 | 256 | 72`. Even though 90% of the 40,000 rows are concentrated
+inside a tiny `0.10° × 0.01°` NYC hotspot across `2026` and `2027`, sorting by the
+24-bit hierarchical `hilbert_id` (4 levels of `lake.hilbert64` across a
+$4,096 \times 4,096 = 16.7\text{M}$-cell grid) subdivides the dense hotspot into
+tight 1 MB row groups without creating empty ocean files, merges the two batches
+into one sorted ZSTD file, rewrites the deleted slice, suppresses
 `min_value`/`max_value` catalog stats on `wide_payload`, and verifies the
-32-bucket hash table (`customer_rows = 71`).
+32-bucket hash table (`72` rows).
 
 DuckLake maintenance (merge/rewrite, expire snapshots, clean old/orphan files),
 pgvs3 reaping and PostgreSQL vacuum are **three distinct stages**. `DROP TABLE`
