@@ -120,8 +120,21 @@ ducklake:
 
 # DuckDB S3 benchmark, DuckLake compatibility and row-group tuning.
 [group('bench')]
-bench parts="s3,compat,tuning":
-    bash deploy/bench/stack.sh bench '{{ parts }}'
+[positional-arguments]
+bench parts="s3,compat,tuning" *args:
+    bash deploy/bench/stack.sh bench "$@"
+
+# Cache the pinned experimental Differential release; no global DuckDB INSTALL.
+[group('dev')]
+[positional-arguments]
+differential-setup *args:
+    mise exec python -- python deploy/bench/differential.py setup "$@"
+
+# Compare Differential snapshot/sync-WAL profiles with DuckLake on disposable pgvs3.
+[group('bench')]
+[positional-arguments]
+differential *args:
+    bash deploy/bench/stack.sh bench differential "$@"
 
 # Direct gateway benchmark: small/large PUT/GET, ranges, listings and OJS queues.
 [group('bench')]

@@ -152,6 +152,23 @@ The catalog database here is `ducklake_catalog`; pgvs3 uses `pgvs3_bench`.
 transactions and pgvs3 object publications are **separate transactions**, not a
 distributed transaction made atomic by co-location.
 
+### Experimental native DuckDB storage with Differential
+
+`just differential` compares pinned [DuckDB Differential](https://github.com/tobilg/duckdb-differential)
+snapshot/synchronous-WAL profiles against DuckLake in the same disposable setup.
+Start smaller with `just differential --differential-mib 10,100 --passes 3`.
+
+Differential has a client-local repository; an S3 data path alone does not make
+each commit PostgreSQL-backed. Its compact call reclaims local SQLite metadata,
+not the entire storage pipeline. It also requires an externally fenced single
+writer: the negative recovery probe demonstrates that snapshot-head conditions
+are not a global WAL-writer fence. See [setup, boundaries and benchmark method](docs/differential.md).
+This is additive; DuckLake and the standard storage roles remain unchanged.
+See the [measured findings](docs/differential-results.md), including the large
+synchronous-commit limit and separate gateway admission results.
+S3 bursts now use a [bounded admission wait](docs/operations.md#admission-control)
+before falling back to overload 503s; scratch-byte admission remains fail-fast.
+
 ## How it works
 
 ```text

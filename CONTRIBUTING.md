@@ -116,6 +116,13 @@ Keep one harness per layer. Do not add a second framework for the same job.
 the gateway module or enter its production binary. It is not another S3
 conformance harness and does not establish full replacement compatibility.
 
+`just differential` is an opt-in part of the existing DuckDB benchmark and Docker
+harness. It pins an experimental external client only; no dependency enters the
+gateway binary or default CI contract. Its standard-library tooling tests run in
+CI, while the real-client/recovery/reclamation experiment is explicit. See
+[differential.md](docs/differential.md) for durable-ACK comparison rules, retained
+negative fencing evidence and upstream artifact expiry.
+
 S3 compatibility is **`s3t` only**. The Python `ceph/s3-tests`/tox/pytest path
 was removed deliberately: it required a separate Python toolchain, duplicated
 the Go integration layer, and was slow and Ceph-specific. Do not reintroduce

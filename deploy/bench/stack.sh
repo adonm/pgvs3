@@ -6,10 +6,16 @@ mode=${1:-contract}
 case "$mode" in contract | analytics | fault | interop | s3t | bench) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
 test_run "$mode"
 [ "$mode" != analytics ] || test_keep_artifacts=true
+parts=${2:-s3,compat,tuning}
+if [[ ",$parts," = *,differential,* ]]; then test_keep_artifacts=true; fi
 
 shared_buffers=1GB
 [ "$mode" = fault ] && shared_buffers=256MB
-test_postgres "$shared_buffers"
+if [ "$mode" = bench ] && [[ ",$parts," = *,differential,* ]]; then
+  test_postgres "$shared_buffers" "" -c max_wal_size=4GB
+else
+  test_postgres "$shared_buffers"
+fi
 for db in pgvs3 ducklake_catalog; do
   docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db" \
     >> "$PGVS3_TEST_RUN_DIR/postgres-start.log" 2>&1
@@ -84,9 +90,18 @@ s3t)
   ;;
 bench)
   mkdir -p .tmp/pgvs3
+  if [[ ",$parts," = *,s3,* ]]; then
+    curl -fsS -X PUT "$PGVS3_TEST_ENDPOINT_A/bench" >/dev/null
+  fi
+  if [[ ",$parts," = *,compat,* || ",$parts," = *,tuning,* ]]; then
+    curl -fsS -X PUT "$PGVS3_TEST_ENDPOINT_A/lake" >/dev/null
+  fi
   export PGVS3_CATALOG="dbname=ducklake_catalog host=${pg%:*} port=${pg#*:} user=postgres password=postgres"
+  if [ "$#" -ge 2 ]; then shift 2; else shift; fi
+  out=.tmp/pgvs3/bench.json
+  if [[ ",$parts," = *,differential,* ]]; then out="$PGVS3_TEST_RUN_DIR/differential.json"; fi
   mise exec uv -- uv run --quiet --no-project --with "duckdb==${DUCKDB_PY:-2.0.0}" \
-    python deploy/bench/duck_bench.py --parts "${2:-s3,compat,tuning}" --out .tmp/pgvs3/bench.json
+    python deploy/bench/duck_bench.py --parts "$parts" --out "$out" "$@"
   ;;
 esac > "$PGVS3_TEST_RUN_DIR/suite.log" 2>&1
-if [ "$mode" = analytics ]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi
+if [ "$mode" = analytics ] || [[ ",$parts," = *,differential,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi

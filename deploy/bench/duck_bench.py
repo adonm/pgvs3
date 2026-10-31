@@ -10,6 +10,7 @@ Parts:
           measured by DuckDB httpfs with its HTTP request log.
   compat  DuckLake lifecycle on pgvs3: writer on gateway A, reader on B.
   tuning  DuckLake Parquet row group size / file size vs load and query time.
+  differential  opt-in Differential snapshot/sync-WAL comparison with DuckLake.
 """
 import argparse
 import hashlib
@@ -32,12 +33,14 @@ def sql_str(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def connect(endpoint: str, threads: int | None = None) -> duckdb.DuckDBPyConnection:
+def connect(endpoint: str, threads: int | None = None, unsigned_extension=None) -> duckdb.DuckDBPyConnection:
     """A fresh DuckDB with an S3 secret for one gateway and no file cache."""
-    con = duckdb.connect()
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"} if unsigned_extension else {})
     for ext in ("httpfs", "postgres", "ducklake"):
         con.sql(f"INSTALL {ext}")
         con.sql(f"LOAD {ext}")
+    if unsigned_extension:
+        con.sql("LOAD " + sql_str(str(unsigned_extension)))
     host = endpoint.split("://", 1)[-1]
     con.sql(
         "CREATE SECRET pgvs3 (TYPE s3, URL_STYLE 'path', USE_SSL false, REGION 'us-east-1', "
@@ -282,6 +285,15 @@ def tuning(args, run: str) -> dict:
     return {"results": results}
 
 
+def fixture_select(rows, start=0):
+    return f"SELECT i,md5(i::VARCHAR) AS id,hash(i)::DOUBLE/18446744073709551615.0 AS value FROM range({start},{start + rows}) t(i)"
+
+
+def differential(args, run):
+    from differential import run as benchmark
+    return benchmark(args, run)
+
+
 def fixtures(args, run):
     folder = Path(args.out).parent / "payloads"
     paths = [folder / f"{kind}-{mib}MiB.{extension}" for mib in args.fixture_mib
@@ -295,7 +307,7 @@ def fixtures(args, run):
     for mib in args.fixture_mib:
         rows = mib * 23700
         parquet = folder / f"parquet-{mib}MiB.parquet"
-        query = f"SELECT i,md5(i::VARCHAR) AS id,hash(i)::DOUBLE/18446744073709551615.0 AS value FROM range({rows}) t(i)"
+        query = fixture_select(rows)
         con.execute(f"COPY ({query}) TO {sql_str(str(parquet))} (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880)")
         binary = folder / f"incompressible-{mib}MiB.bin"
         seed = 20261029 + mib
@@ -327,19 +339,26 @@ def main() -> int:
                    default=[30_720, 122_880, 491_520, 1_966_080])
     p.add_argument("--passes", type=int, default=3)
     p.add_argument("--fixture-mib", type=lambda s: [int(x) for x in s.split(",")], default=[10, 100, 1024])
+    p.add_argument("--differential-extension", default=os.environ.get("PGVS3_DIFFERENTIAL_EXTENSION"))
+    p.add_argument("--differential-mib", type=lambda s: [int(x) for x in s.split(",")], default=[10, 100, 1024])
+    p.add_argument("--differential-ddl-iterations", type=int, default=5)
+    p.add_argument("--differential-small-commits", type=int, default=5)
+    p.add_argument("--differential-timeout", type=int, default=1800)
     args = p.parse_args()
     run = "r" + uuid.uuid4().hex[:12]
-    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures}
+    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures, "differential": differential}
     record = {"duckdb": duckdb.__version__, "cores": os.cpu_count(), "run": run}
+    if "differential" in args.parts.split(",") and Path(args.out).exists():
+        p.error("Differential evidence must use a fresh --out path; existing trials are never overwritten")
     for part in args.parts.split(","):
         print(f"=== {part} ===", flush=True)
         record[part] = parts[part](args, run)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(record, f, indent=1)
-    print(json.dumps({k: v for k, v in record.items() if k != "tuning"}, indent=1))
+    print(json.dumps({k: v for k, v in record.items() if k not in ("tuning", "differential")}, indent=1))
     print(f"wrote {args.out}")
-    return 1 if record.get("compat", {}).get("failed") else 0
+    return 1 if record.get("compat", {}).get("failed") or record.get("differential", {}).get("failures") else 0
 
 
 if __name__ == "__main__":

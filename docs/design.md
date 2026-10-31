@@ -28,6 +28,13 @@ application semantics interchangeable or their operations one transaction.
 | External origin, when configured | Committed origin objects and version/conditional-mutation semantics; freshness outside pgvs3 remains TTL-bounded |
 | Deployment/operator | Trusted-network boundary, writable/read-only endpoints, replication/promotion policy, capacity and backups |
 
+The optional [Differential client experiment](differential.md) adds a native
+DuckDB repository **on the client**, not gateway-local authority or a new pgvs3
+layout. Ordinary local commits differ from remotely durable snapshot/WAL
+publication. Client-writer fencing and snapshot visibility remain that client's
+operating responsibilities; durable PostgreSQL S3 objects alone do not resolve
+diverging native histories. Existing DuckLake and object-storage roles remain.
+
 The architectural bet is **fewer independent systems to coordinate**, not free
 object I/O or unlimited scale. Large bodies and read fills add PostgreSQL disk,
 WAL and replay work. The gateway still implements a specialized storage layout

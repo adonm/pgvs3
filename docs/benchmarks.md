@@ -17,7 +17,11 @@ Two benchmark harnesses are included in the repository:
   measure raw S3 + PostgreSQL throughput and latency, or drives paired acceptance
   through the existing `compare.py` with isolated before/after fixtures.
 - **`just bench`** runs DuckDB 2.0 and DuckLake through `httpfs` to measure
-  end-to-end client performance.
+  end-to-end client performance. Its opt-in `differential` part also measures
+  Differential's native-storage client through the C++ S3 SDK; `just differential`
+  is the shortcut. See [provisioning and comparison contracts](differential.md).
+  [Recorded findings](differential-results.md) separate client performance from
+  gateway retry avoidance and retain unsupported workloads explicitly.
 
 Both harnesses start disposable PostgreSQL 18 containers on loopback. The direct
 matrix uses `shared_buffers=1GB` and pool 128; paired runs use pool 32 per binary
