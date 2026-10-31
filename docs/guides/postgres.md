@@ -109,13 +109,21 @@ ratios and vacuum cost:
   amplify WAL. Keep frequently updated status/counters and B-tree filter keys in
   a narrow table, split rarely read wide columns into a 1:1 companion table by
   primary key, and store multi-MiB blobs or batch extracts in pgvs3 buckets.
-- **Use coarse declarative `RANGE` partitions for retention, not fine cells:**
-  Partition large time-series or append-mostly OLTP tables by a coarse time unit
-  (month, week or day) so expired history can be removed with
-  `ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY` and `DROP TABLE` instead of
-  a bulk `DELETE` + `VACUUM` storm. Keep the partition count in the tens or low
-  hundreds (at most a few thousand): excessive partitions inflate query planning
-  CPU and per-session catalog memory across every connection.
+- **Prefer fixed 32–64 partitions (`HASH` or fixed Hilbert/Morton cells) over
+  time-growing DDL:** Time-partitioned tables require ongoing cron jobs to create
+  future partitions and risk insert failures when a partition is missing. Unless
+  your primary goal is dropping whole expired time windows (`DETACH PARTITION` /
+  `DROP TABLE`), use **32 or 64 fixed partitions** created once at initialization:
+  - *By ID or tenant:* `PARTITION BY HASH (tenant_id)` (or `id`) with `MODULUS 32`
+    (or `64`). At 1 billion rows across 64 partitions, each child table holds
+    ~15.6M rows—keeping B-trees shallow in `shared_buffers` and letting autovacuum
+    workers clean partitions in parallel across orders of magnitude of growth.
+  - *By 2D space:* quantize coordinates into a 6-bit (`0..63`) coarse **Hilbert**
+    or **Morton (Z-order)** cell prefix (`hilbert_bucket SMALLINT`) and partition
+    into 64 fixed child tables, with a composite B-tree on `(fine_hilbert_id, ts)`
+    or `BRIN` index inside each partition.
+  - Reserve rolling time `RANGE` partitions strictly for tables where bulk TTL
+    deletion via `DROP TABLE` is mandatory.
 - **Match the index type to physical correlation:** Use composite B-trees (with
   `INCLUDE` covering columns) for selective point/prefix lookups, `BRIN`
   (`timestamptz_minmax_ops` or `box_inclusion_ops`) when rows are physically

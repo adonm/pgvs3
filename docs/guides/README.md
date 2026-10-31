@@ -14,14 +14,15 @@ What is the primary access and mutation contract?
 │   └── Keep in PostgreSQL SQL (docs/guides/postgres.md)
 │       ├── Wide columns (>2 KiB TOAST / blobs)?
 │       │   └── Split hot narrow row from cold payload table, or store multi-MiB blobs in pgvs3
-│       └── Billion-row time/space lifecycle?
-│           └── Coarse RANGE partitions (month/day) for DETACH/DROP + BRIN/GiST/B-tree
+│       ├── Need 32–64 zero-maintenance partitions across 10M–1B+ rows?
+│       │   └── Fixed HASH(id/tenant_id) or fixed 64-cell Hilbert/Morton prefix (create once, never cron-DDL)
+│       └── Only use time RANGE partitions if you must DROP/DETACH whole expired months
 ├── Analytical scans, aggregations, or billion-row history (minutes-to-hours freshness)
 │   └── Extract to Parquet / DuckLake on pgvs3 (docs/guides/analytics.md)
 │       ├── Single-table/snapshot export? ──► Immutable Parquet + conditional manifest
-│       ├── Multi-file DDL, schema evolution, deletes, compaction? ──► DuckLake + PG catalog
+│       ├── Entity / tenant / ID filters? ──► Fixed PARTITIONED BY (bucket(32..64, id)) + SORTED BY (ts, id)
+│       ├── 2D/spatiotemporal filters? ──► Fixed 64-cell Hilbert prefix PARTITIONED BY (hilbert_bucket) + SORTED BY (hilbert_fine, ts)
 │       ├── Billion rows + wide columns? ──► Byte-bounded row groups, skip_stats_columns, late materialization
-│       ├── Spatiotemporal filters? ──► Coarse epoch_day/month partition + 2D cell SORTED BY (Morton/Hilbert/grid)
 │       └── Willing to pay slow/batch writes for peak read speed?
 │           └── Batch sorted ZSTD writes + merge/rewrite compaction (or sealed ObjFS/DuckDB for heavy joins)
 ├── Shared S3/HTTP acceleration or durable write-back staging across workers
@@ -53,7 +54,7 @@ you are spending and which one you are saving before changing a schema or knob:
 | **Restrictive types (`BIGINT`/`INT`/`TIMESTAMPTZ` vs `VARCHAR`/`UUIDv4`)** | Shrinks DuckDB execution vectors and hash/sort state; avoids non-evictable ART index buffers when omitting PKs. | Smaller Parquet pages, smaller PG indexes, tighter zone maps. | Fewer bytes transferred per column chunk. | Faster vectorized comparisons, hashing and bit-unpacking. |
 | **Wide-column projection + late materialization + `skip_stats_columns`** | Avoids buffering wide strings/blobs during filtering, grouping and sorting. | Keeps `ducklake_file_column_stats` small in the PG catalog; avoids TOAST churn. | Transfers only narrow filter/key column chunks; wide chunks fetched only for matched rows. | Skips ZSTD decompression and string decoding on unreferenced columns. |
 | **Byte-bounded row groups (`parquet_row_group_size_bytes`) on wide tables** | Prevents `122,880 × wide_row` from buffering hundreds of MiB per writer thread. | Slightly more row-group metadata headers; finer pruning granularity. | Smaller byte-range fetches for selective queries. | More row-group footer checks; lower spill risk. |
-| **Coarse temporal `PARTITIONED BY` + 2D spatial `SORTED BY`** | Sorting/compaction buffers a batch in writer RAM (or spills to `temp_directory`). | Temporary write amplification during sorted compaction; avoids small-file explosion. | Skips entire non-overlapping partition files and row-group byte ranges. | Pays sort CPU once on batch write/merge to save scan CPU on every read. |
+| **Fixed 32–64 partitions (`bucket(32..64, id)` or 64-cell Hilbert prefix) + `SORTED BY`** | Sorting/compaction buffers a batch in writer RAM (or spills to `temp_directory`); bounded catalog metadata. | Zero DDL cron maintenance; fixed bucket count prevents small-file explosions across years while `target_file_size` splits growing buckets cleanly. | Prunes to 1..k of 32–64 buckets, then skips non-overlapping row-group byte ranges on the sort key. | Pays sort CPU once on batch write/merge to save scan CPU on every read. |
 | **Batch write-for-read (`SORTED BY`, high `zstd`, `merge`/`rewrite`)** | Higher batch writer/compactor RAM; lower reader buffer footprint. | Rewrites small/deleted files (extra PG WAL + reaper work during batch window); smaller steady-state footprint. | Minimum GET requests and byte transfer; zero delete-file merge-on-read fetches. | Heavy batch sort + ZSTD compression CPU; minimal query decompression/filter CPU. |
 | **pgvs3 shared origin cache (`s3c_`) & range caching** | Uses PG `shared_buffers` + OS page cache (and gateway spool ≤8 MiB in RAM). | Cold fills write logged PG `chunks` rows and WAL; consumes vacuum/reap capacity. | Eliminates repeated upstream S3 GETs across gateways and standbys. | Zstd block check on fill; low CPU on warm PG bitmap heap scans. |
 

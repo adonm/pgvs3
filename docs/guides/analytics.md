@@ -218,28 +218,51 @@ physical layout determines whether queries scan kilobytes or terabytes.
 | **Unnecessary byte transfers** | `SELECT *` fetches and decompresses every column chunk in matching row groups. | Project only required columns. For top-K or selective lookups needing wide payloads, filter/rank on narrow keys first, then join back by key (**late materialization**). |
 | **Compaction rewrite cost** | Updating or compacting a table rewrites wide blobs alongside narrow metrics. | Split immutable multi-KiB/MiB blobs into a companion table (joined by `id`) or store large blobs as direct pgvs3 objects referenced by key/ETag. |
 
-### 3. Consistent spatiotemporal and multi-dimensional partitioning
+### 3. Fixed 32–64 partitioning (hash buckets & Hilbert curves) over time-growing DDL
 
-Partitioning and sorting solve different problems—confusing them causes small-file
-storms:
+Time-growing partitions (`year`/`month`/`day`) add operational friction: partition
+counts grow without bound over multi-year histories, backfills across years
+scatter thousands of small files, and PostgreSQL OLTP tables need cron jobs to
+pre-create future partitions. For most collections, **32 to 64 fixed partitions**
+paired with `SORTED BY` handle two to three orders of magnitude of growth (e.g.,
+10 MiB to 10 GiB per partition, or 640 MiB to 640 GiB total) with **zero ongoing
+partition maintenance**:
 
-- **Keep `PARTITIONED BY` coarse (1D temporal lifecycle):** Partitioning splits
-  each write into separate physical Parquet files per partition key. In DuckLake
-  1.1+, use UTC order-preserving epoch transforms such as `PARTITIONED BY (epoch_day(ts))`
-  or `epoch_month(ts)`—**never** bare `month(ts)` or `day(ts)`, which fold
-  January 2025 and January 2026 into the same partition (`1`). Size the temporal
-  unit so each active partition accumulates at least `64 MiB–512 MiB` of data;
-  never partition directly by fine spatial cells or high-cardinality IDs.
-- **Cluster 2D space + time with `SORTED BY (spatial_cell_id, ts)`:** Sorting by
-  raw `(lat, lon)` orders `lat` but leaves `lon` spanning the entire globe inside
-  every `lat` stripe, so 2D bounding-box queries cannot prune row groups on `lon`.
-  Instead, compute a deterministic 2D locality-preserving cell ID—such as a
-  bit-interleaved Morton (Z-order) key, Hilbert index, H3/S2 cell ID, or quantized
-  grid key—and sort by `(cell_id, ts)` while retaining explicit `lat`/`lon` (or
-  bounding-box `min_x, max_x, min_y, max_y`) columns.
-- **Query with both the coordinate box and the cell range:** File/row-group zone
-  maps prune on `ts`, `cell_id`, `lat` and `lon` before exact geometry predicates
-  run on the surviving rows.
+- **How a fixed partition count scales across orders of magnitude:** When a fixed
+  partition is small (e.g., 10 MiB), `ducklake_merge_adjacent_files` compacts it
+  into **one** sorted Parquet file. When the table grows 100× (e.g., 1 GiB per
+  partition), DuckLake automatically splits that partition into multiple sorted
+  `target_file_size` (`256MB`–`512MB`) files with non-overlapping `min`/`max`
+  zone maps on the `SORTED BY` keys. You get file-level and row-group-level
+  pruning on time and space without ever adding new partition keys.
+- **Strategy A — Fixed 32–64 Hash Buckets (`bucket(32, id)` + `SORTED BY (ts, id)`):**
+  Use when queries filter by `tenant_id`, `customer_id`, `device_id` or `id`:
+  ```sql
+  CREATE TABLE lake.events_by_customer (
+      customer_id INTEGER, id BIGINT, ts TIMESTAMPTZ, amount_cents INTEGER
+  )
+  PARTITIONED BY (bucket(32, customer_id))
+  SORTED BY (ts, id);
+  ```
+  DuckLake hashes `customer_id` into 32 fixed Murmur3 buckets (`0..31`). Equality
+  and `IN` filters on `customer_id` prune 31/32 of the partitions immediately, and
+  `SORTED BY (ts, id)` prunes files and row groups by time *within* each bucket.
+- **Strategy B — Fixed 64-Cell 2D Hilbert Curve (`PARTITIONED BY (hilbert_bucket)` + `SORTED BY (hilbert_fine, ts)`):**
+  Hash buckets only prune equality/`IN`, not 2D bounding boxes (`lat BETWEEN … AND lon BETWEEN …`).
+  And sorting by raw `(lat, lon)` orders `lat` while leaving `lon` spanning the
+  entire domain inside every `lat` stripe. Instead, map normalized 2D grid
+  coordinates `(gx, gy)` onto a **Hilbert curve**:
+  - **Coarse 6-bit prefix (`hilbert_bucket` $\in [0..63]$):** an $8 \times 8 = 64$-cell
+    order-3 Hilbert lookup gives **64 fixed partitions forever**, where every step
+    `b -> b + 1` is physically adjacent in 2D space.
+  - **Fine hierarchical Hilbert key (`hilbert_fine`) + `ts`:** `SORTED BY (hilbert_fine, ts)`
+    clusters both 2D space and time inside each of the 64 fixed buckets.
+  - **Query with both the coarse bucket(s) and coordinate box:** DuckLake prunes
+    to the 1–4 touched buckets out of 64, and row-group zone maps prune on
+    `hilbert_fine`, `lat`, `lon` and `ts`.
+- **When to still use time partitions (`epoch_day` / `epoch_month`):** Only when
+  your dominant operation is dropping whole expired time windows by partition or
+  strictly isolating each day's ingest files from older history.
 
 ### 4. Trade slow/batch transactions for maximum query performance
 
@@ -263,21 +286,36 @@ When you can batch writes (minutes/hours) to maximize read speed:
    flushes SlateDB memtables and cut 1 GiB fresh selective reads **6×** (313 ms →
    52.6 ms) and full scans **2.2×** (1,026 ms → 476 ms) in our benchmark.
 
-Run this executable spatiotemporal + wide-column + batch-compaction recipe in the
-same DuckLake session:
+Run this executable fixed-64 Hilbert + fixed-32 hash + wide-column + batch-compaction
+recipe in the same DuckLake session:
 
 <!-- verify:lake-spatiotemporal -->
 ```sql
+CREATE MACRO lake.hilbert64(rx, ry) AS (
+    list_extract([
+         0,  1, 14, 15, 16, 19, 20, 21,
+         3,  2, 13, 12, 17, 18, 23, 22,
+         4,  7,  8, 11, 30, 29, 24, 25,
+         5,  6,  9, 10, 31, 28, 27, 26,
+        58, 57, 54, 53, 32, 35, 36, 37,
+        59, 56, 55, 52, 33, 34, 39, 38,
+        60, 61, 50, 51, 46, 45, 40, 41,
+        63, 62, 49, 48, 47, 44, 43, 42
+    ], ((rx::INTEGER & 7) * 8 + (ry::INTEGER & 7)) + 1)::SMALLINT
+);
+
 CREATE TABLE lake.spatiotemporal (
     id BIGINT,
+    customer_id INTEGER,
     ts TIMESTAMPTZ,
     lat DOUBLE,
     lon DOUBLE,
-    cell_id BIGINT,
+    hilbert_bucket SMALLINT,
+    hilbert_fine INTEGER,
     wide_payload VARCHAR
 )
-PARTITIONED BY (epoch_day(ts))
-SORTED BY (cell_id, ts);
+PARTITIONED BY (hilbert_bucket)
+SORTED BY (hilbert_fine, ts);
 
 CALL lake.set_option('skip_stats_columns', ['wide_payload'], table_name => 'spatiotemporal');
 CALL lake.set_option('parquet_row_group_size_bytes', '2MB', table_name => 'spatiotemporal');
@@ -285,46 +323,73 @@ CALL lake.set_option('parquet_compression', 'zstd', table_name => 'spatiotempora
 CALL lake.set_option('parquet_compression_level', 9, table_name => 'spatiotemporal');
 
 INSERT INTO lake.spatiotemporal
-SELECT i,
-       TIMESTAMPTZ '2026-10-01 00:00:00+00' + (i % 2) * INTERVAL '1 day' + (i % 3600) * INTERVAL '1 second',
-       (i % 100) * 0.01,
-       ((i // 100) % 100) * 0.01,
-       ((i % 100) // 10) * 10 + (((i // 100) % 100) // 10),
-       repeat(md5(i::VARCHAR), 8)
-FROM range(20000) AS t(i);
+WITH raw AS (
+    SELECT i AS id, (i % 500)::INTEGER AS customer_id,
+           TIMESTAMPTZ '2026-10-01 00:00:00+00' + i * INTERVAL '1 minute' AS ts,
+           (i % 64) / 64.0 AS lat, ((i // 64) % 64) / 64.0 AS lon,
+           (i % 64)::INTEGER AS gx, ((i // 64) % 64)::INTEGER AS gy,
+           repeat(md5(i::VARCHAR), 8) AS wide_payload
+    FROM range(20000) AS t(i)
+)
+SELECT id, customer_id, ts, lat, lon,
+       lake.hilbert64(gx >> 3, gy >> 3) AS hilbert_bucket,
+       (lake.hilbert64(gx >> 3, gy >> 3)::INTEGER << 6) | lake.hilbert64(gx & 7, gy & 7)::INTEGER AS hilbert_fine,
+       wide_payload
+FROM raw;
 
 INSERT INTO lake.spatiotemporal
-SELECT i + 20000,
-       TIMESTAMPTZ '2026-10-01 00:00:00+00' + (i % 2) * INTERVAL '1 day' + (i % 3600) * INTERVAL '1 second',
-       (i % 100) * 0.01,
-       ((i // 100) % 100) * 0.01,
-       ((i % 100) // 10) * 10 + (((i // 100) % 100) // 10),
-       repeat(md5((i + 20000)::VARCHAR), 8)
-FROM range(20000) AS t(i);
+WITH raw AS (
+    SELECT i + 20000 AS id, (i % 500)::INTEGER AS customer_id,
+           TIMESTAMPTZ '2027-03-01 00:00:00+00' + i * INTERVAL '1 minute' AS ts,
+           (i % 64) / 64.0 AS lat, ((i // 64) % 64) / 64.0 AS lon,
+           (i % 64)::INTEGER AS gx, ((i // 64) % 64)::INTEGER AS gy,
+           repeat(md5((i + 20000)::VARCHAR), 8) AS wide_payload
+    FROM range(20000) AS t(i)
+)
+SELECT id, customer_id, ts, lat, lon,
+       lake.hilbert64(gx >> 3, gy >> 3) AS hilbert_bucket,
+       (lake.hilbert64(gx >> 3, gy >> 3)::INTEGER << 6) | lake.hilbert64(gx & 7, gy & 7)::INTEGER AS hilbert_fine,
+       wide_payload
+FROM raw;
 
 CALL ducklake_merge_adjacent_files('lake', 'spatiotemporal');
-DELETE FROM lake.spatiotemporal WHERE id < 5000;
-CALL ducklake_rewrite_data_files('lake', 'spatiotemporal', delete_threshold => 0.1);
+DELETE FROM lake.spatiotemporal WHERE id < 4096;
+CALL ducklake_rewrite_data_files('lake', 'spatiotemporal', delete_threshold => 0.05);
+
+CREATE TABLE lake.events_hash32 (
+    customer_id INTEGER, id BIGINT, ts TIMESTAMPTZ
+)
+PARTITIONED BY (bucket(32, customer_id))
+SORTED BY (ts, id);
+
+INSERT INTO lake.events_hash32
+SELECT customer_id, id, ts FROM lake.spatiotemporal;
 
 WITH matched AS (
-    SELECT id, cell_id
+    SELECT id, hilbert_bucket
     FROM lake.spatiotemporal
-    WHERE ts >= TIMESTAMPTZ '2026-10-01 00:00:00+00'
-      AND ts < TIMESTAMPTZ '2026-10-02 00:00:00+00'
-      AND cell_id = 12
-      AND lat BETWEEN 0.10 AND 0.19
-      AND lon BETWEEN 0.20 AND 0.29
+    WHERE hilbert_bucket = lake.hilbert64(1, 2)
+      AND lat BETWEEN 0.125 AND 0.249
+      AND lon BETWEEN 0.250 AND 0.374
+      AND ts >= TIMESTAMPTZ '2026-10-01 00:00:00+00'
 )
-SELECT count(*) AS rows, min(m.cell_id) AS min_cell, max(length(s.wide_payload)) AS payload_bytes
+SELECT count(*) AS rows,
+       min(m.hilbert_bucket) AS bucket,
+       max(length(s.wide_payload)) AS payload_bytes,
+       (SELECT count(DISTINCT hilbert_bucket) FROM lake.spatiotemporal) AS fixed_buckets,
+       (SELECT count(*) FROM lake.events_hash32 WHERE customer_id = 42) AS customer_rows
 FROM matched AS m
 JOIN lake.spatiotemporal AS s USING (id);
 ```
 
-**Expected:** `150 | 12 | 256`. The two inserts are partitioned by UTC epoch day,
-sorted by `(cell_id, ts)`, compacted from two files per day into one sorted file
-per day, and rewritten after the delete so readers scan clean ZSTD files. The
-catalog omits `min_value`/`max_value` strings for `wide_payload`, and the query
-demonstrates late materialization on the matched IDs.
+**Expected:** `576 | 13 | 256 | 64 | 71`. Even though the two batch inserts span
+different years (`2026` and `2027`), the table maintains **exactly 64 fixed
+Hilbert partitions** (`0..63`), persists `lake.hilbert64` in the PostgreSQL
+DuckLake catalog so every reader session shares the exact same mapping, merges
+the two batches inside each bucket into one sorted ZSTD file per bucket, rewrites
+the deleted slice so readers pay zero delete-file overhead, suppresses
+`min_value`/`max_value` catalog stats on `wide_payload`, and verifies the
+32-bucket hash table (`customer_rows = 71`).
 
 DuckLake maintenance (merge/rewrite, expire snapshots, clean old/orphan files),
 pgvs3 reaping and PostgreSQL vacuum are **three distinct stages**. `DROP TABLE`
