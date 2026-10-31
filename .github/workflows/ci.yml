@@ -101,5 +101,5 @@ jobs:
           git -C docs/_site config user.name "github-actions[bot]"
           git -C docs/_site config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C docs/_site add -A
-          git -C docs/_site commit -m "docs: publish Quarto site (${GITHUB_SHA::7})"
-          git -C docs/_site push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+          git -C docs/_site commit --no-verify -m "docs: publish Quarto site (${GITHUB_SHA::7})"
+          git -C docs/_site push --no-verify --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages

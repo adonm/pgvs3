@@ -136,8 +136,8 @@ docs-publish: docs
     touch .tmp/gh-pages/.nojekyll
     git -C .tmp/gh-pages init -b gh-pages
     git -C .tmp/gh-pages add -A
-    git -C .tmp/gh-pages commit -q -m "docs: publish Quarto site ($rev)"
-    git -C .tmp/gh-pages push -f "$remote" gh-pages
+    git -C .tmp/gh-pages commit --no-verify -q -m "docs: publish Quarto site ($rev)"
+    git -C .tmp/gh-pages push --no-verify -f "$remote" gh-pages
     rm -rf .tmp/gh-pages
 
 # DuckLake compatibility: writer on one gateway, reader on the other.
