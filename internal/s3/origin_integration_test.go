@@ -56,7 +56,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 		originTestStore, objcache.NewRuntime(objcache.RuntimeOptions{}), objcache.TierOptions{Namespace: fmt.Sprintf("origin-http-%d", os.Getpid()), Retention: time.Hour, MaxFills: 2})
 	testutil.Must(t, err)
 	defer tier.Close()
-	srv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
+	srv := New(originTestStore, testutil.DiscardLogger(), false, 8, time.Second, nil)
 	defer srv.Close()
 	srv.SetOrigin(tier)
 	httpSrv := httptest.NewServer(srv)
@@ -212,7 +212,7 @@ func TestOriginWriteValidationAndConditions(t *testing.T) {
 	}
 	t.Run("encoded headers and error statuses", func(t *testing.T) {
 		bucket := fmt.Sprintf("errbucket-%d", time.Now().UnixNano())
-		local := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
+		local := New(originTestStore, testutil.DiscardLogger(), false, 8, time.Second, nil)
 		defer local.Close()
 		localSrv := httptest.NewServer(local)
 		defer localSrv.Close()
@@ -320,11 +320,11 @@ func TestOriginRequiresCatalogBucket(t *testing.T) {
 	testutil.Must(t, err)
 	defer globalTier.Close()
 
-	nativeSrv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
+	nativeSrv := New(originTestStore, testutil.DiscardLogger(), false, 8, time.Second, nil)
 	defer nativeSrv.Close()
 	nativeHTTP := httptest.NewServer(nativeSrv)
 	defer nativeHTTP.Close()
-	globalSrv := New(originTestStore, testutil.DiscardLogger(), false, 8, nil)
+	globalSrv := New(originTestStore, testutil.DiscardLogger(), false, 8, time.Second, nil)
 	defer globalSrv.Close()
 	globalSrv.SetOrigin(globalTier)
 	globalHTTP := httptest.NewServer(globalSrv)

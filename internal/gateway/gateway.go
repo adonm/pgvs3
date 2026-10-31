@@ -28,14 +28,15 @@ type Gateway struct {
 }
 
 type Limits struct {
-	S3   int
-	OJS  int
-	RESP int
+	S3          int
+	S3QueueWait time.Duration
+	OJS         int
+	RESP        int
 }
 
 func New(st *store.Store, log *slog.Logger, readOnly bool, origins *objcache.Registry, lim Limits) *Gateway {
 	g := &Gateway{
-		s3:   s3.New(st, log, readOnly, lim.S3, origins),
+		s3:   s3.New(st, log, readOnly, lim.S3, lim.S3QueueWait, origins),
 		ojs:  ojs.New(st, log, readOnly, lim.OJS, "dev"),
 		resp: resp.New(st, readOnly, lim.RESP),
 	}

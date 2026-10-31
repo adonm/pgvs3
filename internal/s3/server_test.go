@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/objcache"
@@ -55,7 +56,7 @@ func TestCRC64NVMEAgainstBitwise(t *testing.T) {
 }
 
 func TestBackendSelectionSharesAllCapabilities(t *testing.T) {
-	s := New(nil, nil, false, 1, nil)
+	s := New(nil, nil, false, 1, time.Second, nil)
 	defer s.Close()
 	capabilities := func(ctx context.Context) []any {
 		return []any{s.backendFor(ctx, "lake"), s.writeBackendFor(ctx, "lake"), s.multipartBackendFor(ctx, "lake")}
@@ -152,21 +153,94 @@ func TestIngestErrorMapsUnrepresentableKeyToBadRequest(t *testing.T) {
 	}
 }
 
-func TestServerRequestSemaphore(t *testing.T) {
-	s := New(nil, testutil.DiscardLogger(), false, 1, nil)
-	release, ok := s.acquire()
-	if !ok {
-		t.Fatal("first acquisition failed")
+func TestServerAdmissionBoundsWaitsAndCancels(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(nil, testutil.DiscardLogger(), false, 1, time.Second, nil)
+		defer s.Close()
+		release, ok := s.acquire(t.Context())
+		if !ok {
+			t.Fatal("first acquisition failed")
+		}
+		acquired := make(chan func(), 1)
+		go func() {
+			release, _ := s.acquire(t.Context())
+			acquired <- release
+		}()
+		synctest.Wait()
+		if len(s.waiters) != 1 || len(acquired) != 0 {
+			t.Fatal("contended request did not queue")
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		canceled := make(chan *httptest.ResponseRecorder, 1)
+		body := strings.NewReader("unread body")
+		go func() {
+			r := httptest.NewRequest(http.MethodPut, "/bucket/key", body).WithContext(ctx)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, r)
+			canceled <- w
+		}()
+		synctest.Wait()
+		if len(s.waiters) != 2 {
+			t.Fatal("second waiter did not reach the queue bound")
+		}
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/bucket/key", nil))
+		if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "1" {
+			t.Fatalf("full queue: status=%d headers=%v", w.Code, w.Header())
+		}
+		for _, path := range []string{"/healthz", "/metrics"} {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("%s blocked by admission: %d", path, w.Code)
+			}
+			if path == "/metrics" && !strings.Contains(w.Body.String(), "pgvs3_s3_admission_waiting_requests 2\n") {
+				t.Fatal("queue occupancy is missing from metrics")
+			}
+		}
+		cancel()
+		synctest.Wait()
+		if w := <-canceled; w.Code != http.StatusRequestTimeout || len(s.waiters) != 1 {
+			t.Fatalf("cancellation: status=%d waiting=%d", w.Code, len(s.waiters))
+		}
+		if body.Len() != len("unread body") {
+			t.Fatal("queued request body was read before admission")
+		}
+		release()
+		synctest.Wait()
+		release = <-acquired
+		if release == nil || len(s.waiters) != 0 || len(s.sem) != 1 {
+			t.Fatal("slot was not handed to the queued request")
+		}
+		go func() {
+			release, _ := s.acquire(t.Context())
+			acquired <- release
+		}()
+		synctest.Wait()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if queued := <-acquired; queued != nil || len(s.waiters) != 0 || len(s.sem) != 1 {
+			t.Fatal("expired waiter leaked a queue or service slot")
+		}
+		release()
+		if s.queued.Load() != 3 || s.rejected.Load() != 2 {
+			t.Fatalf("queued=%d rejected=%d", s.queued.Load(), s.rejected.Load())
+		}
+	})
+	for _, canceled := range []bool{false, true} {
+		s := New(nil, testutil.DiscardLogger(), false, 1, 0, nil)
+		ctx, cancel := context.WithCancel(t.Context())
+		release, _ := s.acquire(ctx)
+		if canceled {
+			cancel()
+		}
+		if _, ok := s.acquire(ctx); ok {
+			t.Fatal("disabled queue acquired a busy slot")
+		}
+		release()
+		cancel()
+		s.Close()
 	}
-	if _, ok := s.acquire(); ok {
-		t.Fatal("second acquisition succeeded at limit 1")
-	}
-	release()
-	release2, ok := s.acquire()
-	if !ok {
-		t.Fatal("acquisition after release failed")
-	}
-	release2()
 }
 
 func TestSelectRoute(t *testing.T) {
@@ -1655,7 +1729,7 @@ func TestMetricsObserveAndWrite(t *testing.T) {
 	m.Observe("PUT", 403, 25*time.Millisecond, 0)
 
 	rr := httptest.NewRecorder()
-	s := New(nil, nil, false, 1, nil)
+	s := New(nil, nil, false, 1, time.Second, nil)
 	s.metrics = m
 	s.writeMetrics(rr, nil)
 
@@ -1688,7 +1762,7 @@ func TestMetricsConcurrentObserve(t *testing.T) {
 	}
 	wg.Wait()
 	rr := httptest.NewRecorder()
-	s := New(nil, nil, false, 1, nil)
+	s := New(nil, nil, false, 1, time.Second, nil)
 	s.metrics = m
 	s.writeMetrics(rr, nil)
 	if !strings.Contains(rr.Body.String(), `pgvs3_requests_total{method="GET",code="200"} 100`) {

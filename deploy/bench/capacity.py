@@ -14,7 +14,7 @@ def lsn_bytes(value):
 
 
 def metrics(text):
-    return {name: float(value) for name, value in re.findall(r"^(pgvs3_(?:pg_pool|chunk_pool|spool|pending_uploads)\w*) ([0-9.eE+-]+)$", text, re.M)}
+    return {name: float(value) for name, value in re.findall(r"^(pgvs3_(?:pg_pool|chunk_pool|spool|pending_uploads|s3_admission)\w*) ([0-9.eE+-]+)$", text, re.M)}
 
 
 def metric_delta(before, after):

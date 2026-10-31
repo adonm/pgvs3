@@ -809,7 +809,27 @@ For database-side query and wait analysis, run
 `--s3-concurrency` (default 32), `--queue-concurrency` (default 16) and
 `--resp-concurrency` (default 32) bound in-flight protocol work.
 `--fill-concurrency` (default 8) is a process-wide budget for cache fills and
-pending-upload workers. S3 requests over the limit get `503 SlowDown` with `Retry-After`.
+pending-upload workers.
+
+S3 keeps the immediate acquisition fast path. A brief burst above the active
+limit waits in a bounded per-gateway queue: at most **twice `--s3-concurrency`**
+requests, for up to **one second** by default. `--s3-queue-wait` /
+`PGVS3_S3_QUEUE_WAIT` changes that wait; `0` restores immediate rejection. Waiting
+honors request cancellation/deadlines and happens before application body reads,
+origin borrowing or database acquisition. It is not a durable job queue or an
+acknowledgement of a write.
+
+A full queue or expired wait still returns `503 SlowDown` with `Retry-After: 1`.
+Canceled requests leave the queue without executing backend work. Scratch-byte
+admission remains **fail-fast**: queuing partially reserved spools can deadlock,
+and pending acknowledged bodies must remain durable/retryable instead.
+
+`pgvs3_s3_admission_active_requests`, `pgvs3_s3_admission_waiting_requests` and
+`pgvs3_s3_admission_queue_limit` expose occupancy/bounds. The `queued_total`,
+`rejected_total` and `wait_seconds_total` counters under the same prefix expose
+burst pressure; HTTP request latency includes admission wait. Health/readiness
+and metrics stay outside the request guard. OJS/RESP admission is unchanged.
+
 The shared HTTP server has a 30-minute read/write deadline by default; OJS uses
 tighter per-request deadlines for its small bodies and responses. Large S3
 transfers can tune `--http-read-timeout` / `--http-write-timeout`. `--max-conns`

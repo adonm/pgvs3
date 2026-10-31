@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -42,11 +43,16 @@ type Server struct {
 	multipartOverride multipartBackend
 	metricsHook       func(io.Writer)
 	sem               chan struct{}
+	waiters           chan struct{}
+	queueWait         time.Duration
+	queued            atomic.Uint64
+	rejected          atomic.Uint64
+	waitNanos         atomic.Uint64
 }
 
 func (s *Server) SetMetricsHook(f func(io.Writer)) { s.metricsHook = f }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, origins *objcache.Registry) *Server {
+func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, queueWait time.Duration, origins *objcache.Registry) *Server {
 	if maxConc <= 0 {
 		maxConc = 32
 	}
@@ -56,14 +62,22 @@ func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, origins 
 	if origins == nil {
 		origins = objcache.NewRegistry(st, log, objcache.NewRuntime(objcache.RuntimeOptions{}), objcache.TierOptions{ReadOnly: readOnly})
 	}
+	queueSize := 0
+	if queueWait > 0 {
+		queueSize = 2 * maxConc
+	}
 	return &Server{
 		store: st, log: log, metrics: telemetry.NewRequestMetrics(), readOnly: readOnly,
 		origins: origins,
 		sem:     make(chan struct{}, maxConc),
+		waiters: make(chan struct{}, queueSize), queueWait: queueWait,
 	}
 }
 
-func (s *Server) acquire() (func(), bool) {
+func (s *Server) acquire(ctx context.Context) (func(), bool) {
+	if ctx.Err() != nil {
+		return nil, false
+	}
 	if s.sem == nil {
 		return func() {}, true
 	}
@@ -71,6 +85,36 @@ func (s *Server) acquire() (func(), bool) {
 	case s.sem <- struct{}{}:
 		return func() { <-s.sem }, true
 	default:
+	}
+	if s.queueWait <= 0 {
+		s.rejected.Add(1)
+		return nil, false
+	}
+	select {
+	case s.waiters <- struct{}{}:
+	default:
+		s.rejected.Add(1)
+		return nil, false
+	}
+	s.queued.Add(1)
+	start := time.Now()
+	defer func() {
+		<-s.waiters
+		s.waitNanos.Add(uint64(time.Since(start)))
+	}()
+	timer := time.NewTimer(s.queueWait)
+	defer timer.Stop()
+	select {
+	case s.sem <- struct{}{}:
+		if ctx.Err() != nil {
+			<-s.sem
+			return nil, false
+		}
+		return func() { <-s.sem }, true
+	case <-ctx.Done():
+		return nil, false
+	case <-timer.C:
+		s.rejected.Add(1)
 		return nil, false
 	}
 }
@@ -109,10 +153,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { s.metrics.Observe(r.Method, rw.status, time.Since(start), rw.n) }()
 	ensureRequestID(w)
-	release, ok := s.acquire()
+	release, ok := s.acquire(r.Context())
 	if !ok {
+		if r.Context().Err() != nil {
+			writeError(rw, r, apiErr("RequestTimeout", "The request ended before S3 admission.", http.StatusRequestTimeout), s.log)
+			return
+		}
 		w.Header().Set("Retry-After", "1")
-		writeError(rw, r, apiErr("SlowDown", "Too many concurrent S3 requests; retry shortly.", http.StatusServiceUnavailable), s.log)
+		writeError(rw, r, apiErr("SlowDown", "The S3 admission queue is full or its wait budget expired; retry shortly.", http.StatusServiceUnavailable), s.log)
 		return
 	}
 	defer release()
@@ -573,6 +621,8 @@ func ensureRequestID(w http.ResponseWriter) string {
 func (s *Server) writeMetrics(w http.ResponseWriter, st *store.Store) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	s.metrics.Write(w, "pgvs3")
+	fmt.Fprintf(w, "pgvs3_s3_admission_active_requests %d\npgvs3_s3_admission_waiting_requests %d\npgvs3_s3_admission_queue_limit %d\npgvs3_s3_admission_queued_total %d\npgvs3_s3_admission_rejected_total %d\npgvs3_s3_admission_wait_seconds_total %f\n",
+		len(s.sem), len(s.waiters), cap(s.waiters), s.queued.Load(), s.rejected.Load(), float64(s.waitNanos.Load())/float64(time.Second))
 	if st != nil {
 		st.WriteMetrics(w)
 	}

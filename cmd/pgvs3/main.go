@@ -139,6 +139,7 @@ type serveConfig struct {
 	fillConcurrency         int
 	rangeCacheChunk         int64
 	s3Concurrency           int
+	s3QueueWait             time.Duration
 	queueConcurrency        int
 	respConcurrency         int
 	jobRetention            time.Duration
@@ -177,6 +178,7 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "concurrent origin cache fills")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
 	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "concurrent S3 requests")
+	fs.DurationVar(&cfg.s3QueueWait, "s3-queue-wait", time.Second, "maximum S3 admission wait (queue holds twice s3-concurrency; 0 rejects immediately)")
 	fs.IntVar(&cfg.queueConcurrency, "queue-concurrency", 16, "concurrent OJS queue requests")
 	fs.IntVar(&cfg.respConcurrency, "resp-concurrency", 32, "concurrent RESP batches")
 	fs.DurationVar(&cfg.jobRetention, "job-retention", store.DefaultJobRetention, "keep completed/cancelled/discarded OJS jobs this long (0 = forever)")
@@ -195,7 +197,7 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	}
 	if cfg.dbStatementTimeout < 0 || cfg.dbLockTimeout < 0 || cfg.dbIdleTxTimeout < 0 ||
 		cfg.dbMaxConnLifetime < 0 || cfg.dbMaxConnLifetimeJitter < 0 ||
-		cfg.httpReadTimeout < 0 || cfg.httpWriteTimeout < 0 || cfg.simulateLatency < 0 || cfg.simulateRPS < 0 || cfg.simulateBandwidth < 0 {
+		cfg.httpReadTimeout < 0 || cfg.httpWriteTimeout < 0 || cfg.s3QueueWait < 0 || cfg.simulateLatency < 0 || cfg.simulateRPS < 0 || cfg.simulateBandwidth < 0 {
 		return serveConfig{}, fmt.Errorf("timeouts must be non-negative")
 	}
 	return cfg, nil
@@ -348,7 +350,7 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 
 func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, origins *objcache.Registry, log *slog.Logger) *gateway.Gateway {
 	g := gateway.New(st, log, cfg.readOnly, origins, gateway.Limits{
-		S3: cfg.s3Concurrency, OJS: cfg.queueConcurrency, RESP: cfg.respConcurrency,
+		S3: cfg.s3Concurrency, S3QueueWait: cfg.s3QueueWait, OJS: cfg.queueConcurrency, RESP: cfg.respConcurrency,
 	})
 	g.SetVersion(version)
 	go func() {

@@ -52,6 +52,7 @@ func clearServeEnv(t *testing.T) {
 		"PGVS3_QUEUE_CONCURRENCY", "PGVS3_RESP_CONCURRENCY",
 		"PGVS3_JOB_RETENTION",
 		"PGVS3_SPOOL_MAX_BYTES",
+		"PGVS3_S3_QUEUE_WAIT",
 	} {
 		t.Setenv(key, "")
 	}
@@ -85,6 +86,7 @@ func TestParseServeConfigDefaults(t *testing.T) {
 		cacheWriteBack:          true,
 		fillConcurrency:         8,
 		s3Concurrency:           32,
+		s3QueueWait:             time.Second,
 		queueConcurrency:        16,
 		respConcurrency:         32,
 		jobRetention:            store.DefaultJobRetention,
@@ -107,7 +109,7 @@ func TestParseServeConfigFlags(t *testing.T) {
 		"--pprof-addr", "127.0.0.1:6060", "--origin-config", "/tmp/origin.json",
 		"--cache-ttl", "30s", "--cache-retention", "1h", "--cache-namespace", "cache",
 		"--fill-concurrency", "3", "--range-cache-chunk", "4096",
-		"--s3-concurrency", "7",
+		"--s3-concurrency", "7", "--s3-queue-wait", "75ms",
 		"--queue-concurrency", "5", "--resp-concurrency", "6",
 		"--job-retention", "2h",
 		"--simulate-latency", "25ms", "--simulate-rps", "17", "--simulate-bandwidth", "52428800",
@@ -142,6 +144,7 @@ func TestParseServeConfigFlags(t *testing.T) {
 		fillConcurrency:         3,
 		rangeCacheChunk:         4096,
 		s3Concurrency:           7,
+		s3QueueWait:             75 * time.Millisecond,
 		queueConcurrency:        5,
 		respConcurrency:         6,
 		jobRetention:            2 * time.Hour,
@@ -222,6 +225,7 @@ func TestParseServeConfigRejectsInvalidLimits(t *testing.T) {
 		{"--spool-max-bytes", "0"},
 		{"--max-conns", "-1"},
 		{"--s3-concurrency", "0"},
+		{"--s3-queue-wait", "-1s"},
 		{"--http-read-timeout", "-1s"},
 	} {
 		if _, err := parseServeConfig(args); err == nil {
