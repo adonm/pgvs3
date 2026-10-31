@@ -1,11 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 420" role="img" aria-labelledby="page-title page-desc">
-  <title id="page-title">8,192-Byte PostgreSQL Page Anatomy and Cut-Through I/O Pipeline</title>
-  <desc id="page-desc">Oat UI adaptive light/dark diagram of a single 8,192-byte PostgreSQL page holding one 8,120-byte chunk without TOAST, flanked by binary COPY ingest and parallel bitmap-scan reads.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 420" role="img" aria-labelledby="fig3-title fig3-desc">
+  <title id="fig3-title">FIG 03 — 8,192-Byte PostgreSQL Heap Page and Cut-Through I/O Pipeline</title>
+  <desc id="fig3-desc">Visual byte-scale cross-section of a single 8,192-byte PostgreSQL page holding one 8,120-byte chunk without TOAST, flanked by 4 MiB binary COPY framing and parallel bitmap-scan snapshot readers.</desc>
   <defs>
-    <marker id="ar-c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f3-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
     </marker>
-    <marker id="ar-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f3-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
     </marker>
   </defs>
@@ -13,9 +13,10 @@
     svg {
       color-scheme: light dark;
       --bg: light-dark(#ffffff, #09090b);
-      --stage: light-dark(#fafafa, #18181b);
-      --box: light-dark(#ffffff, #1e1e21);
-      --faint: light-dark(#f4f4f5, #27272a);
+      --hdr: light-dark(#fafafa, #141418);
+      --panel: light-dark(#fafafa, #18181b);
+      --card: light-dark(#ffffff, #1e1e22);
+      --pill: light-dark(#f4f4f5, #27272a);
       --border: light-dark(#e4e4e7, #303036);
       --fg: light-dark(#262626, #e5e5e5);
       --muted: light-dark(#71717a, #a1a1aa);
@@ -23,104 +24,111 @@
       --success: light-dark(#008032, #6cc070);
       --warning: light-dark(#a65b00, #f0a030);
       --purple: light-dark(#7c3aed, #c084fc);
-      --payload-bg: light-dark(#e6f4ea, #064e3b);
+      --pay: light-dark(#e6f4ea, #064e3b);
     }
     .bg { fill: var(--bg); }
-    .stage { fill: var(--stage); stroke: var(--border); stroke-width: 1.5; rx: 8; }
-    .box { fill: var(--box); stroke: var(--border); stroke-width: 1.3; rx: 6; }
-    .page-frame { fill: var(--box); stroke: var(--blue); stroke-width: 1.8; rx: 8; }
-    .bar-muted { fill: var(--faint); stroke: var(--border); stroke-width: 1; rx: 4; }
-    .bar-payload { fill: var(--payload-bg); stroke: var(--success); stroke-width: 1.5; rx: 6; animation: pulse-b 2.2s ease-in-out infinite; }
-    .chip { fill: var(--faint); stroke: var(--blue); stroke-width: 1.2; rx: 4; }
-    .title { fill: var(--fg); font: 600 16px system-ui, -apple-system, sans-serif; }
+    .hdr { fill: var(--hdr); stroke: var(--border); stroke-width: 1; }
+    .stage { fill: var(--panel); stroke: var(--border); stroke-width: 1.2; rx: 8; }
+    .box { fill: var(--card); stroke: var(--border); stroke-width: 1.4; rx: 6; }
+    .page-frame { fill: var(--card); stroke: var(--blue); stroke-width: 1.8; rx: 8; }
+    .bar-hdr { fill: var(--pill); stroke: var(--border); stroke-width: 1; rx: 4; }
+    .bar-pay { fill: var(--pay); stroke: var(--success); stroke-width: 1.6; rx: 6; }
+    .chip-b { fill: var(--pill); stroke: var(--blue); stroke-width: 1.2; rx: 4; }
+    .chip-g { fill: var(--pill); stroke: var(--success); stroke-width: 1.2; rx: 4; }
+    .fig { fill: var(--blue); font: 700 10.5px ui-monospace, Consolas, monospace; letter-spacing: 0.06em; }
+    .title { fill: var(--fg); font: 600 14.5px system-ui, -apple-system, sans-serif; }
     .h3 { fill: var(--fg); font: 600 13px system-ui, -apple-system, sans-serif; }
-    .sub { fill: var(--muted); font: 400 11px system-ui, -apple-system, sans-serif; }
-    .mono { fill: var(--fg); font: 600 11px ui-monospace, Consolas, monospace; }
-    .c-blue { fill: var(--blue); }
-    .c-green { fill: var(--success); }
-    .c-amber { fill: var(--warning); }
-    .c-purple { fill: var(--purple); }
-    .flow-in { stroke: var(--blue); stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: shift 1.2s linear infinite; }
-    .flow-out { stroke: var(--success); stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: shift 1.2s linear infinite; }
-    @keyframes shift { to { stroke-dashoffset: -28; } }
-    @keyframes pulse-b { 0%, 100% { opacity: 0.88; } 50% { opacity: 1; } }
+    .sub { fill: var(--muted); font: 400 10.5px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .cb { fill: var(--blue); }
+    .cg { fill: var(--success); }
+    .ca { fill: var(--warning); }
+    .cp { fill: var(--purple); }
+    .ln-b { stroke: var(--blue); stroke-width: 2.3; fill: none; stroke-dasharray: 7 5; animation: f3-d 1.2s linear infinite; }
+    .ln-g { stroke: var(--success); stroke-width: 2.3; fill: none; stroke-dasharray: 7 5; animation: f3-d 1.2s linear infinite; }
+    @keyframes f3-d { to { stroke-dashoffset: -24; } }
     @media (prefers-reduced-motion: reduce) {
-      .flow-in, .flow-out, .bar-payload { animation: none; }
+      .ln-b, .ln-g { animation: none; }
+      .pkt { display: none; }
     }
   </style>
 
   <rect width="1040" height="420" class="bg" rx="8"/>
-  <text x="28" y="34" class="title">8,120-Byte Page-Aligned Layout: Zero TOAST Overhead &amp; O(1) Byte-Range Seeking</text>
+  <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
+  <text x="24" y="27" class="fig">FIG 03</text>
+  <text x="80" y="27" class="title">8,120-Byte Page-Aligned Layout &amp; Cut-Through Streaming Pipeline</text>
+  <text x="720" y="26" class="mono cg">offset = no × 8,120 · 0 TOAST tables</text>
 
   <!-- Stage 1: Write Slicer -->
-  <rect x="28" y="56" width="260" height="336" class="stage"/>
-  <text x="46" y="82" class="h3 c-blue">1. Write Slicer &amp; Binary COPY</text>
+  <rect x="20" y="60" width="268" height="340" class="stage"/>
+  <text x="36" y="84" class="h3 cb">1. Write Slicer &amp; Binary COPY</text>
 
-  <rect x="46" y="98" width="224" height="64" class="box"/>
-  <text x="60" y="120" class="mono c-amber">≤ 64 KiB: Inline Fast Path</text>
-  <text x="60" y="138" class="sub">objects.inline_data (file_id NULL)</text>
-  <text x="60" y="153" class="mono c-green">1 PK Upsert · No chunk rows</text>
+  <rect x="36" y="98" width="236" height="58" class="box"/>
+  <text x="48" y="118" class="mono ca">≤ 64 KiB: Inline Fast Path</text>
+  <text x="48" y="138" class="sub">objects.inline_data (1 PK Upsert)</text>
 
-  <rect x="46" y="178" width="224" height="112" class="box"/>
-  <text x="60" y="200" class="mono c-blue">&gt; 64 KiB: 8,120 B Block Slicer</text>
-  <rect x="60" y="212" width="44" height="24" class="chip"/>
-  <text x="67" y="228" class="mono c-blue">no=0</text>
-  <rect x="110" y="212" width="44" height="24" class="chip"/>
-  <text x="117" y="228" class="mono c-blue">no=1</text>
-  <rect x="160" y="212" width="44" height="24" class="chip"/>
-  <text x="167" y="228" class="mono c-blue">no=2</text>
-  <rect x="210" y="212" width="44" height="24" class="chip"/>
-  <text x="220" y="228" class="mono c-blue">…</text>
-  <text x="60" y="256" class="sub">• Zstd per block only if smaller</text>
-  <text x="60" y="274" class="mono">• 4 MiB Binary COPY Batches</text>
+  <rect x="36" y="170" width="236" height="134" class="box"/>
+  <text x="48" y="192" class="mono cb">&gt; 64 KiB: 8,120 B Block Slicer</text>
+  <rect x="48" y="204" width="50" height="28" class="chip-b"/><text x="56" y="222" class="mono cb">no=0</text>
+  <rect x="104" y="204" width="50" height="28" class="chip-b"/><text x="112" y="222" class="mono cb">no=1</text>
+  <rect x="160" y="204" width="50" height="28" class="chip-b"/><text x="168" y="222" class="mono cb">no=2</text>
+  <rect x="216" y="204" width="42" height="28" class="chip-b"/><text x="230" y="222" class="mono cb">…</text>
+  <rect x="48" y="242" width="210" height="48" class="bar-hdr"/>
+  <text x="58" y="262" class="mono">4 MiB Binary COPY Framer</text>
+  <text x="58" y="279" class="sub">Zstd per block only if it shrinks</text>
 
-  <rect x="46" y="306" width="224" height="68" class="box"/>
-  <text x="60" y="328" class="mono c-purple">Atomic Pointer Swap</text>
-  <text x="60" y="346" class="sub">publish_object swaps file_id;</text>
-  <text x="60" y="362" class="sub">old.file_id → garbage (10m grace)</text>
+  <rect x="36" y="318" width="236" height="64" class="box"/>
+  <text x="48" y="340" class="mono cp">Atomic Publish Swap</text>
+  <text x="48" y="358" class="sub">RETURNING old.file_id → garbage</text>
 
-  <!-- Stage 2: Exact 8,192 B Page Anatomy -->
-  <rect x="336" y="56" width="368" height="336" class="stage"/>
-  <text x="356" y="82" class="h3 c-amber">2. One 8,192-Byte PostgreSQL Heap Page</text>
+  <!-- Stage 2: 8,192 B Page Cross-Section -->
+  <rect x="332" y="60" width="376" height="340" class="stage"/>
+  <text x="352" y="84" class="h3 ca">2. Inside One 8,192-Byte PostgreSQL Page</text>
 
-  <rect x="356" y="98" width="328" height="202" class="page-frame"/>
-  <rect x="372" y="114" width="296" height="28" class="bar-muted"/>
-  <text x="382" y="132" class="mono">28 B Page Header + Line Pointer (ItemId)</text>
+  <rect x="352" y="98" width="336" height="208" class="page-frame"/>
+  <text x="368" y="118" class="sub">Byte 0</text>
+  <text x="618" y="118" class="sub">Byte 8,192</text>
 
-  <rect x="372" y="148" width="296" height="34" class="bar-muted"/>
-  <text x="382" y="169" class="mono">40 B Tuple Hdr + file_id (8B) + no (4B)</text>
+  <rect x="368" y="126" width="304" height="28" class="bar-hdr"/>
+  <text x="380" y="144" class="mono">0..28 B: PageHeaderData + ItemId Pointer</text>
 
-  <rect x="372" y="188" width="296" height="96" class="bar-payload"/>
-  <text x="386" y="216" class="h3 c-green">8,120 Bytes Payload (1 Chunk Tuple)</text>
-  <text x="386" y="238" class="mono">toast_tuple_target = 8160</text>
-  <text x="386" y="256" class="mono">STORAGE EXTERNAL (0 TOAST tables!)</text>
-  <text x="386" y="274" class="sub">Incompressible Parquet stored raw</text>
+  <rect x="368" y="160" width="304" height="32" class="bar-hdr"/>
+  <text x="380" y="180" class="mono">28..68 B: Tuple Hdr + file_id (8B) + no (4B)</text>
 
-  <rect x="356" y="312" width="328" height="62" class="box"/>
-  <text x="372" y="334" class="mono c-green">O(1) Byte-Range Seek Formula:</text>
-  <text x="372" y="356" class="mono">no BETWEEN (start / 8120) AND (end / 8120)</text>
+  <rect x="368" y="198" width="304" height="94" class="bar-pay"/>
+  <text x="382" y="224" class="h3 cg">68..8,188 B: 8,120-Byte Chunk Payload</text>
+  <text x="382" y="246" class="mono">toast_tuple_target = 8160 · STORAGE EXTERNAL</text>
+  <text x="382" y="266" class="sub">1 tuple = 1 page · Zero out-of-line TOAST hops</text>
+  <text x="382" y="282" class="sub">Incompressible Parquet stored raw without expansion</text>
+
+  <rect x="352" y="318" width="336" height="64" class="box"/>
+  <text x="368" y="340" class="mono cg">O(1) HTTP Range Mapping:</text>
+  <text x="368" y="360" class="mono">WHERE file_id = $1 AND no BETWEEN A/8120 AND B/8120</text>
 
   <!-- Stage 3: Cut-Through Reader -->
-  <rect x="752" y="56" width="260" height="336" class="stage"/>
-  <text x="770" y="82" class="h3 c-green">3. Cut-Through Reader</text>
+  <rect x="752" y="60" width="268" height="340" class="stage"/>
+  <text x="768" y="84" class="h3 cg">3. Parallel Cut-Through Reader</text>
 
-  <rect x="770" y="98" width="224" height="84" class="box"/>
-  <text x="784" y="120" class="mono c-green">chunkPool (Bitmap Scan)</text>
-  <text x="784" y="138" class="sub">• enable_indexscan = off</text>
-  <text x="784" y="154" class="sub">• effective_io_concurrency = 32</text>
-  <text x="784" y="170" class="mono">• 2–8 parallel 8 MiB pieces</text>
+  <rect x="768" y="98" width="236" height="94" class="box"/>
+  <text x="780" y="118" class="mono cg">chunkPool (Bitmap Heap Scan)</text>
+  <rect x="780" y="128" width="102" height="24" class="chip-g"/><text x="788" y="144" class="mono">Piece 0 (8MB)</text>
+  <rect x="890" y="128" width="102" height="24" class="chip-g"/><text x="898" y="144" class="mono">Piece 1 (8MB)</text>
+  <rect x="780" y="158" width="102" height="24" class="chip-g"/><text x="788" y="174" class="mono">Piece 2 (8MB)</text>
+  <rect x="890" y="158" width="102" height="24" class="chip-g"/><text x="898" y="174" class="mono">Piece 3 (8MB)</text>
 
-  <rect x="770" y="198" width="224" height="84" class="box"/>
-  <text x="784" y="220" class="mono c-amber">32 × 256 KiB Ring Buffer</text>
-  <text x="784" y="238" class="sub">• Reorders physical TIDs to `no`</text>
-  <text x="784" y="254" class="sub">• Streams directly to socket</text>
-  <text x="784" y="270" class="mono c-green">Bounded RAM on 1 GiB GETs</text>
+  <rect x="768" y="206" width="236" height="98" class="box"/>
+  <text x="780" y="228" class="mono ca">TID Reorder + 32-Slot Ring</text>
+  <text x="780" y="248" class="sub">Reorders bitmap TIDs to strict `no`</text>
+  <rect x="780" y="258" width="212" height="32" class="bar-hdr"/>
+  <text x="790" y="278" class="mono cg">32 × 256 KiB Cut-Through Channel</text>
 
-  <rect x="770" y="298" width="224" height="76" class="box"/>
-  <text x="784" y="320" class="mono c-purple">Shared Exported Snapshot</text>
-  <text x="784" y="338" class="sub">pg_export_snapshot() keeps</text>
-  <text x="784" y="354" class="sub">multi-conn pieces consistent</text>
+  <rect x="768" y="318" width="236" height="64" class="box"/>
+  <text x="780" y="340" class="mono cp">Exported Snapshot Isolation</text>
+  <text x="780" y="358" class="sub">pg_export_snapshot() across pieces</text>
 
-  <path d="M 288 234 L 348 234" class="flow-in" marker-end="url(#ar-c)"/>
-  <path d="M 704 234 L 764 234" class="flow-out" marker-end="url(#ar-g)"/>
+  <!-- Horizontal Connectors -->
+  <path id="p3-in" d="M 288 242 L 346 242" class="ln-b" marker-end="url(#f3-b)"/>
+  <path id="p3-out" d="M 708 242 L 762 242" class="ln-g" marker-end="url(#f3-g)"/>
+  <circle r="4" class="cb pkt"><animateMotion dur="1.1s" repeatCount="indefinite"><mpath href="#p3-in"/></animateMotion></circle>
+  <circle r="4" class="cg pkt"><animateMotion dur="1.1s" repeatCount="indefinite"><mpath href="#p3-out"/></animateMotion></circle>
 </svg>

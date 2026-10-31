@@ -39,13 +39,13 @@ SQL or dependencies were changed.
 ```text
 $ just guides
 guides: 35 bound snippets, 12 scenario checks passed
-guides ok (34s); artifacts: .tmp/verify/guides.LO55Zg
+guides ok (34s); artifacts: .tmp/verify/guides.htfvGk
 
 $ just docs
 Output created: _site/index.html
 
 $ python3 test/documentation.py
-{'documents': 24, 'local_links': 200, 'snippets': 35, 'svgs': 5}
+{'documents': 24, 'local_links': 203, 'snippets': 35, 'svgs': 6}
 
 $ mise exec python -- python -m unittest discover -s deploy/bench -p '*_test.py'
 Ran 24 tests
@@ -62,9 +62,11 @@ OK
 | Jobs | Rollback/no job, lost enqueue reconciliation, mismatched envelope refusal, effect-before-ACK redelivery and stale-token 409. Receipt/effect count stays one even after retained ID removal/reuse. | Permanent uniqueness or exactly-once external work. Retention age is advanced only on one owned fixture row. |
 | Streams | Ceiling 413, same active batch on repeat, ACK then empty receive. | Pagination, job leases on batches or a hard retention/disk cap. |
 
-Canonical report: `.tmp/verify/guides.LO55Zg/guides.json`, SHA-256
-`c95072f77924f3ab8ee2ac514615a650f144c0c69415cba875f88c116ec2a31f`
-(superseding `.tmp/verify/guides.dJ5kp4/guides.json`, SHA-256
+Canonical report: `.tmp/verify/guides.htfvGk/guides.json`, SHA-256
+`d54cc76c63c56a9937667b1fbdcd0d3502c1a9f188712839a891592784deafc3`
+(superseding `.tmp/verify/guides.LO55Zg/guides.json`, SHA-256
+`c95072f77924f3ab8ee2ac514615a650f144c0c69415cba875f88c116ec2a31f`,
+`.tmp/verify/guides.dJ5kp4/guides.json`, SHA-256
 `04fa2c41f6ec1c7421e869e97c5becf8227c4b2296b83a2344fb57f774fe9ef4`,
 `.tmp/verify/guides.rVqHQl/guides.json`, SHA-256
 `8f63be5765a85f21108db9948e7c6c654dcc3429b05c46f24ae6b812fa737b71`,
@@ -98,7 +100,7 @@ The frozen-source CI run retained integration (44 s), Helm/kind (72 s),
 contract (50 s), fault (91 s), interop (16 s) and s3t (13 s) artifacts. Its embedded
 guide report, `.tmp/verify/contract.E4QASf/guides.json` (SHA-256
 `76a9f5cf74317b49cc1c38e928da81313537ec97a127072611f06a94ffd709ce`), and the
-updated 35-snippet standalone run `.tmp/verify/guides.LO55Zg/guides.json` both
+updated 35-snippet standalone run `.tmp/verify/guides.htfvGk/guides.json` both
 completed with matching source hashes. Full CI transcript:
 `.tmp/guidance-20261031/ci-frozen.log`, SHA-256
 `32c0e44297bde13dac56934b321f8521625a1292b9ba626c49b079bb5a8fc0bf`.

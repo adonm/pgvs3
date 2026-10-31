@@ -19,6 +19,8 @@ cache-coherence and coordination services.
 
 ## Start Here: Choose Your Path
 
+![FIG 02 — Workload, Schema and Partitioning Decision Tree](assets/decision-tree.svg)
+
 | Goal | Primary Guide | What You Will Build & Verify |
 | --- | --- | --- |
 | **Choose the right schema, partition & storage model** | [Workload Decision Tree & Resource Trade-offs](guides/index.md) | Map OLTP, DuckLake, cache and queue requirements across RAM, Disk/WAL, Network and CPU. |

@@ -79,13 +79,16 @@ def check_links():
     if errors:
         raise ValueError("\n".join(errors))
     svgs = sorted(ASSETS.glob("*.svg"))
-    if len(svgs) < 5:
-        raise ValueError("Expected at least 5 SVG diagrams in docs/assets")
+    if len(svgs) < 6:
+        raise ValueError("Expected at least 6 SVG diagrams in docs/assets")
     for svg in svgs:
         ET.parse(svg)
         body = svg.read_text()
         if "@keyframes" not in body or "prefers-reduced-motion" not in body or "light-dark(" not in body:
             raise ValueError(f"SVG {svg.relative_to(ROOT)} must include CSS animation, light-dark() tokens, and prefers-reduced-motion support")
+    for source in paths:
+        if any(token in source.read_text() for token in ("├──", "└──", "--WAL-->", "replaceable pgvs3 gateways -------")):
+            raise ValueError(f"ASCII diagram remains in {source.relative_to(ROOT)}; use docs/assets/*.svg instead")
     quarto_cfg = (ROOT / "docs/_quarto.yml").read_text()
     for href in re.findall(r"href:\s*([^\s#]+\.md)", quarto_cfg):
         if not (ROOT / "docs" / href).exists():

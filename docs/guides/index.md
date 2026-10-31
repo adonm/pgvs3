@@ -10,29 +10,7 @@ not with every interface enabled.
 
 ## Decision tree: choose the model and path
 
-```text
-What is the primary access and mutation contract?
-├── Point reads/writes, strict ACID constraints, <10 ms OLTP p99
-│   └── Keep in PostgreSQL SQL (docs/guides/postgres.md)
-│       ├── Wide columns (>2 KiB TOAST / blobs)?
-│       │   └── Split hot narrow row from cold payload table, or store multi-MiB blobs in pgvs3
-│       ├── Need 32–64 zero-maintenance partitions across 10M–1B+ rows?
-│       │   └── Fixed HASH(id/tenant_id), or 32–64 quantile RANGE bounds on 1D Hilbert/Morton curve_id (avoids hotspot skew)
-│       └── Only use time RANGE partitions if you must DROP/DETACH whole expired months
-├── Analytical scans, aggregations, or billion-row history (minutes-to-hours freshness)
-│   └── Extract to Parquet / DuckLake on pgvs3 (docs/guides/analytics.md)
-│       ├── Single-table/snapshot export? ──► Immutable Parquet + conditional manifest
-│       ├── Entity / tenant / ID filters? ──► Fixed PARTITIONED BY (bucket(32..64, id)) + SORTED BY (ts, id)
-│       ├── 2D/spatiotemporal filters (including skewed hotspots)?
-│       │   └── High-res 32/64-bit Hilbert/Morton SORTED BY (curve_id, ts) (row groups & target_file_size auto-split dense hotspots by row/byte quantiles!)
-│       ├── Billion rows + wide columns? ──► Byte-bounded row groups, skip_stats_columns, late materialization
-│       └── Willing to pay slow/batch writes for peak read speed?
-│           └── Batch sorted ZSTD writes + merge/rewrite compaction (or sealed ObjFS/DuckDB for heavy joins)
-├── Shared S3/HTTP acceleration or durable write-back staging across workers
-│   └── Origin-backed pgvs3 cache/stage (docs/guides/cache.md)
-└── Asynchronous background work or fan-out from committed SQL changes
-    └── Application SQL outbox + OJS jobs/streams (docs/guides/jobs.md)
-```
+![FIG 02 — Workload, Schema and Partitioning Decision Tree](../assets/decision-tree.svg)
 
 | I need to… | Start here | Success means |
 | --- | --- | --- |

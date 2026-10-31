@@ -1,17 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 480" role="img" aria-labelledby="arch-title arch-desc">
-  <title id="arch-title">pgvs3 System Architecture and Parallel Data Lanes</title>
-  <desc id="arch-desc">Clean four-column, non-crossing architecture diagram in Oat UI light/dark adaptive style showing Clients, Stateless Gateways, PostgreSQL 18 Primary, and Standby/Origin targets.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 460" role="img" aria-labelledby="fig1-title fig1-desc">
+  <title id="fig1-title">FIG 01 — pgvs3 System Topology and Authority Lanes</title>
+  <desc id="fig1-desc">Four-column, non-crossing architecture diagram showing Clients, Stateless Gateways, PostgreSQL 18 Primary, and Standbys/Origin with animated packets.</desc>
   <defs>
-    <marker id="arr-c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f1-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
     </marker>
-    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f1-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
     </marker>
-    <marker id="arr-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f1-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--purple)"/>
     </marker>
-    <marker id="arr-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f1-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--warning)"/>
     </marker>
   </defs>
@@ -19,9 +19,10 @@
     svg {
       color-scheme: light dark;
       --bg: light-dark(#ffffff, #09090b);
+      --hdr: light-dark(#fafafa, #141418);
       --panel: light-dark(#fafafa, #18181b);
-      --card: light-dark(#ffffff, #1e1e21);
-      --faint: light-dark(#f4f4f5, #27272a);
+      --card: light-dark(#ffffff, #1e1e22);
+      --pill: light-dark(#f4f4f5, #27272a);
       --border: light-dark(#e4e4e7, #303036);
       --fg: light-dark(#262626, #e5e5e5);
       --muted: light-dark(#71717a, #a1a1aa);
@@ -31,113 +32,142 @@
       --purple: light-dark(#7c3aed, #c084fc);
     }
     .bg { fill: var(--bg); }
-    .node { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; rx: 6; }
-    .node-c { fill: var(--panel); stroke: var(--blue); stroke-width: 1.75; rx: 6; }
-    .node-g { fill: var(--panel); stroke: var(--success); stroke-width: 1.75; rx: 6; }
-    .node-p { fill: var(--panel); stroke: var(--purple); stroke-width: 1.75; rx: 6; }
-    .node-a { fill: var(--panel); stroke: var(--warning); stroke-width: 1.75; rx: 6; }
-    .pill { fill: var(--faint); stroke: var(--border); stroke-width: 1; rx: 4; }
-    .title { fill: var(--fg); font: 600 16px system-ui, -apple-system, sans-serif; }
-    .col-hdr { fill: var(--muted); font: 600 11px system-ui, -apple-system, sans-serif; letter-spacing: 0.06em; }
-    .h3 { fill: var(--fg); font: 600 13px system-ui, -apple-system, sans-serif; }
-    .sub { fill: var(--muted); font: 400 11px system-ui, -apple-system, sans-serif; }
+    .hdr { fill: var(--hdr); stroke: var(--border); stroke-width: 1; }
+    .col-bg { fill: var(--panel); stroke: var(--border); stroke-width: 1; rx: 8; }
+    .box { fill: var(--card); stroke: var(--border); stroke-width: 1.4; rx: 6; }
+    .box-b { fill: var(--card); stroke: var(--blue); stroke-width: 1.6; rx: 6; }
+    .box-g { fill: var(--card); stroke: var(--success); stroke-width: 1.6; rx: 6; }
+    .box-p { fill: var(--card); stroke: var(--purple); stroke-width: 1.6; rx: 6; }
+    .box-a { fill: var(--card); stroke: var(--warning); stroke-width: 1.6; rx: 6; }
+    .chip { fill: var(--pill); stroke: var(--border); stroke-width: 1; rx: 4; }
+    .fig { fill: var(--blue); font: 700 10.5px ui-monospace, Consolas, monospace; letter-spacing: 0.06em; }
+    .title { fill: var(--fg); font: 600 14.5px system-ui, -apple-system, sans-serif; }
+    .col-t { fill: var(--muted); font: 700 10.5px system-ui, -apple-system, sans-serif; letter-spacing: 0.08em; }
+    .h4 { fill: var(--fg); font: 600 12.5px system-ui, -apple-system, sans-serif; }
+    .sub { fill: var(--muted); font: 400 10.5px system-ui, -apple-system, sans-serif; }
     .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
-    .c-blue { fill: var(--blue); }
-    .c-green { fill: var(--success); }
-    .c-amber { fill: var(--warning); }
-    .c-purple { fill: var(--purple); }
-    .lane-c { stroke: var(--blue); stroke-width: 2.2; fill: none; stroke-dasharray: 8 6; animation: flow 1.2s linear infinite; }
-    .lane-g { stroke: var(--success); stroke-width: 2.2; fill: none; stroke-dasharray: 8 6; animation: flow 1.2s linear infinite; }
-    .lane-p { stroke: var(--purple); stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: flow 1.0s linear infinite; }
-    .lane-a { stroke: var(--warning); stroke-width: 2.2; fill: none; stroke-dasharray: 8 6; animation: flow 1.5s linear infinite; }
-    @keyframes flow { to { stroke-dashoffset: -28; } }
+    .cb { fill: var(--blue); }
+    .cg { fill: var(--success); }
+    .ca { fill: var(--warning); }
+    .cp { fill: var(--purple); }
+    .ln-b { stroke: var(--blue); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f1-dash 1.2s linear infinite; }
+    .ln-g { stroke: var(--success); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f1-dash 1.2s linear infinite; }
+    .ln-p { stroke: var(--purple); stroke-width: 2.4; fill: none; stroke-dasharray: 7 5; animation: f1-dash 1.0s linear infinite; }
+    .ln-a { stroke: var(--warning); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f1-dash 1.4s linear infinite; }
+    @keyframes f1-dash { to { stroke-dashoffset: -24; } }
     @media (prefers-reduced-motion: reduce) {
-      .lane-c, .lane-g, .lane-p, .lane-a { animation: none; }
+      .ln-b, .ln-g, .ln-p, .ln-a { animation: none; }
+      .pkt { display: none; }
     }
   </style>
 
-  <rect width="1040" height="480" class="bg" rx="8"/>
-  <text x="28" y="34" class="title">pgvs3 — Parallel Data Lanes &amp; Authority Boundaries (Zero Crossings)</text>
+  <rect width="1040" height="460" class="bg" rx="8"/>
+  <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
+  <text x="24" y="27" class="fig">FIG 01</text>
+  <text x="80" y="27" class="title">System Topology &amp; Parallel Authority Lanes</text>
 
-  <text x="40" y="64" class="col-hdr">1. CLIENTS</text>
-  <text x="296" y="64" class="col-hdr">2. STATELESS GATEWAYS (:8014)</text>
-  <text x="580" y="64" class="col-hdr">3. POSTGRESQL 18 PRIMARY</text>
-  <text x="836" y="64" class="col-hdr">4. REPLICAS &amp; ORIGIN</text>
+  <!-- Legend Pills -->
+  <circle cx="670" cy="22" r="4" class="cb"/><text x="680" y="26" class="sub">SQL / S3 Write</text>
+  <circle cx="775" cy="22" r="4" class="cg"/><text x="785" y="26" class="sub">Warm Read Hit</text>
+  <circle cx="880" cy="22" r="4" class="cp"/><text x="890" y="26" class="sub">WAL Stream</text>
+  <circle cx="965" cy="22" r="4" class="ca"/><text x="975" y="26" class="sub">Origin I/O</text>
 
-  <!-- LANE 1: Direct OLTP SQL -->
-  <rect x="28" y="80" width="196" height="72" class="node"/>
-  <text x="44" y="105" class="h3">OLTP &amp; DuckLake SQL</text>
-  <text x="44" y="123" class="sub">App tables · Outbox · Catalog</text>
-  <text x="44" y="140" class="mono c-blue">:5432 / PgBouncer :6432</text>
+  <!-- 4 Column Containers -->
+  <rect x="20" y="58" width="196" height="384" class="col-bg"/>
+  <text x="34" y="78" class="col-t">1. CLIENTS</text>
 
-  <rect x="568" y="80" width="204" height="72" class="node-c"/>
-  <text x="584" y="105" class="h3 c-blue">App &amp; Catalog Schemas</text>
-  <text x="584" y="123" class="sub">guide_app · ducklake_catalog</text>
-  <text x="584" y="140" class="mono">Independent SQL Tx</text>
+  <rect x="268" y="58" width="232" height="384" class="col-bg"/>
+  <text x="282" y="78" class="col-t">2. STATELESS GATEWAYS (:8014)</text>
 
-  <path d="M 224 116 L 562 116" class="lane-c" marker-end="url(#arr-c)"/>
-  <text x="330" y="108" class="mono c-blue">Direct SQL (Bypasses Gateway)</text>
+  <rect x="552" y="58" width="224" height="384" class="col-bg"/>
+  <text x="566" y="78" class="col-t">3. POSTGRESQL 18 PRIMARY</text>
 
-  <!-- LANE 2: S3 / DuckDB / OJS -->
-  <rect x="28" y="176" width="196" height="96" class="node"/>
-  <text x="44" y="201" class="h3">DuckDB / S3 / OJS</text>
-  <text x="44" y="219" class="sub">10 MiB–1 GiB Parquet</text>
-  <text x="44" y="237" class="sub">OJS Jobs &amp; Streams</text>
-  <text x="44" y="255" class="mono">RESP2 Pipelined Cache</text>
+  <rect x="828" y="58" width="192" height="384" class="col-bg"/>
+  <text x="842" y="78" class="col-t">4. REPLICAS &amp; ORIGIN</text>
 
-  <rect x="284" y="176" width="220" height="176" class="node-c"/>
-  <text x="300" y="201" class="h3 c-blue">Writable Fleet (pgvs3)</text>
-  <text x="300" y="221" class="sub">• Admission: 32 active + 64 wait</text>
-  <text x="300" y="239" class="sub">• Spool guard: 8 GiB fail-fast</text>
-  <text x="300" y="257" class="sub">• mainPool (B-tree) + chunkPool</text>
-  <text x="300" y="275" class="sub">• Advisory-locked reaper/leader</text>
-  <rect x="300" y="292" width="188" height="44" class="pill"/>
-  <text x="310" y="311" class="mono c-blue">Session Advisory Locks:</text>
-  <text x="310" y="326" class="mono">Direct or Session Pool Only</text>
+  <!-- LANE 1: Direct OLTP & Catalog SQL -->
+  <rect x="32" y="92" width="172" height="62" class="box"/>
+  <text x="44" y="116" class="h4">OLTP &amp; DuckLake</text>
+  <text x="44" y="136" class="mono cb">:5432 / Pooler :6432</text>
 
-  <rect x="568" y="176" width="204" height="96" class="node-c"/>
-  <text x="584" y="201" class="h3 c-blue">Primary Data Schemas</text>
-  <text x="584" y="219" class="mono">s3b_ (Native) · s3q_ (Queues)</text>
-  <text x="584" y="237" class="mono">s3p  (Catalog &amp; Leases)</text>
-  <text x="584" y="255" class="sub">8,120 B pages · MVCC publish</text>
+  <rect x="564" y="92" width="200" height="62" class="box-b"/>
+  <text x="576" y="116" class="h4 cb">App &amp; Catalog DBs</text>
+  <text x="576" y="136" class="mono">guide_app · ducklake</text>
 
-  <path d="M 224 224 L 278 224" class="lane-c" marker-end="url(#arr-c)"/>
-  <path d="M 504 224 L 562 224" class="lane-c" marker-end="url(#arr-c)"/>
+  <path id="p1-sql" d="M 204 123 L 558 123" class="ln-b" marker-end="url(#f1-b)"/>
+  <rect x="316" y="106" width="136" height="20" class="chip"/>
+  <text x="326" y="120" class="mono cb">Direct SQL Tx</text>
 
-  <!-- LANE 3: Cache & Staging -->
-  <rect x="568" y="292" width="204" height="84" class="node-a"/>
-  <text x="584" y="317" class="h3 c-amber">Cache &amp; Staging</text>
-  <text x="584" y="335" class="mono">s3c_ (Fills) · s3w_ (Pending)</text>
-  <text x="584" y="353" class="sub">s3w_ never expires until drain</text>
+  <!-- LANE 2: Writable Gateways & Native/Queue Schemas -->
+  <rect x="32" y="174" width="172" height="84" class="box"/>
+  <text x="44" y="198" class="h4">DuckDB / S3 / OJS</text>
+  <text x="44" y="216" class="sub">10 MiB–1 GiB Parquet</text>
+  <text x="44" y="234" class="mono">PUT · GET · Jobs · RESP2</text>
 
-  <rect x="824" y="292" width="188" height="84" class="node-a"/>
-  <text x="840" y="317" class="h3 c-amber">S3 / HTTP Origin</text>
-  <text x="840" y="335" class="sub">Coalesced 1-GET cold fill</text>
-  <text x="840" y="353" class="mono c-amber">Leased outbox PUT drain</text>
+  <rect x="280" y="174" width="208" height="166" class="box-b"/>
+  <text x="292" y="196" class="h4 cb">Writable Fleet (serve)</text>
+  <rect x="292" y="206" width="88" height="36" class="chip"/>
+  <text x="300" y="222" class="mono">S3 Guard</text>
+  <text x="300" y="235" class="sub">32 + 64 wait</text>
+  <rect x="388" y="206" width="88" height="36" class="chip"/>
+  <text x="396" y="222" class="mono">Spool Cap</text>
+  <text x="396" y="235" class="sub">8 GiB disk</text>
+  <rect x="292" y="248" width="88" height="36" class="chip"/>
+  <text x="300" y="264" class="mono cb">mainPool</text>
+  <text x="300" y="277" class="sub">B-tree PK</text>
+  <rect x="388" y="248" width="88" height="36" class="chip"/>
+  <text x="396" y="264" class="mono cg">chunkPool</text>
+  <text x="396" y="277" class="sub">Bitmap AIO</text>
+  <rect x="292" y="292" width="184" height="36" class="chip"/>
+  <text x="302" y="308" class="mono cb">Session Advisory Locks</text>
+  <text x="302" y="321" class="sub">Direct / Session Pool Only</text>
 
-  <path d="M 504 334 L 562 334" class="lane-a" marker-end="url(#arr-a)"/>
-  <path d="M 772 334 L 818 334" class="lane-a" marker-end="url(#arr-a)"/>
+  <rect x="564" y="174" width="200" height="84" class="box-b"/>
+  <text x="576" y="198" class="h4 cb">Primary Schemas (v25)</text>
+  <text x="576" y="218" class="mono">s3b_ (Bytes) · s3q_ (OJS)</text>
+  <text x="576" y="236" class="sub">s3p catalog · 8,120 B pages</text>
 
-  <!-- LANE 4: Read-Only Fleet & Standbys -->
-  <rect x="28" y="376" width="196" height="76" class="node"/>
-  <text x="44" y="401" class="h3">Scale-Out Readers</text>
-  <text x="44" y="419" class="sub">DuckDB · S3 GET / Range</text>
-  <text x="44" y="437" class="mono">Read-only service endpoint</text>
+  <path id="p1-w1" d="M 204 216 L 274 216" class="ln-b" marker-end="url(#f1-b)"/>
+  <path id="p1-w2" d="M 488 216 L 558 216" class="ln-b" marker-end="url(#f1-b)"/>
 
-  <rect x="284" y="376" width="220" height="76" class="node-g"/>
-  <text x="300" y="401" class="h3 c-green">Read-Only Fleet (--read-only)</text>
-  <text x="300" y="419" class="sub">Rejects mutations (403)</text>
-  <text x="300" y="437" class="mono c-green">Serves s3b_, s3c_ &amp; s3w_ hits</text>
+  <!-- LANE 3: Origin Cache (s3c_) & Durable Write-Back (s3w_) -->
+  <rect x="564" y="276" width="200" height="64" class="box-a"/>
+  <text x="576" y="300" class="h4 ca">s3c_ Cache &amp; s3w_ Stage</text>
+  <text x="576" y="320" class="mono">s3w_ non-expiring outbox</text>
 
-  <rect x="824" y="376" width="188" height="76" class="node-p"/>
-  <text x="840" y="401" class="h3 c-purple">Physical Standbys</text>
-  <text x="840" y="419" class="sub">Streaming WAL replay</text>
-  <text x="840" y="437" class="mono c-purple">replay_lsn &gt;= flush_lsn</text>
+  <rect x="840" y="276" width="168" height="64" class="box-a"/>
+  <text x="852" y="300" class="h4 ca">S3 / HTTP Origin</text>
+  <text x="852" y="320" class="mono">1-GET fill · Outbox PUT</text>
 
-  <path d="M 224 414 L 278 414" class="lane-g" marker-end="url(#arr-g)"/>
-  <path d="M 818 414 L 510 414" class="lane-g" marker-end="url(#arr-g)"/>
-  <text x="615" y="434" class="mono c-green">Replicated Page Hits (0 Origin GETs)</text>
+  <path id="p1-o1" d="M 488 308 L 558 308" class="ln-a" marker-end="url(#f1-a)"/>
+  <path id="p1-o2" d="M 764 308 L 834 308" class="ln-a" marker-end="url(#f1-a)"/>
 
-  <path d="M 670 376 L 670 392 L 818 392" class="lane-p" marker-end="url(#arr-p)"/>
-  <text x="682" y="388" class="mono c-purple">WAL Stream</text>
+  <!-- LANE 4: Read-Only Fleet & Physical Standbys -->
+  <rect x="32" y="362" width="172" height="64" class="box"/>
+  <text x="44" y="386" class="h4">Scale-Out Readers</text>
+  <text x="44" y="406" class="mono cg">GET · Range · OJS Info</text>
+
+  <rect x="280" y="362" width="208" height="64" class="box-g"/>
+  <text x="292" y="386" class="h4 cg">Read-Only (--read-only)</text>
+  <text x="292" y="406" class="mono">Mutations → 403 Forbidden</text>
+
+  <rect x="840" y="362" width="168" height="64" class="box-p"/>
+  <text x="852" y="386" class="h4 cp">Physical Standbys</text>
+  <text x="852" y="406" class="mono">replay_lsn &gt;= flush_lsn</text>
+
+  <path id="p1-r1" d="M 204 394 L 274 394" class="ln-g" marker-end="url(#f1-g)"/>
+  <path id="p1-r2" d="M 834 394 L 494 394" class="ln-g" marker-end="url(#f1-g)"/>
+  <rect x="596" y="384" width="144" height="20" class="chip"/>
+  <text x="606" y="398" class="mono cg">Replicated Page Hits</text>
+
+  <!-- Vertical WAL Replication (Primary -> Standby) -->
+  <path id="p1-wal" d="M 664 340 L 664 370 L 834 370" class="ln-p" marker-end="url(#f1-p)"/>
+  <text x="674" y="363" class="mono cp">WAL Stream</text>
+
+  <!-- Animated Packets -->
+  <circle r="4" class="cb pkt"><animateMotion dur="2.2s" repeatCount="indefinite"><mpath href="#p1-sql"/></animateMotion></circle>
+  <circle r="4" class="cb pkt"><animateMotion dur="1.4s" repeatCount="indefinite"><mpath href="#p1-w2"/></animateMotion></circle>
+  <circle r="4" class="ca pkt"><animateMotion dur="1.8s" repeatCount="indefinite"><mpath href="#p1-o2"/></animateMotion></circle>
+  <circle r="4" class="cg pkt"><animateMotion dur="2.0s" repeatCount="indefinite"><mpath href="#p1-r2"/></animateMotion></circle>
+  <circle r="4" class="cp pkt"><animateMotion dur="1.5s" repeatCount="indefinite"><mpath href="#p1-wal"/></animateMotion></circle>
 </svg>

@@ -188,17 +188,7 @@ must use a writable object endpoint; gateway read-only protections remain intact
 
 ## How it works
 
-```text
-DuckDB / DuckLake / S3 and HTTP clients
-                    |
-          replaceable pgvs3 gateways ------- optional origin I/O
-                    |                              |
-          PostgreSQL data database          S3 / HTTP origin
-                    |
-              WAL replication
-                    |
-          PostgreSQL streaming standbys
-```
+![FIG 01 — pgvs3 System Topology and Authority Lanes](docs/assets/architecture-flow.svg)
 
 - **PostgreSQL-native byte layout.** Small objects are inline; larger objects
   use logical 8,120-byte blocks sized for one PostgreSQL page without TOAST.

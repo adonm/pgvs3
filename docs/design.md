@@ -95,17 +95,6 @@ API.
 
 ## Shape of the system
 
-```
-S3/HTTP clients              RESP2/OJS companions
-       \                         /
-          stateless pgvs3 fleet ------- optional origin I/O
-                   /       \                     |
-          writer endpoint  read endpoints     S3 / HTTP origin
-                 /           \
-       PostgreSQL primary --WAL--> streaming standbys
-          catalog + bytes + shared fills/staging + control rows
-```
-
 - **One binary, one port.** S3, OJS and plain HTTP share the HTTP listener;
   RESP2 is detected from the first byte. There is no sidecar, no local object
   authority, and no per-pod cache of object bytes or metadata. Scratch spools and

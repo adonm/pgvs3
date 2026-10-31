@@ -14,7 +14,7 @@ class DocumentationTests(unittest.TestCase):
     def test_maintained_markdown_links_and_fences(self):
         summary = documentation.check_links()
         self.assertGreater(summary["local_links"], 100)
-        self.assertGreaterEqual(summary["svgs"], 5)
+        self.assertGreaterEqual(summary["svgs"], 6)
 
     def test_named_python_and_json_are_real_code(self):
         snippets = documentation.snippets()
