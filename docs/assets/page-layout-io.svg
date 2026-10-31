@@ -1,112 +1,126 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 420" role="img" aria-labelledby="page-title page-desc">
   <title id="page-title">8,192-Byte PostgreSQL Page Anatomy and Cut-Through I/O Pipeline</title>
-  <desc id="page-desc">Visual byte-scale diagram of a single 8,192-byte PostgreSQL page holding one 8,120-byte chunk without TOAST, flanked by the 4 MiB binary COPY ingest pipeline and the parallel REPEATABLE READ bitmap-scan cut-through reader.</desc>
+  <desc id="page-desc">Oat UI adaptive light/dark diagram of a single 8,192-byte PostgreSQL page holding one 8,120-byte chunk without TOAST, flanked by binary COPY ingest and parallel bitmap-scan reads.</desc>
   <defs>
-    <linearGradient id="bg-p" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#090d16"/>
-      <stop offset="100%" stop-color="#111827"/>
-    </linearGradient>
     <marker id="ar-c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
     </marker>
     <marker id="ar-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
     </marker>
   </defs>
   <style>
-    .bg { fill: url(#bg-p); }
-    .stage { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 12; }
-    .box { fill: #0f172a; stroke: #475569; stroke-width: 1.4; rx: 8; }
-    .page-frame { fill: #0f172a; stroke: #38bdf8; stroke-width: 2; rx: 10; }
-    .title { fill: #f8fafc; font: 700 16px 'Inter', system-ui, sans-serif; }
-    .h3 { fill: #f8fafc; font: 700 13px 'Inter', system-ui, sans-serif; }
-    .sub { fill: #94a3b8; font: 500 11px 'Inter', system-ui, sans-serif; }
-    .mono { fill: #7dd3fc; font: 600 11px 'JetBrains Mono', monospace; }
-    .flow-in { stroke: #38bdf8; stroke-width: 2.6; fill: none; stroke-dasharray: 8 6; animation: shift 1.2s linear infinite; }
-    .flow-out { stroke: #34d399; stroke-width: 2.6; fill: none; stroke-dasharray: 8 6; animation: shift 1.2s linear infinite; }
-    .pulse-block { animation: pulse-b 2.2s ease-in-out infinite; }
+    svg {
+      color-scheme: light dark;
+      --bg: light-dark(#ffffff, #09090b);
+      --stage: light-dark(#fafafa, #18181b);
+      --box: light-dark(#ffffff, #1e1e21);
+      --faint: light-dark(#f4f4f5, #27272a);
+      --border: light-dark(#e4e4e7, #303036);
+      --fg: light-dark(#262626, #e5e5e5);
+      --muted: light-dark(#71717a, #a1a1aa);
+      --blue: light-dark(#0284c7, #38bdf8);
+      --success: light-dark(#008032, #6cc070);
+      --warning: light-dark(#a65b00, #f0a030);
+      --purple: light-dark(#7c3aed, #c084fc);
+      --payload-bg: light-dark(#e6f4ea, #064e3b);
+    }
+    .bg { fill: var(--bg); }
+    .stage { fill: var(--stage); stroke: var(--border); stroke-width: 1.5; rx: 8; }
+    .box { fill: var(--box); stroke: var(--border); stroke-width: 1.3; rx: 6; }
+    .page-frame { fill: var(--box); stroke: var(--blue); stroke-width: 1.8; rx: 8; }
+    .bar-muted { fill: var(--faint); stroke: var(--border); stroke-width: 1; rx: 4; }
+    .bar-payload { fill: var(--payload-bg); stroke: var(--success); stroke-width: 1.5; rx: 6; animation: pulse-b 2.2s ease-in-out infinite; }
+    .chip { fill: var(--faint); stroke: var(--blue); stroke-width: 1.2; rx: 4; }
+    .title { fill: var(--fg); font: 600 16px system-ui, -apple-system, sans-serif; }
+    .h3 { fill: var(--fg); font: 600 13px system-ui, -apple-system, sans-serif; }
+    .sub { fill: var(--muted); font: 400 11px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 11px ui-monospace, Consolas, monospace; }
+    .c-blue { fill: var(--blue); }
+    .c-green { fill: var(--success); }
+    .c-amber { fill: var(--warning); }
+    .c-purple { fill: var(--purple); }
+    .flow-in { stroke: var(--blue); stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: shift 1.2s linear infinite; }
+    .flow-out { stroke: var(--success); stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: shift 1.2s linear infinite; }
     @keyframes shift { to { stroke-dashoffset: -28; } }
-    @keyframes pulse-b { 0%, 100% { fill-opacity: 0.82; } 50% { fill-opacity: 1; } }
+    @keyframes pulse-b { 0%, 100% { opacity: 0.88; } 50% { opacity: 1; } }
     @media (prefers-reduced-motion: reduce) {
-      .flow-in, .flow-out, .pulse-block { animation: none; }
+      .flow-in, .flow-out, .bar-payload { animation: none; }
     }
   </style>
 
-  <rect width="1040" height="420" class="bg" rx="14"/>
+  <rect width="1040" height="420" class="bg" rx="8"/>
   <text x="28" y="34" class="title">8,120-Byte Page-Aligned Layout: Zero TOAST Overhead &amp; O(1) Byte-Range Seeking</text>
 
   <!-- Stage 1: Write Slicer -->
   <rect x="28" y="56" width="260" height="336" class="stage"/>
-  <text x="46" y="82" class="h3" fill="#38bdf8">1. Write Slicer &amp; Binary COPY</text>
+  <text x="46" y="82" class="h3 c-blue">1. Write Slicer &amp; Binary COPY</text>
 
   <rect x="46" y="98" width="224" height="64" class="box"/>
-  <text x="60" y="120" class="mono" fill="#fbbf24">≤ 64 KiB: Inline Fast Path</text>
+  <text x="60" y="120" class="mono c-amber">≤ 64 KiB: Inline Fast Path</text>
   <text x="60" y="138" class="sub">objects.inline_data (file_id NULL)</text>
-  <text x="60" y="153" class="mono" fill="#34d399">1 PK Upsert · No chunk rows</text>
+  <text x="60" y="153" class="mono c-green">1 PK Upsert · No chunk rows</text>
 
   <rect x="46" y="178" width="224" height="112" class="box"/>
-  <text x="60" y="200" class="mono" fill="#38bdf8">&gt; 64 KiB: 8,120 B Block Slicer</text>
-  <!-- Visual blocks -->
-  <rect x="60" y="212" width="44" height="24" rx="4" fill="#0284c7"/>
-  <text x="67" y="228" class="mono" fill="#fff">no=0</text>
-  <rect x="110" y="212" width="44" height="24" rx="4" fill="#0284c7"/>
-  <text x="117" y="228" class="mono" fill="#fff">no=1</text>
-  <rect x="160" y="212" width="44" height="24" rx="4" fill="#0369a1"/>
-  <text x="167" y="228" class="mono" fill="#fff">no=2</text>
-  <rect x="210" y="212" width="44" height="24" rx="4" fill="#1e3a8a"/>
-  <text x="220" y="228" class="mono" fill="#93c5fd">…</text>
+  <text x="60" y="200" class="mono c-blue">&gt; 64 KiB: 8,120 B Block Slicer</text>
+  <rect x="60" y="212" width="44" height="24" class="chip"/>
+  <text x="67" y="228" class="mono c-blue">no=0</text>
+  <rect x="110" y="212" width="44" height="24" class="chip"/>
+  <text x="117" y="228" class="mono c-blue">no=1</text>
+  <rect x="160" y="212" width="44" height="24" class="chip"/>
+  <text x="167" y="228" class="mono c-blue">no=2</text>
+  <rect x="210" y="212" width="44" height="24" class="chip"/>
+  <text x="220" y="228" class="mono c-blue">…</text>
   <text x="60" y="256" class="sub">• Zstd per block only if smaller</text>
-  <text x="60" y="274" class="mono" fill="#7dd3fc">• 4 MiB Binary COPY Batches</text>
+  <text x="60" y="274" class="mono">• 4 MiB Binary COPY Batches</text>
 
   <rect x="46" y="306" width="224" height="68" class="box"/>
-  <text x="60" y="328" class="mono" fill="#c084fc">Atomic Pointer Swap</text>
+  <text x="60" y="328" class="mono c-purple">Atomic Pointer Swap</text>
   <text x="60" y="346" class="sub">publish_object swaps file_id;</text>
   <text x="60" y="362" class="sub">old.file_id → garbage (10m grace)</text>
 
   <!-- Stage 2: Exact 8,192 B Page Anatomy -->
   <rect x="336" y="56" width="368" height="336" class="stage"/>
-  <text x="356" y="82" class="h3" fill="#fbbf24">2. One 8,192-Byte PostgreSQL Heap Page</text>
+  <text x="356" y="82" class="h3 c-amber">2. One 8,192-Byte PostgreSQL Heap Page</text>
 
   <rect x="356" y="98" width="328" height="202" class="page-frame"/>
-  <!-- Proportional byte bar -->
-  <rect x="372" y="114" width="296" height="28" rx="4" fill="#1e3a8a"/>
-  <text x="382" y="132" class="mono" fill="#bfdbfe">28 B Page Header + Line Pointer (ItemId)</text>
+  <rect x="372" y="114" width="296" height="28" class="bar-muted"/>
+  <text x="382" y="132" class="mono">28 B Page Header + Line Pointer (ItemId)</text>
 
-  <rect x="372" y="148" width="296" height="34" rx="4" fill="#312e81"/>
-  <text x="382" y="169" class="mono" fill="#ddd6fe">40 B Tuple Hdr + file_id (8B) + no (4B)</text>
+  <rect x="372" y="148" width="296" height="34" class="bar-muted"/>
+  <text x="382" y="169" class="mono">40 B Tuple Hdr + file_id (8B) + no (4B)</text>
 
-  <rect x="372" y="188" width="296" height="96" rx="6" fill="#065f46" class="pulse-block"/>
-  <text x="386" y="216" class="h3" fill="#ecfdf5">8,120 Bytes Payload (1 Chunk Tuple)</text>
-  <text x="386" y="238" class="mono" fill="#a7f3d0">toast_tuple_target = 8160</text>
-  <text x="386" y="256" class="mono" fill="#a7f3d0">STORAGE EXTERNAL (0 TOAST tables!)</text>
-  <text x="386" y="274" class="sub" fill="#d1fae5">Incompressible Parquet stored raw</text>
+  <rect x="372" y="188" width="296" height="96" class="bar-payload"/>
+  <text x="386" y="216" class="h3 c-green">8,120 Bytes Payload (1 Chunk Tuple)</text>
+  <text x="386" y="238" class="mono">toast_tuple_target = 8160</text>
+  <text x="386" y="256" class="mono">STORAGE EXTERNAL (0 TOAST tables!)</text>
+  <text x="386" y="274" class="sub">Incompressible Parquet stored raw</text>
 
   <rect x="356" y="312" width="328" height="62" class="box"/>
-  <text x="372" y="334" class="mono" fill="#34d399">O(1) Byte-Range Seek Formula:</text>
-  <text x="372" y="356" class="mono" fill="#f8fafc">no BETWEEN (start / 8120) AND (end / 8120)</text>
+  <text x="372" y="334" class="mono c-green">O(1) Byte-Range Seek Formula:</text>
+  <text x="372" y="356" class="mono">no BETWEEN (start / 8120) AND (end / 8120)</text>
 
   <!-- Stage 3: Cut-Through Reader -->
   <rect x="752" y="56" width="260" height="336" class="stage"/>
-  <text x="770" y="82" class="h3" fill="#34d399">3. Cut-Through Reader</text>
+  <text x="770" y="82" class="h3 c-green">3. Cut-Through Reader</text>
 
   <rect x="770" y="98" width="224" height="84" class="box"/>
-  <text x="784" y="120" class="mono" fill="#34d399">chunkPool (Bitmap Scan)</text>
+  <text x="784" y="120" class="mono c-green">chunkPool (Bitmap Scan)</text>
   <text x="784" y="138" class="sub">• enable_indexscan = off</text>
   <text x="784" y="154" class="sub">• effective_io_concurrency = 32</text>
-  <text x="784" y="170" class="mono" fill="#7dd3fc">• 2–8 parallel 8 MiB pieces</text>
+  <text x="784" y="170" class="mono">• 2–8 parallel 8 MiB pieces</text>
 
   <rect x="770" y="198" width="224" height="84" class="box"/>
-  <text x="784" y="220" class="mono" fill="#fbbf24">32 × 256 KiB Ring Buffer</text>
+  <text x="784" y="220" class="mono c-amber">32 × 256 KiB Ring Buffer</text>
   <text x="784" y="238" class="sub">• Reorders physical TIDs to `no`</text>
   <text x="784" y="254" class="sub">• Streams directly to socket</text>
-  <text x="784" y="270" class="mono" fill="#a7f3d0">Bounded RAM on 1 GiB GETs</text>
+  <text x="784" y="270" class="mono c-green">Bounded RAM on 1 GiB GETs</text>
 
   <rect x="770" y="298" width="224" height="76" class="box"/>
-  <text x="784" y="320" class="mono" fill="#c084fc">Shared Exported Snapshot</text>
+  <text x="784" y="320" class="mono c-purple">Shared Exported Snapshot</text>
   <text x="784" y="338" class="sub">pg_export_snapshot() keeps</text>
   <text x="784" y="354" class="sub">multi-conn pieces consistent</text>
 
-  <!-- Horizontal Non-Crossing Connectors -->
   <path d="M 288 234 L 348 234" class="flow-in" marker-end="url(#ar-c)"/>
   <path d="M 704 234 L 764 234" class="flow-out" marker-end="url(#ar-g)"/>
 </svg>

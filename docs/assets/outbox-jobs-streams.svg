@@ -1,78 +1,91 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 430" role="img" aria-labelledby="q-title q-desc">
   <title id="q-title">Transactional SQL Outbox, OJS Lazy Claims and 3-Segment TRUNCATE Stream Rotation</title>
-  <desc id="q-desc">Two non-crossing horizontal pipelines showing OJS job outbox/claim/receipt boundaries and PgQue-shaped 3-segment TRUNCATE stream rotation.</desc>
+  <desc id="q-desc">Two non-crossing horizontal pipelines in Oat UI light/dark adaptive style showing OJS job outbox/claim/receipt boundaries and PgQue-shaped 3-segment TRUNCATE stream rotation.</desc>
   <defs>
-    <linearGradient id="bg-q" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0b1120"/>
-      <stop offset="100%" stop-color="#111827"/>
-    </linearGradient>
     <marker id="qc" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
     </marker>
     <marker id="qp" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#c084fc"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--purple)"/>
     </marker>
     <marker id="qg" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
     </marker>
   </defs>
   <style>
-    .bg { fill: url(#bg-q); }
-    .lane { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10; }
-    .b-sql { fill: #0f172a; stroke: #38bdf8; stroke-width: 1.7; rx: 8; }
-    .b-ojs { fill: #0f172a; stroke: #c084fc; stroke-width: 1.7; rx: 8; }
-    .b-ack { fill: #064e3b; stroke: #10b981; stroke-width: 1.7; rx: 8; }
-    .s-act { fill: #1e3a8a; stroke: #60a5fa; stroke-width: 1.7; rx: 8; }
-    .s-seal { fill: #312e81; stroke: #a78bfa; stroke-width: 1.7; rx: 8; }
-    .s-trunc { fill: #065f46; stroke: #34d399; stroke-width: 1.7; rx: 8; }
-    .title { fill: #f8fafc; font: 700 16px 'Inter', system-ui, sans-serif; }
-    .h3 { fill: #e2e8f0; font: 700 13px 'Inter', system-ui, sans-serif; }
-    .h4 { fill: #f8fafc; font: 700 12px 'Inter', system-ui, sans-serif; }
-    .sub { fill: #94a3b8; font: 500 10.8px 'Inter', system-ui, sans-serif; }
-    .mono { fill: #7dd3fc; font: 600 10.5px 'JetBrains Mono', monospace; }
-    .fc { stroke: #38bdf8; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: qf 1.3s linear infinite; }
-    .fp { stroke: #c084fc; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: qf 1.3s linear infinite; }
-    .fg { stroke: #34d399; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: qf 1.3s linear infinite; }
+    svg {
+      color-scheme: light dark;
+      --bg: light-dark(#ffffff, #09090b);
+      --lane: light-dark(#fafafa, #18181b);
+      --box: light-dark(#ffffff, #1e1e21);
+      --border: light-dark(#e4e4e7, #303036);
+      --fg: light-dark(#262626, #e5e5e5);
+      --muted: light-dark(#71717a, #a1a1aa);
+      --blue: light-dark(#0284c7, #38bdf8);
+      --success: light-dark(#008032, #6cc070);
+      --warning: light-dark(#a65b00, #f0a030);
+      --danger: light-dark(#d32f2f, #f4807b);
+      --purple: light-dark(#7c3aed, #c084fc);
+      --hit-bg: light-dark(#e6f4ea, #064e3b);
+    }
+    .bg { fill: var(--bg); }
+    .lane { fill: var(--lane); stroke: var(--border); stroke-width: 1.5; rx: 8; }
+    .b-sql { fill: var(--box); stroke: var(--blue); stroke-width: 1.6; rx: 6; }
+    .b-ojs { fill: var(--box); stroke: var(--purple); stroke-width: 1.6; rx: 6; }
+    .b-ack { fill: var(--hit-bg); stroke: var(--success); stroke-width: 1.6; rx: 6; }
+    .title { fill: var(--fg); font: 600 16px system-ui, -apple-system, sans-serif; }
+    .h3 { fill: var(--fg); font: 600 13px system-ui, -apple-system, sans-serif; }
+    .h4 { fill: var(--fg); font: 600 12px system-ui, -apple-system, sans-serif; }
+    .sub { fill: var(--muted); font: 400 10.8px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .c-blue { fill: var(--blue); }
+    .c-green { fill: var(--success); }
+    .c-amber { fill: var(--warning); }
+    .c-red { fill: var(--danger); }
+    .c-purple { fill: var(--purple); }
+    .fc { stroke: var(--blue); stroke-width: 2.3; fill: none; stroke-dasharray: 8 6; animation: qf 1.3s linear infinite; }
+    .fp { stroke: var(--purple); stroke-width: 2.3; fill: none; stroke-dasharray: 8 6; animation: qf 1.3s linear infinite; }
+    .fg { stroke: var(--success); stroke-width: 2.3; fill: none; stroke-dasharray: 8 6; animation: qf 1.3s linear infinite; }
     @keyframes qf { to { stroke-dashoffset: -28; } }
     @media (prefers-reduced-motion: reduce) {
       .fc, .fp, .fg { animation: none; }
     }
   </style>
 
-  <rect width="1040" height="430" class="bg" rx="14"/>
+  <rect width="1040" height="430" class="bg" rx="8"/>
   <text x="28" y="34" class="title">Queue &amp; Stream Model (s3q_&lt;name&gt;): Outbox Transaction Boundaries &amp; 3-Segment TRUNCATE</text>
 
   <!-- Pipeline 1: OJS Jobs -->
   <rect x="28" y="54" width="984" height="168" class="lane"/>
-  <text x="44" y="78" class="h3" fill="#38bdf8">1. OJS Competing Jobs — 4 Separate Transaction Boundaries</text>
+  <text x="44" y="78" class="h3 c-blue">1. OJS Competing Jobs — 4 Separate Transaction Boundaries</text>
 
   <rect x="44" y="92" width="212" height="112" class="b-sql"/>
-  <text x="56" y="114" class="h4" fill="#38bdf8">Tx 1: Producer SQL</text>
+  <text x="56" y="114" class="h4 c-blue">Tx 1: Producer SQL</text>
   <text x="56" y="133" class="mono">UPDATE orders +</text>
   <text x="56" y="149" class="mono">INSERT INTO outbox</text>
   <text x="56" y="168" class="sub">Rollback leaves 0 jobs</text>
-  <text x="56" y="185" class="mono" fill="#fbbf24">args: JSON array [...]</text>
+  <text x="56" y="185" class="mono c-amber">args: JSON array [...]</text>
 
   <rect x="288" y="92" width="212" height="112" class="b-ojs"/>
-  <text x="300" y="114" class="h4" fill="#c084fc">Tx 2: Relay Enqueue</text>
+  <text x="300" y="114" class="h4 c-purple">Tx 2: Relay Enqueue</text>
   <text x="300" y="133" class="mono">POST /ojs/v1/jobs</text>
   <text x="300" y="151" class="sub">Lost reply? Retry POST:</text>
   <text x="300" y="167" class="sub">409 → GET &amp; verify body</text>
-  <text x="300" y="185" class="mono" fill="#f87171">Mismatch halts &amp; alerts</text>
+  <text x="300" y="185" class="mono c-red">Mismatch halts &amp; alerts</text>
 
   <rect x="532" y="92" width="212" height="112" class="b-ojs"/>
-  <text x="544" y="114" class="h4" fill="#c084fc">Tx 3: Lazy Claim</text>
+  <text x="544" y="114" class="h4 c-purple">Tx 3: Lazy Claim</text>
   <text x="544" y="133" class="mono">FOR UPDATE SKIP LOCKED</text>
   <text x="544" y="151" class="sub">1 index: (priority DESC,</text>
   <text x="544" y="167" class="sub">next_visible_at, seq)</text>
-  <text x="544" y="185" class="mono" fill="#34d399">Issues UUIDv7 lease_token</text>
+  <text x="544" y="185" class="mono c-green">Issues UUIDv7 lease_token</text>
 
   <rect x="776" y="92" width="220" height="112" class="b-ack"/>
-  <text x="788" y="114" class="h4" fill="#6ee7b7">Tx 4 → 5: Receipt &amp; ACK</text>
-  <text x="788" y="133" class="mono" fill="#a7f3d0">INSERT INTO receipts</text>
+  <text x="788" y="114" class="h4 c-green">Tx 4 → 5: Receipt &amp; ACK</text>
+  <text x="788" y="133" class="mono">INSERT INTO receipts</text>
   <text x="788" y="151" class="sub">Commits with SQL effect</text>
   <text x="788" y="167" class="sub">before POST /workers/ack</text>
-  <text x="788" y="185" class="mono" fill="#fde68a">Stale token → 409 conflict</text>
+  <text x="788" y="185" class="mono c-amber">Stale token → 409 conflict</text>
 
   <path d="M 256 148 L 282 148" class="fc" marker-end="url(#qc)"/>
   <path d="M 500 148 L 526 148" class="fp" marker-end="url(#qp)"/>
@@ -80,35 +93,35 @@
 
   <!-- Pipeline 2: PgQue-Shaped Streams -->
   <rect x="28" y="240" width="984" height="168" class="lane"/>
-  <text x="44" y="264" class="h3" fill="#34d399">2. PgQue-Shaped Fan-Out Streams — Snapshot Ticks &amp; Zero-Bloat 3-Segment TRUNCATE</text>
+  <text x="44" y="264" class="h3 c-green">2. PgQue-Shaped Fan-Out Streams — Snapshot Ticks &amp; Zero-Bloat 3-Segment TRUNCATE</text>
 
   <rect x="44" y="278" width="246" height="112" class="b-sql"/>
-  <text x="56" y="300" class="h4" fill="#38bdf8">Snapshot-Delimited Ticks</text>
+  <text x="56" y="300" class="h4 c-blue">Snapshot-Delimited Ticks</text>
   <text x="56" y="319" class="mono">pg_visible_in_snapshot()</text>
   <text x="56" y="337" class="sub">Prevents late-commit sequence</text>
   <text x="56" y="353" class="sub">gaps; `max` ceiling returns 413</text>
-  <text x="56" y="371" class="mono" fill="#fbbf24">Repeat receive = same batch</text>
+  <text x="56" y="371" class="mono c-amber">Repeat receive = same batch</text>
 
-  <rect x="322" y="278" width="204" height="112" class="s-act"/>
-  <text x="334" y="300" class="h4" fill="#93c5fd">Segment 0 (Active)</text>
+  <rect x="322" y="278" width="204" height="112" class="b-sql"/>
+  <text x="334" y="300" class="h4 c-blue">Segment 0 (Active)</text>
   <text x="334" y="319" class="mono">stream_events_0</text>
   <text x="334" y="337" class="sub">Receives appends &amp; retries</text>
   <text x="334" y="353" class="sub">Rotates at retention / 2</text>
-  <text x="334" y="371" class="mono" fill="#e0f2fe">(default: 3.5 days)</text>
+  <text x="334" y="371" class="mono">(default: 3.5 days)</text>
 
-  <rect x="558" y="278" width="204" height="112" class="s-seal"/>
-  <text x="570" y="300" class="h4" fill="#ddd6fe">Segment 1 (Sealed)</text>
+  <rect x="558" y="278" width="204" height="112" class="b-ojs"/>
+  <text x="570" y="300" class="h4 c-purple">Segment 1 (Sealed)</text>
   <text x="570" y="319" class="mono">stream_events_1</text>
   <text x="570" y="337" class="sub">Records `sealed_xid`</text>
   <text x="570" y="353" class="sub">Consumers drain batches</text>
-  <text x="570" y="371" class="mono" fill="#fde68a">Slow cursor pins segment</text>
+  <text x="570" y="371" class="mono c-amber">Slow cursor pins segment</text>
 
-  <rect x="794" y="278" width="202" height="112" class="s-trunc"/>
-  <text x="806" y="300" class="h4" fill="#6ee7b7">Segment 2 (Truncate)</text>
-  <text x="806" y="319" class="mono" fill="#a7f3d0">TRUNCATE TABLE</text>
+  <rect x="794" y="278" width="202" height="112" class="b-ack"/>
+  <text x="806" y="300" class="h4 c-green">Segment 2 (Truncate)</text>
+  <text x="806" y="319" class="mono">TRUNCATE TABLE</text>
   <text x="806" y="337" class="sub">When all cursors pass</text>
   <text x="806" y="353" class="sub">`sealed_xid` → instant</text>
-  <text x="806" y="371" class="mono" fill="#6ee7b7">OS reclaim · 0 dead tuples</text>
+  <text x="806" y="371" class="mono c-green">OS reclaim · 0 dead tuples</text>
 
   <path d="M 290 334 L 316 334" class="fc" marker-end="url(#qc)"/>
   <path d="M 526 334 L 552 334" class="fp" marker-end="url(#qp)"/>

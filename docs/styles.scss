@@ -1,110 +1,312 @@
 /*-- scss:defaults --*/
-$font-family-sans-serif: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-$font-family-monospace: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+$font-family-sans-serif: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+$font-family-monospace: ui-monospace, "JetBrains Mono", "Fira Code", SFMono-Regular, Consolas, monospace;
+$border-radius: 0.25rem;
+$border-radius-lg: 0.5rem;
 
 /*-- scss:rules --*/
+/* Oat UI (oat.ink) inspired semantic light-dark() design tokens */
+:root {
+  color-scheme: light dark;
+  --background: light-dark(#ffffff, #09090b);
+  --foreground: light-dark(#262626, #e5e5e5);
+  --card: light-dark(#ffffff, #18181b);
+  --card-foreground: light-dark(#262626, #e5e5e5);
+  --primary: light-dark(#262626, #e5e5e5);
+  --primary-foreground: light-dark(#fafafa, #18181b);
+  --secondary: light-dark(#f4f4f5, #27272a);
+  --secondary-foreground: light-dark(#262626, #fafafa);
+  --muted: light-dark(#f4f4f5, #27272a);
+  --muted-foreground: light-dark(#71717a, #a1a1aa);
+  --faint: light-dark(#fafafa, #1e1e21);
+  --faint-foreground: light-dark(#a1a1aa, #71717a);
+  --accent: light-dark(#f4f4f5, #27272a);
+  --danger: light-dark(#d32f2f, #f4807b);
+  --success: light-dark(#008032, #6cc070);
+  --warning: light-dark(#a65b00, #f0a030);
+  --info: light-dark(#0284c7, #38bdf8);
+  --purple: light-dark(#7c3aed, #c084fc);
+  --border: light-dark(#e4e4e7, #303036);
+  --input: light-dark(#e4e4e7, #3f3f46);
+  --ring: light-dark(#71717a, #a1a1aa);
+  --radius-small: 0.125rem;
+  --radius-medium: 0.25rem;
+  --radius-large: 0.5rem;
+  --shadow-small: 0 1px 2px rgb(0 0 0 / 0.06);
+  --shadow-medium: 0 1px 2px rgb(0 0 0 / 0.08), 0 3px 6px -2px rgb(0 0 0 / 0.12);
+}
+
+body.quarto-light {
+  color-scheme: light;
+}
+
+body.quarto-dark {
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--background) !important;
+  color: var(--foreground) !important;
+  font-family: $font-family-sans-serif;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Navbar & Sidebar in Oat UI minimal style */
+.navbar {
+  background-color: var(--background) !important;
+  border-bottom: 1px solid var(--border) !important;
+  box-shadow: none !important;
+  padding-block: 0.5rem;
+}
+
+.navbar .navbar-brand,
+.navbar .nav-link,
+.navbar .quarto-navbar-tools .quarto-navigation-tool {
+  color: var(--foreground) !important;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.navbar .nav-link:hover,
+.navbar .nav-link.active {
+  background-color: var(--accent) !important;
+  border-radius: var(--radius-medium);
+}
+
+.sidebar.sidebar-navigation,
+#quarto-sidebar {
+  background-color: var(--background) !important;
+  border-right: 1px solid var(--border) !important;
+}
+
+#quarto-sidebar .sidebar-item-text {
+  color: var(--foreground) !important;
+  font-size: 0.875rem;
+  padding: 0.28rem 0.6rem;
+  border-radius: var(--radius-medium);
+  transition: background-color 0.12s ease;
+}
+
+#quarto-sidebar .sidebar-item-text:hover,
+#quarto-sidebar .sidebar-link.active {
+  background-color: var(--accent) !important;
+  color: var(--foreground) !important;
+  font-weight: 600;
+}
+
+#TOC a.nav-link {
+  color: var(--muted-foreground) !important;
+  font-size: 0.82rem;
+}
+
+#TOC a.nav-link.active,
+#TOC a.nav-link:hover {
+  color: var(--foreground) !important;
+  font-weight: 600;
+}
+
+/* Typography, Links, Code & Tables in Oat UI style */
+h1, h2, h3, h4, h5, h6 {
+  color: var(--foreground) !important;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  border-bottom: none !important;
+}
+
+main a {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-decoration-color: var(--muted-foreground);
+  text-underline-offset: 3px;
+  transition: text-decoration-color 0.12s ease;
+}
+
+main a:hover {
+  text-decoration-color: var(--foreground);
+}
+
+code {
+  font-family: $font-family-monospace;
+  font-size: 0.86em;
+  padding: 0.12rem 0.32rem;
+  background-color: var(--muted) !important;
+  color: var(--foreground) !important;
+  border-radius: var(--radius-small);
+}
+
+pre, div.sourceCode {
+  background-color: var(--faint) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-medium) !important;
+}
+
+pre code, div.sourceCode pre code {
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+blockquote {
+  border-inline-start: 2px solid var(--border) !important;
+  background-color: var(--faint) !important;
+  padding: 0.75rem 1rem !important;
+  border-radius: 0 var(--radius-medium) var(--radius-medium) 0;
+  color: var(--muted-foreground) !important;
+}
+
+table, .table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.875rem;
+  color: var(--foreground) !important;
+  border-color: var(--border) !important;
+}
+
+thead {
+  border-bottom: 1px solid var(--border) !important;
+}
+
+th {
+  padding: 0.65rem 0.5rem !important;
+  font-weight: 600 !important;
+  color: var(--muted-foreground) !important;
+  background: transparent !important;
+}
+
+td {
+  padding: 0.65rem 0.5rem !important;
+  border-bottom: 1px solid var(--border) !important;
+  background: transparent !important;
+  color: var(--foreground) !important;
+}
+
+tbody tr:hover td {
+  background-color: color-mix(in srgb, var(--muted) 50%, transparent) !important;
+}
+
+/* SVG Diagrams: responsive Oat cards */
 .quarto-figure svg,
+svg.oat-inline-svg,
 p > img[src$=".svg"] {
   width: 100%;
   max-width: 1040px;
   height: auto;
   display: block;
   margin: 1.25rem auto;
-  border-radius: 10px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
+  border-radius: var(--radius-large);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-small);
 }
 
-table {
-  font-size: 0.93rem;
-}
-
+/* Interactive Estimator in Oat UI style */
 .pgvs3-sim {
-  background: #0f172a;
-  color: #f8fafc;
-  border: 1px solid #334155;
-  border-radius: 12px;
-  padding: 1.4rem;
+  background-color: var(--card);
+  color: var(--card-foreground);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-large);
+  padding: 1.35rem;
   margin: 1.5rem 0;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+  box-shadow: var(--shadow-small);
 }
 
 .pgvs3-sim-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 1rem;
-  margin-bottom: 1.2rem;
+  grid-template-columns: repeat(auto-fit, minmax(225px, 1fr));
+  gap: 0.85rem;
+  margin-bottom: 1.15rem;
 }
 
 .pgvs3-sim-ctrl {
-  background: #1e293b;
-  border: 1px solid #334155;
-  border-radius: 8px;
-  padding: 0.75rem 0.9rem;
+  background-color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  padding: 0.7rem 0.85rem;
 }
 
 .pgvs3-sim-ctrl label {
   display: flex;
   justify-content: space-between;
-  font-size: 0.82rem;
-  font-weight: 600;
-  color: #cbd5e1;
-  margin-bottom: 0.35rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  margin-bottom: 0.4rem;
 }
 
 .pgvs3-sim-ctrl label span.val {
-  color: #38bdf8;
+  color: var(--foreground);
+  font-weight: 600;
   font-family: $font-family-monospace;
 }
 
 .pgvs3-sim-ctrl input[type="range"] {
   width: 100%;
-  accent-color: #38bdf8;
+  height: 0.45rem;
+  appearance: none;
+  background: var(--muted);
+  border-radius: 9999px;
   cursor: pointer;
+}
+
+.pgvs3-sim-ctrl input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 1.1rem;
+  height: 1.1rem;
+  background: var(--primary);
+  border-radius: 9999px;
+}
+
+.pgvs3-sim-ctrl input[type="range"]::-moz-range-thumb {
+  width: 1.1rem;
+  height: 1.1rem;
+  background: var(--primary);
+  border: none;
+  border-radius: 9999px;
 }
 
 .pgvs3-sim-kpis {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 0.85rem;
-  margin-bottom: 1.2rem;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1.15rem;
 }
 
 .pgvs3-kpi {
-  background: #1e293b;
-  border-left: 4px solid #38bdf8;
-  border-radius: 8px;
-  padding: 0.75rem 0.9rem;
+  background-color: var(--faint);
+  border: 1px solid var(--border);
+  border-inline-start: 4px solid var(--info);
+  border-radius: var(--radius-medium);
+  padding: 0.7rem 0.85rem;
 }
 
-.pgvs3-kpi.good { border-left-color: #10b981; }
-.pgvs3-kpi.warn { border-left-color: #f59e0b; }
-.pgvs3-kpi.bad  { border-left-color: #ef4444; }
+.pgvs3-kpi.good { border-inline-start-color: var(--success); }
+.pgvs3-kpi.warn { border-inline-start-color: var(--warning); }
+.pgvs3-kpi.bad  { border-inline-start-color: var(--danger); }
 
 .pgvs3-kpi .k-label {
-  font-size: 0.76rem;
+  font-size: 0.72rem;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #94a3b8;
+  letter-spacing: 0.04em;
+  color: var(--muted-foreground);
 }
 
 .pgvs3-kpi .k-val {
-  font-size: 1.25rem;
-  font-weight: 700;
+  font-size: 1.15rem;
+  font-weight: 600;
   font-family: $font-family-monospace;
-  color: #f8fafc;
-  margin: 0.2rem 0;
+  color: var(--foreground);
+  margin: 0.18rem 0;
 }
 
 .pgvs3-kpi .k-sub {
-  font-size: 0.78rem;
-  color: #cbd5e1;
+  font-size: 0.76rem;
+  color: var(--muted-foreground);
 }
 
 .pgvs3-bars {
-  background: #1e293b;
-  border: 1px solid #334155;
-  border-radius: 8px;
-  padding: 0.9rem 1rem;
+  background-color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  padding: 0.85rem 1rem;
   margin-bottom: 1rem;
 }
 
@@ -119,32 +321,32 @@ table {
 .pgvs3-bar-hdr {
   display: flex;
   justify-content: space-between;
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   margin-bottom: 0.25rem;
-  color: #e2e8f0;
+  color: var(--foreground);
 }
 
 .pgvs3-bar-track {
-  background: #090d16;
-  height: 14px;
-  border-radius: 7px;
+  background-color: var(--muted);
+  height: 0.55rem;
+  border-radius: 9999px;
   overflow: hidden;
 }
 
 .pgvs3-bar-fill {
   height: 100%;
-  border-radius: 7px;
-  transition: width 0.2s ease;
+  border-radius: 9999px;
+  transition: width 0.2s cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 .pgvs3-sql-out {
-  background: #090d16;
-  border: 1px solid #334155;
-  border-radius: 8px;
+  background-color: var(--faint) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-medium) !important;
   padding: 0.85rem 1rem;
   font-family: $font-family-monospace;
-  font-size: 0.8rem;
-  color: #a7f3d0;
+  font-size: 0.78rem;
+  color: var(--foreground);
   overflow-x: auto;
   white-space: pre;
   margin: 0;

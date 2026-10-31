@@ -1,133 +1,143 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 480" role="img" aria-labelledby="arch-title arch-desc">
   <title id="arch-title">pgvs3 System Architecture and Parallel Data Lanes</title>
-  <desc id="arch-desc">Clean four-column, non-crossing architecture diagram showing Clients, Stateless Gateways, PostgreSQL 18 Primary, and Standby/Origin targets with animated packet flows.</desc>
+  <desc id="arch-desc">Clean four-column, non-crossing architecture diagram in Oat UI light/dark adaptive style showing Clients, Stateless Gateways, PostgreSQL 18 Primary, and Standby/Origin targets.</desc>
   <defs>
-    <linearGradient id="bg-a" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0b1120"/>
-      <stop offset="100%" stop-color="#111827"/>
-    </linearGradient>
     <marker id="arr-c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
     </marker>
     <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
     </marker>
     <marker id="arr-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#c084fc"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--purple)"/>
     </marker>
     <marker id="arr-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--warning)"/>
     </marker>
   </defs>
   <style>
-    .bg { fill: url(#bg-a); }
-    .col { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 12; }
-    .node { fill: #0f172a; stroke: #475569; stroke-width: 1.5; rx: 8; }
-    .node-c { fill: #0f172a; stroke: #38bdf8; stroke-width: 1.8; rx: 8; }
-    .node-g { fill: #0f172a; stroke: #34d399; stroke-width: 1.8; rx: 8; }
-    .node-p { fill: #0f172a; stroke: #c084fc; stroke-width: 1.8; rx: 8; }
-    .node-a { fill: #0f172a; stroke: #fbbf24; stroke-width: 1.8; rx: 8; }
-    .title { fill: #f8fafc; font: 700 16px 'Inter', system-ui, sans-serif; }
-    .col-hdr { fill: #94a3b8; font: 700 11px 'Inter', system-ui, sans-serif; letter-spacing: 0.08em; }
-    .h3 { fill: #f8fafc; font: 700 13px 'Inter', system-ui, sans-serif; }
-    .sub { fill: #94a3b8; font: 500 11px 'Inter', system-ui, sans-serif; }
-    .mono { fill: #7dd3fc; font: 600 10.5px 'JetBrains Mono', monospace; }
-    .lane-c { stroke: #38bdf8; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: flow 1.2s linear infinite; }
-    .lane-g { stroke: #34d399; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: flow 1.2s linear infinite; }
-    .lane-p { stroke: #c084fc; stroke-width: 2.8; fill: none; stroke-dasharray: 8 6; animation: flow 1.0s linear infinite; }
-    .lane-a { stroke: #fbbf24; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: flow 1.5s linear infinite; }
+    svg {
+      color-scheme: light dark;
+      --bg: light-dark(#ffffff, #09090b);
+      --panel: light-dark(#fafafa, #18181b);
+      --card: light-dark(#ffffff, #1e1e21);
+      --faint: light-dark(#f4f4f5, #27272a);
+      --border: light-dark(#e4e4e7, #303036);
+      --fg: light-dark(#262626, #e5e5e5);
+      --muted: light-dark(#71717a, #a1a1aa);
+      --blue: light-dark(#0284c7, #38bdf8);
+      --success: light-dark(#008032, #6cc070);
+      --warning: light-dark(#a65b00, #f0a030);
+      --purple: light-dark(#7c3aed, #c084fc);
+    }
+    .bg { fill: var(--bg); }
+    .node { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; rx: 6; }
+    .node-c { fill: var(--panel); stroke: var(--blue); stroke-width: 1.75; rx: 6; }
+    .node-g { fill: var(--panel); stroke: var(--success); stroke-width: 1.75; rx: 6; }
+    .node-p { fill: var(--panel); stroke: var(--purple); stroke-width: 1.75; rx: 6; }
+    .node-a { fill: var(--panel); stroke: var(--warning); stroke-width: 1.75; rx: 6; }
+    .pill { fill: var(--faint); stroke: var(--border); stroke-width: 1; rx: 4; }
+    .title { fill: var(--fg); font: 600 16px system-ui, -apple-system, sans-serif; }
+    .col-hdr { fill: var(--muted); font: 600 11px system-ui, -apple-system, sans-serif; letter-spacing: 0.06em; }
+    .h3 { fill: var(--fg); font: 600 13px system-ui, -apple-system, sans-serif; }
+    .sub { fill: var(--muted); font: 400 11px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .c-blue { fill: var(--blue); }
+    .c-green { fill: var(--success); }
+    .c-amber { fill: var(--warning); }
+    .c-purple { fill: var(--purple); }
+    .lane-c { stroke: var(--blue); stroke-width: 2.2; fill: none; stroke-dasharray: 8 6; animation: flow 1.2s linear infinite; }
+    .lane-g { stroke: var(--success); stroke-width: 2.2; fill: none; stroke-dasharray: 8 6; animation: flow 1.2s linear infinite; }
+    .lane-p { stroke: var(--purple); stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: flow 1.0s linear infinite; }
+    .lane-a { stroke: var(--warning); stroke-width: 2.2; fill: none; stroke-dasharray: 8 6; animation: flow 1.5s linear infinite; }
     @keyframes flow { to { stroke-dashoffset: -28; } }
     @media (prefers-reduced-motion: reduce) {
       .lane-c, .lane-g, .lane-p, .lane-a { animation: none; }
     }
   </style>
 
-  <rect width="1040" height="480" class="bg" rx="14"/>
+  <rect width="1040" height="480" class="bg" rx="8"/>
   <text x="28" y="34" class="title">pgvs3 — Parallel Data Lanes &amp; Authority Boundaries (Zero Crossings)</text>
 
-  <!-- Column Headers -->
   <text x="40" y="64" class="col-hdr">1. CLIENTS</text>
   <text x="296" y="64" class="col-hdr">2. STATELESS GATEWAYS (:8014)</text>
   <text x="580" y="64" class="col-hdr">3. POSTGRESQL 18 PRIMARY</text>
   <text x="836" y="64" class="col-hdr">4. REPLICAS &amp; ORIGIN</text>
 
-  <!-- LANE 1 (Top): Direct OLTP SQL & DuckLake Catalog -->
+  <!-- LANE 1: Direct OLTP SQL -->
   <rect x="28" y="80" width="196" height="72" class="node"/>
-  <text x="44" y="106" class="h3">OLTP &amp; DuckLake SQL</text>
-  <text x="44" y="124" class="sub">App tables · Outbox · Catalog</text>
-  <text x="44" y="141" class="mono">:5432 / PgBouncer :6432</text>
+  <text x="44" y="105" class="h3">OLTP &amp; DuckLake SQL</text>
+  <text x="44" y="123" class="sub">App tables · Outbox · Catalog</text>
+  <text x="44" y="140" class="mono c-blue">:5432 / PgBouncer :6432</text>
 
   <rect x="568" y="80" width="204" height="72" class="node-c"/>
-  <text x="584" y="106" class="h3" fill="#38bdf8">App &amp; Catalog Schemas</text>
-  <text x="584" y="124" class="sub">guide_app · ducklake_catalog</text>
-  <text x="584" y="141" class="mono">Independent SQL Tx</text>
+  <text x="584" y="105" class="h3 c-blue">App &amp; Catalog Schemas</text>
+  <text x="584" y="123" class="sub">guide_app · ducklake_catalog</text>
+  <text x="584" y="140" class="mono">Independent SQL Tx</text>
 
   <path d="M 224 116 L 562 116" class="lane-c" marker-end="url(#arr-c)"/>
-  <text x="330" y="108" class="mono" fill="#38bdf8">Direct SQL (Bypasses Gateway)</text>
+  <text x="330" y="108" class="mono c-blue">Direct SQL (Bypasses Gateway)</text>
 
-  <!-- LANE 2 (Upper-Mid): S3 / DuckDB / OJS Writes & Hot Reads -->
+  <!-- LANE 2: S3 / DuckDB / OJS -->
   <rect x="28" y="176" width="196" height="96" class="node"/>
-  <text x="44" y="202" class="h3">DuckDB / S3 / OJS</text>
-  <text x="44" y="220" class="sub">10 MiB–1 GiB Parquet</text>
-  <text x="44" y="238" class="sub">OJS Jobs &amp; Streams</text>
-  <text x="44" y="256" class="mono">RESP2 Pipelined Cache</text>
+  <text x="44" y="201" class="h3">DuckDB / S3 / OJS</text>
+  <text x="44" y="219" class="sub">10 MiB–1 GiB Parquet</text>
+  <text x="44" y="237" class="sub">OJS Jobs &amp; Streams</text>
+  <text x="44" y="255" class="mono">RESP2 Pipelined Cache</text>
 
   <rect x="284" y="176" width="220" height="176" class="node-c"/>
-  <text x="300" y="202" class="h3" fill="#38bdf8">Writable Fleet (pgvs3)</text>
-  <text x="300" y="222" class="sub">• Admission: 32 active + 64 wait</text>
-  <text x="300" y="240" class="sub">• Spool guard: 8 GiB fail-fast</text>
-  <text x="300" y="258" class="sub">• mainPool (B-tree) + chunkPool</text>
-  <text x="300" y="276" class="sub">• Advisory-locked reaper/leader</text>
-  <rect x="300" y="292" width="188" height="44" rx="6" fill="#172554"/>
-  <text x="310" y="311" class="mono" fill="#93c5fd">Session Advisory Locks:</text>
-  <text x="310" y="326" class="mono" fill="#7dd3fc">Direct or Session Pool Only</text>
+  <text x="300" y="201" class="h3 c-blue">Writable Fleet (pgvs3)</text>
+  <text x="300" y="221" class="sub">• Admission: 32 active + 64 wait</text>
+  <text x="300" y="239" class="sub">• Spool guard: 8 GiB fail-fast</text>
+  <text x="300" y="257" class="sub">• mainPool (B-tree) + chunkPool</text>
+  <text x="300" y="275" class="sub">• Advisory-locked reaper/leader</text>
+  <rect x="300" y="292" width="188" height="44" class="pill"/>
+  <text x="310" y="311" class="mono c-blue">Session Advisory Locks:</text>
+  <text x="310" y="326" class="mono">Direct or Session Pool Only</text>
 
   <rect x="568" y="176" width="204" height="96" class="node-c"/>
-  <text x="584" y="202" class="h3" fill="#38bdf8">Primary Data Schemas</text>
-  <text x="584" y="220" class="mono">s3b_ (Native) · s3q_ (Queues)</text>
-  <text x="584" y="238" class="mono">s3p  (Catalog &amp; Leases)</text>
-  <text x="584" y="256" class="sub">8,120 B pages · MVCC publish</text>
+  <text x="584" y="201" class="h3 c-blue">Primary Data Schemas</text>
+  <text x="584" y="219" class="mono">s3b_ (Native) · s3q_ (Queues)</text>
+  <text x="584" y="237" class="mono">s3p  (Catalog &amp; Leases)</text>
+  <text x="584" y="255" class="sub">8,120 B pages · MVCC publish</text>
 
   <path d="M 224 224 L 278 224" class="lane-c" marker-end="url(#arr-c)"/>
   <path d="M 504 224 L 562 224" class="lane-c" marker-end="url(#arr-c)"/>
 
-  <!-- LANE 3 (Lower-Mid): Origin Cache (s3c_) & Durable Write-Back (s3w_) -->
+  <!-- LANE 3: Cache & Staging -->
   <rect x="568" y="292" width="204" height="84" class="node-a"/>
-  <text x="584" y="318" class="h3" fill="#fbbf24">Cache &amp; Staging</text>
-  <text x="584" y="336" class="mono" fill="#fde68a">s3c_ (Fills) · s3w_ (Pending)</text>
-  <text x="584" y="354" class="sub">s3w_ never expires until drain</text>
+  <text x="584" y="317" class="h3 c-amber">Cache &amp; Staging</text>
+  <text x="584" y="335" class="mono">s3c_ (Fills) · s3w_ (Pending)</text>
+  <text x="584" y="353" class="sub">s3w_ never expires until drain</text>
 
   <rect x="824" y="292" width="188" height="84" class="node-a"/>
-  <text x="840" y="318" class="h3" fill="#fbbf24">S3 / HTTP Origin</text>
-  <text x="840" y="336" class="sub">Coalesced 1-GET cold fill</text>
-  <text x="840" y="354" class="mono" fill="#fde68a">Leased outbox PUT drain</text>
+  <text x="840" y="317" class="h3 c-amber">S3 / HTTP Origin</text>
+  <text x="840" y="335" class="sub">Coalesced 1-GET cold fill</text>
+  <text x="840" y="353" class="mono c-amber">Leased outbox PUT drain</text>
 
   <path d="M 504 334 L 562 334" class="lane-a" marker-end="url(#arr-a)"/>
   <path d="M 772 334 L 818 334" class="lane-a" marker-end="url(#arr-a)"/>
 
-  <!-- LANE 4 (Bottom): Read-Only Gateway Fleet & Physical Standbys -->
+  <!-- LANE 4: Read-Only Fleet & Standbys -->
   <rect x="28" y="376" width="196" height="76" class="node"/>
-  <text x="44" y="402" class="h3">Scale-Out Readers</text>
-  <text x="44" y="420" class="sub">DuckDB · S3 GET / Range</text>
-  <text x="44" y="438" class="mono">Read-only service endpoint</text>
+  <text x="44" y="401" class="h3">Scale-Out Readers</text>
+  <text x="44" y="419" class="sub">DuckDB · S3 GET / Range</text>
+  <text x="44" y="437" class="mono">Read-only service endpoint</text>
 
   <rect x="284" y="376" width="220" height="76" class="node-g"/>
-  <text x="300" y="402" class="h3" fill="#34d399">Read-Only Fleet (--read-only)</text>
-  <text x="300" y="420" class="sub">Rejects mutations (403)</text>
-  <text x="300" y="438" class="mono" fill="#6ee7b7">Serves s3b_, s3c_ &amp; s3w_ hits</text>
+  <text x="300" y="401" class="h3 c-green">Read-Only Fleet (--read-only)</text>
+  <text x="300" y="419" class="sub">Rejects mutations (403)</text>
+  <text x="300" y="437" class="mono c-green">Serves s3b_, s3c_ &amp; s3w_ hits</text>
 
   <rect x="824" y="376" width="188" height="76" class="node-p"/>
-  <text x="840" y="402" class="h3" fill="#c084fc">Physical Standbys</text>
-  <text x="840" y="420" class="sub">Streaming WAL replay</text>
-  <text x="840" y="438" class="mono" fill="#d8b4fe">replay_lsn &gt;= flush_lsn</text>
+  <text x="840" y="401" class="h3 c-purple">Physical Standbys</text>
+  <text x="840" y="419" class="sub">Streaming WAL replay</text>
+  <text x="840" y="437" class="mono c-purple">replay_lsn &gt;= flush_lsn</text>
 
-  <!-- Non-crossing bottom & vertical WAL paths -->
   <path d="M 224 414 L 278 414" class="lane-g" marker-end="url(#arr-g)"/>
   <path d="M 818 414 L 510 414" class="lane-g" marker-end="url(#arr-g)"/>
-  <text x="615" y="434" class="mono" fill="#34d399">Replicated Page Hits (0 Origin GETs)</text>
+  <text x="615" y="434" class="mono c-green">Replicated Page Hits (0 Origin GETs)</text>
 
-  <!-- Vertical WAL stream from Primary to Standby (along right column, no crossing) -->
-  <path d="M 772 224 L 918 224 L 918 282" class="lane-p" stroke-dasharray="none" opacity="0"/>
   <path d="M 670 376 L 670 392 L 818 392" class="lane-p" marker-end="url(#arr-p)"/>
-  <text x="682" y="388" class="mono" fill="#c084fc">WAL Stream</text>
+  <text x="682" y="388" class="mono c-purple">WAL Stream</text>
 </svg>

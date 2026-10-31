@@ -15,7 +15,6 @@ website:
   page-navigation: true
   bread-crumbs: true
   navbar:
-    background: dark
     search: true
     left:
       - text: "Overview & Atlas"
@@ -100,6 +99,7 @@ website:
 
 format:
   html:
+    respect-user-color-scheme: true
     theme:
       light: [cosmo, styles.scss]
       dark: [darkly, styles.scss]
@@ -107,3 +107,34 @@ format:
     toc-depth: 3
     code-copy: true
     smooth-scroll: true
+    include-in-header:
+      text: |
+        <script>
+        (function() {
+          const syncScheme = () => {
+            const isDark = document.body
+              ? document.body.classList.contains('quarto-dark')
+              : window.matchMedia('(prefers-color-scheme: dark)').matches;
+            document.documentElement.style.colorScheme = isDark ? 'dark' : 'light';
+            document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+          };
+          syncScheme();
+          window.addEventListener('DOMContentLoaded', () => {
+            syncScheme();
+            new MutationObserver(syncScheme).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+            document.querySelectorAll('img[src$=".svg"]').forEach(async (img) => {
+              try {
+                const res = await fetch(img.src);
+                if (!res.ok) return;
+                const txt = await res.text();
+                const doc = new DOMParser().parseFromString(txt, 'image/svg+xml');
+                const svg = doc.querySelector('svg');
+                if (svg) {
+                  svg.classList.add('oat-inline-svg');
+                  img.replaceWith(svg);
+                }
+              } catch (_) {}
+            });
+          });
+        })();
+        </script>

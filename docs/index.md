@@ -95,28 +95,28 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
     <div class="pgvs3-bar-row">
       <div class="pgvs3-bar-hdr">
         <span><strong>Naive:</strong> <code>SELECT *</code> + Equal-Area Grid + <code>SORTED BY (lat, lon)</code> (no lon pruning)</span>
-        <span id="bar-naive-txt" style="color:#f87171;font-family:monospace;">142.0 GiB scanned</span>
+        <span id="bar-naive-txt" style="color:var(--danger);font-family:monospace;font-weight:600;">142.0 GiB scanned</span>
       </div>
       <div class="pgvs3-bar-track">
-        <div class="pgvs3-bar-fill" id="bar-naive" style="width:100%;background:#ef4444;"></div>
+        <div class="pgvs3-bar-fill" id="bar-naive" style="width:100%;background:var(--danger);"></div>
       </div>
     </div>
     <div class="pgvs3-bar-row">
       <div class="pgvs3-bar-hdr">
         <span><strong>Column Projection Only:</strong> Narrow + Wide fetched for entire lat stripe</span>
-        <span id="bar-proj-txt" style="color:#fbbf24;font-family:monospace;">28.4 GiB scanned</span>
+        <span id="bar-proj-txt" style="color:var(--warning);font-family:monospace;font-weight:600;">28.4 GiB scanned</span>
       </div>
       <div class="pgvs3-bar-track">
-        <div class="pgvs3-bar-fill" id="bar-proj" style="width:24%;background:#f59e0b;"></div>
+        <div class="pgvs3-bar-fill" id="bar-proj" style="width:24%;background:var(--warning);"></div>
       </div>
     </div>
     <div class="pgvs3-bar-row">
       <div class="pgvs3-bar-hdr">
         <span><strong>pgvs3 + DuckLake Recommended:</strong> 24-Bit Hilbert <code>SORTED BY (hilbert_id, ts)</code> + Late Materialization</span>
-        <span id="bar-hilb-txt" style="color:#34d399;font-family:monospace;">1.1 GiB scanned (129× less I/O)</span>
+        <span id="bar-hilb-txt" style="color:var(--success);font-family:monospace;font-weight:600;">1.1 GiB scanned (129× less I/O)</span>
       </div>
       <div class="pgvs3-bar-track">
-        <div class="pgvs3-bar-fill" id="bar-hilb" style="width:3%;background:#10b981;"></div>
+        <div class="pgvs3-bar-fill" id="bar-hilb" style="width:3%;background:var(--success);"></div>
       </div>
     </div>
   </div>

@@ -84,8 +84,8 @@ def check_links():
     for svg in svgs:
         ET.parse(svg)
         body = svg.read_text()
-        if "@keyframes" not in body or "prefers-reduced-motion" not in body:
-            raise ValueError(f"SVG {svg.relative_to(ROOT)} must include CSS animation and prefers-reduced-motion support")
+        if "@keyframes" not in body or "prefers-reduced-motion" not in body or "light-dark(" not in body:
+            raise ValueError(f"SVG {svg.relative_to(ROOT)} must include CSS animation, light-dark() tokens, and prefers-reduced-motion support")
     quarto_cfg = (ROOT / "docs/_quarto.yml").read_text()
     for href in re.findall(r"href:\s*([^\s#]+\.md)", quarto_cfg):
         if not (ROOT / "docs" / href).exists():

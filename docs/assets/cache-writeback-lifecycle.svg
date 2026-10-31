@@ -1,51 +1,66 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 450" role="img" aria-labelledby="cache-title cache-desc">
   <title id="cache-title">Shared Origin Cache and Ack-First Write-Back Outbox Swimlanes</title>
-  <desc id="cache-desc">Three clean horizontal swimlanes showing Coalesced Cold Fill, Aligned Parquet Range Cache, and Ack-First Durable Write-Back Outbox.</desc>
+  <desc id="cache-desc">Three horizontal swimlanes in Oat UI light/dark adaptive style showing Coalesced Cold Fill, Aligned Parquet Range Cache, and Ack-First Durable Write-Back Outbox.</desc>
   <defs>
-    <linearGradient id="bg-c" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0b1120"/>
-      <stop offset="100%" stop-color="#172033"/>
-    </linearGradient>
     <marker id="mc" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
     </marker>
     <marker id="mg" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
     </marker>
     <marker id="ma" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/>
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--warning)"/>
     </marker>
   </defs>
   <style>
-    .bg { fill: url(#bg-c); }
-    .swim { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10; }
-    .node { fill: #0f172a; stroke: #475569; stroke-width: 1.4; rx: 8; }
-    .node-hit { fill: #064e3b; stroke: #10b981; stroke-width: 1.6; rx: 8; }
-    .node-stage { fill: #1c1917; stroke: #f59e0b; stroke-width: 1.8; rx: 8; }
-    .title { fill: #f8fafc; font: 700 16px 'Inter', system-ui, sans-serif; }
-    .lane-title { fill: #e2e8f0; font: 700 12.5px 'Inter', system-ui, sans-serif; }
-    .h4 { fill: #f8fafc; font: 700 12px 'Inter', system-ui, sans-serif; }
-    .sub { fill: #94a3b8; font: 500 10.8px 'Inter', system-ui, sans-serif; }
-    .mono { fill: #7dd3fc; font: 600 10.5px 'JetBrains Mono', monospace; }
-    .fc { stroke: #38bdf8; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: mv 1.3s linear infinite; }
-    .fg { stroke: #34d399; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: mv 1.3s linear infinite; }
-    .fa { stroke: #fbbf24; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: mv 1.5s linear infinite; }
+    svg {
+      color-scheme: light dark;
+      --bg: light-dark(#ffffff, #09090b);
+      --swim: light-dark(#fafafa, #18181b);
+      --node: light-dark(#ffffff, #1e1e21);
+      --border: light-dark(#e4e4e7, #303036);
+      --fg: light-dark(#262626, #e5e5e5);
+      --muted: light-dark(#71717a, #a1a1aa);
+      --blue: light-dark(#0284c7, #38bdf8);
+      --success: light-dark(#008032, #6cc070);
+      --warning: light-dark(#a65b00, #f0a030);
+      --purple: light-dark(#7c3aed, #c084fc);
+      --hit-bg: light-dark(#e6f4ea, #064e3b);
+      --stage-bg: light-dark(#fef3c7, #1c1917);
+    }
+    .bg { fill: var(--bg); }
+    .swim { fill: var(--swim); stroke: var(--border); stroke-width: 1.5; rx: 8; }
+    .node { fill: var(--node); stroke: var(--border); stroke-width: 1.3; rx: 6; }
+    .node-hit { fill: var(--hit-bg); stroke: var(--success); stroke-width: 1.6; rx: 6; }
+    .node-stage { fill: var(--stage-bg); stroke: var(--warning); stroke-width: 1.6; rx: 6; }
+    .title { fill: var(--fg); font: 600 16px system-ui, -apple-system, sans-serif; }
+    .lane-title { fill: var(--fg); font: 600 12.5px system-ui, -apple-system, sans-serif; }
+    .h4 { fill: var(--fg); font: 600 12px system-ui, -apple-system, sans-serif; }
+    .sub { fill: var(--muted); font: 400 10.8px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .c-blue { fill: var(--blue); }
+    .c-green { fill: var(--success); }
+    .c-amber { fill: var(--warning); }
+    .c-purple { fill: var(--purple); }
+    .fc { stroke: var(--blue); stroke-width: 2.3; fill: none; stroke-dasharray: 8 6; animation: mv 1.3s linear infinite; }
+    .fg { stroke: var(--success); stroke-width: 2.3; fill: none; stroke-dasharray: 8 6; animation: mv 1.3s linear infinite; }
+    .fa { stroke: var(--warning); stroke-width: 2.3; fill: none; stroke-dasharray: 8 6; animation: mv 1.5s linear infinite; }
     @keyframes mv { to { stroke-dashoffset: -28; } }
     @media (prefers-reduced-motion: reduce) {
       .fc, .fg, .fa { animation: none; }
     }
   </style>
 
-  <rect width="1040" height="450" class="bg" rx="14"/>
+  <rect width="1040" height="450" class="bg" rx="8"/>
   <text x="28" y="34" class="title">Origin Cache (s3c_) &amp; Durable Write-Back Stage (s3w_) Swimlanes</text>
 
   <!-- Swimlane 1: Cold Fill -->
   <rect x="28" y="52" width="984" height="116" class="swim"/>
-  <text x="44" y="74" class="lane-title" fill="#38bdf8">1. Coalesced Cold Fill → Replicated Cross-Gateway HIT</text>
+  <text x="44" y="74" class="lane-title c-blue">1. Coalesced Cold Fill → Replicated Cross-Gateway HIT</text>
 
   <rect x="44" y="86" width="210" height="68" class="node"/>
   <text x="56" y="108" class="h4">1. Lease Ownership</text>
-  <text x="56" y="125" class="mono">s3p.cache_fill_leases</text>
+  <text x="56" y="125" class="mono c-blue">s3p.cache_fill_leases</text>
   <text x="56" y="141" class="sub">1 gateway fetches; peers wait</text>
 
   <rect x="288" y="86" width="210" height="68" class="node"/>
@@ -59,8 +74,8 @@
   <text x="544" y="141" class="sub">Checks live owner + ETag</text>
 
   <rect x="776" y="86" width="220" height="68" class="node-hit"/>
-  <text x="788" y="108" class="h4" fill="#6ee7b7">4. Fleet &amp; Standby HIT</text>
-  <text x="788" y="125" class="mono" fill="#a7f3d0">X-Cache: HIT (0 Origin GETs)</text>
+  <text x="788" y="108" class="h4 c-green">4. Fleet &amp; Standby HIT</text>
+  <text x="788" y="125" class="mono">X-Cache: HIT (0 Origin GETs)</text>
   <text x="788" y="141" class="sub">Post-TTL: HEAD revalidates</text>
 
   <path d="M 254 120 L 282 120" class="fc" marker-end="url(#mc)"/>
@@ -69,11 +84,11 @@
 
   <!-- Swimlane 2: Aligned Range Cache -->
   <rect x="28" y="184" width="984" height="116" class="swim"/>
-  <text x="44" y="206" class="lane-title" fill="#34d399">2. Aligned Parquet Range Cache (--range-cache-chunk 1048576)</text>
+  <text x="44" y="206" class="lane-title c-green">2. Aligned Parquet Range Cache (--range-cache-chunk 1048576)</text>
 
   <rect x="44" y="218" width="290" height="68" class="node"/>
   <text x="56" y="240" class="h4">1. DuckDB Footer &amp; Column Range</text>
-  <text x="56" y="257" class="mono">Range: bytes=start-end</text>
+  <text x="56" y="257" class="mono c-blue">Range: bytes=start-end</text>
   <text x="56" y="273" class="sub">Skips unprojected wide columns</text>
 
   <rect x="372" y="218" width="290" height="68" class="node"/>
@@ -82,8 +97,8 @@
   <text x="384" y="273" class="sub">1 MiB aligned slices cached in PG</text>
 
   <rect x="700" y="218" width="296" height="68" class="node-hit"/>
-  <text x="712" y="240" class="h4" fill="#6ee7b7">3. 206 Partial Content HIT</text>
-  <text x="712" y="257" class="mono" fill="#a7f3d0">Shared across gateways &amp; standbys</text>
+  <text x="712" y="240" class="h4 c-green">3. 206 Partial Content HIT</text>
+  <text x="712" y="257" class="mono">Shared across gateways &amp; standbys</text>
   <text x="712" y="273" class="sub">Reused by subsequent selective scans</text>
 
   <path d="M 334 252 L 366 252" class="fc" marker-end="url(#mc)"/>
@@ -91,25 +106,25 @@
 
   <!-- Swimlane 3: Ack-First Write-Back -->
   <rect x="28" y="316" width="984" height="116" class="swim"/>
-  <text x="44" y="338" class="lane-title" fill="#fbbf24">3. Ack-First Durable Write-Back (&gt;8 MiB PUT / Multipart) → Leased Outbox Drain</text>
+  <text x="44" y="338" class="lane-title c-amber">3. Ack-First Durable Write-Back (&gt;8 MiB PUT / Multipart) → Leased Outbox Drain</text>
 
   <rect x="44" y="350" width="210" height="68" class="node-stage"/>
-  <text x="56" y="372" class="h4" fill="#fbbf24">1. Atomic PG Commit</text>
-  <text x="56" y="389" class="mono" fill="#fde68a">s3w_ + pending_uploads</text>
+  <text x="56" y="372" class="h4 c-amber">1. Atomic PG Commit</text>
+  <text x="56" y="389" class="mono">s3w_ + pending_uploads</text>
   <text x="56" y="405" class="sub">expires_at IS NULL (Sole Copy!)</text>
 
   <rect x="288" y="350" width="210" height="68" class="node-hit"/>
-  <text x="300" y="372" class="h4" fill="#6ee7b7">2. Fast 200 OK &amp; Read HIT</text>
-  <text x="300" y="389" class="mono" fill="#a7f3d0">Immediate MVCC visibility</text>
+  <text x="300" y="372" class="h4 c-green">2. Fast 200 OK &amp; Read HIT</text>
+  <text x="300" y="389" class="mono">Immediate MVCC visibility</text>
   <text x="300" y="405" class="sub">Stable public content ETag</text>
 
   <rect x="532" y="350" width="210" height="68" class="node"/>
   <text x="544" y="372" class="h4">3. Advisory-Locked Upload</text>
-  <text x="544" y="389" class="mono">5m lease + PG key lock</text>
+  <text x="544" y="389" class="mono c-blue">5m lease + PG key lock</text>
   <text x="544" y="405" class="sub">Serializes per-key origin order</text>
 
   <rect x="776" y="350" width="220" height="68" class="node"/>
-  <text x="788" y="372" class="h4" fill="#c084fc">4. Token-Fenced Handoff</text>
+  <text x="788" y="372" class="h4 c-purple">4. Token-Fenced Handoff</text>
   <text x="788" y="389" class="mono">Origin now Copy of Record</text>
   <text x="788" y="405" class="sub">Enables normal 24h retention</text>
 
