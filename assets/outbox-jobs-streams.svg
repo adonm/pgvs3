@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 580" role="img" aria-labelledby="ojs-title ojs-desc">
+  <title id="ojs-title">Transactional SQL Outbox, OJS Lease Token State Machine and 3-Segment TRUNCATE Stream Rotation</title>
+  <desc id="ojs-desc">Animated diagram showing the two views in an s3q_ queue schema: OJS jobs bridged from application SQL via an outbox, reconciled on HTTP 409, claimed via SKIP LOCKED and completed after an idempotent receipt commit; and PgQue-shaped streams using pg_snapshot ticks and 3 rotating TRUNCATE partitions.</desc>
+  <defs>
+    <linearGradient id="bg5" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <marker id="a-cyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="a-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+    <marker id="a-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#c084fc"/>
+    </marker>
+  </defs>
+  <style>
+    .bg { fill: url(#bg5); }
+    .panel { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10; }
+    .tx-box { fill: #0f172a; stroke: #38bdf8; stroke-width: 1.8; rx: 8; }
+    .ojs-box { fill: #0f172a; stroke: #c084fc; stroke-width: 1.8; rx: 8; }
+    .eff-box { fill: #064e3b; stroke: #10b981; stroke-width: 1.8; rx: 8; }
+    .seg-active { fill: #1e3a8a; stroke: #60a5fa; stroke-width: 1.8; rx: 8; }
+    .seg-sealed { fill: #312e81; stroke: #a78bfa; stroke-width: 1.6; rx: 8; }
+    .seg-trunc { fill: #065f46; stroke: #34d399; stroke-width: 1.6; rx: 8; }
+    .title { fill: #f8fafc; font: 700 17px 'Inter', system-ui, sans-serif; }
+    .h2 { fill: #e2e8f0; font: 700 13.5px 'Inter', system-ui, sans-serif; }
+    .txt { fill: #cbd5e1; font: 500 11.2px 'Inter', system-ui, sans-serif; }
+    .mono { fill: #7dd3fc; font: 600 10.8px 'JetBrains Mono', monospace; }
+    .f-c { stroke: #38bdf8; stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: step 1.4s linear infinite; }
+    .f-p { stroke: #c084fc; stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: step 1.4s linear infinite; }
+    .f-g { stroke: #34d399; stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: step 1.4s linear infinite; }
+    @keyframes step { to { stroke-dashoffset: -28; } }
+    @media (prefers-reduced-motion: reduce) {
+      .f-c, .f-p, .f-g { animation: none; }
+    }
+  </style>
+
+  <rect width="1080" height="580" class="bg" rx="14"/>
+  <text x="28" y="34" class="title">Queue &amp; Stream Model (s3q_&lt;name&gt;): Outbox Boundaries, Lazy Claims &amp; Zero-Bloat Streams</text>
+  <text x="28" y="54" class="txt">Separate SQL and HTTP transaction boundaries · Single-index SKIP LOCKED job claims · 3-segment TRUNCATE stream rotation</text>
+
+  <!-- Top Half: OJS Jobs + Outbox + Idempotent Receipt -->
+  <rect x="28" y="72" width="1024" height="232" class="panel"/>
+  <text x="44" y="95" class="h2" fill="#38bdf8">View 1 — OJS Competing Jobs: Producer SQL Outbox → HTTP Enqueue → Lazy Claim → Receipt + ACK</text>
+
+  <rect x="44" y="110" width="225" height="176" class="tx-box"/>
+  <text x="56" y="130" class="mono" fill="#38bdf8">Tx 1: Application SQL Commit</text>
+  <text x="56" y="149" class="txt">BEGIN;</text>
+  <text x="56" y="165" class="txt">UPDATE guide_app.orders</text>
+  <text x="56" y="181" class="txt">  SET paid = true WHERE id = 42;</text>
+  <text x="56" y="197" class="txt">INSERT INTO guide_app.outbox</text>
+  <text x="56" y="213" class="txt">  (event_id, job) VALUES (...);</text>
+  <text x="56" y="229" class="txt">COMMIT;</text>
+  <text x="56" y="252" class="mono" fill="#fbbf24">Rollback leaves 0 queued jobs</text>
+  <text x="56" y="269" class="mono" fill="#93c5fd">args MUST be a JSON array [...]</text>
+
+  <rect x="297" y="110" width="235" height="176" class="ojs-box"/>
+  <text x="309" y="130" class="mono" fill="#c084fc">Tx 2: Relay POST /ojs/v1/jobs</text>
+  <text x="309" y="149" class="txt">• Inserts s3q_&lt;q&gt;.jobs + s3p.job_index</text>
+  <text x="309" y="166" class="txt">• Lost HTTP reply? Retry POST:</text>
+  <text x="309" y="182" class="txt">  409 Conflict → GET /jobs/{id}</text>
+  <text x="309" y="198" class="txt">  &amp; verify immutable envelope</text>
+  <text x="309" y="215" class="txt">• Sets outbox.published_at = now()</text>
+  <text x="309" y="238" class="mono" fill="#f87171">Mismatched payload on 409</text>
+  <text x="309" y="254" class="mono" fill="#f87171">halts &amp; alerts (not skipped!)</text>
+
+  <rect x="560" y="110" width="230" height="176" class="ojs-box"/>
+  <text x="572" y="130" class="mono" fill="#c084fc">Tx 3: Lazy Claim (/workers/fetch)</text>
+  <text x="572" y="149" class="txt">• 1 index: jobs_claim ON</text>
+  <text x="572" y="165" class="mono" fill="#ddd6fe">  (priority DESC, next_visible_at, seq)</text>
+  <text x="572" y="183" class="txt">• FOR UPDATE SKIP LOCKED claims</text>
+  <text x="572" y="199" class="txt">  available, due scheduled/retryable</text>
+  <text x="572" y="215" class="txt">  &amp; expired non-exhausted leases!</text>
+  <text x="572" y="235" class="txt">• Issues fresh UUIDv7 lease_token</text>
+  <text x="572" y="252" class="mono" fill="#34d399">No per-queue subtransactions</text>
+  <text x="572" y="269" class="mono" fill="#34d399">(avoids MultiXact LWLock)</text>
+
+  <rect x="818" y="110" width="218" height="176" class="eff-box"/>
+  <text x="830" y="130" class="mono" fill="#6ee7b7">Tx 4 &amp; 5: Receipt SQL → ACK</text>
+  <text x="830" y="149" class="txt">• Worker commits SQL receipt</text>
+  <text x="830" y="165" class="txt">  (ON CONFLICT DO NOTHING) +</text>
+  <text x="830" y="181" class="txt">  business update together</text>
+  <text x="830" y="198" class="txt">• Then POST /workers/ack with</text>
+  <text x="830" y="214" class="txt">  current lease_token</text>
+  <text x="830" y="235" class="mono" fill="#fde68a">Crash before ACK? Redelivery</text>
+  <text x="830" y="251" class="mono" fill="#fde68a">hits receipt (effect count = 1)</text>
+  <text x="830" y="268" class="mono" fill="#fca5a5">Stale token gets 409 stale_lease</text>
+
+  <path d="M 269 198 L 291 198" class="f-c" marker-end="url(#a-cyan)"/>
+  <path d="M 532 198 L 554 198" class="f-p" marker-end="url(#a-purple)"/>
+  <path d="M 790 198 L 812 198" class="f-g" marker-end="url(#a-green)"/>
+
+  <!-- Bottom Half: PgQue-Shaped Streams & 3-Segment TRUNCATE Rotation -->
+  <rect x="28" y="322" width="1024" height="230" class="panel"/>
+  <text x="44" y="345" class="h2" fill="#34d399">View 2 — PgQue-Shaped Fan-Out Streams: Snapshot-Delimited Ticks &amp; Consumer-Pinned 3-Segment TRUNCATE</text>
+
+  <rect x="44" y="362" width="305" height="172" class="tx-box"/>
+  <text x="56" y="382" class="mono" fill="#38bdf8">1. Snapshot-Delimited Batches (No Sequence Gaps)</text>
+  <text x="56" y="401" class="txt">• Appends write xid8 (`txid`) into current segment</text>
+  <text x="56" y="418" class="txt">• Receive creates a `stream_ticks` row (`pg_snapshot`)</text>
+  <text x="56" y="434" class="txt">  only when new committed events are visible</text>
+  <text x="56" y="451" class="txt">• Late-committing lower `seq` is picked up by the</text>
+  <text x="56" y="467" class="txt">  next tick's `pg_visible_in_snapshot` diff!</text>
+  <text x="56" y="488" class="mono" fill="#fbbf24">`max` is a ceiling (returns 413 batch_too_large,</text>
+  <text x="56" y="504" class="mono" fill="#fbbf24">never a partial page); repeat receive returns</text>
+  <text x="56" y="520" class="mono" fill="#fbbf24">the same active batch until POST /streams/ack</text>
+
+  <!-- 3 Rotating Segments -->
+  <rect x="378" y="362" width="205" height="172" class="seg-active"/>
+  <text x="390" y="382" class="mono" fill="#93c5fd">stream_events_0 (Active)</text>
+  <text x="390" y="402" class="txt">• Receives new appends &amp;</text>
+  <text x="390" y="418" class="txt">  due retry re-insertions</text>
+  <text x="390" y="438" class="txt">• Shared advisory lock during</text>
+  <text x="390" y="454" class="txt">  append/receive</text>
+  <text x="390" y="478" class="mono" fill="#e0f2fe">Rotates after retention / 2</text>
+  <text x="390" y="495" class="mono" fill="#e0f2fe">(default: 7d / 2 = 3.5 days)</text>
+
+  <rect x="605" y="362" width="205" height="172" class="seg-sealed"/>
+  <text x="617" y="382" class="mono" fill="#ddd6fe">stream_events_1 (Sealed)</text>
+  <text x="617" y="402" class="txt">• Sealed with `sealed_xid`</text>
+  <text x="617" y="418" class="txt">• Fan-out consumers &amp;</text>
+  <text x="617" y="434" class="txt">  cooperative members finish</text>
+  <text x="617" y="450" class="txt">  reading active batches</text>
+  <text x="617" y="478" class="mono" fill="#fde68a">Slow consumer pins segment</text>
+  <text x="617" y="495" class="mono" fill="#fde68a">(retention is a minimum!)</text>
+
+  <rect x="832" y="362" width="204" height="172" class="seg-trunc"/>
+  <text x="844" y="382" class="mono" fill="#6ee7b7">stream_events_2 (Truncate)</text>
+  <text x="844" y="402" class="txt">• Once zero active batches &amp;</text>
+  <text x="844" y="418" class="txt">  all consumer cursors pass</text>
+  <text x="844" y="434" class="txt">  `sealed_xid`:</text>
+  <text x="844" y="456" class="mono" fill="#a7f3d0">TRUNCATE stream_events_2</text>
+  <text x="844" y="478" class="txt">• Reclaims OS blocks instantly</text>
+  <text x="844" y="494" class="txt">• Zero dead tuples, zero</text>
+  <text x="844" y="510" class="txt">  autovacuum bloat!</text>
+
+  <path d="M 349 448 L 372 448" class="f-c" marker-end="url(#a-cyan)"/>
+  <path d="M 583 448 L 599 448" class="f-p" marker-end="url(#a-purple)"/>
+  <path d="M 810 448 L 826 448" class="f-g" marker-end="url(#a-green)"/>
+</svg>

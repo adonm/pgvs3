@@ -1,0 +1,1316 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.20">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>queue-stream – pgvs3</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+</style>
+
+
+<script src="site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="site_libs/quarto-nav/headroom.min.js"></script>
+<script src="site_libs/clipboard/clipboard.min.js"></script>
+<script src="site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="site_libs/quarto-search/fuse.min.js"></script>
+<script src="site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="./">
+<link href="./operations.html" rel="next">
+<link href="./partitioning.html" rel="prev">
+<script src="site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="site_libs/quarto-html/popper.min.js"></script>
+<script src="site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="site_libs/quarto-html/anchor.min.js"></script>
+<link href="site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-dark-c2d5e23be7e7628261be6023ad4f5e54.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="site_libs/bootstrap/bootstrap-dark-dc650676e3a330219d37e48c46543a39.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+<style>html{ scroll-behavior: smooth; }</style>
+
+
+</head>
+
+<body class="nav-sidebar docked nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="./index.html">
+    <span class="navbar-title">pgvs3</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="./index.html" aria-current="page"> 
+<span class="menu-text">Overview &amp; Atlas</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="./guides/index.html"> 
+<span class="menu-text">Workload Guides</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="./design.html"> 
+<span class="menu-text">Architecture &amp; Layout</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="./operations.html"> 
+<span class="menu-text">Operations</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="./benchmarks.html"> 
+<span class="menu-text">Benchmarks &amp; Evidence</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/adonm/pgvs3"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="./design.html">Architecture &amp; Data Layout</a></li><li class="breadcrumb-item"><a href="./queue-stream.html">Queue &amp; Stream Model (OJS + PgQue)</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation docked overflow-auto">
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Home &amp; Visual Atlas</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">Workload &amp; Schema Guides</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Decision Tree &amp; Resource Trade-offs</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/postgres.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1. Protect OLTP &amp; Partitioning</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/analytics.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">2. DuckLake, Wide Columns &amp; Hilbert</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/cache.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">3. Shared Cache &amp; Write-Back Staging</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/jobs.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">4. Jobs, Outboxes &amp; Streams</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/observe-recover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">5. Observe, Diagnose &amp; Recover</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/sources.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Primary Research Ledger (44 Sources)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/validation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Executable Validation Evidence</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">Architecture &amp; Data Layout</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./design.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">System Architecture &amp; Authority</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./performance.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">8 KiB Page Layout &amp; I/O Paths</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./partitioning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Why Chunks Are Unpartitioned</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./queue-stream.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Queue &amp; Stream Model (OJS + PgQue)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Operations &amp; Production</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./operations.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Deployment, Pools, Cache &amp; CLI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./roadmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Roadmap &amp; Priorities</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">Benchmarks &amp; Qualification</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./benchmarks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Paired Runner &amp; Capacity Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./data-plane-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Replica Proof &amp; Capacity Ledger</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./modernization-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">v24/v25 Modernization Results</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./object-storage.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./object-storage-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Results (27 Cohorts)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./differential.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./differential-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Results</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Historical Design Proposals</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./proposals/modernization-review.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Modernization Review</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./proposals/high-value-improvements.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">High-Value Improvements</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./proposals/hardening-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Hardening Options</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#queue-and-stream-model" id="toc-queue-and-stream-model" class="nav-link active" data-scroll-target="#queue-and-stream-model">Queue and stream model</a>
+  <ul class="collapse">
+  <li><a href="#why-one-namespace-two-views" id="toc-why-one-namespace-two-views" class="nav-link" data-scroll-target="#why-one-namespace-two-views">Why one namespace, two views</a></li>
+  <li><a href="#design-invariants" id="toc-design-invariants" class="nav-link" data-scroll-target="#design-invariants">Design invariants</a></li>
+  <li><a href="#stream-tables" id="toc-stream-tables" class="nav-link" data-scroll-target="#stream-tables">Stream tables</a>
+  <ul class="collapse">
+  <li><a href="#visibility-and-batches" id="toc-visibility-and-batches" class="nav-link" data-scroll-target="#visibility-and-batches">Visibility and batches</a></li>
+  <li><a href="#ack-nack-retry-dlq" id="toc-ack-nack-retry-dlq" class="nav-link" data-scroll-target="#ack-nack-retry-dlq">Ack, nack, retry, DLQ</a></li>
+  <li><a href="#retention-and-segment-rotation" id="toc-retention-and-segment-rotation" class="nav-link" data-scroll-target="#retention-and-segment-rotation">Retention and segment rotation</a></li>
+  </ul></li>
+  <li><a href="#http-api" id="toc-http-api" class="nav-link" data-scroll-target="#http-api">HTTP API</a></li>
+  <li><a href="#pgque-feature-mapping" id="toc-pgque-feature-mapping" class="nav-link" data-scroll-target="#pgque-feature-mapping">PgQue feature mapping</a></li>
+  <li><a href="#jobstream-consolidation" id="toc-jobstream-consolidation" class="nav-link" data-scroll-target="#jobstream-consolidation">Job/stream consolidation</a></li>
+  <li><a href="#current-limits" id="toc-current-limits" class="nav-link" data-scroll-target="#current-limits">Current limits</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/queue-stream.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="./design.html">Architecture &amp; Data Layout</a></li><li class="breadcrumb-item"><a href="./queue-stream.html">Queue &amp; Stream Model (OJS + PgQue)</a></li></ol></nav></header>
+
+
+
+
+
+<section id="queue-and-stream-model" class="level1">
+<h1>Queue and stream model</h1>
+<p>pgvs3 has one queue namespace type, <code>s3q_&lt;name&gt;</code>, with two delivery views over the same PostgreSQL schema:</p>
+<ul>
+<li><strong>Jobs (OJS core):</strong> mutable per-job state, competing workers, leases, priority, delayed delivery, retries, heartbeats, cancellation and id lookup.</li>
+<li><strong>Streams (PgQue-shaped):</strong> an append-only event log, snapshot-delimited batches, independent fan-out cursors, batch ack, per-message retry and a dead-letter queue.</li>
+</ul>
+<p>Both views share the namespace catalog, configuration, quota, autovacuum, maintenance pass, <code>DROP SCHEMA</code> deletion, and backup boundary. A queue may be used as a job queue, a stream, or both; the tables do not interfere.</p>
+<p>For runnable producer/worker recipes and failure handling, see <a href="./guides/jobs.html">jobs, application outboxes and streams</a>. Sharing PostgreSQL does not make application SQL + HTTP enqueue/append/ACK atomic. Stable IDs, leases, effect receipts and retention are distinct boundaries, not exactly-once execution or a supported direct-SQL mutation API.</p>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="assets/outbox-jobs-streams.svg" class="img-fluid figure-img"></p>
+<figcaption>Transactional SQL Outbox, OJS Lease Token State Machine and 3-Segment TRUNCATE Stream Rotation</figcaption>
+</figure>
+</div>
+<section id="why-one-namespace-two-views" class="level2">
+<h2 class="anchored" data-anchor-id="why-one-namespace-two-views">Why one namespace, two views</h2>
+<p>PgQue’s useful idea is not “replace jobs with events”. It is that an append-only shared log plus per-consumer cursors gives replay, fan-out and predictable retention without a row-claim queue. OJS jobs need the opposite shape: a small mutable row per job and a lease. Keeping both in one schema gives each workload the right delivery path while consolidating:</p>
+<ul>
+<li>namespace creation, listing, quotas, drop and backup;</li>
+<li>queue configuration and observability;</li>
+<li>maintenance (TTL, retries, retention, leases);</li>
+<li>one HTTP route family and one operational port.</li>
+</ul>
+<p>The job table is not event-sourced. It remains the authoritative state for OJS; the stream log is a separate append-only log in the same namespace.</p>
+</section>
+<section id="design-invariants" class="level2">
+<h2 class="anchored" data-anchor-id="design-invariants">Design invariants</h2>
+<ul>
+<li>The OJS <code>jobs</code> row is authoritative for job state. Stream consumers never mutate job state.</li>
+<li><code>seq</code> orders storage only. Tick snapshots decide batch visibility, so a transaction that commits late cannot be skipped by a sequence cursor.</li>
+<li>A stream cursor advances only on batch ack or an empty receive that reaches a newer existing tick. There is no per-message cursor.</li>
+<li>The event log is segmented. Rotation never truncates a segment that a subscription cursor or batch still needs.</li>
+<li><code>retention</code> is a minimum. Table-granular rotation can keep events longer; a slow consumer extends it rather than losing data.</li>
+<li>All stream mutations go through OJS. There is no supported direct-SQL API.</li>
+<li>Each stream operation is one PL/pgSQL call. The <code>stream_*</code> functions in every queue schema (<code>internal/store/schema.sql</code>) hold the transaction, segment lock, row locks and cursor arithmetic; Go validates arguments and maps errors.</li>
+</ul>
+</section>
+<section id="stream-tables" class="level2">
+<h2 class="anchored" data-anchor-id="stream-tables">Stream tables</h2>
+<p>All tables are created by <code>s3p.ensure_queue_schema</code>:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Table</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>stream_config</code></td>
+<td><code>max_retries</code>, <code>retention</code>, current segment and its start time; one row per queue.</td>
+</tr>
+<tr class="even">
+<td><code>stream_ticks</code></td>
+<td><code>tick_id</code>, <code>pg_snapshot</code>, <code>max_seq</code>; batch boundaries.</td>
+</tr>
+<tr class="odd">
+<td><code>stream_segments</code></td>
+<td>per-segment seal transaction/time for three physical event segments.</td>
+</tr>
+<tr class="even">
+<td><code>stream_events</code></td>
+<td>partitioned append-only <code>seq</code>, <code>segment</code>, <code>event_id</code>, <code>txid</code> (<code>xid8</code>), type, JSON payload, headers, retry count, created time.</td>
+</tr>
+<tr class="odd">
+<td><code>stream_events_0..2</code></td>
+<td>the three physical partitions; the oldest is truncated on rotation.</td>
+</tr>
+<tr class="even">
+<td><code>stream_subscriptions</code></td>
+<td>one row per consumer/group, with <code>last_tick</code> and cooperative <code>next_tick</code> cursors.</td>
+</tr>
+<tr class="odd">
+<td><code>stream_batches</code></td>
+<td>one active batch per consumer/member, with start/end tick and <code>acked_at</code> for out-of-order cooperative acks.</td>
+</tr>
+<tr class="even">
+<td><code>stream_batch_events</code></td>
+<td>the exact event sequence in a batch, so ack/nack is stable if later events arrive.</td>
+</tr>
+<tr class="odd">
+<td><code>stream_retry_events</code></td>
+<td>due retries with a new delivery time.</td>
+</tr>
+<tr class="even">
+<td><code>stream_dead_letters</code></td>
+<td>exhausted messages with reason and payload.</td>
+</tr>
+</tbody>
+</table>
+<section id="visibility-and-batches" class="level3">
+<h3 class="anchored" data-anchor-id="visibility-and-batches">Visibility and batches</h3>
+<p>A receive reuses the latest existing tick when possible. If there is no newer tick, it checks the current snapshot for newly visible events and creates a tick only when there are events to return. The batch is the set of events visible in the new snapshot but not visible in the consumer’s previous tick. This is PgQue’s two-snapshot diff and avoids the classic sequence-gap problem: an event inserted before the tick but committed after it is picked up by a later tick even if its sequence number is lower.</p>
+<p><code>max</code> on receive is a ceiling, not a page size. If the next batch exceeds it, the receive returns <code>413 batch_too_large</code> and leaves the cursor and active batch unchanged; the consumer can retry with a larger ceiling. An active batch is returned again rather than creating a second one.</p>
+</section>
+<section id="ack-nack-retry-dlq" class="level3">
+<h3 class="anchored" data-anchor-id="ack-nack-retry-dlq">Ack, nack, retry, DLQ</h3>
+<ul>
+<li><code>ack(batch_id)</code> advances the fan-out cursor to the batch’s end tick and releases the batch. With cooperative members, acks may complete out of order; the group cursor advances only over contiguous completed batches.</li>
+<li><code>nack(batch_id, message_id, retry_after)</code> leaves the batch active and records one message in <code>stream_retry_events</code>, or in <code>stream_dead_letters</code> when <code>max_retries</code> is exhausted. The batch can then be acked for the remaining messages.</li>
+<li>Maintenance moves due retry rows into <code>stream_events</code> as fresh events. The next receive tick makes them visible. Retry count is preserved for the next nack decision.</li>
+<li>Dead letters can be inspected, replayed individually or all at once, and purged by age.</li>
+</ul>
+</section>
+<section id="retention-and-segment-rotation" class="level3">
+<h3 class="anchored" data-anchor-id="retention-and-segment-rotation">Retention and segment rotation</h3>
+<p><code>stream_config.retention</code> is the configured minimum retention, defaulting to seven days. Stream events live in three physical partitions. Maintenance rotates the current partition after <code>retention / 2</code>:</p>
+<ol type="1">
+<li>Mutations that append events or allocate a new cursor position (append, retry/replay, subscribe and receive) hold a shared transaction advisory lock keyed by the queue schema; rotation takes the exclusive lock. Ack/nack only update a batch/cursor and are protected by the batch event references.</li>
+<li>The next segment is locked <code>NOWAIT</code>. An empty segment is safe to reuse. A non-empty segment is truncated only if no batch references its events and every subscription cursor is past the segment’s <code>sealed_xid</code> (or there are no subscriptions). A slow consumer therefore pins the current segment instead of losing events.</li>
+<li>A segment sealed in one rotation becomes the current segment again two rotations later, after truncation. Ticks at or before the truncated segment’s seal, plus unreferenced ticks older than the retention age, are cleaned up on rotation and on every maintenance pass; one floor tick is always retained so <code>from_tick: 0</code> can replay events still present in later segments.</li>
+</ol>
+<p>Because rotation is table-granular, retention is a <strong>minimum</strong>, not an upper bound: with no consumers, events live for roughly the configured retention up to about 1.5x it, depending on the maintenance interval. Slow consumers extend it. Truncation is a real <code>TRUNCATE</code>, so stream events do not leave dead tuples behind and are not subject to an xmin-driven bloat horizon. Retry rows are removed when they are moved back into the log; dead letters have a separate age-based purge.</p>
+</section>
+</section>
+<section id="http-api" class="level2">
+<h2 class="anchored" data-anchor-id="http-api">HTTP API</h2>
+<p>Streams extend the OJS HTTP binding. The job endpoints are unchanged.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Method</th>
+<th>Path</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>POST</code></td>
+<td><code>/ojs/v1/queues/{q}/messages</code></td>
+<td>append one message</td>
+</tr>
+<tr class="even">
+<td><code>POST</code></td>
+<td><code>/ojs/v1/queues/{q}/messages/batch</code></td>
+<td>append up to 1,000 messages</td>
+</tr>
+<tr class="odd">
+<td><code>POST</code></td>
+<td><code>/ojs/v1/queues/{q}/consumers</code></td>
+<td>subscribe a fan-out consumer (<code>from_tick</code> optional)</td>
+</tr>
+<tr class="even">
+<td><code>GET</code></td>
+<td><code>/ojs/v1/queues/{q}/consumers</code></td>
+<td>list consumer cursors and active batches</td>
+</tr>
+<tr class="odd">
+<td><code>DELETE</code></td>
+<td><code>/ojs/v1/queues/{q}/consumers/{consumer}</code></td>
+<td>unsubscribe</td>
+</tr>
+<tr class="even">
+<td><code>POST</code></td>
+<td><code>/ojs/v1/queues/{q}/receive</code></td>
+<td>receive the next batch (<code>consumer</code>, <code>max</code>, optional cooperative <code>member</code>, optional <code>wait_ms</code> long-poll up to 5s)</td>
+</tr>
+<tr class="odd">
+<td><code>GET</code></td>
+<td><code>/ojs/v1/queues/{q}/batches/{id}</code></td>
+<td>inspect an active batch</td>
+</tr>
+<tr class="even">
+<td><code>POST</code></td>
+<td><code>/ojs/v1/streams/ack</code></td>
+<td>acknowledge a batch (<code>queue</code>, <code>batch_id</code>)</td>
+</tr>
+<tr class="odd">
+<td><code>POST</code></td>
+<td><code>/ojs/v1/streams/nack</code></td>
+<td>retry/dead-letter one message</td>
+</tr>
+<tr class="even">
+<td><code>GET</code></td>
+<td><code>/ojs/v1/queues/{q}/info</code></td>
+<td>stream counts, watermarks, current segment and rotation period</td>
+</tr>
+<tr class="odd">
+<td><code>GET</code>/<code>POST</code></td>
+<td><code>/ojs/v1/queues/{q}/config</code></td>
+<td>read/update <code>max_retries</code>, <code>retention</code></td>
+</tr>
+<tr class="even">
+<td><code>GET</code></td>
+<td><code>/ojs/v1/queues/{q}/dlq</code></td>
+<td>inspect dead letters</td>
+</tr>
+<tr class="odd">
+<td><code>POST</code></td>
+<td><code>/ojs/v1/queues/{q}/dlq/{id}/replay</code></td>
+<td>replay one dead letter</td>
+</tr>
+<tr class="even">
+<td><code>POST</code></td>
+<td><code>/ojs/v1/queues/{q}/dlq/replay</code></td>
+<td>replay all dead letters</td>
+</tr>
+<tr class="odd">
+<td><code>DELETE</code></td>
+<td><code>/ojs/v1/queues/{q}/dlq?older_than=720h</code></td>
+<td>purge dead letters by age</td>
+</tr>
+</tbody>
+</table>
+<p>Messages use JSON: <code>{type, payload, headers?, id?}</code>. A generated UUIDv7 is used when <code>id</code> is omitted. A subscription starts at the latest tick by default; <code>from_tick: 0</code> starts at the oldest retained tick, and a positive tick replays from that tick.</p>
+<p>Read-only gateways allow stream metadata reads (<code>info</code>, <code>config</code>, consumers, DLQ, batch inspection) and reject append/subscribe/receive/ack/nack/DLQ mutations.</p>
+</section>
+<section id="pgque-feature-mapping" class="level2">
+<h2 class="anchored" data-anchor-id="pgque-feature-mapping">PgQue feature mapping</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>PgQue capability</th>
+<th>pgvs3</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>send</code> / <code>send_batch</code></td>
+<td><code>POST .../messages</code> and <code>/messages/batch</code></td>
+</tr>
+<tr class="even">
+<td><code>subscribe</code> / <code>unsubscribe</code></td>
+<td><code>POST</code> / <code>DELETE .../consumers</code></td>
+</tr>
+<tr class="odd">
+<td><code>receive</code></td>
+<td><code>POST .../receive</code></td>
+</tr>
+<tr class="even">
+<td>batch <code>ack</code></td>
+<td><code>POST /streams/ack</code></td>
+</tr>
+<tr class="odd">
+<td>per-message <code>nack</code> / retry / DLQ</td>
+<td><code>POST /streams/nack</code> + retry maintenance</td>
+</tr>
+<tr class="even">
+<td>fan-out cursors</td>
+<td>one <code>stream_subscriptions</code> row per consumer</td>
+</tr>
+<tr class="odd">
+<td>queue config</td>
+<td><code>GET</code>/<code>POST .../config</code></td>
+</tr>
+<tr class="even">
+<td>queue/consumer/batch info</td>
+<td><code>.../info</code>, <code>.../consumers</code>, <code>.../batches/{id}</code></td>
+</tr>
+<tr class="odd">
+<td>DLQ inspect/replay/purge</td>
+<td><code>.../dlq</code> routes</td>
+</tr>
+<tr class="even">
+<td>tick snapshot visibility</td>
+<td><code>stream_ticks</code> + <code>pg_visible_in_snapshot</code></td>
+</tr>
+<tr class="odd">
+<td>on-demand ticker</td>
+<td>receive creates a tick only when new events are visible; no pg_cron dependency</td>
+</tr>
+<tr class="even">
+<td>consumer-pinned retention</td>
+<td>three-segment seal/rotation with cursor watermarks</td>
+</tr>
+<tr class="odd">
+<td>cooperative subconsumers</td>
+<td><code>receive</code> with <code>member</code>; one group cursor, one active batch per member</td>
+</tr>
+<tr class="even">
+<td><code>TRUNCATE</code> rotation</td>
+<td>three physical <code>stream_events</code> partitions, reused after truncation</td>
+</tr>
+<tr class="odd">
+<td>SQL triggers / roles</td>
+<td>not exposed over the HTTP binding; pgvs3 remains a trusted-network single-user service</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="jobstream-consolidation" class="level2">
+<h2 class="anchored" data-anchor-id="jobstream-consolidation">Job/stream consolidation</h2>
+<ul>
+<li><code>QueueStats</code> now includes stream event, consumer and dead-letter counts.</li>
+<li><code>GET /ojs/v1/queues</code> lists both job and stream queues; they are the same catalog entries.</li>
+<li><code>Maintain</code> handles job TTL/lease expiry, stream retries, and segmented stream rotation in one pass.</li>
+<li><code>DROP SCHEMA</code> removes both views atomically; <code>pg_dump -n s3q_&lt;name&gt;</code> captures both.</li>
+<li>One queue can have job workers and stream consumers simultaneously; the integration test <code>TestIntegrationJobAndStreamShareQueue</code> covers this.</li>
+</ul>
+</section>
+<section id="current-limits" class="level2">
+<h2 class="anchored" data-anchor-id="current-limits">Current limits</h2>
+<ul>
+<li>Stream retention is table-granular: it is at least the configured value and may run up to roughly 1.5x without consumers. A slow cursor pins the current segment, so lagging consumers can extend it further.</li>
+<li>Cooperative consumer allocation serializes on the subscription row, as PgQue warns; use larger batches when scaling members. Members must ack contiguous batches eventually or the group cursor stays pinned.</li>
+<li><code>receive</code> supports an optional <code>wait_ms</code> long-poll (capped at five seconds); without it, an empty batch returns immediately. Long polling does not hold an OJS concurrency slot between attempts, and it still reuses the latest tick without creating a tick for an idle poll.</li>
+<li>Stream payloads are JSON; PgQue’s opaque text/binary payloads are not exposed. (<code>jsonb</code> is the canonical form for OJS-style messages.)</li>
+<li>The stream log is per-queue; consumers pin the queue’s retention watermark.</li>
+<li>Job lifecycle events are not automatically mirrored into the stream log. A stream receives explicitly appended messages; job workers continue to use the <code>jobs</code> table and its lease/ack protocol.</li>
+</ul>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/adonm\.github\.io\/pgvs3");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="./partitioning.html" class="pagination-link" aria-label="Why Chunks Are Unpartitioned">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text">Why Chunks Are Unpartitioned</span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="./operations.html" class="pagination-link" aria-label="Deployment, Pools, Cache &amp; CLI">
+        <span class="nav-page-text">Deployment, Pools, Cache &amp; CLI</span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+<footer class="footer"><div class="nav-footer"><div class="nav-footer-center"><div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/queue-stream.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div></div></footer><script src="site_libs/quarto-html/zenscroll-min.js"></script>
+</body></html>

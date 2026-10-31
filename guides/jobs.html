@@ -1,0 +1,1223 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.20">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>jobs – pgvs3</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../guides/observe-recover.html" rel="next">
+<link href="../guides/cache.html" rel="prev">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-c2d5e23be7e7628261be6023ad4f5e54.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-dc650676e3a330219d37e48c46543a39.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+<style>html{ scroll-behavior: smooth; }</style>
+
+
+</head>
+
+<body class="nav-sidebar docked nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">pgvs3</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../index.html" aria-current="page"> 
+<span class="menu-text">Overview &amp; Atlas</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../guides/index.html"> 
+<span class="menu-text">Workload Guides</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../design.html"> 
+<span class="menu-text">Architecture &amp; Layout</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../operations.html"> 
+<span class="menu-text">Operations</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../benchmarks.html"> 
+<span class="menu-text">Benchmarks &amp; Evidence</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/adonm/pgvs3"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../guides/index.html">Workload &amp; Schema Guides</a></li><li class="breadcrumb-item"><a href="../guides/jobs.html">4. Jobs, Outboxes &amp; Streams</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation docked overflow-auto">
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Home &amp; Visual Atlas</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">Workload &amp; Schema Guides</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Decision Tree &amp; Resource Trade-offs</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/postgres.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1. Protect OLTP &amp; Partitioning</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/analytics.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">2. DuckLake, Wide Columns &amp; Hilbert</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/cache.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">3. Shared Cache &amp; Write-Back Staging</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/jobs.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">4. Jobs, Outboxes &amp; Streams</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/observe-recover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">5. Observe, Diagnose &amp; Recover</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/sources.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Primary Research Ledger (44 Sources)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/validation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Executable Validation Evidence</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">Architecture &amp; Data Layout</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../design.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">System Architecture &amp; Authority</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../performance.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">8 KiB Page Layout &amp; I/O Paths</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../partitioning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Why Chunks Are Unpartitioned</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../queue-stream.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Queue &amp; Stream Model (OJS + PgQue)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Operations &amp; Production</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../operations.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Deployment, Pools, Cache &amp; CLI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../roadmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Roadmap &amp; Priorities</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">Benchmarks &amp; Qualification</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../benchmarks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Paired Runner &amp; Capacity Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-plane-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Replica Proof &amp; Capacity Ledger</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../modernization-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">v24/v25 Modernization Results</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../object-storage.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../object-storage-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Results (27 Cohorts)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../differential.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../differential-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Results</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Historical Design Proposals</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/modernization-review.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Modernization Review</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/high-value-improvements.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">High-Value Improvements</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/hardening-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Hardening Options</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#reliable-jobs-application-outboxes-and-streams" id="toc-reliable-jobs-application-outboxes-and-streams" class="nav-link active" data-scroll-target="#reliable-jobs-application-outboxes-and-streams">Reliable jobs, application outboxes and streams</a>
+  <ul class="collapse">
+  <li><a href="#choose-jobs-or-streams" id="toc-choose-jobs-or-streams" class="nav-link" data-scroll-target="#choose-jobs-or-streams">Choose jobs or streams</a></li>
+  <li><a href="#commit-business-state-and-intent-together" id="toc-commit-business-state-and-intent-together" class="nav-link" data-scroll-target="#commit-business-state-and-intent-together">1. Commit business state and intent together</a></li>
+  <li><a href="#relay-reconcile-an-ambiguous-response-then-mark-published" id="toc-relay-reconcile-an-ambiguous-response-then-mark-published" class="nav-link" data-scroll-target="#relay-reconcile-an-ambiguous-response-then-mark-published">2. Relay, reconcile an ambiguous response, then mark published</a></li>
+  <li><a href="#commit-a-deduplicated-sql-effect-before-ack" id="toc-commit-a-deduplicated-sql-effect-before-ack" class="nav-link" data-scroll-target="#commit-a-deduplicated-sql-effect-before-ack">3. Commit a deduplicated SQL effect before ACK</a></li>
+  <li><a href="#scheduling-retries-and-throughput" id="toc-scheduling-retries-and-throughput" class="nav-link" data-scroll-target="#scheduling-retries-and-throughput">Scheduling, retries and throughput</a></li>
+  <li><a href="#streams-a-receive-ceiling-is-not-pagination" id="toc-streams-a-receive-ceiling-is-not-pagination" class="nav-link" data-scroll-target="#streams-a-receive-ceiling-is-not-pagination">Streams: a receive ceiling is not pagination</a></li>
+  <li><a href="#validate-failure-windows-then-clean-up" id="toc-validate-failure-windows-then-clean-up" class="nav-link" data-scroll-target="#validate-failure-windows-then-clean-up">Validate failure windows, then clean up</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/guides/jobs.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../guides/index.html">Workload &amp; Schema Guides</a></li><li class="breadcrumb-item"><a href="../guides/jobs.html">4. Jobs, Outboxes &amp; Streams</a></li></ol></nav></header>
+
+
+
+
+
+<section id="reliable-jobs-application-outboxes-and-streams" class="level1">
+<h1>Reliable jobs, application outboxes and streams</h1>
+<p><a href="../guides/index.html">Guide index</a> · Before: <a href="../guides/postgres.html">demo application</a> · Next: <a href="../guides/observe-recover.html">operations</a></p>
+<p><strong>Goal:</strong> bridge a committed application change to OJS without pretending HTTP participates in its SQL transaction. Expect retries; make effects idempotent. If you need enqueue/completion <strong>inside the caller’s SQL transaction</strong>, a library with an explicit transaction API (for example River) is a better fit than writing pgvs3’s internal tables. <a href="../guides/sources.html#jobs-and-transaction-boundaries">Research and differences</a>.</p>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="../assets/outbox-jobs-streams.svg" class="img-fluid figure-img"></p>
+<figcaption>Transactional SQL Outbox, OJS Lease Token State Machine and 3-Segment TRUNCATE Stream Rotation</figcaption>
+</figure>
+</div>
+<section id="choose-jobs-or-streams" class="level2">
+<h2 class="anchored" data-anchor-id="choose-jobs-or-streams">Choose jobs or streams</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Need</th>
+<th>Use</th>
+<th>Boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Competing workers, leases, priority and retries</td>
+<td>OJS jobs</td>
+<td>Each HTTP lifecycle operation commits independently.</td>
+</tr>
+<tr class="even">
+<td>Independent fan-out/replay cursors</td>
+<td>OJS streams</td>
+<td>Snapshot-delimited batches; effects and batch ACK are separate.</td>
+</tr>
+<tr class="odd">
+<td>Atomic application change + publish intent</td>
+<td>Application-owned SQL outbox</td>
+<td>Relay later to HTTP; not a distributed transaction.</td>
+</tr>
+<tr class="even">
+<td>Atomic application SQL effect + HTTP ACK</td>
+<td>Not supplied</td>
+<td>Commit a deduplication receipt with the effect, then ACK.</td>
+</tr>
+</tbody>
+</table>
+<p>OJS <code>args</code> must be a <strong>JSON array</strong>, e.g.&nbsp;<code>[{"order_id":42}]</code>, not an object; <code>meta</code>, if present, is an object. A caller UUID identifies a stored job, not a permanent unique-work key. A duplicate ID in its original queue returns <code>409 conflict</code>; it does not compare payloads or return the original job as successful insertion. Jobs can be removed by retention (<code>24h</code> default for terminal jobs), expiry or namespace deletion. After removal, an old ID can be inserted again. The manifest correctly advertises <code>unique_jobs:false</code>. Keep the ID <strong>and queue</strong> immutable: reusing an ID in a different queue can surface a global job-index storage error instead of <code>409</code>. Do not use a changed queue as a retry strategy or treat an arbitrary error as successful insertion.</p>
+</section>
+<section id="commit-business-state-and-intent-together" class="level2">
+<h2 class="anchored" data-anchor-id="commit-business-state-and-intent-together">1. Commit business state and intent together</h2>
+<p>In the disposable <code>guide_app</code> schema from the PostgreSQL guide:</p>
+<!-- verify:outbox-schema -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> guide_app.outbox (</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    event_id UUID <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    job JSONB <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">CHECK</span> (job ? <span class="st">'id'</span> <span class="kw">AND</span> job<span class="op">-&gt;&gt;</span><span class="st">'id'</span> <span class="op">=</span> event_id:<span class="ch">:TEXT</span>),</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    created_at TIMESTAMPTZ <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> now(),</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    published_at TIMESTAMPTZ</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> outbox_unsent <span class="kw">ON</span> guide_app.outbox (created_at, event_id)</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> published_at <span class="kw">IS</span> <span class="kw">NULL</span>;</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> guide_app.receipts (</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    event_id UUID <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    order_id BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> guide_app.orders(<span class="kw">id</span>)</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The UUID below is a fixed <strong>demo event</strong>. Real producers create a stable event ID once per business transition and persist it, rather than generating one on every HTTP retry. Keep its envelope immutable.</p>
+<!-- verify:outbox-commit -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> guide_app.orders <span class="kw">SET</span> paid <span class="op">=</span> <span class="kw">true</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">42</span>;</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> guide_app.outbox (event_id, job) <span class="kw">VALUES</span> (</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="st">'018f0000-0000-7000-8000-000000000042'</span>,</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">'{"id":"018f0000-0000-7000-8000-000000000042","type":"order.fulfill","args":[{"version":1,"order_id":42}],"queue":"guide-jobs"}'</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><strong>Expected:</strong> paid order + unsent outbox row, but <strong>no OJS job yet</strong>. Replacing <code>COMMIT</code> with <code>ROLLBACK</code> leaves neither business change nor intent. The test does both. Never call HTTP before commit and assume a worker can see uncommitted data. This recipe uses an existing order; in a real producer assert the transition actually happened (or create it and its intent in the same transaction).</p>
+</section>
+<section id="relay-reconcile-an-ambiguous-response-then-mark-published" class="level2">
+<h2 class="anchored" data-anchor-id="relay-reconcile-an-ambiguous-response-then-mark-published">2. Relay, reconcile an ambiguous response, then mark published</h2>
+<p>The following is a runnable <strong>single-relay demonstration</strong>, using Python’s standard library and <code>psql</code>. Save as <code>relay.py</code>, set <code>PGVS3_URL</code> and <code>PGVS3_ENDPOINT</code> to the disposable writer endpoints, then run <code>python3 relay.py</code>. The test uses the same code. It holds no SQL transaction/lock across HTTP.</p>
+<!-- verify:outbox-relay -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> json</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> subprocess</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> uuid</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> urllib.error <span class="im">import</span> HTTPError</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> urllib.request <span class="im">import</span> Request, urlopen</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> sql(statement):</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> subprocess.check_output([</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>        os.environ.get(<span class="st">"PSQL"</span>, <span class="st">"psql"</span>), os.environ[<span class="st">"PGVS3_URL"</span>],</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>        <span class="st">"-XAt"</span>, <span class="st">"-v"</span>, <span class="st">"ON_ERROR_STOP=1"</span>, <span class="st">"-c"</span>, statement</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    ], text<span class="op">=</span><span class="va">True</span>, timeout<span class="op">=</span><span class="dv">30</span>).strip()</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> call(path, job<span class="op">=</span><span class="va">None</span>):</span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    request <span class="op">=</span> Request(os.environ[<span class="st">"PGVS3_ENDPOINT"</span>] <span class="op">+</span> <span class="st">"/ojs/v1"</span> <span class="op">+</span> path,</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>                      data<span class="op">=</span><span class="va">None</span> <span class="cf">if</span> job <span class="kw">is</span> <span class="va">None</span> <span class="cf">else</span> json.dumps(job).encode(),</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>                      headers<span class="op">=</span>{<span class="st">"Content-Type"</span>: <span class="st">"application/openjobspec+json"</span>})</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> urlopen(request, timeout<span class="op">=</span><span class="dv">10</span>) <span class="im">as</span> response:</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> json.load(response)</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>raw <span class="op">=</span> sql(<span class="st">"SELECT job FROM guide_app.outbox WHERE published_at IS NULL "</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>          <span class="st">"ORDER BY created_at, event_id LIMIT 1"</span>)</span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> raw:</span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    expected <span class="op">=</span> json.loads(raw)</span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    event_id <span class="op">=</span> <span class="bu">str</span>(uuid.UUID(expected[<span class="st">"id"</span>]))</span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        actual <span class="op">=</span> call(<span class="st">"/jobs"</span>, expected)[<span class="st">"job"</span>]</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> HTTPError <span class="im">as</span> error:</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> error.code <span class="op">!=</span> <span class="dv">409</span>:</span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">raise</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        actual <span class="op">=</span> call(<span class="st">"/jobs/"</span> <span class="op">+</span> event_id)[<span class="st">"job"</span>]</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> field <span class="kw">in</span> (<span class="st">"id"</span>, <span class="st">"type"</span>, <span class="st">"args"</span>, <span class="st">"queue"</span>):</span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> actual[field] <span class="op">!=</span> expected[field]:</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>            <span class="cf">raise</span> <span class="pp">RuntimeError</span>(<span class="st">"job ID collision or changed envelope: "</span> <span class="op">+</span> field)</span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    sql(<span class="st">"UPDATE guide_app.outbox SET published_at=now() "</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>        <span class="st">"WHERE event_id='"</span> <span class="op">+</span> event_id <span class="op">+</span> <span class="st">"'::uuid AND published_at IS NULL"</span>)</span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(json.dumps({<span class="st">"published"</span>: event_id, <span class="st">"observed_state"</span>: actual[<span class="st">"state"</span>]}))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>A network error leaves the row unsent. Retry this program with a bounded backoff and jitter: a prior committed POST becomes <code>409</code>, then GET + envelope comparison reconciles it. Do not treat <strong>every</strong> <code>409</code> as success; a different payload/queue must stop and alert. Read this reconciliation from the <strong>primary</strong>, not a lagging replica. If GET races retention and returns <code>404</code>, leave unsent and retry/reconcile; do not invent a new UUID. <code>published_at</code> means transport accepted, not business effect completed—monitor cancelled/discarded jobs separately.</p>
+<p>This deliberately uses one relay. For parallel relays add short SQL claim leases, owner tokens, bounded retry scheduling and dead/error inspection in your <strong>application</strong> outbox; do not hold <code>FOR UPDATE</code> locks during network calls or copy this loop to hundreds of processes. Persist all relevant immutable fields and include them in reconciliation if extending the envelope (including options or metadata). Retain/reconcile intents and worker receipts for your replay/restore horizon, independently of OJS job retention.</p>
+</section>
+<section id="commit-a-deduplicated-sql-effect-before-ack" class="level2">
+<h2 class="anchored" data-anchor-id="commit-a-deduplicated-sql-effect-before-ack">3. Commit a deduplicated SQL effect before ACK</h2>
+<p>Fetch on a writable endpoint:</p>
+<!-- verify:job-fetch -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode json code-with-copy"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">"queues"</span><span class="fu">:</span><span class="ot">[</span><span class="st">"guide-jobs"</span><span class="ot">]</span><span class="fu">,</span><span class="dt">"count"</span><span class="fu">:</span><span class="dv">1</span><span class="fu">,</span><span class="dt">"worker_id"</span><span class="fu">:</span><span class="st">"guide-worker"</span><span class="fu">,</span><span class="dt">"visibility_timeout_ms"</span><span class="fu">:</span><span class="dv">30000</span><span class="fu">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Send that JSON to <code>POST /ojs/v1/workers/fetch</code>. Validate the returned <code>type</code>, argument version, order ID and stable event ID against your application intent. For this demo, the effect SQL is:</p>
+<!-- verify:job-effect -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> first_delivery <span class="kw">AS</span> (</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INSERT</span> <span class="kw">INTO</span> guide_app.receipts (event_id, order_id)</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">VALUES</span> (<span class="st">'018f0000-0000-7000-8000-000000000042'</span>, <span class="dv">42</span>)</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">ON</span> CONFLICT (event_id) DO <span class="kw">NOTHING</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">RETURNING</span> order_id</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> guide_app.orders <span class="kw">AS</span> o</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> fulfillment_count <span class="op">=</span> fulfillment_count <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> first_delivery <span class="kw">AS</span> d <span class="kw">WHERE</span> o.<span class="kw">id</span> <span class="op">=</span> d.order_id;</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><strong>Expected:</strong> running it twice leaves <code>fulfillment_count=1</code> and one receipt. The receipt and effect commit together. It protects this demonstrated SQL effect, not an email/payment/HTTP call outside the transaction; use that downstream system’s idempotency key and reconciliation as well. Validate payload identity before accepting a receipt collision. Do not expire receipts before jobs can be replayed, retried or restored from an older backup.</p>
+<p>Then <code>POST /ojs/v1/workers/ack</code> with the returned <strong>job ID and current <code>lease_token</code></strong>, e.g.&nbsp;<code>{"job_id":"…","lease_token":"…","result":{"applied":true}}</code>. If the process dies after SQL commit but before ACK, redelivery sees the receipt and suppresses a second effect. If a lease expires/reclaims, the old token gets <code>409 stale_lease</code>; that is not permission to overwrite the newer delivery. Heartbeat well before the visibility deadline, or stop work and reconcile when ownership is lost. <code>timeout_ms</code> is job metadata, not a worker process killer.</p>
+</section>
+<section id="scheduling-retries-and-throughput" class="level2">
+<h2 class="anchored" data-anchor-id="scheduling-retries-and-throughput">Scheduling, retries and throughput</h2>
+<ul>
+<li>Due scheduled/retryable jobs and expired <strong>non-exhausted</strong> active leases are claimed lazily by fetch; no minute-long maintenance wait is required. Expired jobs are excluded from claims; maintenance removes expired/terminal rows and marks exhausted expired leases discarded. Queue-state counts can lag those transitions until claim/maintenance; they are not a freshness clock.</li>
+<li>Long polling is at most two seconds for an existing empty queue. Fetch accepts at most 64 queues and 100 jobs; requests and batches have a 1 MiB body bound. Fetch claims queues in the supplied order, not one global cross-queue priority order. Avoid a hot first queue starving later queues; use dedicated workers or rotate bounded subscriptions.</li>
+<li>Fetch no more than can start/heartbeat safely. Measure enqueue/claim/ACK tails, oldest ready work, retries, abandoned leases and autovacuum, not merely jobs/sec. <code>queue-concurrency</code> is server request admission, <strong>not</strong> worker concurrency or an application SQL resource reservation.</li>
+<li>Use bounded atomic batches (<code>POST /jobs/batch</code>, at most 100) for independent jobs when useful; it is not atomic with application SQL. Retryable nack follows the configured backoff/attempt limit; cancellation/discard is not success.</li>
+<li>No workflows, cron, queue pause/resume, permanent uniqueness or job-level DLQ management is supplied. Streams have a <strong>separate</strong> retry/DLQ API.</li>
+</ul>
+</section>
+<section id="streams-a-receive-ceiling-is-not-pagination" class="level2">
+<h2 class="anchored" data-anchor-id="streams-a-receive-ceiling-is-not-pagination">Streams: a receive ceiling is not pagination</h2>
+<p>Save/run this Python snippet with <code>PGVS3_ENDPOINT</code> set to a writable gateway. It creates only <code>guide-events</code>; processing here means inspecting IDs, not an external business effect:</p>
+<!-- verify:stream-roundtrip -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> json</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> urllib.error <span class="im">import</span> HTTPError</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> urllib.request <span class="im">import</span> Request, urlopen</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> post(path, body):</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    request <span class="op">=</span> Request(os.environ[<span class="st">"PGVS3_ENDPOINT"</span>] <span class="op">+</span> <span class="st">"/ojs/v1"</span> <span class="op">+</span> path,</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>                      data<span class="op">=</span>json.dumps(body).encode(),</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>                      headers<span class="op">=</span>{<span class="st">"Content-Type"</span>: <span class="st">"application/openjobspec+json"</span>})</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> urlopen(request, timeout<span class="op">=</span><span class="dv">10</span>) <span class="im">as</span> response:</span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> json.load(response)</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>post(<span class="st">"/queues/guide-events/consumers"</span>, {<span class="st">"consumer"</span>: <span class="st">"audit"</span>, <span class="st">"from_tick"</span>: <span class="dv">0</span>})</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>post(<span class="st">"/queues/guide-events/messages/batch"</span>, {<span class="st">"messages"</span>: [</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    {<span class="st">"type"</span>: <span class="st">"order.paid"</span>, <span class="st">"payload"</span>: {<span class="st">"id"</span>: <span class="dv">42</span>}},</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    {<span class="st">"type"</span>: <span class="st">"order.paid"</span>, <span class="st">"payload"</span>: {<span class="st">"id"</span>: <span class="dv">43</span>}}</span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>]})</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="cf">try</span>:</span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    post(<span class="st">"/queues/guide-events/receive"</span>, {<span class="st">"consumer"</span>: <span class="st">"audit"</span>, <span class="st">"max"</span>: <span class="dv">1</span>})</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="cf">except</span> HTTPError <span class="im">as</span> error:</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> error.code <span class="op">!=</span> <span class="dv">413</span>:</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">raise</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span>:</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">raise</span> <span class="pp">RuntimeError</span>(<span class="st">"expected batch_too_large, not a partial page"</span>)</span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>batch <span class="op">=</span> post(<span class="st">"/queues/guide-events/receive"</span>, {<span class="st">"consumer"</span>: <span class="st">"audit"</span>, <span class="st">"max"</span>: <span class="dv">100</span>})</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>again <span class="op">=</span> post(<span class="st">"/queues/guide-events/receive"</span>, {<span class="st">"consumer"</span>: <span class="st">"audit"</span>, <span class="st">"max"</span>: <span class="dv">100</span>})</span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> batch[<span class="st">"batch_id"</span>] <span class="op">==</span> again[<span class="st">"batch_id"</span>] <span class="kw">and</span> batch[<span class="st">"count"</span>] <span class="op">==</span> <span class="dv">2</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>post(<span class="st">"/streams/ack"</span>, {<span class="st">"queue"</span>: <span class="st">"guide-events"</span>, <span class="st">"batch_id"</span>: batch[<span class="st">"batch_id"</span>]})</span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(json.dumps({<span class="st">"processed"</span>: batch[<span class="st">"count"</span>], <span class="st">"redelivered_same_batch"</span>: <span class="va">True</span>}))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Snapshot ticks prevent the late-commit sequence gap; they do not make the application’s SQL + HTTP append atomic. On an ambiguous append, do not assume a caller message ID deduplicates insertion. Deduplicate downstream by your stable business event key. Fan-out consumers advance independently; cooperative members must eventually ACK contiguous batches. A failed member is not an OJS job lease; plan recovery of its outstanding batch explicitly.</p>
+<p>Retention is a <strong>minimum</strong>, not a disk cap: a slow consumer/active batch pins segments beyond it. Inspect <code>/queues/{q}/consumers</code>, <code>/info</code> and <code>/dlq</code>; do not unsubscribe a slow consumer merely to reclaim space without accepting lost replay history. <a href="../queue-stream.html">Full stream model</a>.</p>
+</section>
+<section id="validate-failure-windows-then-clean-up" class="level2">
+<h2 class="anchored" data-anchor-id="validate-failure-windows-then-clean-up">Validate failure windows, then clean up</h2>
+<p><code>just guides</code> runs rollback + committed intent, simulates a lost enqueue response, rejects a mismatched duplicate, commits an effect without ACK, reclaims its lease, rejects the stale token and verifies one SQL effect after redelivery. It also checks JSON-array validation, retention-bounded ID reuse and the stream roundtrip. These are bounded examples, not an exactly-once claim. Keep reports and investigate failures before retrying cleanup; <a href="../guides/observe-recover.html#safe-demo-cleanup">remove only owned demo data</a>.</p>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/adonm\.github\.io\/pgvs3");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="../guides/cache.html" class="pagination-link" aria-label="3. Shared Cache &amp; Write-Back Staging">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text">3. Shared Cache &amp; Write-Back Staging</span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="../guides/observe-recover.html" class="pagination-link" aria-label="5. Observe, Diagnose &amp; Recover">
+        <span class="nav-page-text">5. Observe, Diagnose &amp; Recover</span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+<footer class="footer"><div class="nav-footer"><div class="nav-footer-center"><div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/guides/jobs.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div></div></footer><script src="../site_libs/quarto-html/zenscroll-min.js"></script>
+</body></html>

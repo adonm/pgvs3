@@ -1,0 +1,179 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 640" role="img" aria-labelledby="arch-title arch-desc">
+  <title id="arch-title">pgvs3 Data-Plane Architecture and Authority Flow</title>
+  <desc id="arch-desc">Animated architecture diagram showing DuckDB, S3, RESP2 and OJS clients connecting through stateless writable and read-only pgvs3 gateways to a PostgreSQL 18 primary, physical streaming standbys, DuckLake catalog, and optional upstream S3/HTTP origin.</desc>
+  <defs>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="pg-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1e3a8a"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <marker id="arrow-cyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#c084fc"/>
+    </marker>
+  </defs>
+  <style>
+    .bg { fill: url(#bg-grad); }
+    .panel { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10; }
+    .panel-pg { fill: #0f172a; stroke: #3b82f6; stroke-width: 2; rx: 12; }
+    .panel-ro { fill: #0f172a; stroke: #10b981; stroke-width: 1.8; rx: 10; }
+    .panel-origin { fill: #1c1917; stroke: #f59e0b; stroke-width: 1.8; rx: 10; }
+    .box { fill: #0f172a; stroke: #475569; stroke-width: 1.2; rx: 6; }
+    .title { fill: #f8fafc; font: 700 17px 'Inter', system-ui, sans-serif; }
+    .h2 { fill: #e2e8f0; font: 700 13.5px 'Inter', system-ui, sans-serif; }
+    .label { fill: #cbd5e1; font: 500 11.5px 'Inter', system-ui, sans-serif; }
+    .mono { fill: #93c5fd; font: 600 11px 'JetBrains Mono', monospace; }
+    .badge { font: 700 10px 'JetBrains Mono', monospace; }
+    .flow-write { stroke: #38bdf8; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: dash 1.4s linear infinite; }
+    .flow-read { stroke: #34d399; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: dash 1.6s linear infinite; }
+    .flow-wal { stroke: #c084fc; stroke-width: 3; fill: none; stroke-dasharray: 10 6; animation: dash 1.1s linear infinite; }
+    .flow-origin { stroke: #fbbf24; stroke-width: 2.3; fill: none; stroke-dasharray: 7 6; animation: dash 1.8s linear infinite; }
+    .pulse { animation: pulse-op 2.4s ease-in-out infinite; }
+    @keyframes dash { to { stroke-dashoffset: -28; } }
+    @keyframes pulse-op { 0%, 100% { opacity: 0.75; } 50% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .flow-write, .flow-read, .flow-wal, .flow-origin, .pulse { animation: none; }
+    }
+  </style>
+
+  <rect width="1080" height="640" class="bg" rx="14"/>
+
+  <!-- Header -->
+  <text x="28" y="34" class="title">pgvs3 — PostgreSQL 18 as the Object, Cache, Acceleration &amp; Queue Data Plane</text>
+  <text x="28" y="54" class="label">Trusted-network stateless gateways (:8014) · PostgreSQL stores the bytes, metadata, leases &amp; WAL · Separate SQL &amp; HTTP commit boundaries</text>
+
+  <!-- Tier 1: Clients -->
+  <rect x="28" y="72" width="1024" height="82" class="panel"/>
+  <text x="46" y="94" class="h2">1. Client Workloads (Separate Transaction Boundaries)</text>
+
+  <rect x="46" y="104" width="230" height="38" class="box"/>
+  <text x="58" y="121" class="mono" fill="#38bdf8">Application OLTP SQL</text>
+  <text x="58" y="135" class="label">Direct PG / PgBouncer (:5432/:6432)</text>
+
+  <rect x="292" y="104" width="265" height="38" class="box"/>
+  <text x="304" y="121" class="mono" fill="#34d399">DuckDB 2.0 / DuckLake / ObjFS</text>
+  <text x="304" y="135" class="label">10 MiB–1 GiB Parquet · Async Range I/O</text>
+
+  <rect x="573" y="104" width="220" height="38" class="box"/>
+  <text x="585" y="121" class="mono" fill="#fbbf24">S3 / HTTP &amp; RESP2 Clients</text>
+  <text x="585" y="135" class="label">PUT/GET/Range · Pipelined MGet/MSet</text>
+
+  <rect x="809" y="104" width="225" height="38" class="box"/>
+  <text x="821" y="121" class="mono" fill="#c084fc">OJS Jobs &amp; PgQue Streams</text>
+  <text x="821" y="135" class="label">Outbox Relay · Lease Token · Fan-out</text>
+
+  <!-- Tier 2: Stateless Gateways -->
+  <rect x="240" y="192" width="440" height="128" class="panel" stroke="#38bdf8"/>
+  <text x="258" y="214" class="h2" fill="#38bdf8">2a. Writable Gateway Fleet (pgvs3 serve :8014)</text>
+  <text x="258" y="233" class="label">• S3 Admission: 32 active + 64 queue (1s wait) · Spool: 8 GiB fail-fast</text>
+  <text x="258" y="250" class="label">• Split Pools: mainPool (B-tree indexscan) + chunkPool (bitmap heap scan)</text>
+  <text x="258" y="267" class="label">• Advisory-locked maintenance leader (reconcile, TTL expiry, 65,536-row reap)</text>
+  <text x="258" y="284" class="label">• Coalesced cold-fill owner &amp; 5m leased write-back outbox workers</text>
+  <rect x="258" y="293" width="404" height="19" rx="4" fill="#0c4a6e"/>
+  <text x="268" y="306" class="badge" fill="#7dd3fc">REQUIRES DIRECT OR SESSION-POOLED PG (HOLDS SESSION ADVISORY LOCKS)</text>
+
+  <rect x="710" y="192" width="342" height="128" class="panel-ro"/>
+  <text x="728" y="214" class="h2" fill="#34d399">2b. Read-Only Fleet (--read-only :8014)</text>
+  <text x="728" y="233" class="label">• Rejects S3 / OJS / Stream / RESP mutations (403)</text>
+  <text x="728" y="250" class="label">• Serves replicated s3b_, s3c_ &amp; pending s3w_ hits</text>
+  <text x="728" y="267" class="label">• Skips DDL, reaping, cache fills &amp; outbox workers</text>
+  <text x="728" y="284" class="label">• Cold whole-object misses pass through from origin</text>
+  <rect x="728" y="293" width="306" height="19" rx="4" fill="#064e3b"/>
+  <text x="738" y="306" class="badge" fill="#6ee7b7">SAFE ON PHYSICAL STANDBYS (SUBJECT TO REPLAY LAG)</text>
+
+  <!-- Tier 3: PostgreSQL 18 Primary -->
+  <rect x="28" y="366" width="652" height="246" class="panel-pg"/>
+  <text x="46" y="390" class="h2" fill="#60a5fa">3. PostgreSQL 18 Primary Cluster (WAL-Logged Copy of Record · Layout v25)</text>
+
+  <rect x="46" y="404" width="185" height="92" class="box"/>
+  <text x="56" y="422" class="mono" fill="#f8fafc">App DB &amp; DuckLake</text>
+  <text x="56" y="439" class="label">• guide_app.orders / outbox</text>
+  <text x="56" y="455" class="label">• guide_app.receipts</text>
+  <text x="56" y="471" class="label">• ducklake_catalog tables</text>
+  <text x="56" y="487" class="mono" fill="#fbbf24">Separate SQL Tx Boundary</text>
+
+  <rect x="243" y="404" width="205" height="92" class="box"/>
+  <text x="253" y="422" class="mono" fill="#38bdf8">s3b_&lt;name&gt; (Native Bucket)</text>
+  <text x="253" y="439" class="label">• objects (≤64 KiB inline)</text>
+  <text x="253" y="455" class="label">• chunks (8,120 B · 1 page)</text>
+  <text x="253" y="471" class="label">• uploads &amp; garbage queue</text>
+  <text x="253" y="487" class="mono" fill="#34d399">MVCC Atomic Publish</text>
+
+  <rect x="460" y="404" width="202" height="92" class="box"/>
+  <text x="470" y="422" class="mono" fill="#fbbf24">s3c_ &amp; s3w_ (Cache/Stage)</text>
+  <text x="470" y="439" class="label">• s3c_: read fills, ranges, RESP</text>
+  <text x="470" y="455" class="label">• s3w_: acked pending bodies</text>
+  <text x="470" y="471" class="label">• origin_metadata validators</text>
+  <text x="470" y="487" class="mono" fill="#f87171">s3w_ Never Expires While Pending</text>
+
+  <rect x="46" y="508" width="295" height="88" class="box"/>
+  <text x="56" y="526" class="mono" fill="#93c5fd">s3p (Shared Control Schema)</text>
+  <text x="56" y="543" class="label">• namespaces (≤100 scale guard) &amp; file_ids</text>
+  <text x="56" y="559" class="label">• cache_fill_leases (2m renewable owner)</text>
+  <text x="56" y="575" class="label">• pending_uploads (5m lease + token guard)</text>
+
+  <rect x="355" y="508" width="307" height="88" class="box"/>
+  <text x="365" y="526" class="mono" fill="#c084fc">s3q_&lt;name&gt; (OJS Jobs + PgQue Streams)</text>
+  <text x="365" y="543" class="label">• jobs (SKIP LOCKED · next_visible_at claim)</text>
+  <text x="365" y="559" class="label">• stream_events_0..2 (3-segment TRUNCATE)</text>
+  <text x="365" y="575" class="label">• stream_ticks (pg_snapshot) &amp; subscriptions</text>
+
+  <!-- Tier 4: Standby & External Origin -->
+  <rect x="710" y="366" width="342" height="114" class="panel-ro"/>
+  <text x="728" y="388" class="h2" fill="#c084fc">4. PostgreSQL 18 Physical Standbys</text>
+  <text x="728" y="407" class="label">• Replays WAL for s3b_, s3c_, s3w_, s3q_ &amp; s3p</text>
+  <text x="728" y="424" class="label">• Shared cache hits without re-fetching origin</text>
+  <text x="728" y="441" class="label">• Sync standby preserves acked s3w_ on failover</text>
+  <text x="728" y="458" class="mono" fill="#34d399">Barrier: pg_last_wal_replay_lsn() &gt;= flush_lsn</text>
+
+  <rect x="710" y="496" width="342" height="116" class="panel-origin"/>
+  <text x="728" y="518" class="h2" fill="#fbbf24">5. External S3 / HTTP Origin (Optional)</text>
+  <text x="728" y="537" class="label">• Long-term copy of record for committed objects</text>
+  <text x="728" y="554" class="label">• Single-GET cold fill + ETag/version fencing</text>
+  <text x="728" y="571" class="label">• Outbox drain under PG session advisory key lock</text>
+  <text x="728" y="588" class="mono" fill="#fbbf24">Conditional PUT (If-Match / If-None-Match: *)</text>
+
+  <!-- Animated Flows -->
+  <!-- Direct App SQL to PG -->
+  <path d="M 110 142 L 110 398" class="flow-write" marker-end="url(#arrow-cyan)"/>
+  <text x="118" y="265" class="mono" fill="#38bdf8">OLTP SQL + Outbox</text>
+
+  <!-- Clients to Writable Gateway -->
+  <path d="M 425 142 L 425 186" class="flow-write" marker-end="url(#arrow-cyan)"/>
+  <path d="M 660 142 L 560 186" class="flow-write" marker-end="url(#arrow-cyan)"/>
+
+  <!-- Clients to Read-Only Gateway -->
+  <path d="M 510 142 L 810 186" class="flow-read" marker-end="url(#arrow-green)"/>
+  <path d="M 910 142 L 910 186" class="flow-read" marker-end="url(#arrow-green)"/>
+
+  <!-- Writable Gateway to PG Primary -->
+  <path d="M 380 320 L 380 360" class="flow-write" marker-end="url(#arrow-cyan)"/>
+  <text x="275" y="345" class="mono" fill="#38bdf8">Binary COPY / Publish</text>
+
+  <!-- PG Primary to Writable Gateway (Warm Hit) -->
+  <path d="M 520 360 L 520 320" class="flow-read" marker-end="url(#arrow-green)"/>
+  <text x="530" y="345" class="mono" fill="#34d399">Warm Stream</text>
+
+  <!-- WAL Replication Primary -> Standby -->
+  <path d="M 680 422 L 704 422" class="flow-wal" marker-end="url(#arrow-purple)"/>
+  <text x="652" y="357" class="mono" fill="#c084fc">WAL Stream</text>
+
+  <!-- Standby -> Read-Only Gateway -->
+  <path d="M 880 366 L 880 326" class="flow-read" marker-end="url(#arrow-green)"/>
+  <text x="890" y="350" class="mono" fill="#34d399">Standby Read Hit</text>
+
+  <!-- Writable Gateway <-> Origin -->
+  <path d="M 650 320 L 760 490" class="flow-origin" marker-end="url(#arrow-amber)"/>
+  <text x="642" y="486" class="mono" fill="#fbbf24">Cold Fill &amp; Outbox Drain</text>
+</svg>

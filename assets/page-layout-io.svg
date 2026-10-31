@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 580" role="img" aria-labelledby="layout-title layout-desc">
+  <title id="layout-title">PostgreSQL 8 KiB Page Layout, Binary COPY Ingest and Cut-Through Streaming Read Path</title>
+  <desc id="layout-desc">Animated diagram showing how pgvs3 stores inline small objects in objects.inline_data and splits larger objects into 8,120-byte chunks that fit exactly one 8,192-byte PostgreSQL page without TOAST, ingested via 4 MiB binary COPY batches and read via parallel REPEATABLE READ bitmap heap scans.</desc>
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#090d16"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arr-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+  </defs>
+  <style>
+    .bg { fill: url(#bg2); }
+    .card { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10; }
+    .page-box { fill: #0f172a; stroke: #38bdf8; stroke-width: 2; rx: 8; }
+    .sub-box { fill: #0f172a; stroke: #475569; stroke-width: 1.2; rx: 6; }
+    .title { fill: #f8fafc; font: 700 17px 'Inter', system-ui, sans-serif; }
+    .h2 { fill: #e2e8f0; font: 700 13.5px 'Inter', system-ui, sans-serif; }
+    .txt { fill: #cbd5e1; font: 500 11.5px 'Inter', system-ui, sans-serif; }
+    .mono { fill: #7dd3fc; font: 600 11px 'JetBrains Mono', monospace; }
+    .stream-in { stroke: #38bdf8; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: move 1.3s linear infinite; }
+    .stream-out { stroke: #34d399; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; animation: move 1.3s linear infinite; }
+    .chunk-pulse { animation: glow 2.2s ease-in-out infinite; }
+    @keyframes move { to { stroke-dashoffset: -28; } }
+    @keyframes glow { 0%, 100% { fill-opacity: 0.75; } 50% { fill-opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .stream-in, .stream-out, .chunk-pulse { animation: none; }
+    }
+  </style>
+
+  <rect width="1080" height="580" class="bg" rx="14"/>
+  <text x="28" y="34" class="title">8,120-Byte Page-Aligned Storage Layout &amp; Cut-Through I/O Pipeline</text>
+  <text x="28" y="54" class="txt">Zero TOAST pointer chasing · O(1) byte-range offset seeking (offset = no × 8,120) · Split B-tree and Bitmap-Scan pools</text>
+
+  <!-- Left Column: Write & Ingest Pipeline -->
+  <rect x="28" y="74" width="320" height="478" class="card"/>
+  <text x="44" y="98" class="h2" fill="#38bdf8">1. Write &amp; Atomic Publish Pipeline</text>
+
+  <rect x="44" y="112" width="288" height="74" class="sub-box"/>
+  <text x="56" y="131" class="mono" fill="#fbbf24">Fast Path A: Inline Small Objects</text>
+  <text x="56" y="148" class="txt">• ≤64 KiB (s3b_/s3w_) or ≤8,120 B (s3c_/RESP)</text>
+  <text x="56" y="164" class="txt">• Stored in objects.inline_data (file_id = NULL)</text>
+  <text x="56" y="179" class="mono" fill="#34d399">1 SQL round-trip · 64 KiB pooled buffer</text>
+
+  <rect x="44" y="200" width="288" height="110" class="sub-box"/>
+  <text x="56" y="219" class="mono" fill="#38bdf8">Fast Path B: Streaming Binary COPY (&gt;64 KiB)</text>
+  <text x="56" y="236" class="txt">1. Allocate immutable file_id from s3p.file_ids</text>
+  <text x="56" y="252" class="txt">2. Slice stream into 8,120 B blocks (no = 0,1,2…)</text>
+  <text x="56" y="268" class="txt">3. Compress block with Zstd ONLY if it shrinks</text>
+  <text x="56" y="284" class="txt">4. Frame 4 MiB binary COPY batches + hash MD5/CRC</text>
+  <text x="56" y="300" class="mono" fill="#7dd3fc">Zero temp table · Direct heap page write</text>
+
+  <rect x="44" y="324" width="288" height="106" class="sub-box"/>
+  <text x="56" y="343" class="mono" fill="#c084fc">Atomic Pointer Swap (publish_object)</text>
+  <text x="56" y="360" class="txt">• Evaluates If-Match / If-None-Match in same Tx</text>
+  <text x="56" y="376" class="txt">• PG 18 RETURNING old.file_id, old.parts</text>
+  <text x="56" y="392" class="txt">• Queues replaced file_id to schema.garbage</text>
+  <text x="56" y="408" class="txt">• Aborted upload rolls back cleanly; no torn read</text>
+  <text x="56" y="423" class="mono" fill="#34d399">Zero-Copy CopyObject &amp; Multipart Assembly</text>
+
+  <rect x="44" y="444" width="288" height="92" class="sub-box"/>
+  <text x="56" y="463" class="mono" fill="#f87171">Bounded Reaper &amp; Aggressive Autovacuum</text>
+  <text x="56" y="480" class="txt">• Retired file_ids kept for --reap-grace (10m)</text>
+  <text x="56" y="496" class="txt">• Leader deletes 65,536 rows (~508 MiB)/pass</text>
+  <text x="56" y="512" class="txt">• autovacuum_vacuum_scale_factor = 0.01</text>
+  <text x="56" y="528" class="mono" fill="#fbbf24">Freed 8 KiB pages recycled in steady state</text>
+
+  <!-- Center Column: Physical 8,192-Byte PostgreSQL Page Anatomy -->
+  <rect x="372" y="74" width="336" height="478" class="card"/>
+  <text x="388" y="98" class="h2" fill="#fbbf24">2. Inside One 8,192-Byte PostgreSQL Page</text>
+  <text x="388" y="116" class="txt">Table: s3b_&lt;bucket&gt;.chunks (unpartitioned up to 32 TiB)</text>
+
+  <rect x="388" y="132" width="304" height="248" class="page-box"/>
+  <text x="402" y="153" class="mono" fill="#f8fafc">PostgreSQL 8,192 B Heap Page (BLCKSZ = 8192)</text>
+
+  <!-- Page Header -->
+  <rect x="402" y="164" width="276" height="32" rx="4" fill="#1e3a8a"/>
+  <text x="412" y="184" class="mono" fill="#bfdbfe">24 B PageHeaderData + 4 B Line Pointer (ItemId)</text>
+
+  <!-- Tuple Header + Keys -->
+  <rect x="402" y="202" width="276" height="42" rx="4" fill="#312e81"/>
+  <text x="412" y="220" class="mono" fill="#ddd6fe">23 B HeapTupleHeader + Alignment + PK Columns</text>
+  <text x="412" y="236" class="txt">file_id: INT8 (8 B) · no: INT4 (4 B) · varlena hdr (4 B)</text>
+
+  <!-- 8,120-Byte Data Block -->
+  <rect x="402" y="250" width="276" height="92" rx="6" fill="#065f46" class="chunk-pulse"/>
+  <text x="414" y="273" class="h2" fill="#ecfdf5">data: BYTEA (up to 8,120 Bytes)</text>
+  <text x="414" y="293" class="mono" fill="#a7f3d0">• Compressed Zstd frame if len(zstd) &lt; wantLen</text>
+  <text x="414" y="311" class="mono" fill="#a7f3d0">• Raw bytes if len(raw) == wantLen (Parquet)</text>
+  <text x="414" y="329" class="txt" fill="#d1fae5">Never expands incompressible data past 8,120 B!</text>
+
+  <!-- Page Footer badge -->
+  <rect x="402" y="348" width="276" height="22" rx="4" fill="#0f172a"/>
+  <text x="412" y="363" class="mono" fill="#38bdf8">toast_tuple_target = 8160 · STORAGE EXTERNAL</text>
+
+  <!-- Offset Formula Box -->
+  <rect x="388" y="394" width="304" height="142" class="sub-box"/>
+  <text x="402" y="415" class="mono" fill="#fbbf24">Why 8,120 Bytes Beats TOAST &amp; Large Objects</text>
+  <text x="402" y="435" class="txt">• Standard PG TOAST splits at ~2 KiB into a side</text>
+  <text x="402" y="451" class="txt">  table, adding extra index lookups on every read.</text>
+  <text x="402" y="470" class="txt">• Fixed 8,120 B logical blocks map any HTTP</text>
+  <text x="402" y="486" class="txt">  Range: bytes=A-B directly to chunk numbers:</text>
+  <text x="402" y="507" class="mono" fill="#34d399">start_no = A / 8120,  end_no = B / 8120</text>
+  <text x="402" y="525" class="mono" fill="#93c5fd">WHERE file_id = $1 AND no BETWEEN $2 AND $3</text>
+
+  <!-- Right Column: Split-Pool & Cut-Through Read Pipeline -->
+  <rect x="732" y="74" width="320" height="478" class="card"/>
+  <text x="748" y="98" class="h2" fill="#34d399">3. Split-Pool &amp; Cut-Through Read Path</text>
+
+  <rect x="748" y="112" width="288" height="82" class="sub-box"/>
+  <text x="760" y="131" class="mono" fill="#93c5fd">mainPool (enable_indexscan = on)</text>
+  <text x="760" y="148" class="txt">• Point PK lookup on objects (key, version, ETag)</text>
+  <text x="760" y="164" class="txt">• Returns inline_data immediately if file_id IS NULL</text>
+  <text x="760" y="180" class="txt">• Warm cache GET reuses metadata row (1 lookup)</text>
+
+  <rect x="748" y="208" width="288" height="106" class="sub-box"/>
+  <text x="760" y="227" class="mono" fill="#34d399">chunkPool (enable_indexscan = off)</text>
+  <text x="760" y="244" class="txt">• Forces PG 18 Bitmap Heap Scan on chunks</text>
+  <text x="760" y="260" class="txt">• effective_io_concurrency = 32 (AIO prefetch)</text>
+  <text x="760" y="276" class="txt">• ≤64 MiB span: 1 range query on chunkPool</text>
+  <text x="760" y="292" class="txt">• &gt;64 MiB / Multipart: 2–8 parallel 8 MiB pieces</text>
+  <text x="760" y="307" class="mono" fill="#7dd3fc">Shared pg_export_snapshot() REPEATABLE READ</text>
+
+  <rect x="748" y="328" width="288" height="104" class="sub-box"/>
+  <text x="760" y="347" class="mono" fill="#fbbf24">TID Reorder + 32-Buffer Cut-Through Ring</text>
+  <text x="760" y="364" class="txt">• Bitmap scan yields pages in physical TID order;</text>
+  <text x="760" y="380" class="txt">  streamRows reorders in RAM to strict `no` order</text>
+  <text x="760" y="396" class="txt">• &gt;8 MiB reads feed 32 × 256 KiB channel buffers</text>
+  <text x="760" y="412" class="txt">• Overlaps DB prefetch with socket Body.WriteTo</text>
+
+  <rect x="748" y="446" width="288" height="90" class="sub-box"/>
+  <text x="760" y="465" class="mono" fill="#c084fc">Client Memory &amp; Backpressure Safety</text>
+  <text x="760" y="482" class="txt">• Slow HTTP readers backpressure the 32-slot ring</text>
+  <text x="760" y="498" class="txt">• Gateway never buffers whole 1 GiB object in RAM</text>
+  <text x="760" y="514" class="mono" fill="#34d399">DuckDB 2.0 Async Range Reads Hit O(1) Offsets</text>
+
+  <!-- Animated connectors between columns -->
+  <path d="M 332 255 L 396 255" class="stream-in" marker-end="url(#arr-blue)"/>
+  <path d="M 684 260 L 744 260" class="stream-out" marker-end="url(#arr-emerald)"/>
+</svg>

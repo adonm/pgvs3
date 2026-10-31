@@ -1,0 +1,1740 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.20">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>modernization-review – pgvs3</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../proposals/high-value-improvements.html" rel="next">
+<link href="../differential-results.html" rel="prev">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-c2d5e23be7e7628261be6023ad4f5e54.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-dc650676e3a330219d37e48c46543a39.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+<style>html{ scroll-behavior: smooth; }</style>
+
+
+</head>
+
+<body class="nav-sidebar docked nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">pgvs3</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../index.html" aria-current="page"> 
+<span class="menu-text">Overview &amp; Atlas</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../guides/index.html"> 
+<span class="menu-text">Workload Guides</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../design.html"> 
+<span class="menu-text">Architecture &amp; Layout</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../operations.html"> 
+<span class="menu-text">Operations</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../benchmarks.html"> 
+<span class="menu-text">Benchmarks &amp; Evidence</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/adonm/pgvs3"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../proposals/modernization-review.html">Historical Design Proposals</a></li><li class="breadcrumb-item"><a href="../proposals/modernization-review.html">Modernization Review</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation docked overflow-auto">
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Home &amp; Visual Atlas</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">Workload &amp; Schema Guides</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Decision Tree &amp; Resource Trade-offs</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/postgres.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1. Protect OLTP &amp; Partitioning</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/analytics.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">2. DuckLake, Wide Columns &amp; Hilbert</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/cache.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">3. Shared Cache &amp; Write-Back Staging</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/jobs.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">4. Jobs, Outboxes &amp; Streams</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/observe-recover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">5. Observe, Diagnose &amp; Recover</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/sources.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Primary Research Ledger (44 Sources)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/validation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Executable Validation Evidence</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">Architecture &amp; Data Layout</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../design.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">System Architecture &amp; Authority</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../performance.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">8 KiB Page Layout &amp; I/O Paths</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../partitioning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Why Chunks Are Unpartitioned</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../queue-stream.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Queue &amp; Stream Model (OJS + PgQue)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Operations &amp; Production</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../operations.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Deployment, Pools, Cache &amp; CLI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../roadmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Roadmap &amp; Priorities</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">Benchmarks &amp; Qualification</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../benchmarks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Paired Runner &amp; Capacity Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-plane-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Replica Proof &amp; Capacity Ledger</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../modernization-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">v24/v25 Modernization Results</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../object-storage.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../object-storage-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Results (27 Cohorts)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../differential.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../differential-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Results</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Historical Design Proposals</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/modernization-review.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Modernization Review</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/high-value-improvements.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">High-Value Improvements</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/hardening-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Hardening Options</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#capability-by-capability-modernization-review" id="toc-capability-by-capability-modernization-review" class="nav-link active" data-scroll-target="#capability-by-capability-modernization-review">Capability-by-capability modernization review</a>
+  <ul class="collapse">
+  <li><a href="#conclusion" id="toc-conclusion" class="nav-link" data-scroll-target="#conclusion">Conclusion</a></li>
+  <li><a href="#guardrails-and-evaluation" id="toc-guardrails-and-evaluation" class="nav-link" data-scroll-target="#guardrails-and-evaluation">Guardrails and evaluation</a></li>
+  <li><a href="#complete-capability-map" id="toc-complete-capability-map" class="nav-link" data-scroll-target="#complete-capability-map">Complete capability map</a></li>
+  <li><a href="#postgresql-storage-and-publication" id="toc-postgresql-storage-and-publication" class="nav-link" data-scroll-target="#postgresql-storage-and-publication">PostgreSQL storage and publication</a>
+  <ul class="collapse">
+  <li><a href="#what-is-already-appropriate" id="toc-what-is-already-appropriate" class="nav-link" data-scroll-target="#what-is-already-appropriate">What is already appropriate</a></li>
+  <li><a href="#alternatives-and-their-actual-limits" id="toc-alternatives-and-their-actual-limits" class="nav-link" data-scroll-target="#alternatives-and-their-actual-limits">Alternatives and their actual limits</a></li>
+  <li><a href="#best-sql-simplification" id="toc-best-sql-simplification" class="nav-link" data-scroll-target="#best-sql-simplification">Best SQL simplification</a></li>
+  </ul></li>
+  <li><a href="#streaming-and-database-access" id="toc-streaming-and-database-access" class="nav-link" data-scroll-target="#streaming-and-database-access">Streaming and database access</a></li>
+  <li><a href="#s3-and-http-frontends" id="toc-s3-and-http-frontends" class="nav-link" data-scroll-target="#s3-and-http-frontends">S3 and HTTP frontends</a>
+  <ul class="collapse">
+  <li><a href="#replacing-the-s3-server" id="toc-replacing-the-s3-server" class="nav-link" data-scroll-target="#replacing-the-s3-server">Replacing the S3 server</a></li>
+  <li><a href="#multipart-conditions-and-static-http" id="toc-multipart-conditions-and-static-http" class="nav-link" data-scroll-target="#multipart-conditions-and-static-http">Multipart, conditions, and static HTTP</a></li>
+  </ul></li>
+  <li><a href="#origin-adapters" id="toc-origin-adapters" class="nav-link" data-scroll-target="#origin-adapters">Origin adapters</a></li>
+  <li><a href="#shared-read-and-range-caching" id="toc-shared-read-and-range-caching" class="nav-link" data-scroll-target="#shared-read-and-range-caching">Shared read and range caching</a>
+  <ul class="collapse">
+  <li><a href="#highest-value-request-path-opportunity" id="toc-highest-value-request-path-opportunity" class="nav-link" data-scroll-target="#highest-value-request-path-opportunity">Highest-value request-path opportunity</a></li>
+  <li><a href="#other-cache-architectures" id="toc-other-cache-architectures" class="nav-link" data-scroll-target="#other-cache-architectures">Other cache architectures</a></li>
+  </ul></li>
+  <li><a href="#fill-coordination-and-write-back" id="toc-fill-coordination-and-write-back" class="nav-link" data-scroll-target="#fill-coordination-and-write-back">Fill coordination and write-back</a>
+  <ul class="collapse">
+  <li><a href="#improve-the-existing-fill-lease" id="toc-improve-the-existing-fill-lease" class="nav-link" data-scroll-target="#improve-the-existing-fill-lease">Improve the existing fill lease</a></li>
+  <li><a href="#keep-durable-outbox-ownership" id="toc-keep-durable-outbox-ownership" class="nav-link" data-scroll-target="#keep-durable-outbox-ownership">Keep durable outbox ownership</a></li>
+  </ul></li>
+  <li><a href="#cache-state-model" id="toc-cache-state-model" class="nav-link" data-scroll-target="#cache-state-model">Cache state model</a></li>
+  <li><a href="#resp" id="toc-resp" class="nav-link" data-scroll-target="#resp">RESP</a></li>
+  <li><a href="#ojs-jobs-and-streams" id="toc-ojs-jobs-and-streams" class="nav-link" data-scroll-target="#ojs-jobs-and-streams">OJS, jobs, and streams</a>
+  <ul class="collapse">
+  <li><a href="#http-and-json" id="toc-http-and-json" class="nav-link" data-scroll-target="#http-and-json">HTTP and JSON</a></li>
+  <li><a href="#job-engine-alternatives" id="toc-job-engine-alternatives" class="nav-link" data-scroll-target="#job-engine-alternatives">Job engine alternatives</a></li>
+  <li><a href="#streams-and-wakeups" id="toc-streams-and-wakeups" class="nav-link" data-scroll-target="#streams-and-wakeups">Streams and wakeups</a></li>
+  </ul></li>
+  <li><a href="#namespaces-copy-clone-and-garbage-collection" id="toc-namespaces-copy-clone-and-garbage-collection" class="nav-link" data-scroll-target="#namespaces-copy-clone-and-garbage-collection">Namespaces, copy, clone, and garbage collection</a></li>
+  <li><a href="#quotas-and-resource-admission" id="toc-quotas-and-resource-admission" class="nav-link" data-scroll-target="#quotas-and-resource-admission">Quotas and resource admission</a>
+  <ul class="collapse">
+  <li><a href="#byte-aware-scratch-admission-do-next" id="toc-byte-aware-scratch-admission-do-next" class="nav-link" data-scroll-target="#byte-aware-scratch-admission-do-next">Byte-aware scratch admission: do next</a></li>
+  <li><a href="#namespace-and-database-quota" id="toc-namespace-and-database-quota" class="nav-link" data-scroll-target="#namespace-and-database-quota">Namespace and database quota</a></li>
+  </ul></li>
+  <li><a href="#duckdb-and-ducklake" id="toc-duckdb-and-ducklake" class="nav-link" data-scroll-target="#duckdb-and-ducklake">DuckDB and DuckLake</a></li>
+  <li><a href="#observability" id="toc-observability" class="nav-link" data-scroll-target="#observability">Observability</a></li>
+  <li><a href="#ha-backups-and-deployment" id="toc-ha-backups-and-deployment" class="nav-link" data-scroll-target="#ha-backups-and-deployment">HA, backups, and deployment</a>
+  <ul class="collapse">
+  <li><a href="#correct-the-durability-contract-not-the-trust-model" id="toc-correct-the-durability-contract-not-the-trust-model" class="nav-link" data-scroll-target="#correct-the-durability-contract-not-the-trust-model">Correct the durability contract, not the trust model</a></li>
+  <li><a href="#recovery-and-operational-simplicity" id="toc-recovery-and-operational-simplicity" class="nav-link" data-scroll-target="#recovery-and-operational-simplicity">Recovery and operational simplicity</a></li>
+  <li><a href="#deployment" id="toc-deployment" class="nav-link" data-scroll-target="#deployment">Deployment</a></li>
+  </ul></li>
+  <li><a href="#cli-toolchain-and-tests" id="toc-cli-toolchain-and-tests" class="nav-link" data-scroll-target="#cli-toolchain-and-tests">CLI, toolchain, and tests</a>
+  <ul class="collapse">
+  <li><a href="#cli-and-layout-lifecycle" id="toc-cli-and-layout-lifecycle" class="nav-link" data-scroll-target="#cli-and-layout-lifecycle">CLI and layout lifecycle</a></li>
+  <li><a href="#tests-and-performance-evidence" id="toc-tests-and-performance-evidence" class="nav-link" data-scroll-target="#tests-and-performance-evidence">Tests and performance evidence</a></li>
+  </ul></li>
+  <li><a href="#prioritized-roadmap" id="toc-prioritized-roadmap" class="nav-link" data-scroll-target="#prioritized-roadmap">Prioritized roadmap</a></li>
+  <li><a href="#required-experiment-gates" id="toc-required-experiment-gates" class="nav-link" data-scroll-target="#required-experiment-gates">Required experiment gates</a></li>
+  <li><a href="#online-sources" id="toc-online-sources" class="nav-link" data-scroll-target="#online-sources">Online sources</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/proposals/modernization-review.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../proposals/modernization-review.html">Historical Design Proposals</a></li><li class="breadcrumb-item"><a href="../proposals/modernization-review.html">Modernization Review</a></li></ol></nav></header>
+
+
+
+
+
+<section id="capability-by-capability-modernization-review" class="level1">
+<h1>Capability-by-capability modernization review</h1>
+<blockquote class="blockquote">
+<p>Historical analysis, not the active backlog. Priorities and status labels below describe the reviewed snapshots and may be superseded. Use the <a href="../design.html">current architecture</a>, <a href="../roadmap.html">ranked roadmap</a> and <a href="../modernization-results.html">implementation evidence</a>.</p>
+</blockquote>
+<p>Reviewed <strong>2026-10-28</strong>, against commit <strong>a879472</strong>, layout <strong>v23</strong>.</p>
+<p>Source paths in this historical review refer to that snapshot. Related files were subsequently consolidated; see the current file map in <a href="https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#package-map">CONTRIBUTING.md</a>.</p>
+<p>The capability map below records the pre-implementation review. The subsequent implementation uses layout <strong>v24</strong> (the current baseline is <strong>v25</strong>): shared range parent metadata, one-round-trip cache shadow resolution, renewable owner-fenced fills, bounded shared spool bytes, and PostgreSQL 18 publication SQL. The S3 client experiments are isolated in the <code>test/s3clients</code> module (<code>just s3-clients</code>); the existing fork remains the production client because the initial SDK metadata/small-object comparisons exceeded the 20% gate. No S3 server, job engine, RESP transport or cache-namespace replacement was made.</p>
+<section id="conclusion" class="level2">
+<h2 class="anchored" data-anchor-id="conclusion">Conclusion</h2>
+<p><strong>Keep the PostgreSQL-centered architecture and its specialized streaming paths. Modernize the surrounding coordination and adapters before replacing whole subsystems.</strong> The best near-term opportunities are fewer origin round trips for range reads, byte-aware resource admission, better fill leases, PostgreSQL 18 publication SQL, and retiring the owned S3 client fork if an SDK prototype passes.</p>
+<p>There is no demonstrated drop-in library that replaces all of pgvs3’s S3, durable shared cache, RESP, jobs, and streams while retaining its operating model. Several alternatives are good products but simplify a different problem.</p>
+<p>This is a source-backed design review, not a replacement benchmark. It covers the credible implementation families and named candidates below, not every project on the internet. Expected performance and code reduction are hypotheses unless explicitly identified as existing measurements.</p>
+</section>
+<section id="guardrails-and-evaluation" class="level2">
+<h2 class="anchored" data-anchor-id="guardrails-and-evaluation">Guardrails and evaluation</h2>
+<ul>
+<li>Optimize for <strong>performance, then compatibility, then correctness</strong>, while retaining the project’s durability and multi-worker safety requirements.</li>
+<li>The main workload is <strong>10 MiB–1 GiB Parquet objects</strong>. Accept no more than a <strong>20% regression on an individual relevant path</strong>; do not hide it in averages.</li>
+<li>Keep acknowledged write-back bodies WAL-logged. No UNLOGGED substitution.</li>
+<li>Keep shared fills/cache visibility across gateways and read-only replicas; no authoritative gateway-local object or metadata cache.</li>
+<li>Keep one primary plus standbys, at most 100 namespaces, one port, and the permanent trusted-network/no-auth model. Extensions must not become an unverified requirement for managed PostgreSQL.</li>
+<li>Fresh databases and version-pinned layouts are acceptable. A new layout does not need a migration framework or compatibility decoder.</li>
+<li>Judge simplicity by <strong>owned behavior, adapters, failure modes, dependencies, and operational burden</strong>, not only deleted Go lines.</li>
+</ul>
+<p>Decision labels:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Label</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Keep</strong></td>
+<td>No convincing simpler equivalent under the guardrails.</td>
+</tr>
+<tr class="even">
+<td><strong>Simplify</strong></td>
+<td>A bounded change worth planning next; still requires tests and the performance gate.</td>
+</tr>
+<tr class="odd">
+<td><strong>Prototype</strong></td>
+<td>Plausible benefit, but compatibility or performance fit is unproven.</td>
+</tr>
+<tr class="even">
+<td><strong>Scope change</strong></td>
+<td>Useful alternative only if a product requirement is relaxed.</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="complete-capability-map" class="level2">
+<h2 class="anchored" data-anchor-id="complete-capability-map">Complete capability map</h2>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Capability</th>
+<th>Modern/simpler avenues reviewed</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Durable PostgreSQL object bytes</td>
+<td>One TOASTed <code>bytea</code>, larger TOASTed segments, PostgreSQL large objects, external object storage</td>
+<td><strong>Keep</strong> page-sized chunks. A single datum cannot cover a full 1 GiB payload; large objects move complexity into lifecycle/backup. External storage changes the premise. <a href="#postgresql-storage-and-publication">PG storage</a></td>
+</tr>
+<tr class="even">
+<td>Streaming ingest / atomic publish</td>
+<td>High-level pgx <code>CopyFrom</code>, existing low-level binary COPY, row inserts/batches</td>
+<td><strong>Keep</strong> binary COPY as the default. Prototype high-level COPY only if it removes meaningful framing code within the 20% gate. <a href="#streaming-and-database-access">COPY</a></td>
+</tr>
+<tr class="odd">
+<td>Streaming GET, ranges, multipart reads</td>
+<td>Ordered binary rows, <code>CopyTo</code>, serial reads, exported-snapshot parallel reads</td>
+<td><strong>Keep</strong> bounded parallel pieces and snapshot consistency. A COPY export is not a raw HTTP body and does not eliminate block decoding. <a href="#streaming-and-database-access">Streaming</a></td>
+</tr>
+<tr class="even">
+<td>Inline values, compression, integrity</td>
+<td>TOAST compression, existing Zstd frames/raw fallback, disabling redundant compression for selected content</td>
+<td><strong>Keep</strong> the current format. Benchmark any compression fast-path separately on Parquet and compressible data; do not skip requested checksum verification. <a href="#postgresql-storage-and-publication">Storage</a></td>
+</tr>
+<tr class="odd">
+<td>Conditional writes / metadata publication</td>
+<td>PostgreSQL 18 <code>RETURNING old/new</code>, shared mutation SQL, generated fixed-schema queries</td>
+<td><strong>Simplify</strong> duplicated publication/old-file bookkeeping; preserve missing-key locking, TTL, CAS, checksum metadata, and GC. <a href="#postgresql-storage-and-publication">Publication</a></td>
+</tr>
+<tr class="even">
+<td>S3 server API, listings, conditions, XML</td>
+<td>VersityGW embedding, GoFakeS3 backend, external S3 frontend</td>
+<td><strong>Keep</strong> current server pending a narrow frontend spike. Neither inspected embedding/backend API is a proven drop-in. <a href="#s3-and-http-frontends">S3 frontend</a></td>
+</tr>
+<tr class="odd">
+<td>Multipart uploads / part checksums</td>
+<td>Library multipart managers, persistent backend interfaces, current PostgreSQL upload tables</td>
+<td><strong>Keep</strong> persistent server-side state. Origin SDK upload managers do not replace the gateway’s multipart server. <a href="#s3-and-http-frontends">Multipart</a></td>
+</tr>
+<tr class="even">
+<td>Same-bucket zero-copy / cross-bucket copy</td>
+<td>Shared immutable IDs, SQL <code>INSERT ... SELECT</code>, generic stream-copy helpers</td>
+<td><strong>Keep</strong> specialized server-side copies; a generic reader/writer copy is a regression in architecture. <a href="#namespaces-copy-clone-and-garbage-collection">Copy and clone</a></td>
+</tr>
+<tr class="odd">
+<td>Namespace clone / dump / restore</td>
+<td>Current schema clone, physical storage snapshots, large-object backing, globally shared blobs</td>
+<td><strong>Keep</strong> schema-local ownership. Review clone/adoption sequence adjustment separately; physical snapshots are cluster/volume-level, not bucket clones. <a href="#namespaces-copy-clone-and-garbage-collection">Clone</a></td>
+</tr>
+<tr class="even">
+<td>Namespace isolation / fast drop / GC</td>
+<td>Shared tables, declarative partitioning, pg_partman/pg_cron, current schema-local tables and bounded leader</td>
+<td><strong>Keep</strong> for the 100-namespace envelope. More partitioning adds DDL and GC coordination without an established benefit here. <a href="#namespaces-copy-clone-and-garbage-collection">Namespaces</a></td>
+</tr>
+<tr class="odd">
+<td>S3 origin client</td>
+<td>AWS SDK Go v2, MinIO Go SDK, Go CDK blob, existing owned fork</td>
+<td><strong>Prototype</strong> AWS SDK first, MinIO SDK second. Retire the fork only after origin contracts and binary/resource costs are measured. <a href="#origin-adapters">Origin adapters</a></td>
+</tr>
+<tr class="even">
+<td>HTTP and filesystem origins</td>
+<td>Standard <code>net/http</code>, Go CDK fileblob, generic blob abstraction</td>
+<td><strong>Keep</strong> the small HTTP driver; it has different range/list/write semantics. Local providers remain development tools unless their metadata persistence is redesigned. <a href="#origin-adapters">Origin adapters</a></td>
+</tr>
+<tr class="odd">
+<td>Shared read-through / range cache</td>
+<td>Shared parent metadata, explicit immutable prefixes, NGINX slices, DuckDB client cache, local caches</td>
+<td><strong>Simplify</strong> range-hit metadata resolution in PostgreSQL. Other caches are complementary or scope-changing, not equivalent shared authority. <a href="#shared-read-and-range-caching">Read caching</a></td>
+</tr>
+<tr class="even">
+<td>Cross-gateway fill coalescing</td>
+<td>Renewed/token-fenced database leases, size-aware wait, session locks, local singleflight</td>
+<td><strong>Simplify</strong> leases and waiting. Keep local singleflight as an optimization, not cross-process authority. <a href="#fill-coordination-and-write-back">Fill leases</a></td>
+</tr>
+<tr class="odd">
+<td>Durable write-through / write-back / merged listing</td>
+<td>Transactional outbox, generic job library, CDC worker, direct-to-origin writes</td>
+<td><strong>Keep</strong> the transactional body/outbox and remote ordering protection. Prototype worker changes only after proving stale uploads cannot win. <a href="#fill-coordination-and-write-back">Write-back</a></td>
+</tr>
+<tr class="even">
+<td>Cache states, stable public ETags, flush guards</td>
+<td>Explicit state/source/generation columns; merge <code>s3c_</code> and <code>s3w_</code></td>
+<td><strong>Prototype</strong> explicit state columns. <strong>Do not merge by default</strong>: persistence, shadowing, ETags, quotas, RESP, and flush semantics differ. <a href="#cache-state-model">Cache model</a></td>
+</tr>
+<tr class="odd">
+<td>RESP2 / TTL / mutation / pipelining</td>
+<td>Redcon, RESP3, gnet, external Valkey, shared SQL mutation helpers</td>
+<td><strong>Keep</strong> Redcon/RESP2. Review oversized MSET semantics and batching before transport replacement. <a href="#resp">RESP</a></td>
+</tr>
+<tr class="even">
+<td>OJS HTTP binding / JSON envelopes</td>
+<td>Standard <code>ServeMux</code>, JSON v2 APIs, official Go SDK, reference backend</td>
+<td><strong>Simplify</strong> only bounded routing/envelope boilerplate. SDK is a client; reference backend is not a small server binding. <a href="#ojs-jobs-and-streams">OJS</a></td>
+</tr>
+<tr class="odd">
+<td>Job lifecycle / priorities / retries / leases</td>
+<td>Current atomic <code>SKIP LOCKED</code> SQL, River, PGMQ, reference OJS backend</td>
+<td><strong>Keep</strong> the recently consolidated claim path. Replacing it entails semantic adapters and possibly a different product scope. <a href="#ojs-jobs-and-streams">Jobs</a></td>
+</tr>
+<tr class="even">
+<td>Stream replay / fan-out / retry / DLQ / retention</td>
+<td>PgQue library/backend, PGMQ topics, external log, current snapshot batches and rotation</td>
+<td><strong>Keep</strong> the segmented model; PgQue is the closest architectural reference, not automatically the same API. <a href="#ojs-jobs-and-streams">Streams</a></td>
+</tr>
+<tr class="odd">
+<td>Long polling / wakeups</td>
+<td>Polling, debounced <code>LISTEN/NOTIFY</code>, a new notification service</td>
+<td><strong>Prototype</strong> database wakeup hints only if idle polling is material; retain polling fallback. <a href="#ojs-jobs-and-streams">Wakeups</a></td>
+</tr>
+<tr class="even">
+<td>SQL typing / connections / coordination</td>
+<td>pgx helpers, sqlc, ORM, PgBouncer transaction pooling</td>
+<td><strong>Keep</strong> pgx. Selective sqlc is plausible for <code>s3p</code>; dynamic namespace SQL and session advisory locks limit broader substitution. <a href="#streaming-and-database-access">Database access</a></td>
+</tr>
+<tr class="odd">
+<td>Quotas / load shedding / scratch admission</td>
+<td>Existing sampled guardrails, weighted semaphore, database reservation ledger</td>
+<td><strong>Simplify</strong> byte admission now; hard cluster quota is a separate, potentially contended design. <a href="#quotas-and-resource-admission">Resources</a></td>
+</tr>
+<tr class="even">
+<td>DuckDB / DuckLake integration</td>
+<td>DuckLake inlining/compaction, DuckDB file cache, pg_ducklake, direct cloud storage</td>
+<td><strong>Keep</strong> S3 interoperability; use DuckLake’s existing small-change inlining rather than adding a staging engine. <a href="#duckdb-and-ducklake">Analytics</a></td>
+</tr>
+<tr class="odd">
+<td>Metrics / tracing / logging / profiling</td>
+<td><code>otelhttp</code>, <code>otelpgx</code>, Prometheus collectors, standard <code>slog</code> and pprof</td>
+<td><strong>Prototype</strong> standard boundary instrumentation; keep no-export operation cheap and existing metric names stable. <a href="#observability">Observability</a></td>
+</tr>
+<tr class="even">
+<td>Read replicas / failover / readiness</td>
+<td>pgx target-session attributes, managed endpoints, established HA operator</td>
+<td><strong>Simplify</strong> role diagnostics and durability claims. Do not implement another HA controller inside pgvs3. <a href="#ha-backups-and-deployment">HA</a></td>
+</tr>
+<tr class="odd">
+<td>Backups / PITR / origin recovery</td>
+<td>Managed PITR, pgBackRest, CloudNativePG backup plugin, logical namespace exports</td>
+<td><strong>Keep</strong> PostgreSQL-native physical recovery; improve restore drills and external-origin reconciliation. <a href="#ha-backups-and-deployment">Recovery</a></td>
+</tr>
+<tr class="even">
+<td>Container / Helm / drain / network boundary</td>
+<td>Current ko/distroless/Deployment, fixed release digests, scratch sizing, external DB operator</td>
+<td><strong>Keep</strong> the stack; align storage, pool, and rollout budgets. No authentication expansion. <a href="#ha-backups-and-deployment">Deployment</a></td>
+</tr>
+<tr class="odd">
+<td>CLI / environment / layout initialization</td>
+<td>Standard <code>flag</code>, declarative Kong CLI, generated option documentation, migrations</td>
+<td><strong>Keep</strong> current parser unless a Kong spike clearly reduces total code. Keep the pinned baseline, not a migration framework. <a href="#cli-toolchain-and-tests">Tooling</a></td>
+</tr>
+<tr class="even">
+<td>Unit / concurrency / SQL / conformance / interoperability tests</td>
+<td><code>testing/synctest</code>, fake-network httptest, existing testcontainers and pinned s3t, differential tests</td>
+<td><strong>Simplify</strong> timer tests with standard Go tools; retain real database/client tests and one harness per layer. <a href="#cli-toolchain-and-tests">Tests</a></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="postgresql-storage-and-publication" class="level2">
+<h2 class="anchored" data-anchor-id="postgresql-storage-and-publication">PostgreSQL storage and publication</h2>
+<section id="what-is-already-appropriate" class="level3">
+<h3 class="anchored" data-anchor-id="what-is-already-appropriate">What is already appropriate</h3>
+<p>The current 8,120-byte blocks, inline small values, raw-or-Zstd encoding, immutable file IDs, and transactional metadata publish are specialized, but they provide range addressing, no-TOAST chunk rows, crash-safe visibility, zero-copy references, and bounded streaming together. Removing the block code does not necessarily remove those responsibilities.</p>
+<p>PostgreSQL 18 AIO covers sequential scans, bitmap heap scans, and vacuum. The separate bitmap-oriented chunk pool already targets that capability; simply upgrading PostgreSQL or switching drivers is not a new optimization. <a href="https://www.postgresql.org/docs/release/18.0/">PG18</a></p>
+</section>
+<section id="alternatives-and-their-actual-limits" class="level3">
+<h3 class="anchored" data-anchor-id="alternatives-and-their-actual-limits">Alternatives and their actual limits</h3>
+<ol type="1">
+<li><strong>One <code>bytea</code> per object:</strong> much smaller application data model, but the TOAST datum limit is <code>2^30 - 1</code> bytes, below a full 1 GiB payload before any further practical constraints. <code>STORAGE EXTERNAL</code> can make uncompressed substring access efficient; that does not solve the maximum object size or all ingest/memory costs. Not a full-range replacement. <a href="https://www.postgresql.org/docs/18/storage-toast.html">TOAST</a></li>
+<li><strong>Larger TOASTed segments:</strong> retain a segment layer and range arithmetic, exchange current page behavior for TOAST behavior, and need new WAL, storage, read-amplification, and memory measurements. This is a storage experiment, not a recommended change to the current chunk invariant. <a href="https://www.postgresql.org/docs/18/storage-toast.html">TOAST</a></li>
+<li><strong>Large objects:</strong> genuine seek/stream support, but descriptors are transaction-scoped and bytes have a separate global lifecycle. Namespace drop, object copies, reference tracking, orphan cleanup, permissions, and schema-selective exports become harder. A shorter upload loop is not enough to establish a simpler system. <a href="https://www.postgresql.org/docs/18/largeobjects.html">LO</a></li>
+<li><strong>S3/SeaweedFS/Ceph plus PostgreSQL metadata:</strong> often the better choice for much larger data sets or independent storage scaling. It introduces another authoritative storage/recovery system and changes pgvs3’s central premise. It is an architectural alternative, not an internal refactor. <a href="https://github.com/seaweedfs/seaweedfs">SeaweedFS</a></li>
+</ol>
+</section>
+<section id="best-sql-simplification" class="level3">
+<h3 class="anchored" data-anchor-id="best-sql-simplification">Best SQL simplification</h3>
+<p><code>internal/store/schema.sql</code> contains parallel <code>put_inline</code> and <code>publish_object</code> paths with repeated old-row selection, preconditions, metadata updates, and garbage handling. PostgreSQL 18 can return both <strong>old and new values</strong>, including the conflicting old row on <code>INSERT ... ON CONFLICT DO UPDATE</code>. <a href="https://www.postgresql.org/docs/18/dml-returning.html">RETURNING</a></p>
+<p>Prototype one publication primitive with small inline/chunked entry points:</p>
+<ul>
+<li>Return overwritten <code>file_id</code>/<code>parts</code> from the mutation rather than separately reading them solely for garbage bookkeeping.</li>
+<li>Share metadata projection and condition evaluation across put/copy/cache mutations where the semantics actually match.</li>
+<li>Keep the key lock or another demonstrated serialization mechanism for absent keys, origin publication fences, and multi-table work. <code>RETURNING</code> does not replace locking or make every conditional insert trivial.</li>
+<li>Preserve TTL/expired-row semantics, stable ETags, multipart checksum cleanup, old-file references, pending-outbox atomicity, and return outcomes.</li>
+</ul>
+<p>This is a strong code-reduction candidate because PostgreSQL 18 is already the minimum, so it does not introduce a new service or library. The reduction and speedup have not been measured.</p>
+<p>Keep existing integrity algorithms. WAL compression is not a replacement for object compression: <code>wal_compression</code> compresses <strong>full-page images</strong>, not every arbitrary Parquet payload written into WAL. <a href="https://www.postgresql.org/docs/18/runtime-config-wal.html">WAL</a></p>
+</section>
+</section>
+<section id="streaming-and-database-access" class="level2">
+<h2 class="anchored" data-anchor-id="streaming-and-database-access">Streaming and database access</h2>
+<p>The project already uses standard low-level <code>PgConn.CopyFrom(ctx, reader, sql)</code> in <code>internal/store/ingest.go</code>. Do not describe the entire PostgreSQL protocol implementation as custom: the owned part is primarily binary row framing, block processing, and lifecycle orchestration.</p>
+<ul>
+<li><strong>High-level <code>pgx.Conn.CopyFrom</code>:</strong> could remove framing using a streaming <code>CopyFromSource</code>. Compare allocations and throughput, not only source length. Retain compression/checksum processing and close/unblock readers on errors.</li>
+<li><strong><code>PgConn.CopyTo</code>:</strong> writes COPY output to an <code>io.Writer</code>, but binary COPY still has headers/rows/fields. Block decompression, ordering, clipping, errors, and exported-snapshot lifecycle remain. It is not zero-framing raw download.</li>
+<li><strong>Current GET:</strong> binary <code>pgx.Rows.RawValues()</code> already avoids ordinary scan decoding. Preserve cut-through reads, bounded out-of-order buffers, client cancellation, and consistent parallel-piece snapshots.</li>
+<li><strong>Cancellation:</strong> pgconn documents that COPY cancellation interrupts database network operations but may not unblock an arbitrary input reader. A library substitution must retain pipe/body closure and abort tests. <a href="https://pkg.go.dev/github.com/jackc/pgx/v5@v5.11.0/pgconn">PGX</a></li>
+</ul>
+<p>For ordinary SQL, use existing shared scanners and pgx collection helpers before adding an ORM. sqlc generates pgx/v5-compatible typed code, but its static schema model is a better fit for fixed <code>s3p</code> tables than dynamic per-namespace relation names. A small pilot is reasonable; manufacturing a template/generation layer for every schema may add more complexity than it removes. Pin a sqlc release that understands the chosen PostgreSQL syntax before adopting it. <a href="https://docs.sqlc.dev/en/v1.31.1/tutorials/getting-started-postgresql.html">SQLC</a></p>
+<p><strong>Do not put all runtime traffic behind transaction-pooled PgBouncer.</strong> Current maintenance and origin-key coordination use session advisory locks. PgBouncer also lists <code>LISTEN</code> and session settings as transaction-pooling incompatibilities. Moving <code>SET</code>s to database defaults does not fix the locks. Direct or session-pooled connections remain the straightforward supported path; splitting pools by capability is possible but adds another operational boundary. <a href="https://www.pgbouncer.org/features.html">PgBouncer</a></p>
+</section>
+<section id="s3-and-http-frontends" class="level2">
+<h2 class="anchored" data-anchor-id="s3-and-http-frontends">S3 and HTTP frontends</h2>
+<section id="replacing-the-s3-server" class="level3">
+<h3 class="anchored" data-anchor-id="replacing-the-s3-server">Replacing the S3 server</h3>
+<p>The owned S3 frontend is roughly 4,000 production Go lines at the review commit. It is a reasonable library-replacement target, but its backend contract is not just CRUD: it includes streaming/cancellation, conditional mutation, persistent multipart, ranges, checksum metadata, shared cache behavior, and SQL-native copies.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Candidate</th>
+<th>Why consider it</th>
+<th>Why it is not yet a replacement</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>VersityGW <code>embedgw</code></strong></td>
+<td>Apache-2.0 gateway, broad S3 surface, backend interface and unsupported-operation defaults</td>
+<td>The inspected v1.10.0 embedding runner owns listener ports, requires root credentials, uses Fiber/fasthttp, and documents one gateway per process. A handler/listener seam compatible with the existing no-auth, one-port gateway must be proved. Broader API coverage also needs explicit rejection of pgvs3 non-goals. <a href="https://pkg.go.dev/github.com/versity/versitygw/embedgw">Versity</a></td>
+</tr>
+<tr class="even">
+<td><strong>GoFakeS3</strong></td>
+<td>Embeddable Go HTTP S3 implementation with custom backend and conditional-operation work</td>
+<td>Its backend is explicitly unstable and lacks <code>context.Context</code>; multipart defaults to process-local state unless a persistent multipart backend is supplied. Generic fallback copies can move bytes through Go. Existing tests do not prove equivalent cancellation, atomic conditions, checksums, or zero-copy. <a href="https://raw.githubusercontent.com/johannesboyne/gofakes3/master/backend.go">GoFakeS3</a></td>
+</tr>
+<tr class="odd">
+<td><strong>External S3 gateway/store</strong></td>
+<td>Delegate compatibility maintenance and deployment to a dedicated product</td>
+<td>Extra process/storage/backup or integration boundary; auth and routing behavior may differ. Only simpler if those product constraints are relaxed.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Verdict:</strong> keep the current S3 handlers for now. A time-boxed VersityGW frontend spike is reasonable only after the smaller origin-client experiment. Do not spend weeks adapting a larger server merely to delete the current router.</p>
+</section>
+<section id="multipart-conditions-and-static-http" class="level3">
+<h3 class="anchored" data-anchor-id="multipart-conditions-and-static-http">Multipart, conditions, and static HTTP</h3>
+<ul>
+<li>Preserve multipart persistence across gateway loss, checksum enforcement, concurrent complete/abort/overwrite ordering, and part-copy optimization. An SDK’s upload manager is an <strong>origin client</strong>, not a server implementation.</li>
+<li>Current AWS documentation includes conditional <code>PutObject</code>, <code>CompleteMultipartUpload</code>, and <code>CopyObject</code>. A multipart conflict can require starting a new upload and re-uploading parts; retrying completion blindly is not always enough. <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html">S3 conditions</a></li>
+<li>Multipart <strong>FULL_OBJECT</strong> checksums remain explicitly out of scope here. Newer AWS support is not authorization to expand pgvs3’s compatibility surface.</li>
+<li>Keep raw S3 key handling separate from ordinary web routing. Standard <code>ServeMux</code> path cleaning, redirects, wildcard decoding, automatic 405s, and GET-to-HEAD matching require compatibility review. Its method/path patterns are more attractive for <code>/ojs</code> than opaque object keys. <a href="https://go.dev/blog/routing-enhancements">ServeMux</a></li>
+<li><code>http.ServeContent</code> can help a seekable static-file service, but adapting a PostgreSQL streaming body into a seekable file abstraction is not necessarily simpler than the current range/condition path. Keep index resolution and S3 error behavior explicit.</li>
+<li>The current first-byte HTTP/RESP mux is small. <code>cmux</code> is a genuine generic alternative, but does not remove connection admission, sniff deadlines, shutdown, or protocol-drain responsibilities. Keep it unless a measured replacement demonstrably reduces those responsibilities. <a href="https://github.com/soheilhy/cmux">cmux</a></li>
+</ul>
+</section>
+</section>
+<section id="origin-adapters" class="level2">
+<h2 class="anchored" data-anchor-id="origin-adapters">Origin adapters</h2>
+<p>The <code>internal/s3client</code> fork is roughly 1,850 production Go lines of owned client behavior. <strong>This is the strongest dependency-substitution candidate</strong>, because pgvs3 needs a client adapter rather than a replacement server.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Option</th>
+<th>Assessment</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>AWS SDK Go v2</strong></td>
+<td>First prototype. Generated, current S3 request/response models and explicit conditional fields reduce owned protocol/signing/retry behavior. Measure binary size, dependency growth, buffering, request count, checksum behavior, and first-byte latency. <a href="https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/s3-checksums.html">AWS SDK</a></td>
+</tr>
+<tr class="even">
+<td><strong>MinIO Go SDK v7</strong></td>
+<td>Credible second candidate with straightforward S3-compatible APIs; the SDK is Apache-2.0. Verify low-level multipart completion preconditions and metadata/checksum fidelity instead of assuming high-level <code>PutObject</code> covers them. Do not conflate SDK licensing with server-product licensing. <a href="https://github.com/minio/minio-go">MinIO SDK</a></td>
+</tr>
+<tr class="odd">
+<td><strong>Go CDK <code>blob</code></strong></td>
+<td>Useful if adding multiple cloud providers becomes a goal. The inspected API includes <code>IfNotExist</code> and driver escape hatches, so it is not accurate to claim it has no conditional writes. However, ETag-match writes/completion, checksums, and S3-specific response details still need capability mapping. HTTP origins are not ordinary writable blob buckets. <a href="https://pkg.go.dev/gocloud.dev/blob">Go CDK</a></td>
+</tr>
+<tr class="even">
+<td><strong>Keep the fork</strong></td>
+<td>Smallest immediate dependency/build change, but every new S3 compatibility issue remains owned work. Keep only if SDK adapter/behavior costs outweigh retirement of the fork.</td>
+</tr>
+</tbody>
+</table>
+<p>Prototype acceptance checklist:</p>
+<ol type="1">
+<li>Path-style custom endpoints, signing/credentials, escaped keys, range and conditional reads, correct origin not-found/precondition classification.</li>
+<li><code>If-Match</code> / <code>If-None-Match</code> upload and multipart completion, copy conditions, retry/re-upload behavior, cancellation, and operation timeout ownership.</li>
+<li>Seekable spooled bodies; no hidden whole-object memory upload/download.</li>
+<li>Exact Content-Type, Content-Encoding, user metadata, ETag, Last-Modified, object/part checksum round-tripping required by the current server.</li>
+<li>Known checksum defaults: AWS SDK S3 v1.74.1 introduced automatic CRC32 upload checksums; download validation is also configurable. Decide intentionally rather than accepting a wire/performance change accidentally. <a href="https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/s3-checksums.html">AWS SDK</a></li>
+<li>Error-injected and cross-gateway write-back tests, then the benchmark matrix below. A self-hosted origin is useful but not sufficient proof of real AWS interoperability.</li>
+</ol>
+<p>Keep the existing small <code>net/http</code> origin implementation unless a replacement preserves validators, range handling, redirects, and its read-only/no-listing contract. <code>filesystem</code>/<code>inmem</code> remain development origins; current filesystem user metadata is process-local, not production-persistent metadata.</p>
+</section>
+<section id="shared-read-and-range-caching" class="level2">
+<h2 class="anchored" data-anchor-id="shared-read-and-range-caching">Shared read and range caching</h2>
+<section id="highest-value-request-path-opportunity" class="level3">
+<h3 class="anchored" data-anchor-id="highest-value-request-path-opportunity">Highest-value request-path opportunity</h3>
+<p><code>internal/objcache/read.go</code> resolves parent object metadata before looking up aligned range blocks. When only range blocks are cached and the parent body row is absent, it calls <code>origin.Attributes</code> again. Thus an apparently warm range workload can still pay an origin HEAD RTT.</p>
+<p><strong>Recommendation:</strong> a small <strong>logged PostgreSQL parent-metadata record</strong>, shared by all gateways, containing size, validator/generation, response metadata, and validation time. Resolve ranges against it and bind every range block to that generation. Preserve TTL revalidation, tombstones, write-back shadowing, and stale-fill fences. Read-only workers must be able to use the replicated record without trying to renew or mutate it.</p>
+<p>This potentially removes a network round trip on the workload that matters most, rather than optimizing a few Go allocations. It adds state and therefore needs a clear benefit in request counts and latency. It is not an in-process metadata cache.</p>
+<p>An <strong>explicit immutable-prefix mode</strong> is another avenue for immutable DuckLake data files: reduce repeated validation and simplify state transitions for those keys. Do not silently infer immutability from <code>.parquet</code>, and do not apply it to arbitrary mutable objects or delete/recreate keys.</p>
+</section>
+<section id="other-cache-architectures" class="level3">
+<h3 class="anchored" data-anchor-id="other-cache-architectures">Other cache architectures</h3>
+<ul>
+<li><strong>NGINX slice caching:</strong> well-established ranged HTTP caching, but introduces another cache/process and does not provide PostgreSQL-replicated cache hits, transactional write-back, or shared RESP data. Useful for a read-only edge variant, not an equivalent internal replacement. Its documentation also warns about slice/background-update interaction. <a href="https://nginx.org/en/docs/http/ngx_http_slice_module.html">NGINX</a></li>
+<li><strong>DuckDB’s external file cache:</strong> already caches remote bytes in memory and is enabled by default in the inspected DuckDB 2.0 configuration. It complements pgvs3 but is local to the client, not a cross-gateway cache. Benchmark with client caching both enabled and disabled to avoid attributing client hits to the server. Do not use old <code>enable_object_cache</code> advice: that pragma is a deprecated no-op in DuckDB 2.0. <a href="https://duckdb.org/docs/2.0/configuration/overview.html">DuckDB cache</a></li>
+<li><strong>Local LRU/Ristretto/filesystem cache:</strong> could be a valid different design, but violates the current zero-local-object/metadata-cache invariant and does not make shared PostgreSQL state unnecessary.</li>
+<li><strong>UNLOGGED read fills:</strong> excluded by the requested design and replica-sharing requirement; not a proposed optimization.</li>
+</ul>
+</section>
+</section>
+<section id="fill-coordination-and-write-back" class="level2">
+<h2 class="anchored" data-anchor-id="fill-coordination-and-write-back">Fill coordination and write-back</h2>
+<section id="improve-the-existing-fill-lease" class="level3">
+<h3 class="anchored" data-anchor-id="improve-the-existing-fill-lease">Improve the existing fill lease</h3>
+<p>At this commit, <code>internal/objcache/tier.go</code> sets a <strong>2-minute fill lease</strong> and <strong>45-second waiter budget</strong>; a whole-object fill may run for <strong>10 minutes</strong>. <code>internal/store/filllease.go</code> has acquire/release/cleanup but no renewal path. Slow origins can therefore outlive ownership, and waiters can fall back to duplicate origin traffic before the owner finishes.</p>
+<p>Plan one cohesive improvement:</p>
+<ul>
+<li>Renew using the database clock and owner token while work is alive.</li>
+<li>Fence final publication by the live lease owner/generation <strong>as well as</strong> the expected origin version. Release ownership conditionally.</li>
+<li>Cancel/discard a fill on ownership loss; do not let renewal become local authority or a reason to hold a DB connection during download.</li>
+<li>Make waiting/fallback policy explicit and size-aware. More waiting reduces duplicate traffic but can worsen tail latency; measure both.</li>
+<li>Test a fill exceeding 2 minutes, owner crash, cancelled waiter, lost renewal, overwrite/delete/recreate, and several gateways requesting the same range.</li>
+</ul>
+<p>Local <code>singleflight</code> remains useful but cannot coordinate separate gateways. Session advisory locks during the entire download would be shorter to write but consume a database session per slow origin request, undoing current isolation.</p>
+</section>
+<section id="keep-durable-outbox-ownership" class="level3">
+<h3 class="anchored" data-anchor-id="keep-durable-outbox-ownership">Keep durable outbox ownership</h3>
+<p><code>internal/objcache/writeback.go</code> detaches the database body into a spool before uploading, but <strong>retains the session key-lock connection</strong> through the origin upload. That is intentional ordering protection, not merely an accidental connection leak.</p>
+<p><strong>Do not replace it with a token check after upload and call it safe.</strong> A token can reject stale local publication after an old upload has already overwritten the remote object. A lock-free alternative needs demonstrated remote ordering: conditional origin mutations with the correct base version, or immutable generation objects plus a conditional authoritative pointer. The latter changes origin key/layout semantics and is not a transparent refactor.</p>
+<p>River/PGMQ/generic workers can supply claim/retry machinery, but do not remove the atomic body-plus-outbox commit, supersession, public ETag, merged listings, delete coordination, pending-row flush guards, or remote side-effect ordering. CDC/Debezium would add a service and delivery semantics, not simplify this bounded in-process worker by default.</p>
+<p>Retain logged bodies until they are safely committed at the origin under the existing policy. Scratch files are disposable; acknowledged pending bodies are not. Processing and remote side effects must be treated as <strong>at least once</strong>, with idempotency/preconditions where required, not end-to-end exactly once.</p>
+</section>
+</section>
+<section id="cache-state-model" class="level2">
+<h2 class="anchored" data-anchor-id="cache-state-model">Cache state model</h2>
+<p><code>origin_etag</code> currently carries both origin versions and lifecycle sentinels; the shared parser improves organization, but SQL and Go still need to interpret the same encoded state.</p>
+<p>A future layout could use explicit <code>state</code>, <code>source</code>, <code>generation</code>, <code>origin_version</code>, and <code>validated_at</code> fields with constraints and typed accessors. This is a maintainability experiment, not a claim that more columns are faster. First design the transition table and the indexes required for workers/expiry.</p>
+<p>Keep <code>s3c_</code> and <code>s3w_</code> separate until there is a complete equivalence proof for:</p>
+<ul>
+<li>durable pending-body ownership and outbox references;</li>
+<li>stable gateway ETags versus changing origin validators;</li>
+<li>range rows, parent metadata, deletes, and read shadowing;</li>
+<li>RESP mutation/flush behavior, cache eviction, quotas, and namespace drop;</li>
+<li>logged replica reads and restored data.</li>
+</ul>
+<p>One tagged table may eventually simplify lookups, but a tagged table plus many exceptional retention/flush paths can be more complex than two namespaces.</p>
+</section>
+<section id="resp" class="level2">
+<h2 class="anchored" data-anchor-id="resp">RESP</h2>
+<p>Redcon is a compact server dependency, not an obvious source of excess owned code. RESP3 has a different type/handshake surface and is a compatibility expansion, not a necessary modernization. gnet is an event-loop transport; PostgreSQL’s blocking work still needs dispatch/backpressure and all command semantics remain owned. External Valkey changes the one-database authority and backup model. <a href="https://github.com/tidwall/redcon">RESP sources</a></p>
+<p>Better avenues within scope:</p>
+<ol type="1">
+<li>Measure SET batching independently: current README records that 4 KiB redcon read batches can fragment the old pipelined write coalescing. Tune/prototype batching only against latency and throughput together.</li>
+<li>Keep SQL-native atomic operations, TTL, numeric mutation, NX/XX, GETDEL, APPEND/SETRANGE, and shared-cache visibility; do not replace them with read/modify/write in Go.</li>
+<li><code>internal/store/cache_mset.go</code> falls back to sequential single-key writes when any value exceeds the inline ceiling. That path is not atomic across keys. Review a staged-body/one-publication-transaction implementation, or an explicit documented/rejected unsupported case; do not imply full Redis MSET semantics for the existing fallback.</li>
+<li>Cross-namespace <code>FLUSHALL</code> is also sequential. State that boundary explicitly rather than adding a broad transaction/locking framework by default.</li>
+<li>Continue explicitly rejecting <code>MULTI</code>/<code>EXEC</code>/<code>WATCH</code>; a pipeline is not a transaction. Keep <code>HELLO 3</code> rejection and RESP2 client instructions unless RESP3 becomes an explicit requirement.</li>
+</ol>
+</section>
+<section id="ojs-jobs-and-streams" class="level2">
+<h2 class="anchored" data-anchor-id="ojs-jobs-and-streams">OJS, jobs, and streams</h2>
+<section id="http-and-json" class="level3">
+<h3 class="anchored" data-anchor-id="http-and-json">HTTP and JSON</h3>
+<p>The official OJS Go SDK is a <strong>client/worker SDK</strong>, not a server binding. The reference PostgreSQL backend is a broader server with features deliberately excluded from pgvs3. Its inspected module also uses a sibling-directory module replacement; packaging/release maturity needs verification before embedding. Its actual LICENSE is Apache-2.0, despite an inconsistent changelog statement. Validate lease-token fencing against any upstream implementation. <a href="https://github.com/openjobspec/ojs-backend-postgres">OJS sources</a></p>
+<p>For the current bounded API:</p>
+<ul>
+<li>Standard <code>http.ServeMux</code> method/wildcard routes may remove dispatch plumbing in <code>internal/ojs</code>. Preserve exact error envelopes, HEAD behavior, trailing slash handling, methods, and <code>/ojs/manifest</code> routing. <a href="https://go.dev/blog/routing-enhancements">ServeMux</a></li>
+<li>Go <strong>1.27 already backs <code>encoding/json</code> with the v2 implementation</strong>. Changing the import is not an automatic speed upgrade. Stable v2 offers <code>MarshalWrite</code>/<code>UnmarshalRead</code> and stricter defaults, but duplicate-name, invalid-UTF-8, nil collection, case matching, and omission behavior can change the wire contract. Use golden fixtures and compatible options where needed. Do not rely on old experimental <code>format</code> tags: the released API removed them. <a href="https://go.dev/doc/go1.27">Go27</a> <a href="https://go.dev/doc/jsonv2-migration">JSON migration</a></li>
+<li>Broad OpenAPI/server generation is only attractive if an authoritative spec exactly captures pgvs3’s implemented subset and token extension. Generating a larger server and then maintaining exceptions is not an established saving.</li>
+</ul>
+</section>
+<section id="job-engine-alternatives" class="level3">
+<h3 class="anchored" data-anchor-id="job-engine-alternatives">Job engine alternatives</h3>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Candidate</th>
+<th>Fit</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Existing atomic claim SQL</strong></td>
+<td>Already consolidated to candidate/update/return with <code>SKIP LOCKED</code>, including due/expired eligibility. Highest confidence for retaining current priorities, leases, retention, and namespace behavior.</td>
+</tr>
+<tr class="even">
+<td><strong>River</strong></td>
+<td>Strong PostgreSQL job framework and a sensible choice for applications wanting its worker ecosystem. An OJS server would still need lifecycle/state/token/namespace adapters; some advanced features are Pro. Do not replace working claim SQL solely to recreate the current server on top. <a href="https://riverqueue.com/docs">River</a></td>
+</tr>
+<tr class="odd">
+<td><strong>PGMQ</strong></td>
+<td>Lightweight visibility-timeout queue, with SQL-only installation as well as an extension. Managed hosting is therefore not categorically disqualifying, but OJS states, priority/retry policy, token fencing, stream batches, and namespace lifecycle remain to be mapped. A visibility window is not end-to-end exactly-once processing. <a href="https://pgmq.github.io/pgmq/latest/">PGMQ</a></td>
+</tr>
+<tr class="even">
+<td><strong>Reference OJS PostgreSQL backend</strong></td>
+<td>Closest wire-family alternative, but much broader scope, deployment surface, and dependencies. Most relevant if full OJS becomes a goal, not as a proven small dependency replacement. <a href="https://github.com/openjobspec/ojs-backend-postgres">OJS sources</a></td>
+</tr>
+</tbody>
+</table>
+<p>Do not unify jobs and streams into one delivery algorithm just because both carry JSON. Mutable competing-worker jobs and replayable fan-out streams have different row ownership, retention, and acknowledgment semantics.</p>
+</section>
+<section id="streams-and-wakeups" class="level3">
+<h3 class="anchored" data-anchor-id="streams-and-wakeups">Streams and wakeups</h3>
+<p>PgQue’s snapshot batches and rotating log are directly relevant to the existing three-segment stream model. Replacing current code with an upstream package still requires checking member cooperation, batch leases/acks, nack retries, DLQ, payload/quota limits, schema ownership, and managed-PostgreSQL operation. Keep the design; use upstream as a comparison and potential future extraction target rather than assuming method names establish equivalence. <a href="https://pgque.dev/docs/concepts/">PgQue</a></p>
+<p>Consider <strong>debounced <code>LISTEN/NOTIFY</code> as a lossy wakeup hint</strong> for job/stream long polls and outbox workers only if polling load is significant. One dedicated session can wake eligible local waiters; reconnect and periodic polling must recover missed notifications. Notifications must not become queue authority or cache invalidation correctness, and one notification per item can introduce global-lock/contention costs. River documents batching/throttling concerns. This is not a default replacement for the already-small polling path. <a href="https://github.com/riverqueue/river/discussions/977">Notify</a></p>
+</section>
+</section>
+<section id="namespaces-copy-clone-and-garbage-collection" class="level2">
+<h2 class="anchored" data-anchor-id="namespaces-copy-clone-and-garbage-collection">Namespaces, copy, clone, and garbage collection</h2>
+<p>Keep schema-per-namespace while the supported limit is 100. It preserves a clear physical/drop/export boundary. A single shared table makes SQL generation easier but complicates fast bucket disk reclamation and isolation; partitioning can restore some benefits while adding DDL and maintenance. No evidence in this review justifies that trade yet.</p>
+<p>Keep SQL-native same-bucket shared-file copies and cross-bucket <code>INSERT ... SELECT</code>. Global content-addressed bytes/dedup could save storage, but require cross-namespace reference tracking and undermine independent drop, clone, and schema exports. Generic S3 copy helpers must not silently replace these paths with gateway byte streaming.</p>
+<p>Keep bounded GC and the existing advisory-lock leader. <code>pg_cron</code> or pg_partman would add installation/version requirements and would not eliminate reference safety, snapshot lifetime, or cooperative stream retention.</p>
+<p><strong>Sequence review item:</strong> <code>clone_namespace</code> copies already-issued IDs, then calls <code>setval(GREATEST(last_value, max_id))</code>; adoption has a related pattern. The read/max/set sequence is not itself a concurrency-safe monotonic update relative to concurrent allocation. PostgreSQL documents that <code>setval</code> changes are immediately visible and not rolled back. Audit with a deterministic clone/adopt-versus-allocation test before changing it; do not claim a reproduced collision from source inspection alone. An ordinary in-database clone should not need to readjust an already-ahead sequence; imported schema adoption needs its own safe allocation/reconciliation design. <a href="https://www.postgresql.org/docs/18/functions-sequence.html">Sequences</a></p>
+<p>The existing Go block of 64 file IDs is a cache of values <strong>already allocated by PostgreSQL</strong>, not a locally authoritative ID generator. Replacing it with UUIDs merely because Go 1.27/PostgreSQL 18 supply new UUID facilities would add key/index costs without an established need.</p>
+</section>
+<section id="quotas-and-resource-admission" class="level2">
+<h2 class="anchored" data-anchor-id="quotas-and-resource-admission">Quotas and resource admission</h2>
+<section id="byte-aware-scratch-admission-do-next" class="level3">
+<h3 class="anchored" data-anchor-id="byte-aware-scratch-admission-do-next">Byte-aware scratch admission: do next</h3>
+<p>The chart provides <strong>10 GiB</strong> of scratch. Default fill and pending-worker budgets can each allow eight spools; sixteen 1 GiB bodies already exceed that, before foreground write spools, other temporary usage, and logs. Count-only limits do not bound bytes. <code>GOMEMLIMIT</code> does not bound scratch storage or all process/cgroup memory.</p>
+<p>Use one process-wide scratch-byte budget across fills, pending uploads, and foreground spooling, in addition to operation counts. <code>x/sync/semaphore.Weighted</code> is already available through the existing dependency. <a href="https://pkg.go.dev/golang.org/x/sync/semaphore">Weighted</a> <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#local-ephemeral-storage">K8s resources</a></p>
+<ul>
+<li>Reserve known sizes before creating large spools; reject or use an explicit pass-through policy when a request cannot fit.</li>
+<li>Define a hard bound for unknown-length inputs. Naively blocking all partial spools while each waits for more bytes can deadlock the budget; reserve a bounded maximum or use nonblocking growth with a clean abort/fallback policy.</li>
+<li>Release on every error/cancel/close path and account for simultaneous spool copies rather than just logical object size.</li>
+<li>Align chart <code>ephemeral-storage</code> requests/limits, <code>emptyDir.sizeLimit</code>, spool configuration, and metrics. <code>emptyDir.sizeLimit</code> is not a scheduler reservation.</li>
+<li>Preserve disk, not tmpfs, for large scratch bodies. A scratch file is not a reason to move acknowledged bodies out of PostgreSQL.</li>
+</ul>
+</section>
+<section id="namespace-and-database-quota" class="level3">
+<h3 class="anchored" data-anchor-id="namespace-and-database-quota">Namespace and database quota</h3>
+<p>Current quota and <code>--max-db-bytes</code> checks are documented sampled, per-worker guardrails. They are not hard cross-worker storage quotas. PostgreSQL roles and tablespaces alone do not create a general per-namespace byte-quota mechanism; the operational wording should not suggest that they do.</p>
+<p>Audit unknown-length multipart admission and overwrite accounting separately. A hard logical quota would need transactional reservations, commit/release, crash cleanup, and unknown-size policy; a single shared counter can become a write hotspot. Sharded reservation blocks trade exactness for throughput. Do not add that machinery without a hard-quota requirement. Physical disk/WAL headroom still needs monitoring regardless of logical reservations.</p>
+</section>
+</section>
+<section id="duckdb-and-ducklake" class="level2">
+<h2 class="anchored" data-anchor-id="duckdb-and-ducklake">DuckDB and DuckLake</h2>
+<p>DuckLake <strong>1.1</strong>, released 2026-10-21 with DuckDB 2.0, improves catalog/pruning and stores row-group counts in metadata. Small insertion/deletion inlining already places changes directly in the PostgreSQL catalog instead of creating a Parquet file for every change. Prefer configuring existing inlining and compaction over adding another pgvs3 small-file staging layer. <a href="https://ducklake.select/2026/10/21/ducklake-11/">DuckLake</a></p>
+<p>Pin exact client/catalog versions in compatibility and performance runs. Existing DuckLake catalogs do not automatically become 1.1. The inspected stable inlining page still conflicts with the 1.1 release description on PostgreSQL VARIANT support; use versioned release behavior and a contract test, not an unqualified support claim.</p>
+<p><code>pg_ducklake</code> is a potentially simpler analytics deployment for people wanting SQL analytics inside PostgreSQL. It is not an S3 server, RESP cache, or OJS replacement, and its extension availability on Aurora has not been verified. Keep it in the scope-changing alternatives list. Direct DuckLake-on-cloud-S3 is likewise simpler if storing all file bytes in PostgreSQL ceases to be a requirement. <a href="https://pgducklake.select/blog/releasing-v1/">pg_ducklake</a></p>
+</section>
+<section id="observability" class="level2">
+<h2 class="anchored" data-anchor-id="observability">Observability</h2>
+<p><code>internal/telemetry/telemetry.go</code> owns HTTP tracing, a ResponseWriter wrapper, and basic query spans; S3/OJS/RESP/store metrics have separate exposition code.</p>
+<ul>
+<li><strong><code>otelhttp</code></strong> can own standard server/client spans and response-body lifetime handling. Preserve <code>X-Trace-Id</code>, filter probes/metrics if desired, use bounded route names, and test streaming/Flush/ResponseController behavior. Disable per-read/write events for large bodies unless explicitly wanted. <a href="https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@v0.72.0">OTel HTTP</a></li>
+<li><strong><code>otelpgx</code></strong> covers queries, batches, connect/acquire, prepare, high-level COPY, and pool statistics. Direct <code>PgConn</code> calls and custom streaming spans still need explicit coverage; a new tracer does not magically observe every low-level operation. Do not include query parameters or object keys in metric labels, and decide whether SQL text should be exported. <a href="https://pkg.go.dev/github.com/exaring/otelpgx@v0.13.0">OTel pgx</a></li>
+<li><strong>Prometheus client collectors</strong> can replace manual text formatting while retaining current cheap atomic observations: use a custom collector at scrape time, not necessarily a dynamic <code>CounterVec</code> lookup on every request. Preserve metric names/labels and test cardinality plus histogram correctness. Native histograms or a full OTel metrics pipeline are optional scope, not prerequisites to removing duplicate exposition. <a href="https://github.com/prometheus/client_golang/blob/main/prometheus/doc.go">Prometheus</a></li>
+<li>Keep standard <strong><code>slog</code> and pprof</strong>. Go 1.27’s goroutine-leak profile helps diagnose some unreachable blocked goroutines, but is not a complete leak or shutdown detector. <a href="https://go.dev/doc/go1.27">Go27</a></li>
+</ul>
+<p>The current tracing module is small enough that dependency/version cost might outweigh deletion. Benchmark <strong>export disabled</strong>, sampled tracing, and export enabled under collector failure. Do not accidentally turn disabled telemetry into a hot-path allocation or network requirement.</p>
+</section>
+<section id="ha-backups-and-deployment" class="level2">
+<h2 class="anchored" data-anchor-id="ha-backups-and-deployment">HA, backups, and deployment</h2>
+<section id="correct-the-durability-contract-not-the-trust-model" class="level3">
+<h3 class="anchored" data-anchor-id="correct-the-durability-contract-not-the-trust-model">Correct the durability contract, not the trust model</h3>
+<p>The README says pending write-back bodies survive crash/failover without qualifying replication policy. Logged storage and <code>synchronous_commit=on</code> guarantee local WAL durability, but <strong>do not by themselves guarantee lossless promotion of an asynchronous standby</strong>. Synchronous-standby configuration and promotion policy determine remote durability; immediate visibility on arbitrary standbys additionally depends on replay. Aurora uses a different storage/HA model and needs service-specific validation. <a href="https://www.postgresql.org/docs/18/runtime-config-wal.html">WAL</a></p>
+<p>Clarify this operationally rather than silently enabling synchronous replication and changing latency/availability. Benchmark the intended production durability mode, not an async mode while claiming RPO=0. Keep all current data logged.</p>
+<p>pgx already supports <code>target_session_attrs=read-write</code> and related host-role validation. This is a useful optional writer-connection guard alongside managed writer endpoints, plus role reporting in <code>doctor</code>/readiness. It does not replace endpoint failover, retries, or fencing. Read-only gateways may intentionally connect to the primary, so do not require a physical standby in that mode. <a href="https://pkg.go.dev/github.com/jackc/pgx/v5@v5.11.0/pgconn">PGX</a></p>
+</section>
+<section id="recovery-and-operational-simplicity" class="level3">
+<h3 class="anchored" data-anchor-id="recovery-and-operational-simplicity">Recovery and operational simplicity</h3>
+<ul>
+<li>Keep managed PITR or a standard tool such as <strong>pgBackRest</strong> for physical base backup/WAL retention. pgBackRest supports parallelism, standby backup, bundled files, and block-incremental repositories; choose using restore and archive throughput measurements, not a new backup implementation in pgvs3. <a href="https://pgbackrest.org/user-guide.html">pgBackRest</a></li>
+<li>If self-managing PostgreSQL on Kubernetes, an established operator such as <strong>CloudNativePG</strong> can own database HA and backup orchestration. Prefer its plugin-based Barman Cloud path for new configurations; old native backup examples are version-sensitive/deprecated. This is an operator choice, not another dependency in the gateway. <a href="https://github.com/cloudnative-pg/cloudnative-pg/blob/main/docs/src/backup.md">CNPG</a></li>
+<li>A schema <code>pg_dump</code> is an export boundary, not a complete standalone system restore: restore into an initialized matching layout, reconcile global catalog/IDs, and verify functions/config/outbox dependencies. Large-object backing would weaken this simple boundary further.</li>
+<li>Whole-cluster PITR preserves PostgreSQL transactional state, but it cannot rewind external origin writes or worker side effects. Test restoration with pending uploads and reconcile remote versions before restarting retry workers.</li>
+<li>Keep backups/WAL archives outside the pgvs3 database being protected. Using the same gateway as its only backup object store creates a circular recovery dependency.</li>
+<li>Drill recovery of DuckLake catalog plus files, RESP TTL data, jobs, stream consumer positions, tombstones, and acknowledged pending bodies. A reachable database or a successful dump alone is not the acceptance test.</li>
+</ul>
+</section>
+<section id="deployment" class="level3">
+<h3 class="anchored" data-anchor-id="deployment">Deployment</h3>
+<p>Keep <strong>ko, static distroless images, Helm, stateless Deployments, network policy, and external PostgreSQL</strong>. Replacing this with a gateway operator would add an API/controller without simplifying the current resource set. Pin release images or digests for repeatable rollout instead of relying on <code>latest</code>.</p>
+<p>Budget connections across main + chunk pools, maintenance/key-lock sessions, other applications, HPA maximums, and rollout surge. The chart’s three workers at pool 64 can have a much larger database connection footprint than the apparent <code>poolMax</code> value. HPA cannot make PostgreSQL capacity infinite.</p>
+<p>Match termination grace to actual transfer/drain policy: the chart’s 60 seconds does not guarantee completion of requests whose HTTP deadlines permit 30 minutes. Keep bounded cancellation/retry behavior rather than claiming arbitrary-size transfers always finish on rollout.</p>
+<p>Trusted private networking remains the security boundary. No proposal here adds gateway auth, signature validation, or TLS termination. Preserve default-deny ingress, loopback/private exposure, and existing external mesh options.</p>
+</section>
+</section>
+<section id="cli-toolchain-and-tests" class="level2">
+<h2 class="anchored" data-anchor-id="cli-toolchain-and-tests">CLI, toolchain, and tests</h2>
+<section id="cli-and-layout-lifecycle" class="level3">
+<h3 class="anchored" data-anchor-id="cli-and-layout-lifecycle">CLI and layout lifecycle</h3>
+<p>The refactor already consolidated environment parsing. Keep standard <code>flag</code> unless command growth makes declarative <strong>Kong</strong> schemas cheaper: Kong supports subcommands, env/default tags, validation, and help generation. Compare a complete small command group, including parsing precedence, global flag placement, explicit false/zero values, exit codes, and existing scripts. Cobra/Viper would be more machinery than demonstrated need here. <a href="https://github.com/alecthomas/kong">Kong</a></p>
+<p>A shared option definition used for help/config documentation may yield more benefit than changing parsers. Go 1.27 generic methods can improve selected helper ergonomics, but a broad generics rewrite is not a capability improvement.</p>
+<p>Keep the <strong>single version-pinned baseline</strong> and drift doctor. Goose/Atlas-style migration histories solve in-place upgrades, which are not currently required. New third-party schemas must not accidentally introduce an unplanned migration policy.</p>
+</section>
+<section id="tests-and-performance-evidence" class="level3">
+<h3 class="anchored" data-anchor-id="tests-and-performance-evidence">Tests and performance evidence</h3>
+<p>Use stable <strong><code>testing/synctest</code></strong> for retry/backoff, timer, long-poll, cancellation, and waiter unit tests. Go 1.27’s fake-network <code>httptest.NewTestServer</code> can make HTTP timing tests deterministic without real sockets. Real PostgreSQL/network I/O is not durably blocked inside synctest; keep database and failover integration tests. <a href="https://go.dev/blog/testing-time">Synctest</a> <a href="https://go.dev/doc/go1.27">Go27</a></p>
+<p>Keep one harness per layer as CONTRIBUTING requires:</p>
+<ul>
+<li>Unit/model/fuzz tests for state transitions, range/key/XML/JSON/RESP parsing.</li>
+<li>PostgreSQL integration for locks, MVCC, sequence allocation, quotas, leases, GC, and concurrent mutation; do not validate replacement SQL only against mocks.</li>
+<li>The existing <strong>pinned Go s3t allow-list</strong>, not a reintroduced Python Ceph suite.</li>
+<li>Existing real-client contract/interop tests for boto3, DuckDB/DuckLake, rclone/restic, OJS workers, and RESP2 clients.</li>
+<li>Differential/golden fixtures for adapter and wire-format changes, plus race, crash, shutdown, read-only replica, and origin-error cases.</li>
+</ul>
+<p>PG19/Go experimental SIMD/event-loop rewrites are not default modernization targets. Stable features already in the project’s baseline offer better near-term risk/reward.</p>
+</section>
+</section>
+<section id="prioritized-roadmap" class="level2">
+<h2 class="anchored" data-anchor-id="prioritized-roadmap">Prioritized roadmap</h2>
+<p>This is an implementation order <strong>for approval</strong>, not work already performed.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Order</th>
+<th>Change</th>
+<th>Expected payoff</th>
+<th>Risk / proof required</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>Shared parent metadata for range-only cache hits</td>
+<td>Remove avoidable origin RTTs on Parquet range workloads</td>
+<td>New shared state; prove TTL/generation/delete/write-back and read-only semantics; count origin HEADs</td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>One byte-weighted scratch budget + matching chart resources</td>
+<td>Predictable 1 GiB concurrency; avoid scratch exhaustion and cascading retries</td>
+<td>Unknown-length policy, fairness, clean abort, no budget leaks/deadlock; measure loaded throughput</td>
+</tr>
+<tr class="odd">
+<td>3</td>
+<td>Renewable, owner-fenced fill leases and explicit wait policy</td>
+<td>Reduce duplicate slow-origin traffic across gateways</td>
+<td>Renewal/owner loss/crash tests; tail latency and duplicate-byte measurements</td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>PostgreSQL 18 old/new publication SQL</td>
+<td>Less duplicated state/GC/CAS code without a new dependency</td>
+<td>Full absent-key/CAS/TTL/copy/multipart/outbox tests; new layout if structural changes</td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>AWS SDK origin adapter versus existing fork</td>
+<td>Retire substantial owned S3-client behavior</td>
+<td>Conditional multipart, checksums, cancellation, buffering, errors, binary size; no claim of benefit before comparison</td>
+</tr>
+<tr class="even">
+<td>6</td>
+<td><code>synctest</code> timer tests, then bounded OJS routing/envelope cleanup</td>
+<td>Less flaky timing and smaller protocol plumbing</td>
+<td>Wire goldens and real integration retained; JSON v2 semantic changes opt-in</td>
+</tr>
+<tr class="odd">
+<td>7</td>
+<td>Standard tracing/Prometheus exposition pilots</td>
+<td>Less instrumentation maintenance; better boundary coverage</td>
+<td>Disabled/enabled overhead, metric compatibility, streaming, dependency growth</td>
+</tr>
+<tr class="even">
+<td>8</td>
+<td>Explicit cache state columns; optional debounced wakeups</td>
+<td>Clearer lifecycle model; possibly lower idle polling</td>
+<td>Only after state table and workload evidence; do not merge namespaces or require NOTIFY</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Small operational/documentation work can proceed independently:</strong> qualify failover durability, clarify PgBouncer restrictions, distinguish guardrails from hard quotas, document oversized MSET behavior, and align connection/scratch/drain budgets. Reproduce the clone/adopt sequence hazard before selecting its remedy.</p>
+<p><strong>Not recommended now:</strong> whole S3-server replacement, River/PGMQ rewrite, job/stream algorithm unification, RESP3/gnet rewrite, one-bytea storage, large-object storage, global dedup, a migration framework, another cache service, or merging logged cache/write-back namespaces without a semantic proof.</p>
+</section>
+<section id="required-experiment-gates" class="level2">
+<h2 class="anchored" data-anchor-id="required-experiment-gates">Required experiment gates</h2>
+<p>Use the current binary as the control and change one major variable at a time. Record exact tool/library/database versions, hardware, origin bandwidth/latency, concurrency, warm/cold state, durability settings, repetitions, and variance.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Area</th>
+<th>Required comparison</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Large objects</td>
+<td>10 MiB, 64 MiB, 256 MiB, 1 GiB Parquet and incompressible fixtures; single-client and saturated GET/PUT</td>
+</tr>
+<tr class="even">
+<td>Ranges</td>
+<td>Footer/tiny ranges, aligned 1 MiB/8 MiB spans, multipart boundaries; cold fill, warm body, warm range-only, post-TTL; origin HEAD/GET counts</td>
+</tr>
+<tr class="odd">
+<td>Write-back</td>
+<td>ACK latency <strong>and</strong> origin drain rate, pending oldest age/bytes, retry amplification, conditional completion, concurrent overwrite/delete</td>
+</tr>
+<tr class="even">
+<td>Small values</td>
+<td>4 KiB HEAD/GET/SET, pipeline depth 1/16, MGET/MSET inline and oversized, mutation/TTL races</td>
+</tr>
+<tr class="odd">
+<td>Jobs/streams</td>
+<td>Enqueue/claim/ack and receive/ack p50/p95/p99, idle poll query rate, contention/vacuum, fan-out and stalled consumer retention</td>
+</tr>
+<tr class="even">
+<td>Resources</td>
+<td>CPU, allocations/RSS/cgroup memory, spool peak bytes, WAL bytes, DB pool wait/connections, origin requests/bytes, build/image size</td>
+</tr>
+<tr class="odd">
+<td>Failure/replication</td>
+<td>Owner expiry/crash, origin disconnect/timeout/conflict, mid-COPY cancel/restart, stale worker, primary promotion, replica lag, restored pending outbox</td>
+</tr>
+</tbody>
+</table>
+<p>For latency/time metrics require <strong>candidate &lt;= 1.20 × baseline</strong> on each relevant path. For throughput, define the gate explicitly rather than using an inverse accidentally: no more than 20% throughput loss means <strong>candidate &gt;= 0.80 × baseline</strong>; also report elapsed-time ratios for fixed work. Resource growth and correctness/compatibility requirements remain independent acceptance conditions. Improvements must not merely shift cost from ACK time to an unbounded background backlog.</p>
+<p>Existing refactoring measurements met the prior 20% budget; they are not evidence that any replacement above will meet it. At the time of the original review no candidate had been implemented or benchmarked; see the implementation status at the top for the subsequent work. Real AWS/Aurora and real promotion remain separate validation requirements. A constrained local origin is useful for repeatable comparisons, not proof of those environments.</p>
+</section>
+<section id="online-sources" class="level2">
+<h2 class="anchored" data-anchor-id="online-sources">Online sources</h2>
+<p>Primary documentation/source inspected during this review; links can evolve. Version-specific statements above identify inspected versions where material.</p>
+<p>Additional source details:</p>
+<ul>
+<li><a href="https://raw.githubusercontent.com/versity/versitygw/main/backend/backend.go">VersityGW backend contract</a></li>
+<li><a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html">S3 CompleteMultipartUpload conflict/checksum API</a></li>
+<li><a href="https://github.com/jackc/pgx/blob/v5.11.0/pgconn/pgconn.go">pgx COPY implementation and reader cancellation caveat</a></li>
+<li><a href="https://gocloud.dev/howto/blob/">Go CDK blob guide</a></li>
+<li><a href="https://valkey.io/topics/protocol/">Valkey RESP specification</a> and <a href="https://github.com/panjf2000/gnet">gnet</a></li>
+<li><a href="https://github.com/openjobspec/ojs-go-sdk">OJS Go client SDK</a>, <a href="https://raw.githubusercontent.com/openjobspec/ojs-backend-postgres/main/go.mod">backend module packaging</a>, and <a href="https://raw.githubusercontent.com/openjobspec/ojs-backend-postgres/main/LICENSE">backend license</a></li>
+<li><a href="https://riverqueue.com/docs/sql">River SQL/notification guidance</a></li>
+<li><a href="https://ducklake.select/docs/stable/duckdb/advanced_features/data_inlining.html">DuckLake data inlining</a></li>
+<li><a href="https://duckdb.org/docs/2.0/configuration/pragmas.html#object-cache">DuckDB 2.0 obsolete object-cache pragma</a></li>
+<li><a href="https://cloudnative-pg.github.io/plugin-barman-cloud/docs/concepts/">CloudNativePG Barman Cloud plugin concepts</a></li>
+</ul>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/adonm\.github\.io\/pgvs3");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="../differential-results.html" class="pagination-link" aria-label="DuckDB Differential Results">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text">DuckDB Differential Results</span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="../proposals/high-value-improvements.html" class="pagination-link" aria-label="High-Value Improvements">
+        <span class="nav-page-text">High-Value Improvements</span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+<footer class="footer"><div class="nav-footer"><div class="nav-footer-center"><div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/proposals/modernization-review.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div></div></footer><script src="../site_libs/quarto-html/zenscroll-min.js"></script>
+</body></html>

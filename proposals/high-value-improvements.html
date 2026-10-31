@@ -1,0 +1,1501 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.20">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>high-value-improvements – pgvs3</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../proposals/hardening-options.html" rel="next">
+<link href="../proposals/modernization-review.html" rel="prev">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-c2d5e23be7e7628261be6023ad4f5e54.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-dc650676e3a330219d37e48c46543a39.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+<style>html{ scroll-behavior: smooth; }</style>
+
+
+</head>
+
+<body class="nav-sidebar docked nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">pgvs3</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../index.html" aria-current="page"> 
+<span class="menu-text">Overview &amp; Atlas</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../guides/index.html"> 
+<span class="menu-text">Workload Guides</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../design.html"> 
+<span class="menu-text">Architecture &amp; Layout</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../operations.html"> 
+<span class="menu-text">Operations</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../benchmarks.html"> 
+<span class="menu-text">Benchmarks &amp; Evidence</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/adonm/pgvs3"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../proposals/modernization-review.html">Historical Design Proposals</a></li><li class="breadcrumb-item"><a href="../proposals/high-value-improvements.html">High-Value Improvements</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation docked overflow-auto">
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Home &amp; Visual Atlas</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">Workload &amp; Schema Guides</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Decision Tree &amp; Resource Trade-offs</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/postgres.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1. Protect OLTP &amp; Partitioning</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/analytics.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">2. DuckLake, Wide Columns &amp; Hilbert</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/cache.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">3. Shared Cache &amp; Write-Back Staging</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/jobs.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">4. Jobs, Outboxes &amp; Streams</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/observe-recover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">5. Observe, Diagnose &amp; Recover</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/sources.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Primary Research Ledger (44 Sources)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/validation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Executable Validation Evidence</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">Architecture &amp; Data Layout</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../design.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">System Architecture &amp; Authority</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../performance.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">8 KiB Page Layout &amp; I/O Paths</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../partitioning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Why Chunks Are Unpartitioned</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../queue-stream.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Queue &amp; Stream Model (OJS + PgQue)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Operations &amp; Production</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../operations.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Deployment, Pools, Cache &amp; CLI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../roadmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Roadmap &amp; Priorities</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">Benchmarks &amp; Qualification</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../benchmarks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Paired Runner &amp; Capacity Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-plane-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Replica Proof &amp; Capacity Ledger</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../modernization-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">v24/v25 Modernization Results</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../object-storage.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../object-storage-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Results (27 Cohorts)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../differential.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../differential-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Results</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Historical Design Proposals</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/modernization-review.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Modernization Review</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/high-value-improvements.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">High-Value Improvements</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/hardening-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Hardening Options</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#high-value-improvements-and-simplifications" id="toc-high-value-improvements-and-simplifications" class="nav-link active" data-scroll-target="#high-value-improvements-and-simplifications">High-value improvements and simplifications</a>
+  <ul class="collapse">
+  <li><a href="#executive-summary" id="toc-executive-summary" class="nav-link" data-scroll-target="#executive-summary">Executive summary</a></li>
+  <li><a href="#what-is-implemented" id="toc-what-is-implemented" class="nav-link" data-scroll-target="#what-is-implemented">What is implemented</a></li>
+  <li><a href="#how-it-compares-with-current-practice" id="toc-how-it-compares-with-current-practice" class="nav-link" data-scroll-target="#how-it-compares-with-current-practice">How it compares with current practice</a></li>
+  <li><a href="#urgent-findings" id="toc-urgent-findings" class="nav-link" data-scroll-target="#urgent-findings">Urgent findings</a>
+  <ul class="collapse">
+  <li><a href="#metrics-panics-after-any-normal-request-p0-fixed" id="toc-metrics-panics-after-any-normal-request-p0-fixed" class="nav-link" data-scroll-target="#metrics-panics-after-any-normal-request-p0-fixed">1. <code>/metrics</code> panics after any normal request (P0, fixed)</a></li>
+  <li><a href="#max-conns-only-limits-connections-during-protocol-sniffing-p0-fixed" id="toc-max-conns-only-limits-connections-during-protocol-sniffing-p0-fixed" class="nav-link" data-scroll-target="#max-conns-only-limits-connections-during-protocol-sniffing-p0-fixed">2. <code>--max-conns</code> only limits connections during protocol sniffing (P0, fixed)</a></li>
+  <li><a href="#read-only-origins-fail-writes-with-500-not-an-explicit-error-p0p1-fixed" id="toc-read-only-origins-fail-writes-with-500-not-an-explicit-error-p0p1-fixed" class="nav-link" data-scroll-target="#read-only-origins-fail-writes-with-500-not-an-explicit-error-p0p1-fixed">3. Read-only origins fail writes with 500, not an explicit error (P0/P1, fixed)</a></li>
+  </ul></li>
+  <li><a href="#correctness-findings" id="toc-correctness-findings" class="nav-link" data-scroll-target="#correctness-findings">Correctness findings</a>
+  <ul class="collapse">
+  <li><a href="#missing-buckets-return-the-wrong-s3-errors-p1" id="toc-missing-buckets-return-the-wrong-s3-errors-p1" class="nav-link" data-scroll-target="#missing-buckets-return-the-wrong-s3-errors-p1">4. Missing buckets return the wrong S3 errors (P1)</a></li>
+  <li><a href="#mixed-localorigin-copy-uses-the-wrong-backend-p1" id="toc-mixed-localorigin-copy-uses-the-wrong-backend-p1" class="nav-link" data-scroll-target="#mixed-localorigin-copy-uses-the-wrong-backend-p1">5. Mixed local/origin copy uses the wrong backend (P1)</a></li>
+  <li><a href="#clone-is-not-snapshot-isolated-and-drops-part-checksums-p1p2" id="toc-clone-is-not-snapshot-isolated-and-drops-part-checksums-p1p2" class="nav-link" data-scroll-target="#clone-is-not-snapshot-isolated-and-drops-part-checksums-p1p2">6. Clone is not snapshot-isolated and drops part checksums (P1/P2)</a></li>
+  <li><a href="#empty-if-match-bypasses-the-sql-write-condition-p1" id="toc-empty-if-match-bypasses-the-sql-write-condition-p1" class="nav-link" data-scroll-target="#empty-if-match-bypasses-the-sql-write-condition-p1">7. Empty <code>If-Match</code> bypasses the SQL write condition (P1)</a></li>
+  <li><a href="#deleted-tombstones-are-treated-as-a-hard-miss-ttl-equals-fill-timeout-p1" id="toc-deleted-tombstones-are-treated-as-a-hard-miss-ttl-equals-fill-timeout-p1" class="nav-link" data-scroll-target="#deleted-tombstones-are-treated-as-a-hard-miss-ttl-equals-fill-timeout-p1">8. Deleted tombstones are treated as a hard miss; TTL equals fill timeout (P1)</a></li>
+  <li><a href="#resp-cross-namespace-and-command-semantics-p1p2" id="toc-resp-cross-namespace-and-command-semantics-p1p2" class="nav-link" data-scroll-target="#resp-cross-namespace-and-command-semantics-p1p2">9. RESP cross-namespace and command semantics (P1/P2)</a></li>
+  <li><a href="#listmultipartuploads-loses-one-upload-at-a-page-boundary-p1" id="toc-listmultipartuploads-loses-one-upload-at-a-page-boundary-p1" class="nav-link" data-scroll-target="#listmultipartuploads-loses-one-upload-at-a-page-boundary-p1">10. <code>ListMultipartUploads</code> loses one upload at a page boundary (P1)</a></li>
+  <li><a href="#invalid-range-responses-report-bytes-0-p2" id="toc-invalid-range-responses-report-bytes-0-p2" class="nav-link" data-scroll-target="#invalid-range-responses-report-bytes-0-p2">11. Invalid-range responses report <code>bytes */0</code> (P2)</a></li>
+  <li><a href="#cache-last-modified-and-write-through-ordering-are-approximate-p2" id="toc-cache-last-modified-and-write-through-ordering-are-approximate-p2" class="nav-link" data-scroll-target="#cache-last-modified-and-write-through-ordering-are-approximate-p2">12. Cache <code>Last-Modified</code> and write-through ordering are approximate (P2)</a></li>
+  </ul></li>
+  <li><a href="#simplifications" id="toc-simplifications" class="nav-link" data-scroll-target="#simplifications">Simplifications</a>
+  <ul class="collapse">
+  <li><a href="#remove-the-origin-listing-index-highest-value-simplification-fixed" id="toc-remove-the-origin-listing-index-highest-value-simplification-fixed" class="nav-link" data-scroll-target="#remove-the-origin-listing-index-highest-value-simplification-fixed">13. Remove the origin listing index (highest-value simplification, fixed)</a></li>
+  <li><a href="#revisit-the-multipart-outbox-write-through-scope" id="toc-revisit-the-multipart-outbox-write-through-scope" class="nav-link" data-scroll-target="#revisit-the-multipart-outbox-write-through-scope">14. Revisit the multipart outbox / write-through scope</a></li>
+  <li><a href="#unify-the-three-publish-paths" id="toc-unify-the-three-publish-paths" class="nav-link" data-scroll-target="#unify-the-three-publish-paths">15. Unify the three publish paths</a></li>
+  <li><a href="#remove-legacy-sqs-remnants" id="toc-remove-legacy-sqs-remnants" class="nav-link" data-scroll-target="#remove-legacy-sqs-remnants">16. Remove legacy SQS remnants</a></li>
+  </ul></li>
+  <li><a href="#performance-and-operations" id="toc-performance-and-operations" class="nav-link" data-scroll-target="#performance-and-operations">Performance and operations</a>
+  <ul class="collapse">
+  <li><a href="#ojs-fetch-does-maintenance-on-every-poll-p1" id="toc-ojs-fetch-does-maintenance-on-every-poll-p1" class="nav-link" data-scroll-target="#ojs-fetch-does-maintenance-on-every-poll-p1">17. OJS fetch does maintenance on every poll (P1)</a></li>
+  <li><a href="#a.-pgque-is-not-a-drop-in-replacement-for-ojs-evaluated-2026-10-26" id="toc-a.-pgque-is-not-a-drop-in-replacement-for-ojs-evaluated-2026-10-26" class="nav-link" data-scroll-target="#a.-pgque-is-not-a-drop-in-replacement-for-ojs-evaluated-2026-10-26">17a. PgQue is not a drop-in replacement for OJS (evaluated 2026-10-26)</a></li>
+  <li><a href="#outbox-workers-are-per-tier-and-poll-every-second-p1p2-fixed" id="toc-outbox-workers-are-per-tier-and-poll-every-second-p1p2-fixed" class="nav-link" data-scroll-target="#outbox-workers-are-per-tier-and-poll-every-second-p1p2-fixed">18. Outbox workers are per tier and poll every second (P1/P2, fixed)</a></li>
+  <li><a href="#ojs-terminal-jobs-accumulate-p2" id="toc-ojs-terminal-jobs-accumulate-p2" class="nav-link" data-scroll-target="#ojs-terminal-jobs-accumulate-p2">19. OJS terminal jobs accumulate (P2)</a></li>
+  <li><a href="#origin-listingcopydelete-can-use-fewer-origin-calls-p2" id="toc-origin-listingcopydelete-can-use-fewer-origin-calls-p2" class="nav-link" data-scroll-target="#origin-listingcopydelete-can-use-fewer-origin-calls-p2">20. Origin listing/copy/delete can use fewer origin calls (P2)</a></li>
+  <li><a href="#pg18-aio-is-available-but-not-guided" id="toc-pg18-aio-is-available-but-not-guided" class="nav-link" data-scroll-target="#pg18-aio-is-available-but-not-guided">21. PG18 AIO is available but not guided</a></li>
+  <li><a href="#chunk-size-experiment-only-if-write-throughput-matters" id="toc-chunk-size-experiment-only-if-write-throughput-matters" class="nav-link" data-scroll-target="#chunk-size-experiment-only-if-write-throughput-matters">22. Chunk-size experiment (only if write throughput matters)</a></li>
+  <li><a href="#metrics-observability-and-docs" id="toc-metrics-observability-and-docs" class="nav-link" data-scroll-target="#metrics-observability-and-docs">23. Metrics, observability and docs</a></li>
+  </ul></li>
+  <li><a href="#testing-gaps-worth-closing-first" id="toc-testing-gaps-worth-closing-first" class="nav-link" data-scroll-target="#testing-gaps-worth-closing-first">Testing gaps worth closing first</a></li>
+  <li><a href="#recommended-sequence" id="toc-recommended-sequence" class="nav-link" data-scroll-target="#recommended-sequence">Recommended sequence</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/proposals/high-value-improvements.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../proposals/modernization-review.html">Historical Design Proposals</a></li><li class="breadcrumb-item"><a href="../proposals/high-value-improvements.html">High-Value Improvements</a></li></ol></nav></header>
+
+
+
+
+
+<section id="high-value-improvements-and-simplifications" class="level1">
+<h1>High-value improvements and simplifications</h1>
+<blockquote class="blockquote">
+<p>Historical analysis, not the active backlog. Priorities and status labels below describe the reviewed snapshots and may be superseded. Use the <a href="../design.html">current architecture</a>, <a href="../roadmap.html">ranked roadmap</a> and <a href="../modernization-results.html">implementation evidence</a>.</p>
+</blockquote>
+<p>Status: research note, 2026-10-25, at commit <code>1a7e94b</code>. It records what exists, how it compares with current practice, and which changes look worth making. Findings are ranked by risk and effort, not by novelty.</p>
+<p>Source paths and line numbers below refer to the reviewed snapshot. Current ownership after consolidation is listed in <a href="https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#package-map">CONTRIBUTING.md</a>.</p>
+<p>Implementation note (2026-10-26): the OJS queue fixes recommended here are implemented in layout v14 and carried into v18: fetch uses one lazy claim over available, due and expired-lease rows; expiry/due promotion/exhausted leases run in maintenance; lease validation uses the database clock; terminal jobs are removed after <code>--job-retention</code>. Layout v18 adds the consolidated PgQue-shaped stream side to the same <code>s3q_</code> namespace (snapshot batches, fan-out subscriptions, ack/nack, retry, DLQ, queue/consumer info and three-segment <code>TRUNCATE</code> rotation). The three urgent user-visible findings below (<code>/metrics</code>, connection lifetime and read-only origin errors) and the OJS fetch-maintenance gap and the origin listing-index removal are fixed in the current tree. The other P1/P0 findings remain open.</p>
+<section id="executive-summary" class="level2">
+<h2 class="anchored" data-anchor-id="executive-summary">Executive summary</h2>
+<p>pgvs3 is in good shape: <code>go test ./...</code>, <code>go test -race ./...</code>, <code>go vet</code> and <code>staticcheck</code> are clean, and the repository has 205 unit/integration test functions plus four fuzzers. The core design is coherent and several choices match or lead current practice (schema-per-namespace, immutable chunks, strong ETags, <code>SKIP LOCKED</code> queues, conditional origin writes).</p>
+<p>Three findings were urgent because they were small and user-visible; all are now fixed:</p>
+<ol type="1">
+<li><strong><code>/metrics</code> panicked after any normal request.</strong> The metrics map used string keys but asserted <code>requestKey</code> on scrape.</li>
+<li><strong><code>--max-conns</code> only capped connections during protocol sniffing.</strong> The slot is now held until the wrapped connection closes.</li>
+<li><strong>Writes to a read-only HTTP origin returned <code>500 InternalError</code>.</strong> S3 now maps the capability error to <code>501 NotImplemented</code>.</li>
+</ol>
+<p>The origin listing-index simplification is now implemented. Listings walk the origin directly with one bounded page in memory, so <code>origin_listing</code>, <code>origin_listing_state</code>, <code>origin_generations</code>, the refresh generation logic and per-write listing upserts are gone. Listings are exact rather than TTL-stale; the tradeoff is an O(N) origin walk for deep <code>StartAfter</code> pages until adapters gain a native start-after cursor.</p>
+<p>The biggest correctness gap is a cluster of <strong>backend-selection and error semantics</strong> issues: missing buckets return <code>NoSuchKey</code>/empty listings instead of <code>NoSuchBucket</code>, mixed local/origin <code>CopyObject</code>, <code>UploadPartCopy</code> and bucket clone silently use the wrong backend, and clone is not snapshot-isolated.</p>
+<p>The biggest performance gap at review time was <strong>OJS fetch maintenance</strong>; the lazy-claim change moved expiry, lease-expiry and due promotion into maintenance. The process-wide DB session budget is now bounded by conservative defaults. Cache fills and pending-upload workers use process-wide semaphores, so <code>--fill-concurrency</code> is no longer multiplied by the number of origin tiers.</p>
+</section>
+<section id="what-is-implemented" class="level2">
+<h2 class="anchored" data-anchor-id="what-is-implemented">What is implemented</h2>
+<ul>
+<li>One stateless Go gateway, one listener, five protocols: S3, plain HTTP, OJS, RESP2, and the origin cache tier.</li>
+<li>One PostgreSQL schema per namespace (<code>s3b_</code>, <code>s3c_</code>, <code>s3q_</code>), with typed catalog rows, per-namespace functions, instant <code>DROP SCHEMA CASCADE</code>, and per-namespace autovacuum settings.</li>
+<li>Immutable <code>file_id</code> objects, inline objects up to 64 KiB, 8,120-byte chunk rows mapped to one 8 KiB page, length-discriminated Zstd, binary <code>COPY</code> ingest, atomic publish, bounded GC, MVCC reads.</li>
+<li>Cache tier with read-through fills, write-through PUT/COPY/DELETE, multipart pending/outbox, version-fenced fills, tombstones, range chunks, and direct bounded origin listings.</li>
+<li>OJS core lifecycle with typed state transitions, leases, retries, delayed delivery, and a short long poll.</li>
+<li>RESP2 with pipelined GET/SET coalescing.</li>
+<li>Strong ETags, byte ranges, conditional reads, conditional writes, S3 checksums, multipart, zero-copy copy, and s3t/contract/interop/fault gates.</li>
+</ul>
+<p>Current package sizes (non-test / test lines):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Package</th>
+<th style="text-align: right;">Non-test</th>
+<th style="text-align: right;">Test</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>internal/store</code></td>
+<td style="text-align: right;">6,752</td>
+<td style="text-align: right;">2,770</td>
+</tr>
+<tr class="even">
+<td><code>internal/s3</code></td>
+<td style="text-align: right;">3,846</td>
+<td style="text-align: right;">1,718</td>
+</tr>
+<tr class="odd">
+<td><code>internal/objcache</code></td>
+<td style="text-align: right;">2,843</td>
+<td style="text-align: right;">3,074</td>
+</tr>
+<tr class="even">
+<td><code>internal/ojs</code></td>
+<td style="text-align: right;">1,341</td>
+<td style="text-align: right;">1,464</td>
+</tr>
+<tr class="odd">
+<td><code>internal/resp</code></td>
+<td style="text-align: right;">1,075</td>
+<td style="text-align: right;">121</td>
+</tr>
+<tr class="even">
+<td><code>cmd/pgvs3</code></td>
+<td style="text-align: right;">632</td>
+<td style="text-align: right;">179</td>
+</tr>
+<tr class="odd">
+<td><code>internal/gateway</code></td>
+<td style="text-align: right;">269</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="how-it-compares-with-current-practice" class="level2">
+<h2 class="anchored" data-anchor-id="how-it-compares-with-current-practice">How it compares with current practice</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Problem</th>
+<th>pgvs3</th>
+<th>Current comparable practice</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Blob bytes in PostgreSQL</td>
+<td>8,120-byte chunk rows, one per page, no TOAST; inline ≤64 KiB</td>
+<td>App-level chunk table or <code>bytea STORAGE EXTERNAL</code>; JuiceFS uses 64 MiB chunks / 4 MiB blocks; large objects are slower for streaming</td>
+<td>The page-aligned design is deliberate and benchmarked. Worth one controlled experiment with 64–256 KiB <code>EXTERNAL</code> rows, not a rewrite.</td>
+</tr>
+<tr class="even">
+<td>Metadata store</td>
+<td>PostgreSQL catalog and per-namespace schemas</td>
+<td>Supabase Storage: PG metadata, bytes in S3; SeaweedFS filer on PG: one table per bucket, dropped on bucket delete</td>
+<td>Schema-per-bucket is validated by SeaweedFS; pgvs3 goes further by keeping bytes in PG.</td>
+</tr>
+<tr class="odd">
+<td>Immutable files</td>
+<td><code>file_id</code> sequence, atomic pointer swap, GC grace</td>
+<td>RisingWave/JuiceFS: immutable blobs and PG metadata; GC by reference/grace</td>
+<td>Aligned.</td>
+</tr>
+<tr class="even">
+<td>Queue</td>
+<td><code>SKIP LOCKED</code>, leases, typed transitions, lazy maintenance outside fetch</td>
+<td>River, pgmq, pg-boss, Oban: <code>SKIP LOCKED</code>, transactional enqueue, background/lazy maintenance, retention/partitioning</td>
+<td>Claim pattern and maintenance placement now align; terminal retention is bounded.</td>
+</tr>
+<tr class="odd">
+<td>Cache tier</td>
+<td>Read/write-through, full-object cache, range chunks, outbox, direct origin listing</td>
+<td>Rclone serve s3: stream multipart through; AWS hybrid cache sample: range cache with streaming and bounded memory; most caches invalidate on write</td>
+<td>The outbox is durable but heavy; direct listing removed the clearest overbuild.</td>
+</tr>
+<tr class="even">
+<td>Conditional writes</td>
+<td><code>If-Match</code>/<code>If-None-Match</code> at the origin, multipart conditions on complete</td>
+<td>S3 gained <code>If-None-Match</code> (2024) and conditional copy (2025)</td>
+<td>Ahead of many S3-compatible gateways.</td>
+</tr>
+<tr class="odd">
+<td>Cold-read I/O</td>
+<td>PG18 bitmap heap scans, <code>effective_io_concurrency=32</code></td>
+<td>PG18 AIO: <code>io_method=worker</code>/<code>io_uring</code>, <code>io_workers</code>, <code>io_combine_limit</code>; 10–25% gains on bitmap/seq scans are reported</td>
+<td>Add operator guidance and benchmark with the real deployment.</td>
+</tr>
+<tr class="even">
+<td>Verification</td>
+<td>Unit + integration + s3t allow-list + contract/interop/fault; gateway and metrics tests added</td>
+<td>River/pgmq have extensive DB-level queue tests; S3 gateways use s3-tests and SDK matrices</td>
+<td>Strong breadth; keep adding concurrency/load coverage.</td>
+</tr>
+</tbody>
+</table>
+<p>References:</p>
+<ul>
+<li>Supabase Storage: <a href="https://github.com/supabase/storage" class="uri">https://github.com/supabase/storage</a></li>
+<li>SeaweedFS filer <code>postgres2</code> one table per bucket: <a href="https://github.com/gntik-ai/falcone/blob/main/docs-site/architecture/seaweedfs.md" class="uri">https://github.com/gntik-ai/falcone/blob/main/docs-site/architecture/seaweedfs.md</a></li>
+<li>JuiceFS chunk/block design: <a href="https://juicefs.com/en/blog/engineering/design-metadata-data-storage" class="uri">https://juicefs.com/en/blog/engineering/design-metadata-data-storage</a></li>
+<li>RisingWave S3-primary storage: <a href="https://risingwave.com/blog/how-we-built-risingwave-on-s3-a-deep-dive-into-s3-as-primary-storage-architecture/" class="uri">https://risingwave.com/blog/how-we-built-risingwave-on-s3-a-deep-dive-into-s3-as-primary-storage-architecture/</a></li>
+<li>River: <a href="https://github.com/riverqueue/river/" class="uri">https://github.com/riverqueue/river/</a>; pgmq/PGQue queue benchmarking: <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking" class="uri">https://github.com/hardbyte/postgresql-job-queue-benchmarking</a></li>
+<li>AWS S3 conditional writes: <a href="https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes/" class="uri">https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes/</a> and conditional copy: <a href="https://aws.amazon.com/about-aws/whats-new/2025/10/amazon-s3-conditional-write-functionality-copy-operations/" class="uri">https://aws.amazon.com/about-aws/whats-new/2025/10/amazon-s3-conditional-write-functionality-copy-operations/</a></li>
+<li>PostgreSQL 18 AIO: <a href="https://www.postgresql.org/about/press/presskit18/en/" class="uri">https://www.postgresql.org/about/press/presskit18/en/</a></li>
+<li>PostgreSQL binary-data guidance: <a href="https://www.cybertec-postgresql.com/en/binary-data-performance-in-postgresql/" class="uri">https://www.cybertec-postgresql.com/en/binary-data-performance-in-postgresql/</a> and the chunk-table recommendation: <a href="https://www.postgresql.org/message-id/CAFCRh--KMuUHPvSb5KL6TJoJmykwQTgh3mAfP4B3KxHMULXMTw%40mail.gmail.com" class="uri">https://www.postgresql.org/message-id/CAFCRh--KMuUHPvSb5KL6TJoJmykwQTgh3mAfP4B3KxHMULXMTw%40mail.gmail.com</a></li>
+<li>Rclone S3 multipart streaming: <a href="https://rclone.org/commands/rclone_serve_s3/" class="uri">https://rclone.org/commands/rclone_serve_s3/</a></li>
+<li>AWS S3 hybrid cache sample: <a href="https://github.com/aws-samples/sample-s3-hybrid-cache/blob/main/docs/ARCHITECTURE.md" class="uri">https://github.com/aws-samples/sample-s3-hybrid-cache/blob/main/docs/ARCHITECTURE.md</a></li>
+</ul>
+</section>
+<section id="urgent-findings" class="level2">
+<h2 class="anchored" data-anchor-id="urgent-findings">Urgent findings</h2>
+<section id="metrics-panics-after-any-normal-request-p0-fixed" class="level3">
+<h3 class="anchored" data-anchor-id="metrics-panics-after-any-normal-request-p0-fixed">1. <code>/metrics</code> panics after any normal request (P0, fixed)</h3>
+<p><code>internal/s3/metrics.go:31-37</code> builds a string key:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode go code-with-copy"><code class="sourceCode go"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>key <span class="op">:=</span> fmt<span class="op">.</span>Sprintf<span class="op">(</span><span class="st">"%s</span><span class="ch">\x00</span><span class="st">%d"</span><span class="op">,</span> method<span class="op">,</span> code<span class="op">)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>v<span class="op">,</span> ok <span class="op">:=</span> m<span class="op">.</span>requests<span class="op">.</span>Load<span class="op">(</span>key<span class="op">)</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>m<span class="op">.</span>requests<span class="op">.</span>LoadOrStore<span class="op">(</span>key<span class="op">,</span> <span class="bu">new</span><span class="op">(</span>atomic<span class="op">.</span>Uint64<span class="op">))</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>but <code>metrics.write</code> ranges with <code>k.(requestKey)</code> at line 57. The first normal request stores a string key; the next <code>/metrics</code> request panics on the type assertion. The endpoint is therefore unusable in a running gateway.</p>
+<p>Fix: use <code>requestKey{method: method, code: code}</code> as the map key, and add a <code>metrics_test.go</code> that observes one request and writes the exposition. This also removes the per-request <code>Sprintf</code> allocation.</p>
+</section>
+<section id="max-conns-only-limits-connections-during-protocol-sniffing-p0-fixed" class="level3">
+<h3 class="anchored" data-anchor-id="max-conns-only-limits-connections-during-protocol-sniffing-p0-fixed">2. <code>--max-conns</code> only limits connections during protocol sniffing (P0, fixed)</h3>
+<p><code>internal/gateway/gateway.go:144-179</code>: the semaphore is acquired in <code>acceptLoop</code> and released by the deferred <code>&lt;-m.sem</code> as soon as the connection is classified and handed to <code>httpCh</code>/<code>respCh</code>. The HTTP and RESP servers then own the connection with no further cap. A client can classify any number of connections and keep them open; <code>--max-conns</code> does not bound active sockets or server goroutines as documented.</p>
+<p>Fix: hold the slot for the connection lifetime. Wrap <code>peekConn</code> with a <code>Close</code> that releases the semaphore exactly once, remove the deferred release, and drain/close pending channel connections in <code>muxListener.Close</code>. Add a test with a fake listener and two connections to prove the second is shed while the first is live.</p>
+</section>
+<section id="read-only-origins-fail-writes-with-500-not-an-explicit-error-p0p1-fixed" class="level3">
+<h3 class="anchored" data-anchor-id="read-only-origins-fail-writes-with-500-not-an-explicit-error-p0p1-fixed">3. Read-only origins fail writes with 500, not an explicit error (P0/P1, fixed)</h3>
+<p><code>objcache.origin.Upload/Delete/Copy</code> correctly return <code>ErrOriginUnsupported</code> when the origin lacks <code>capWrite</code> (<code>internal/objcache/origin.go:233-263</code>), and <code>origin_caps_test.go</code> verifies it. But <code>s3.Server.ingestError</code> (<code>internal/s3/server.go:724-750</code>) does not map <code>objcache.ErrOriginUnsupported</code>, so a PUT, DELETE, CopyObject or multipart completion against a read-only HTTP origin becomes <code>500 InternalError</code>. The operations guide promises an explicit error (<code>docs/operations.md:458-479</code>), and a read-only HTTP origin is a documented production mode.</p>
+<p>Fix:</p>
+<ul>
+<li>In <code>objcache.Tier</code>, check <code>t.origin.Supports(capWrite)</code> at the top of <code>UploadWithOptions</code>, <code>Delete</code>, <code>DeleteMany</code>, <code>Copy</code>, <code>CreateUpload</code>, <code>StartPart</code> and <code>CompleteUpload</code>, returning <code>ErrOriginUnsupported</code> before staging any bytes.</li>
+<li>Map <code>ErrOriginUnsupported</code> and <code>ErrOriginListingUnsupported</code> to <code>501 NotImplemented</code> (or <code>403 AccessDenied</code> for writes) in the S3 layer.</li>
+<li>Map the same errors per key in <code>DeleteObjects</code>.</li>
+<li>Add an S3 handler test using a read-only HTTP origin.</li>
+</ul>
+</section>
+</section>
+<section id="correctness-findings" class="level2">
+<h2 class="anchored" data-anchor-id="correctness-findings">Correctness findings</h2>
+<section id="missing-buckets-return-the-wrong-s3-errors-p1" class="level3">
+<h3 class="anchored" data-anchor-id="missing-buckets-return-the-wrong-s3-errors-p1">4. Missing buckets return the wrong S3 errors (P1)</h3>
+<p>The catalog is authoritative, but reads do not distinguish a missing bucket from a missing key:</p>
+<ul>
+<li><code>store.metaRef</code> (<code>internal/store/object.go:103</code>) maps a missing schema to <code>ErrNotFound</code>, so <code>GET</code>/<code>HEAD /missing/key</code> returns <code>NoSuchKey</code>.</li>
+<li><code>store.List</code> (<code>internal/store/object.go:849-866</code>) returns <code>nil, nil</code> for a missing schema, so <code>ListObjectsV2 /missing</code> returns <code>200</code> with zero keys.</li>
+<li><code>store.DeleteMany</code> (<code>internal/store/object.go:825</code>) returns <code>0, nil</code>, so <code>DELETE /missing/key</code> returns <code>204</code> instead of <code>NoSuchBucket</code>.</li>
+<li><code>readCopySource</code> maps a missing source schema to <code>ErrNotFound</code>, so a copy from a missing bucket returns <code>NoSuchKey</code>.</li>
+</ul>
+<p>Fix: when the SQLSTATE says the schema/relation is missing and the namespace kind is <code>bucket</code>, return <code>store.ErrNoBucket</code>; keep empty/not-found behavior for cache namespaces. Add <code>ErrNoBucket</code> cases to <code>metaError</code>, <code>ingestError</code>, <code>listObjectsV2</code>, <code>listMultipartUploads</code>, <code>listParts</code>, <code>copyObject</code>, <code>uploadPartCopy</code>, <code>deleteObject</code> and <code>deleteObjects</code>. This is mostly mechanical and improves conformance without adding a hot-path existence query.</p>
+</section>
+<section id="mixed-localorigin-copy-uses-the-wrong-backend-p1" class="level3">
+<h3 class="anchored" data-anchor-id="mixed-localorigin-copy-uses-the-wrong-backend-p1">5. Mixed local/origin copy uses the wrong backend (P1)</h3>
+<p>Per-bucket origins are supported (<code>pgvs3 origin --bucket</code>). With a local bucket and an origin-backed bucket, copy operations silently use one side only:</p>
+<ul>
+<li><code>s3.copyObject</code> selects <code>writeBackendFor(destination)</code> and calls <code>Copy</code> (<code>internal/s3/copy.go:56-61</code>). <code>Tier.Copy</code> reads the source through the destination tier and cache namespace (<code>internal/objcache/objcache.go:809-834</code>); a local source is never read.</li>
+<li><code>tryFastPartCopy</code> checks the source through the local store whenever the destination is local (<code>internal/s3/copy.go:143-147</code>); an origin-backed source returns a spurious 404 instead of streaming.</li>
+<li><code>createBucket</code> clone always calls <code>store.CloneBucket</code> (<code>internal/s3/server.go:193-214</code>); cloning an origin-backed source creates an empty/partial local copy instead of failing or copying origin objects.</li>
+</ul>
+<p>Fix: choose source and destination independently. Keep the zero-copy path for local→local, keep <code>Tier.Copy</code> for same-tier origin→origin, and stream <code>source.Open</code> → <code>destination.Put</code> for mixed cases (with source conditions checked against the opened result). At minimum, detect mixed backends and return <code>501 NotImplemented</code> rather than returning wrong bytes or a wrong 404. Skip the local fast path when the source bucket has an origin. Reject or implement origin bucket clones explicitly.</p>
+</section>
+<section id="clone-is-not-snapshot-isolated-and-drops-part-checksums-p1p2" class="level3">
+<h3 class="anchored" data-anchor-id="clone-is-not-snapshot-isolated-and-drops-part-checksums-p1p2">6. Clone is not snapshot-isolated and drops part checksums (P1/P2)</h3>
+<p><code>s3p.clone_namespace</code> (<code>internal/store/schema.sql:136-171</code>) runs two statements, <code>INSERT INTO dst.chunks ... SELECT</code> and <code>INSERT INTO dst.objects ... SELECT</code>, under READ COMMITTED. A concurrent overwrite between them can publish an object that references chunks not copied into the clone. Clone should run in a repeatable-read transaction (or lock the source tables) so chunks and objects come from one snapshot.</p>
+<p>The clone also does not copy <code>object_part_checksums</code>. A cloned multipart object loses per-part checksums, so <code>GetObjectAttributes</code>/<code>ObjectParts</code> differs from the source. Add the copy, mapping no file IDs because the clone shares them.</p>
+<p><code>setval('s3p.file_ids', GREATEST(last_value, max_id))</code> in <code>adopt_namespace</code> and <code>clone_namespace</code> is racy across different namespaces: two concurrent adoptions can read the same <code>last_value</code> and the later <code>setval</code> can move the sequence backwards. Add a shared transaction advisory lock around <code>setval</code> (and document that restore/clone should not race writes), or replace the sequence with a locked counter row if exactness matters.</p>
+</section>
+<section id="empty-if-match-bypasses-the-sql-write-condition-p1" class="level3">
+<h3 class="anchored" data-anchor-id="empty-if-match-bypasses-the-sql-write-condition-p1">7. Empty <code>If-Match</code> bypasses the SQL write condition (P1)</h3>
+<p><code>store.Precondition.SQL</code> (now in <code>internal/store/object.go</code>) returns a nil match value when <code>Mode == IfMatch</code> and <code>ETag == ""</code>. The SQL functions compare <code>old_etag &lt;&gt; p_if_match</code>; with <code>NULL</code> the expression is <code>NULL</code>, not true, so the precondition passes. <code>Precondition.Allows</code> correctly rejects the same input, so the inline/streaming paths disagree.</p>
+<p>This is not reachable through the S3 handler today (<code>putCondition</code> rejects an empty ETag), but it is a parity bug in the shared API and exactly the class of problem the recent condition refactors were removing. Return <code>"if_match", ""</code> so the SQL comparison fails, and map <code>IfMatch: "*"</code> to <code>if_present</code> for parity with <code>Allows</code>. Add a table test for <code>SQL</code>/<code>Allows</code> parity.</p>
+<p>More broadly, <code>swapObjectParts</code> (<code>internal/store/ingest.go:458-498</code>) evaluates conditions in Go while <code>publish_object</code>/<code>put_inline</code> evaluate them in SQL. They already differ for expired objects and <code>IfPresent</code>. One source of truth (an SQL function called by all write paths, or a Go helper that receives liveness) would prevent future drift.</p>
+</section>
+<section id="deleted-tombstones-are-treated-as-a-hard-miss-ttl-equals-fill-timeout-p1" class="level3">
+<h3 class="anchored" data-anchor-id="deleted-tombstones-are-treated-as-a-hard-miss-ttl-equals-fill-timeout-p1">8. Deleted tombstones are treated as a hard miss; TTL equals fill timeout (P1)</h3>
+<p><code>Tier.resolveCache</code> returns <code>ErrNotFound</code> immediately for <code>CacheDeleted</code> (<code>internal/objcache/objcache.go:236-239</code>). That intentionally hides an object recreated directly at the origin for ten minutes, but it also creates a cross-gateway race: a concurrent PUT can write a newer origin object and a cache row, then a delayed DELETE tombstone overwrites the cache row; readers see 404 until the tombstone expires even though the origin has the newer object.</p>
+<p>Treating a tombstone as “revalidate against the origin” fixes this: remove the early return, fetch origin attrs, and plan a pass-through (do not fill while the tombstone row exists). The tombstone still fences an in-flight fill because the fill’s expected origin version no longer matches the tombstone token. This also removes the documented “recreated directly at origin stays hidden” limitation, which is surprising for an origin-authoritative cache.</p>
+<p>Related races:</p>
+<ul>
+<li><code>resolveCache</code> deletes a stale row with unconditional <code>CacheDel</code> (<code>internal/objcache/objcache.go:266-268</code>). If a concurrent delete writes a tombstone between the read and this delete, the tombstone is removed and an old fill can reinsert deleted bytes. Delete conditionally on the observed <code>origin_etag</code> (add <code>CacheDelExpected</code>).</li>
+<li><code>originTombstoneTTL</code> is 10 minutes and the fill timeout is also 10 minutes (<code>internal/objcache/objcache.go:72</code>, <code>568-603</code>). A fill can outlive its tombstone at the boundary. Make the tombstone TTL clearly longer (15–20 minutes) or shorten the fill timeout.</li>
+</ul>
+</section>
+<section id="resp-cross-namespace-and-command-semantics-p1p2" class="level3">
+<h3 class="anchored" data-anchor-id="resp-cross-namespace-and-command-semantics-p1p2">9. RESP cross-namespace and command semantics (P1/P2)</h3>
+<p>Concrete gaps in <code>internal/resp/commands.go</code>:</p>
+<ul>
+<li><code>MGET</code>, <code>EXISTS</code> and <code>TTL</code>/<code>PTTL</code> call <code>resolveTarget</code> but discard the kind/bucket result, then query the current cache namespace with the literal <code>s3://...</code> key. A cross-namespace key silently becomes a cache miss or a lookup for a key that cannot exist. Either support cross-namespace reads or reject <code>s3://</code> consistently, as <code>writeTarget</code> already does.</li>
+<li><code>FLUSHALL</code> is aliased to <code>FLUSHDB</code> (<code>resp.go:259-260</code>); it clears only the current cache namespace, not all cache namespaces. Implement all-namespace flush or return an explicit unsupported error.</li>
+<li><code>GETSET</code>, <code>SET ... GET</code>, <code>APPEND</code> and <code>SETRANGE</code> are read-then-unconditional- write. Concurrent updates can return a stale old value or lose an append. Use the same optimistic conditional-retry pattern as <code>CacheIncrBy</code>, or add a single store operation.</li>
+<li><code>MSET</code> is atomic only when every value fits inline; the large-value fallback writes keys one at a time (<code>internal/store/cache_mset.go:20-30</code>). Either keep atomicity with a transaction or reject large values explicitly.</li>
+<li><code>KEYS</code>/<code>SCAN</code> use <code>path.Match</code>, which treats <code>/</code> as a segment separator. Redis globs do not; <code>foo/*</code> should match <code>foo/bar/baz</code>. Use a Redis-compatible glob matcher.</li>
+<li><code>INFO</code> calls <code>StatNamespace</code>, which scans every object and expands <code>part_ends</code> to estimate chunks (<code>internal/store/namespace.go:646-724</code>). INFO can be expensive on a large cache. Use <code>DBSIZE</code>-style counts and relation sizes for INFO; keep the detailed scan for <code>pgvs3 stat</code>.</li>
+<li>A cross-namespace <code>GET s3://bucket/key</code> reads the whole object into memory. Either cap the response size or document it as small-value only.</li>
+</ul>
+<p>Add store-backed RESP tests; the current 121-line test file only covers pure parsing and dispatch.</p>
+</section>
+<section id="listmultipartuploads-loses-one-upload-at-a-page-boundary-p1" class="level3">
+<h3 class="anchored" data-anchor-id="listmultipartuploads-loses-one-upload-at-a-page-boundary-p1">10. <code>ListMultipartUploads</code> loses one upload at a page boundary (P1)</h3>
+<p><code>internal/s3/attributes.go:219-249</code> sets <code>lastKey, lastID = u.Key, u.UploadID</code> before checking whether the output budget is full. When the budget is hit, the current (unreturned) upload becomes the next marker, so the next page starts after it and drops it. Common-prefix roll-ups have the same problem. Set the marker only when an item is actually returned; add a test with <code>max-uploads=1</code> and two uploads.</p>
+</section>
+<section id="invalid-range-responses-report-bytes-0-p2" class="level3">
+<h3 class="anchored" data-anchor-id="invalid-range-responses-report-bytes-0-p2">11. Invalid-range responses report <code>bytes */0</code> (P2)</h3>
+<p><code>getObject</code> on <code>ErrInvalidRange</code> sets <code>Content-Range</code> using <code>resSize(res)</code> where <code>res</code> is nil (<code>internal/s3/server.go:375-413</code>), so a 416 for a non-empty object says the total size is zero. On the error path, fetch the object size with <code>Head</code> (or return a typed range error carrying the size) and emit <code>bytes */&lt;size&gt;</code>. s3-tests checks the status but may not check the header; a real client can.</p>
+</section>
+<section id="cache-last-modified-and-write-through-ordering-are-approximate-p2" class="level3">
+<h3 class="anchored" data-anchor-id="cache-last-modified-and-write-through-ordering-are-approximate-p2">12. Cache <code>Last-Modified</code> and write-through ordering are approximate (P2)</h3>
+<p><code>setObjectInfoHeaders</code> uses <code>ObjectInfo.CreatedAt</code> as <code>Last-Modified</code> (<code>internal/s3/response.go:28-30</code>). For native objects this is the write time; for cache hits it is the cache fill/touch time, not the origin <code>Last-Modified</code>. Clients that use date conditionals see the wrong value, and write-through cache rows have no ordering key to reject a delayed older write that arrives after a newer one. Add an <code>origin_modified</code> column (origin Last-Modified) to cache objects, set it on fill/write-through, use it for <code>Last-Modified</code>, and make cache publication conditional on <code>origin_modified &gt;= current</code> (or keep a generation). This is a schema change, so schedule it with the next layout bump.</p>
+</section>
+</section>
+<section id="simplifications" class="level2">
+<h2 class="anchored" data-anchor-id="simplifications">Simplifications</h2>
+<section id="remove-the-origin-listing-index-highest-value-simplification-fixed" class="level3">
+<h3 class="anchored" data-anchor-id="remove-the-origin-listing-index-highest-value-simplification-fixed">13. Remove the origin listing index (highest-value simplification, fixed)</h3>
+<p>The index and its generation machinery are removed. <code>Tier.List</code> now walks the origin directly and keeps only the requested page in memory. This removes the global tables, write-through upserts, TTL-stale listings and refresh races. The remaining follow-up is a native start-after cursor in origin adapters to avoid rescanning a prefix for deep pages.</p>
+</section>
+<section id="revisit-the-multipart-outbox-write-through-scope" class="level3">
+<h3 class="anchored" data-anchor-id="revisit-the-multipart-outbox-write-through-scope">14. Revisit the multipart outbox / write-through scope</h3>
+<p><code>pending_uploads</code>, pending cache objects, token guards, leased flush workers, and <code>flushOneLocked</code> are coherent but are the most complex part of the cache tier. They exist to make a failed first origin upload retryable in the background after the multipart <code>uploadId</code> has been consumed. Two alternatives:</p>
+<ul>
+<li><strong>Origin-native multipart for S3 origins</strong>: proxy <code>CreateMultipartUpload</code>, <code>UploadPart</code> and <code>Complete</code> to the origin, store part ETags in PG, and let the origin assemble. This removes the staged part data and the whole-object flush; cache population can be a next-read fill. It requires extending the vendored client and changes retry semantics.</li>
+<li><strong>Read-only cache tier</strong>: if write-through is not a target workload, dropping it removes the outbox, tombstones, origin write capability checks and most of the cache-tier failure modes. This is the largest scope lever; decide it before investing more in the outbox.</li>
+</ul>
+<p>If write-through stays, at least make a failed completion retryable without consuming the staging rows (origin-first with staging retained until success), or add a bounded attempt/dead-letter state so a poison row does not retry forever.</p>
+</section>
+<section id="unify-the-three-publish-paths" class="level3">
+<h3 class="anchored" data-anchor-id="unify-the-three-publish-paths">15. Unify the three publish paths</h3>
+<p><code>publish_object</code> and <code>put_inline</code> in <code>schema.sql</code> and <code>swapObjectParts</code> in <code>internal/store/ingest.go</code> each implement advisory locking, old-value capture, conditions, <code>origin_etag</code>, TTL handling and garbage queueing. They already differ on empty <code>If-Match</code>, expiry and <code>IfPresent</code>. A single SQL function that accepts the common bundle (including inline data) or a single Go transaction helper would reduce the surface and make condition tests meaningful.</p>
+</section>
+<section id="remove-legacy-sqs-remnants" class="level3">
+<h3 class="anchored" data-anchor-id="remove-legacy-sqs-remnants">16. Remove legacy SQS remnants</h3>
+<p><code>JobPending</code> is never written (<code>internal/store/ojs_state.go:19-22</code>); the <code>messages</code> checks in <code>adopt_namespace</code>/<code>ensure_namespace</code>/<code>drop_namespace</code> and the <code>job_index.kind</code> column are historical. The layout was v13 at review time (v14 after the OJS fix) with no migration path, so this can be deleted in the next layout bump. Small, but it removes misleading compatibility code.</p>
+</section>
+</section>
+<section id="performance-and-operations" class="level2">
+<h2 class="anchored" data-anchor-id="performance-and-operations">Performance and operations</h2>
+<section id="ojs-fetch-does-maintenance-on-every-poll-p1" class="level3">
+<h3 class="anchored" data-anchor-id="ojs-fetch-does-maintenance-on-every-poll-p1">17. OJS fetch does maintenance on every poll (P1)</h3>
+<p><strong>Implemented in layout v14.</strong> Fetch now performs one claim over available, due and expired-lease rows using the generated <code>next_visible_at</code> column; maintenance owns expiry, due promotion and exhausted leases; enqueue/fetch/ ack/nack/heartbeat use the database clock. The notes below are the original analysis and alternatives.</p>
+<p><code>Store.FetchJobs</code> (<code>internal/store/ojs.go:320-394</code>) runs <code>expireJobs</code>, <code>expireLeases</code> and <code>promoteDueJobs</code> in a transaction, per queue, on every fetch. <code>ojs.waitForFetch</code> (<code>internal/ojs/ojs.go:546-560</code>) retries every 100 ms for up to two seconds, so an idle worker can issue roughly 20 transactions and 60 update statements per long poll. With many workers, this is a write and lock amplification problem even when the queue is empty.</p>
+<p>Modern queues use a cheap claim query and run expiry/promotion outside the fetch path. Options, in increasing effort:</p>
+<ol type="1">
+<li>Add a <code>maintain bool</code> parameter to fetch: run maintenance on the first attempt and then at most once per second during a long poll; later attempts only select/lease.</li>
+<li>Fold due scheduled/retryable rows into the candidate query and drop <code>promoteDueJobs</code> from fetch. Expired active rows can be treated as candidates, with the lease transition handling exhaustion/discard in Go.</li>
+<li>Move queue expiry and terminal-job cleanup to the maintenance leader (or a dedicated ticker), leaving fetch with one <code>SELECT ... SKIP LOCKED</code> and one <code>UPDATE</code>.</li>
+</ol>
+<p>Also cap <code>expireLeases</code> with <code>LIMIT</code>/<code>ORDER BY lease_until</code>; today it selects every expired active row with no bound. Use the same database clock for lease validation (<code>AckJob</code>, <code>NackJob</code>, <code>validateQueueLeases</code> compare DB <code>lease_until</code> to gateway <code>time.Now()</code>; skew can cause spurious 409s or accept an expired lease).</p>
+</section>
+<section id="a.-pgque-is-not-a-drop-in-replacement-for-ojs-evaluated-2026-10-26" class="level3">
+<h3 class="anchored" data-anchor-id="a.-pgque-is-not-a-drop-in-replacement-for-ojs-evaluated-2026-10-26">17a. PgQue is not a drop-in replacement for OJS (evaluated 2026-10-26)</h3>
+<p>Implementation note: the PgQue-shaped <strong>stream</strong> half of this comparison is now implemented as OJS streams in the same <code>s3q_</code> schema (<code>docs/queue-stream.md</code>), including fan-out, cooperative members and three-segment <code>TRUNCATE</code> rotation. The OJS <strong>job</strong> half remains lease-based. This section is retained as the rationale for that split.</p>
+<p><a href="https://pgque.dev/">PgQue</a> is a well-designed pure-SQL queue, but it targets a different problem: a <strong>shared append-only event log with independent consumer cursors</strong>, closer to an event stream than a job queue. Its own docs say:</p>
+<blockquote class="blockquote">
+<p>“PgQue is an event/message queue optimized for high-throughput streaming with fan-out — not a job-queue framework.”</p>
+</blockquote>
+<p>and:</p>
+<blockquote class="blockquote">
+<p>“Choose a job queue when you need per-job lifecycle, sub-millisecond dispatch, priority queues, cron scheduling, unique jobs, or deep ecosystem integration.”</p>
+</blockquote>
+<p>OJS is exactly that job-queue shape. The mappings do not line up:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>OJS requirement</th>
+<th>PgQue behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Per-job state (<code>scheduled</code>, <code>available</code>, <code>active</code>, <code>retryable</code>, <code>completed</code>, <code>cancelled</code>, <code>discarded</code>)</td>
+<td>Events have <code>ev_type</code>/<code>ev_data</code> and a retry count; no job state machine</td>
+</tr>
+<tr class="even">
+<td><code>fetch(count)</code> returns up to <code>count</code> individually leased jobs</td>
+<td><code>receive()</code> returns the <strong>whole next tick batch</strong> or raises <code>54000</code> if it exceeds <code>max_return</code>; <code>max_return</code> is a safety ceiling, not a page size</td>
+</tr>
+<tr class="odd">
+<td>Per-job <code>lease_token</code>, <code>visibility_timeout_ms</code>, heartbeat</td>
+<td>Batch-level <code>ack(batch_id)</code>; <code>receive_coop</code> has stale-batch takeover via <code>dead_interval</code>, not a per-job lease/heartbeat</td>
+</tr>
+<tr class="even">
+<td><code>ack</code>/<code>nack</code> per job</td>
+<td><code>ack</code> is per batch; <code>nack(batch_id, msg, retry_after)</code> is per message but only inside the active batch</td>
+</tr>
+<tr class="odd">
+<td>Priority, <code>scheduled_at</code>, <code>expires_at</code>, <code>timeout</code>, tags</td>
+<td>No priority or delayed send; retry queue only (<code>nack</code> after delivery)</td>
+</tr>
+<tr class="even">
+<td><code>GET</code>/<code>DELETE /jobs/{id}</code>, queue state stats</td>
+<td>No job-id index, cancel, or OJS state counts</td>
+</tr>
+<tr class="odd">
+<td>Per-queue schema, <code>DROP SCHEMA</code>, <code>pg_dump -n</code>, namespace quota</td>
+<td>One global <code>pgque</code> schema with rotating tables; roles are database-global, not per-queue; per-tenant installs are not yet officially supported</td>
+</tr>
+<tr class="even">
+<td>No scheduler dependency</td>
+<td>Requires <code>pg_cron</code> or an external ticker; no ticks means no delivery. Default tick is 100 ms; p50 latency is ~52 ms (p99 ~103 ms), and 10 ms ticks improve the median but push the tail to ~1 s</td>
+</tr>
+<tr class="odd">
+<td>Low-latency co-located queue</td>
+<td>Batch/tick design is explicitly a latency trade-off; current OJS fetches are immediate and lease per job</td>
+</tr>
+</tbody>
+</table>
+<p>Mapping OJS onto PgQue would not remove the complex part:</p>
+<ul>
+<li>OJS still needs a <code>jobs</code> table for state, id lookup, cancellation, per-job results/errors and stats. PgQue would only replace the claim/receive mechanism.</li>
+<li>OJS <code>count</code>/visibility/heartbeat/priority/scheduling do not map to PgQue’s batch cursor. A compatibility shim would have to emulate them, likely with one event per job, a side state table, a custom ticker and a worker heartbeat layer.</li>
+<li>The global <code>pgque</code> schema conflicts with the current one-schema-per-queue model (<code>DROP SCHEMA CASCADE</code>, per-queue <code>pg_dump</code>, per-namespace quota and maintenance). We would either give up those properties or install/track PgQue queues separately.</li>
+<li><code>pg_cron</code> or a new high-frequency ticker becomes an availability dependency. The current OJS fetch works as soon as a writable gateway is up.</li>
+<li>PgQue 0.2 is young, and its cooperative-consumer API is marked <strong>experimental</strong>.</li>
+</ul>
+<p>The useful part of the suggestion is the <strong>bloat diagnosis</strong>: row-mutating <code>SKIP LOCKED</code> queues can suffer under a held xmin horizon, and pgvs3’s large repeatable-read reads can hold xmin for the duration of a slow 64 MiB+ stream. That risk now drives a separate stream path with three-segment <code>TRUNCATE</code> rotation, while OJS hot-row churn is handled by the lease/retention changes in items 17 and 19. It does not justify replacing a per-job lifecycle with an event log.</p>
+<p>The cache-tier outbox is a similarly poor fit: it needs one unique mutable row per <code>(namespace, key)</code>, a captured origin base version, leases, immediate first flush, and token-fenced completion. PgQue is an append-only shared log with batch acks and no per-key dedupe/update; using it would add a side table and tick latency without removing the conditional origin-flush logic.</p>
+<p>The implemented shape is a <strong>stream view inside the queue namespace</strong>, not an OJS storage backend. PgQue itself is not vendored; its snapshot/batch/rotation ideas are implemented in the queue schema and share its lifecycle. The OJS job table remains the job authority.</p>
+</section>
+<section id="outbox-workers-are-per-tier-and-poll-every-second-p1p2-fixed" class="level3">
+<h3 class="anchored" data-anchor-id="outbox-workers-are-per-tier-and-poll-every-second-p1p2-fixed">18. Outbox workers are per tier and poll every second (P1/P2, fixed)</h3>
+<p><code>newTier</code> starts <code>min(maxFills, 8)</code> workers per origin tier (<code>internal/objcache/objcache.go:128-140</code>). Each worker claims one row and sleeps one second when idle (<code>runPendingWorker</code>). With per-bucket origins, 100 tiers can mean 800 idle workers and ~800 queries/s per gateway; the docs’ “<code>--fill-concurrency</code> bounds the pending-upload worker pool” is not true across tiers. <code>fills</code>/<code>completes</code> are also per-tier, so total fill concurrency is tiers × <code>--fill-concurrency</code>.</p>
+<p>Status: fixed with process-wide fill and pending-upload semaphores. Idle per-tier workers still exist but no longer generate per-tier claim traffic, and global concurrency is bounded. One dispatcher and a terminal dead-letter state for permanently failing uploads remain possible follow-ups.</p>
+</section>
+<section id="ojs-terminal-jobs-accumulate-p2" class="level3">
+<h3 class="anchored" data-anchor-id="ojs-terminal-jobs-accumulate-p2">19. OJS terminal jobs accumulate (P2)</h3>
+<p><strong>Implemented in layout v14.</strong> <code>ExpireQueueMessages</code> now also removes completed/cancelled/discarded jobs older than <code>--job-retention</code> (default 24h) and their <code>job_index</code> rows. The notes below are the original analysis.</p>
+<p><code>ExpireQueueMessages</code> only deletes rows with <code>expires_at</code> set (<code>internal/store/ojs.go:1016-1042</code>). Completed/cancelled/discarded jobs without an explicit TTL remain forever, along with <code>s3p.job_index</code> rows. Modern queues keep a bounded retention/archive. Add a <code>--job-retention</code> (e.g., 24 h after terminal timestamp) with a bounded maintenance delete, or require/default <code>expires_at</code>.</p>
+</section>
+<section id="origin-listingcopydelete-can-use-fewer-origin-calls-p2" class="level3">
+<h3 class="anchored" data-anchor-id="origin-listingcopydelete-can-use-fewer-origin-calls-p2">20. Origin listing/copy/delete can use fewer origin calls (P2)</h3>
+<ul>
+<li><code>Tier.DeleteMany</code> performs one origin DELETE per key (<code>internal/objcache/objcache.go:1152-1182</code>); S3 <code>DeleteObjects</code> supports up to 1,000 keys per request.</li>
+<li><code>Tier.Copy</code> streams the source through the gateway; for the same S3 origin a native <code>CopyObject</code> would avoid data movement. <code>UploadPartCopy</code> could use the origin’s multipart copy for large parts.</li>
+<li><code>Tier.Copy</code> spools the whole source before uploading; a large copy can need a full temp file in addition to the origin read.</li>
+</ul>
+<p>These are worthwhile for large-bucket operations but are not required for correctness.</p>
+</section>
+<section id="pg18-aio-is-available-but-not-guided" class="level3">
+<h3 class="anchored" data-anchor-id="pg18-aio-is-available-but-not-guided">21. PG18 AIO is available but not guided</h3>
+<p>The storage design already relies on bitmap heap scans and sets <code>effective_io_concurrency=32</code> per connection. PG18’s new <code>io_method=worker</code> (default) / <code>io_uring</code>, <code>io_workers</code> (default 3), <code>io_combine_limit</code> and <code>maintenance_io_concurrency</code> are not mentioned in the compose/chart/ops docs. PG18 benchmarks report 10–25% gains on bitmap/sequential scans. Add a short operations note and benchmark with <code>io_method=worker</code>, <code>io_workers≈cores/4</code>, <code>io_combine_limit=16</code> (or <code>io_uring</code> where available). This is environment specific, so measure before changing defaults.</p>
+</section>
+<section id="chunk-size-experiment-only-if-write-throughput-matters" class="level3">
+<h3 class="anchored" data-anchor-id="chunk-size-experiment-only-if-write-throughput-matters">22. Chunk-size experiment (only if write throughput matters)</h3>
+<p>The current 8,120-byte row is a clever page-budget fit, but it is at the small extreme compared with JuiceFS’s 4 MiB blocks and the PostgreSQL community’s 128 KiB–32 MiB chunk-table guidance. A 64 KiB <code>EXTERNAL</code> row would reduce row count/index size/WAL records by ~8×, improve compression ratio, and may improve large-write throughput; it would also introduce TOAST/detoast on every chunk read and change range planning. Run a controlled benchmark before changing the layout. Do not switch to <code>pg_largeobject</code> or a single <code>bytea</code>; both lose streaming/VACUUM/immutability advantages.</p>
+</section>
+<section id="metrics-observability-and-docs" class="level3">
+<h3 class="anchored" data-anchor-id="metrics-observability-and-docs">23. Metrics, observability and docs</h3>
+<ul>
+<li>Fix the metrics panic and add cache counters (<code>hit</code>, <code>miss</code>, <code>fill_error</code>, <code>pending_uploads</code>, <code>listing_refresh_error</code>), OJS fetch duration/claimed jobs, and S3 error-code counters.</li>
+<li><code>s3.writeError</code> writes <code>x-amz-request-id</code> three times with different values (<code>internal/s3/errors.go:82-98</code>); set one ID per request and reuse it in logs.</li>
+<li>Update docs that currently overstate behavior: the HTTP-origin listing error is a 500 today; <code>--fill-concurrency</code> is per tier; the image/chart examples in README are older than the current tags; <code>ListObjectVersions</code>/<code>partNumber</code> on origin buckets are more limited than the general statement.</li>
+<li>Add <code>just s3t</code> to the PR CI path (the allow-list is only 36 tests and already runs nightly); handler regressions currently wait for the nightly job.</li>
+</ul>
+</section>
+</section>
+<section id="testing-gaps-worth-closing-first" class="level2">
+<h2 class="anchored" data-anchor-id="testing-gaps-worth-closing-first">Testing gaps worth closing first</h2>
+<ul>
+<li><code>internal/s3/metrics_test.go</code>: observe then write (would have caught P0 1).</li>
+<li><code>internal/gateway</code>: mux classification and <code>--max-conns</code> lifetime.</li>
+<li><code>internal/resp</code>: store-backed MGET/EXISTS/TTL/FLUSHALL, atomic GETSET/APPEND/ SETRANGE, Redis glob.</li>
+<li><code>internal/s3</code>: missing-bucket GET/HEAD/LIST/DELETE, invalid-range <code>Content-Range</code>, <code>ListMultipartUploads</code> page boundary, read-only-origin writes.</li>
+<li><code>internal/store</code>: <code>Precondition.SQL</code>/<code>Allows</code> parity, self-copy multipart part checksums, clone checksum/snapshot tests, sequence <code>setval</code> race (or a documented test for the lock).</li>
+<li><code>internal/objcache</code>: tombstone revalidation, tombstone/fill boundary, conditional stale delete, per-tier worker bounds.</li>
+<li>Strengthen <code>FuzzChunkedBody</code> to assert that a truncated non-final body returns <code>IncompleteBody</code>, not a silent EOF.</li>
+</ul>
+</section>
+<section id="recommended-sequence" class="level2">
+<h2 class="anchored" data-anchor-id="recommended-sequence">Recommended sequence</h2>
+<ol type="1">
+<li><strong>Small P0/P1 fixes (0.5–1 day):</strong> metrics key, mux connection lifetime, origin capability mapping, empty <code>If-Match</code>, invalid-range header, <code>ListMultipartUploads</code> marker.</li>
+<li><strong>S3 error fidelity and copy routing (3–5 days):</strong> missing-bucket errors, mixed-backend copy/part-copy/clone, RESP cross-namespace/FLUSHALL/atomic commands, clone snapshot/checksums/sequence lock.</li>
+<li><strong>Origin listing cursor (1–2 days):</strong> add native start-after support to origin adapters so direct <code>Tier.List</code> does not rescan a prefix for deep pages. The index itself is already removed.</li>
+<li><strong>Queue/cache performance follow-ups:</strong> one outbox dispatcher with terminal failure state, cheap <code>INFO</code>, and any remaining queue hot-path profiling.</li>
+<li><strong>Cache consistency and scope decision (2–4 days):</strong> tombstone revalidation, conditional stale delete, <code>origin_modified</code>, then decide whether write-through/outbox stays or the tier becomes read-only.</li>
+<li><strong>Ops/documentation:</strong> PG18 AIO guidance, metrics, s3t on PR, version/chart examples, restore/clone caveats.</li>
+</ol>
+<p>Do not spend time on authentication, TLS, S3 versioning, RESP3 or in-place schema migrations for this envelope; those are explicit non-goals or premature before a public beta.</p>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/adonm\.github\.io\/pgvs3");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="../proposals/modernization-review.html" class="pagination-link" aria-label="Modernization Review">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text">Modernization Review</span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="../proposals/hardening-options.html" class="pagination-link" aria-label="Hardening Options">
+        <span class="nav-page-text">Hardening Options</span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+<footer class="footer"><div class="nav-footer"><div class="nav-footer-center"><div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/proposals/high-value-improvements.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div></div></footer><script src="../site_libs/quarto-html/zenscroll-min.js"></script>
+</body></html>

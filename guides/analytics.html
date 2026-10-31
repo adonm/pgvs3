@@ -1,0 +1,1419 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.20">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>analytics – pgvs3</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../guides/cache.html" rel="next">
+<link href="../guides/postgres.html" rel="prev">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-c2d5e23be7e7628261be6023ad4f5e54.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-dc650676e3a330219d37e48c46543a39.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+<style>html{ scroll-behavior: smooth; }</style>
+
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script defer="" src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-chtml.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN" && texText && texText.data) {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
+
+</head>
+
+<body class="nav-sidebar docked nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">pgvs3</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../index.html" aria-current="page"> 
+<span class="menu-text">Overview &amp; Atlas</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../guides/index.html"> 
+<span class="menu-text">Workload Guides</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../design.html"> 
+<span class="menu-text">Architecture &amp; Layout</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../operations.html"> 
+<span class="menu-text">Operations</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="../benchmarks.html"> 
+<span class="menu-text">Benchmarks &amp; Evidence</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/adonm/pgvs3"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../guides/index.html">Workload &amp; Schema Guides</a></li><li class="breadcrumb-item"><a href="../guides/analytics.html">2. DuckLake, Wide Columns &amp; Hilbert</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation docked overflow-auto">
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Home &amp; Visual Atlas</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">Workload &amp; Schema Guides</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Decision Tree &amp; Resource Trade-offs</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/postgres.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1. Protect OLTP &amp; Partitioning</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/analytics.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">2. DuckLake, Wide Columns &amp; Hilbert</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/cache.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">3. Shared Cache &amp; Write-Back Staging</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/jobs.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">4. Jobs, Outboxes &amp; Streams</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/observe-recover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">5. Observe, Diagnose &amp; Recover</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/sources.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Primary Research Ledger (44 Sources)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../guides/validation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Executable Validation Evidence</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">Architecture &amp; Data Layout</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../design.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">System Architecture &amp; Authority</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../performance.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">8 KiB Page Layout &amp; I/O Paths</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../partitioning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Why Chunks Are Unpartitioned</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../queue-stream.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Queue &amp; Stream Model (OJS + PgQue)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Operations &amp; Production</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../operations.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Deployment, Pools, Cache &amp; CLI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../roadmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Roadmap &amp; Priorities</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">Benchmarks &amp; Qualification</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../benchmarks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Paired Runner &amp; Capacity Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-plane-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Replica Proof &amp; Capacity Ledger</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../modernization-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">v24/v25 Modernization Results</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../object-storage.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../object-storage-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Results (27 Cohorts)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../differential.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../differential-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Results</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Historical Design Proposals</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/modernization-review.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Modernization Review</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/high-value-improvements.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">High-Value Improvements</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../proposals/hardening-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Hardening Options</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#publish-analytical-snapshots-not-repeated-oltp-scans" id="toc-publish-analytical-snapshots-not-repeated-oltp-scans" class="nav-link active" data-scroll-target="#publish-analytical-snapshots-not-repeated-oltp-scans">Publish analytical snapshots, not repeated OLTP scans</a>
+  <ul class="collapse">
+  <li><a href="#choose-an-analytical-storage-format" id="toc-choose-an-analytical-storage-format" class="nav-link" data-scroll-target="#choose-an-analytical-storage-format">Choose an analytical storage format</a></li>
+  <li><a href="#export-a-bounded-source-snapshot" id="toc-export-a-bounded-source-snapshot" class="nav-link" data-scroll-target="#export-a-bounded-source-snapshot">Export a bounded source snapshot</a></li>
+  <li><a href="#validate-then-publish-discovery" id="toc-validate-then-publish-discovery" class="nav-link" data-scroll-target="#validate-then-publish-discovery">Validate, then publish discovery</a></li>
+  <li><a href="#freshness-is-a-pipeline-not-one-ttl" id="toc-freshness-is-a-pipeline-not-one-ttl" class="nav-link" data-scroll-target="#freshness-is-a-pipeline-not-one-ttl">Freshness is a pipeline, not one TTL</a></li>
+  <li><a href="#ducklake-tune-a-candidate-and-inspect-it" id="toc-ducklake-tune-a-candidate-and-inspect-it" class="nav-link" data-scroll-target="#ducklake-tune-a-candidate-and-inspect-it">DuckLake: tune a candidate and inspect it</a></li>
+  <li><a href="#schema-wide-column-spatiotemporal-and-write-for-read-modeling" id="toc-schema-wide-column-spatiotemporal-and-write-for-read-modeling" class="nav-link" data-scroll-target="#schema-wide-column-spatiotemporal-and-write-for-read-modeling">Schema, wide-column, spatiotemporal and write-for-read modeling</a>
+  <ul class="collapse">
+  <li><a href="#schema-and-type-discipline" id="toc-schema-and-type-discipline" class="nav-link" data-scroll-target="#schema-and-type-discipline">1. Schema and type discipline</a></li>
+  <li><a href="#billion-row-collections-with-wide-columns" id="toc-billion-row-collections-with-wide-columns" class="nav-link" data-scroll-target="#billion-row-collections-with-wide-columns">2. Billion-row collections with wide columns</a></li>
+  <li><a href="#fixed-3264-partitioning-hash-buckets-hilbert-curves-over-time-growing-ddl" id="toc-fixed-3264-partitioning-hash-buckets-hilbert-curves-over-time-growing-ddl" class="nav-link" data-scroll-target="#fixed-3264-partitioning-hash-buckets-hilbert-curves-over-time-growing-ddl">3. Fixed 32–64 partitioning (hash buckets &amp; Hilbert curves) over time-growing DDL</a></li>
+  <li><a href="#trade-slowbatch-transactions-for-maximum-query-performance" id="toc-trade-slowbatch-transactions-for-maximum-query-performance" class="nav-link" data-scroll-target="#trade-slowbatch-transactions-for-maximum-query-performance">4. Trade slow/batch transactions for maximum query performance</a></li>
+  </ul></li>
+  <li><a href="#verification-and-cleanup" id="toc-verification-and-cleanup" class="nav-link" data-scroll-target="#verification-and-cleanup">Verification and cleanup</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/guides/analytics.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../guides/index.html">Workload &amp; Schema Guides</a></li><li class="breadcrumb-item"><a href="../guides/analytics.html">2. DuckLake, Wide Columns &amp; Hilbert</a></li></ol></nav></header>
+
+
+
+
+
+<section id="publish-analytical-snapshots-not-repeated-oltp-scans" class="level1">
+<h1>Publish analytical snapshots, not repeated OLTP scans</h1>
+<p><a href="../guides/index.html">Guide index</a> · Before: <a href="../guides/postgres.html">demo source tables</a> · Next: <a href="../guides/cache.html">cache</a></p>
+<p><strong>Goal:</strong> extract a deliberate source snapshot once, then run repeated scans on Parquet/DuckLake with a measured freshness budget. PostgreSQL remains the OLTP system; DuckDB executes the analytical SQL; pgvs3 stores or caches the object bytes. This is application-managed materialization, <strong>not built-in CDC</strong>. <a href="../guides/sources.html#analytics-and-object-storage">Research basis</a>.</p>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="../assets/spatiotemporal-hilbert-layout.svg" class="img-fluid figure-img"></p>
+<figcaption>DuckLake Fixed Hash Buckets, 24-Bit Hierarchical Hilbert Curve and Density-Adaptive Row Groups</figcaption>
+</figure>
+</div>
+<section id="choose-an-analytical-storage-format" class="level2">
+<h2 class="anchored" data-anchor-id="choose-an-analytical-storage-format">Choose an analytical storage format</h2>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Need</th>
+<th>Choice</th>
+<th>Cost or limit not to overlook</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Portable immutable extracts; simplest publication</td>
+<td>Parquet + application manifest</td>
+<td>You own refresh, schema evolution, deletes and manifest/reader retention.</td>
+</tr>
+<tr class="even">
+<td>Catalog snapshots, table DDL and multi-file lifecycle</td>
+<td>DuckLake + PostgreSQL catalog + pgvs3</td>
+<td>Catalog/object commits are separate; maintain files, snapshots and PostgreSQL.</td>
+</tr>
+<tr class="odd">
+<td>Experiment with native DuckDB small commits</td>
+<td><a href="../differential.html">Differential</a></td>
+<td>Local repository, external writer fencing and a retained large sync-WAL failure. Not the default.</td>
+</tr>
+<tr class="even">
+<td>Native format over SlateDB</td>
+<td><a href="../object-storage.html">ObjFS</a></td>
+<td>Extra memory, write/retention costs and SQL read-only clients that still PUT retention checkpoints. Not a standby endpoint client.</td>
+</tr>
+</tbody>
+</table>
+<p>Choose <a href="../operations.html#choosing-and-sizing-a-storage-role">native objects or origin-backed staging</a> independently of the file format. Object cache hits reduce remote I/O, not decoding, joins or aggregation. For repeated join-heavy queries, a local DuckDB materialization can help, but its refresh, extra storage, RSS and restart/recovery are separate costs; pgvs3 does not manage that accelerator.</p>
+<p>The locally qualified DuckLake workflow is <strong>one coordinated writer per dataset prefix/catalog and many readers</strong>. That is not an upstream single-writer limit: DuckLake’s PostgreSQL catalog supports multi-client concurrency with conflict handling. Concurrent-writer/failover policies need their own qualification; a shared bucket is neither a global writer lock nor a transaction coordinator.</p>
+</section>
+<section id="export-a-bounded-source-snapshot" class="level2">
+<h2 class="anchored" data-anchor-id="export-a-bounded-source-snapshot">Export a bounded source snapshot</h2>
+<p>Prerequisites: DuckDB <strong>2.0.0</strong>, <code>httpfs</code>/<code>postgres</code> extensions, the disposable <code>guide_app.orders</code> fixture and the quick-start gateway. Create a fresh native bucket with <code>curl -fsS -X PUT "$PGVS3_ENDPOINT/guide-analytics"</code>. Use a source read-only role in real deployments; the local credentials below are demo-only.</p>
+<p>In a new DuckDB session (the test substitutes only host/port/database):</p>
+<!-- verify:extract-setup -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>INSTALL httpfs; LOAD httpfs;</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>INSTALL postgres; LOAD postgres;</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> SECRET (<span class="kw">TYPE</span> s3, KEY_ID <span class="st">'test'</span>, SECRET <span class="st">'test'</span>, REGION <span class="st">'us-east-1'</span>,</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    ENDPOINT <span class="st">'127.0.0.1:8014'</span>, URL_STYLE <span class="st">'path'</span>, USE_SSL <span class="kw">false</span>);</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> SECRET (<span class="kw">TYPE</span> POSTGRES, HOST <span class="st">'127.0.0.1'</span>, PORT <span class="dv">5432</span>,</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">DATABASE</span> <span class="st">'pgvs3_bench'</span>, <span class="fu">USER</span> <span class="st">'postgres'</span>, <span class="kw">PASSWORD</span> <span class="st">'postgres'</span>);</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> threads <span class="op">=</span> <span class="dv">4</span>;</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> memory_limit <span class="op">=</span> <span class="st">'1GB'</span>;</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> pg_pool_max_connections <span class="op">=</span> <span class="dv">4</span>;</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> pg_statement_timeout_millis <span class="op">=</span> <span class="dv">30000</span>;</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>ATTACH <span class="st">''</span> <span class="kw">AS</span> <span class="kw">source</span> (<span class="kw">TYPE</span> postgres, READ_ONLY, <span class="kw">SCHEMA</span> <span class="st">'guide_app'</span>,</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">ISOLATION_LEVEL</span> <span class="st">'REPEATABLE READ'</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The bounded client settings illustrate syntax, not optimal throughput. Configure a local disk <code>temp_directory</code> and its capacity for larger-than-memory operators. The PostgreSQL scanner’s connections count separately from pgvs3’s pools. Use temporary DuckDB secrets or your deployment’s secret injection; do not put production passwords in URLs, SQL transcripts or persistent secret files.</p>
+<!-- verify:extract-copy -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> (</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> <span class="kw">id</span>, customer_id, created_at, amount_cents, payload</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> <span class="kw">source</span>.guide_app.orders</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">ORDER</span> <span class="kw">BY</span> <span class="kw">id</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>) <span class="kw">TO</span> <span class="st">'s3://guide-analytics/orders/snapshot-v1.parquet'</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE <span class="dv">122880</span>);</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Use a <strong>new immutable key per generation</strong>. <code>REPEATABLE READ</code> keeps source reads inside this extraction transaction consistent, but a long snapshot can retain old PostgreSQL tuples. Bound duration and refresh concurrency. Close/commit promptly; do not keep the source transaction open while dashboards query files. An S3 publication is not rolled back by a later DuckDB/source transaction error. Failed exports can leave unpublished files: retain them for investigation, then clean them only after the reader/publication safety window.</p>
+</section>
+<section id="validate-then-publish-discovery" class="level2">
+<h2 class="anchored" data-anchor-id="validate-then-publish-discovery">Validate, then publish discovery</h2>
+<p>In a fresh DuckDB client pointing at gateway B/the read service, run:</p>
+<!-- verify:extract-check -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> <span class="kw">rows</span>, <span class="fu">sum</span>(<span class="kw">id</span>) <span class="kw">AS</span> id_sum, <span class="fu">sum</span>(amount_cents) <span class="kw">AS</span> cents</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> read_parquet(<span class="st">'s3://guide-analytics/orders/snapshot-v1.parquet'</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><strong>Expected:</strong> <code>1000000 | 499999500000 | 4999500000</code>. Also validate schema, business invariants and projected string columns; a metadata-only <code>count(*)</code> is not proof that every data page is readable. The guide test hashes the transferred body and checks the payload length sum (<code>32000000</code>) with client caches disabled.</p>
+<p>Only after validation, publish a small discovery object. This example is for a <strong>native</strong> pgvs3 bucket and creates the pointer only if absent:</p>
+<!-- verify:extract-manifest -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-fsS</span> <span class="at">-X</span> PUT <span class="st">"</span><span class="va">$PGVS3_ENDPOINT</span><span class="st">/guide-analytics/current.json"</span> <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">'Content-Type: application/json'</span> <span class="at">-H</span> <span class="st">'If-None-Match: *'</span> <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-binary</span> <span class="st">'{"generation":"v1","files":["orders/snapshot-v1.parquet"],"rows":1000000,"id_sum":499999500000}'</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><strong>Expected:</strong> <code>200</code>; another create returns <code>412</code>, not a silent overwrite. Readers read one manifest generation and pin its listed keys for the query. Advance a pointer with the previous <strong>quoted ETag</strong> in <code>If-Match</code>; on <code>412</code>, reread and reconcile instead of blindly retrying. Never remove files used by retained manifests or active readers. A production manifest should also record schema version, source snapshot/window, completion time, integrity checks and freshness.</p>
+<p>Objects and pointer are separate publications, not a multi-key transaction. With an origin-backed bucket, a new object can still be pending in PostgreSQL when a synchronous pointer reaches the origin. Do <strong>not</strong> expose that pointer to origin-only readers until all referenced bodies are verified at the origin. Monitor outbox drain or use synchronous staging for that delivery contract.</p>
+</section>
+<section id="freshness-is-a-pipeline-not-one-ttl" class="level2">
+<h2 class="anchored" data-anchor-id="freshness-is-a-pipeline-not-one-ttl">Freshness is a pipeline, not one TTL</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Stage</th>
+<th>Record</th>
+<th>Failure policy</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Source extraction</td>
+<td>Snapshot/window and source version/watermark</td>
+<td>Fail the generation, retain previous known-good manifest.</td>
+</tr>
+<tr class="even">
+<td>Publication</td>
+<td>Validated file set and pointer generation</td>
+<td>Reconcile ambiguous PUTs by key/validator; never advertise partial data.</td>
+</tr>
+<tr class="odd">
+<td>Origin staging</td>
+<td>Pending bytes/oldest age, remote validation</td>
+<td>Alert on drain lag; preserve PostgreSQL-only bodies.</td>
+</tr>
+<tr class="even">
+<td>Query serving</td>
+<td>Manifest/catalog generation, replica lag, result-cache age if any</td>
+<td>Reject too-old data or explicitly serve labeled stale data; do not silently query OLTP on every miss.</td>
+</tr>
+</tbody>
+</table>
+<p>These delays can stack. A five-minute refresh plus cache/result TTL and replica lag is not a five-minute freshness guarantee. A failed refresh has no finite bound unless you detect it and enforce a maximum served age. Test updates, deletes, late commits, clock skew and schema changes before incremental refresh. <code>max(id)</code> or <code>max(updated_at)</code> alone can miss late-committing rows; overlap alone does not solve deletes. For continuous source mutations use a separately operated CDC pipeline with replica identity, keys, deduplication, deletes and slot/WAL retention designed explicitly. pgvs3 supplies none of that automatically.</p>
+</section>
+<section id="ducklake-tune-a-candidate-and-inspect-it" class="level2">
+<h2 class="anchored" data-anchor-id="ducklake-tune-a-candidate-and-inspect-it">DuckLake: tune a candidate and inspect it</h2>
+<p>In a <strong>separate</strong> DuckDB session, create the same temporary S3 secret first. This uses the quick-start <code>ducklake_catalog</code> database, not the application one. The following is a <strong>syntax-validated candidate</strong>, not a measured winning preset:</p>
+<!-- verify:lake-options -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>INSTALL ducklake; INSTALL postgres; LOAD ducklake; LOAD postgres;</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> SECRET (<span class="kw">TYPE</span> POSTGRES, HOST <span class="st">'127.0.0.1'</span>, PORT <span class="dv">5432</span>,</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">DATABASE</span> <span class="st">'ducklake_catalog'</span>, <span class="fu">USER</span> <span class="st">'postgres'</span>, <span class="kw">PASSWORD</span> <span class="st">'postgres'</span>);</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>ATTACH <span class="st">'ducklake:postgres:'</span> <span class="kw">AS</span> lake</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    (DATA_PATH <span class="st">'s3://guide-analytics/ducklake/'</span>, METADATA_SCHEMA <span class="st">'guide_lake'</span>);</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> lake.set_option(<span class="st">'parquet_compression'</span>, <span class="st">'zstd'</span>);</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> lake.set_option(<span class="st">'parquet_row_group_size'</span>, <span class="dv">122880</span>);</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> lake.set_option(<span class="st">'target_file_size'</span>, <span class="st">'256MB'</span>);</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> lake.set_option(<span class="st">'data_inlining_row_limit'</span>, <span class="dv">10</span>);</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> lake.orders <span class="kw">AS</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> read_parquet(<span class="st">'s3://guide-analytics/orders/snapshot-v1.parquet'</span>);</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> lake.options();</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Compare projected full scans <strong>and</strong> selective filters at 10/100/1,024 MiB with <code>just bench tuning</code>. Row groups are rows, file targets are bytes; neither is a hard exact physical file size. Larger groups improve scan/compression efficiency; smaller ones can improve pruning but cost metadata/requests. Sorting by useful filters matters more than blindly choosing 8,192-row groups. DuckDB 2.0 Parquet uses async I/O: inspect <code>async_threads</code>, read-ahead and HTTP pool capacity as well as execution <code>threads</code>; keep aggregate client pressure within gateway admission.</p>
+<p>Inlining is another choice, not an invisible benchmark advantage:</p>
+<!-- verify:lake-inlining -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> lake.inline_probe (i <span class="dt">INTEGER</span>);</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> lake.inline_probe <span class="kw">VALUES</span> (<span class="dv">42</span>);</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> lake.inline_probe;</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> ducklake_flush_inlined_data(<span class="st">'lake'</span>, table_name <span class="op">=&gt;</span> <span class="st">'inline_probe'</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><strong>Expected:</strong> <code>42</code> before and after flushing. The tiny insert initially lives in the catalog, not an object; flushing creates a Parquet file. Benchmark pure object writes with inlining disabled and label that choice. Retain it when it helps your actual small-commit workload. Persistent <code>set_option</code> settings affect future writes; undo by restoring the saved scoped values, not merely <code>RESET</code>ting an unrelated session option.</p>
+</section>
+<section id="schema-wide-column-spatiotemporal-and-write-for-read-modeling" class="level2">
+<h2 class="anchored" data-anchor-id="schema-wide-column-spatiotemporal-and-write-for-read-modeling">Schema, wide-column, spatiotemporal and write-for-read modeling</h2>
+<p>When scaling DuckLake and Parquet on pgvs3 to <strong>billion-row collections</strong>, <strong>wide columns</strong>, <strong>spatiotemporal relations</strong>, or <strong>batch-write / fast-read</strong> workloads, physical layout determines whether queries scan kilobytes or terabytes.</p>
+<section id="schema-and-type-discipline" class="level3">
+<h3 class="anchored" data-anchor-id="schema-and-type-discipline">1. Schema and type discipline</h3>
+<ul>
+<li><strong>Use the narrowest native types (<code>BIGINT</code>, <code>INTEGER</code>, <code>SMALLINT</code>, <code>TIMESTAMPTZ</code>, <code>DOUBLE</code>):</strong> Never store numeric IDs or timestamps as <code>VARCHAR</code>. DuckDB bitpacks integers on disk, but in-memory execution vectors, hash tables and sort buffers allocate according to the declared SQL type. Narrow types cut RAM, spill I/O and join CPU.</li>
+<li><strong>Prefer ordered integers, timestamps or <code>UUIDv7</code> over random <code>UUIDv4</code>:</strong> DuckDB and DuckLake rely on file- and row-group-level <strong>zone maps</strong> (<code>min</code>/<code>max</code> bounds). Random <code>UUIDv4</code> values span <code>[0000…, ffff…]</code> in every row group, making zone-map pruning useless. Monotonic integers or timestamps (or <code>UUIDv7</code> paired with a timestamp filter) keep row-group bounds disjoint.</li>
+<li><strong>Encode low-cardinality strings as <code>ENUM</code> or integer-keyed dimension tables:</strong> Parquet dictionary-encodes strings on disk, but repeated joins and <code>GROUP BY</code> on integer keys execute faster and use less hash memory.</li>
+<li><strong>Omit <code>PRIMARY KEY</code> / <code>UNIQUE</code> constraints on analytical tables:</strong> In native DuckDB tables, constraints build ART indexes that slow bulk loads by 2–4×, consume non-evictable buffer memory, and are not used by joins or aggregations. Enforce uniqueness in the OLTP source or batch deduplication step instead.</li>
+</ul>
+</section>
+<section id="billion-row-collections-with-wide-columns" class="level3">
+<h3 class="anchored" data-anchor-id="billion-row-collections-with-wide-columns">2. Billion-row collections with wide columns</h3>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Bottleneck on wide tables</th>
+<th>Mechanism</th>
+<th>Concrete fix</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Row-group memory explosion</strong></td>
+<td><code>parquet_row_group_size</code> defaults to <code>122880</code> <em>rows</em>. At 8 KiB/row across wide columns, one row group is ~960 MiB uncompressed in writer RAM.</td>
+<td>Set <code>parquet_row_group_size_bytes</code> (e.g.&nbsp;<code>'32MB'</code> to <code>'128MB'</code>) or reduce <code>parquet_row_group_size</code> (e.g.&nbsp;<code>16384</code>–<code>32768</code>) on wide tables.</td>
+</tr>
+<tr class="even">
+<td><strong>PostgreSQL catalog bloat</strong></td>
+<td>DuckLake records per-file, per-column <code>min</code>/<code>max</code> stats in <code>ducklake_file_column_stats</code>. Hundreds of wide <code>VARCHAR</code>/JSON/blob columns across thousands of files bloat the catalog.</td>
+<td>Call <code>lake.set_option('skip_stats_columns', ['wide_col', ...], table_name =&gt; '...')</code> so min/max bounds are only stored for filter/join columns.</td>
+</tr>
+<tr class="odd">
+<td><strong>Unnecessary byte transfers</strong></td>
+<td><code>SELECT *</code> fetches and decompresses every column chunk in matching row groups.</td>
+<td>Project only required columns. For top-K or selective lookups needing wide payloads, filter/rank on narrow keys first, then join back by key (<strong>late materialization</strong>).</td>
+</tr>
+<tr class="even">
+<td><strong>Compaction rewrite cost</strong></td>
+<td>Updating or compacting a table rewrites wide blobs alongside narrow metrics.</td>
+<td>Split immutable multi-KiB/MiB blobs into a companion table (joined by <code>id</code>) or store large blobs as direct pgvs3 objects referenced by key/ETag.</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="fixed-3264-partitioning-hash-buckets-hilbert-curves-over-time-growing-ddl" class="level3">
+<h3 class="anchored" data-anchor-id="fixed-3264-partitioning-hash-buckets-hilbert-curves-over-time-growing-ddl">3. Fixed 32–64 partitioning (hash buckets &amp; Hilbert curves) over time-growing DDL</h3>
+<p>Time-growing partitions (<code>year</code>/<code>month</code>/<code>day</code>) add operational friction: partition counts grow without bound over multi-year histories, backfills across years scatter thousands of small files, and PostgreSQL OLTP tables need cron jobs to pre-create future partitions. For most collections, <strong>32 to 64 fixed partitions</strong> paired with <code>SORTED BY</code> handle two to three orders of magnitude of growth (e.g., 10 MiB to 10 GiB per partition, or 640 MiB to 640 GiB total) with <strong>zero ongoing partition maintenance</strong>:</p>
+<ul>
+<li><p><strong>How a fixed partition count scales across orders of magnitude:</strong> When a fixed partition is small (e.g., 10 MiB), <code>ducklake_merge_adjacent_files</code> compacts it into <strong>one</strong> sorted Parquet file. When the table grows 100× (e.g., 1 GiB per partition), DuckLake automatically splits that partition into multiple sorted <code>target_file_size</code> (<code>256MB</code>–<code>512MB</code>) files with non-overlapping <code>min</code>/<code>max</code> zone maps on the <code>SORTED BY</code> keys. You get file-level and row-group-level pruning on time and space without ever adding new partition keys.</p></li>
+<li><p><strong>Strategy A — Fixed 32–64 Hash Buckets (<code>bucket(32, id)</code> + <code>SORTED BY (ts, id)</code>):</strong> Use when queries filter by <code>tenant_id</code>, <code>customer_id</code>, <code>device_id</code> or <code>id</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> lake.events_by_customer (</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    customer_id <span class="dt">INTEGER</span>, <span class="kw">id</span> BIGINT, ts TIMESTAMPTZ, amount_cents <span class="dt">INTEGER</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>PARTITIONED <span class="kw">BY</span> (bucket(<span class="dv">32</span>, customer_id))</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>SORTED <span class="kw">BY</span> (ts, <span class="kw">id</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>DuckLake hashes <code>customer_id</code> into 32 fixed Murmur3 buckets (<code>0..31</code>). Equality and <code>IN</code> filters on <code>customer_id</code> prune 31/32 of the partitions immediately, and <code>SORTED BY (ts, id)</code> prunes files and row groups by time <em>within</em> each bucket.</p></li>
+<li><p><strong>Strategy B — High-Resolution 2D Hilbert / Morton <code>SORTED BY (curve_id, ts)</code> (Density-Adaptive Spatial Pruning):</strong> What happens when spatial density is heavily skewed (e.g., 90% of points in NYC/Tokyo and 10% across oceans/rural areas)?</p>
+<ul>
+<li><strong>The equal-area partition trap:</strong> If you partition by 64 <em>equal-area</em> coarse grid cells (<code>PARTITIONED BY (coarse_cell)</code>), 1 urban partition gets 90% of all bytes while 50 sparse partitions create tiny <code>&lt;1 MiB</code> files on every insert. And if your spatial key is too coarse (e.g.&nbsp;<span class="math inline">\(64 \times 64\)</span>), millions of urban rows share the exact same cell ID and cannot prune inside the city.</li>
+<li><strong>Why high-resolution <code>SORTED BY (curve_id, ts)</code> is automatically density-adaptive:</strong> Map coordinates to a <strong>high-resolution</strong> 1D space-filling integer—such as a 32-bit or 64-bit Hilbert or Morton (<code>Z-order</code>) key across a <span class="math inline">\(65,536 \times 65,536\)</span> (<span class="math inline">\(4.3 \times 10^9\)</span>-cell) grid—and use <code>SORTED BY (curve_id, ts)</code> <strong>without</strong> equal-area spatial <code>PARTITIONED BY</code>. Because Parquet row groups (<code>122,880</code> rows or <code>parquet_row_group_size_bytes</code>) and DuckLake files (<code>target_file_size = '256MB'</code>) slice the sorted stream by <strong>row/byte count (empirical quantiles)</strong> rather than geographic area:
+<ul>
+<li>Sparse rural/ocean regions automatically pack into <strong>one</strong> row group/file (zero tiny-file waste).</li>
+<li>Dense urban hotspots automatically split into <strong>many</strong> row groups and files, each covering a tiny neighborhood with razor-sharp <code>min(lat)..max(lat)</code> and <code>min(lon)..max(lon)</code> zone maps!</li>
+</ul></li>
+<li><strong>When you also want 32–64 fixed <code>PARTITIONED BY</code> buckets on skewed spatial data:</strong> Either partition by an orthogonal entity key (<code>PARTITIONED BY (bucket(32, tenant_id))</code>
+<ul>
+<li><code>SORTED BY (curve_id, ts)</code>), or partition <code>curve_id</code> by <strong>empirical quantiles</strong> (31 or 63 cutpoints from <code>quantile_disc(curve_id, ...)</code>) so every bucket holds <span class="math inline">\(\approx 1/32\)</span> or <span class="math inline">\(1/64\)</span> of the rows.</li>
+</ul></li>
+</ul></li>
+<li><p><strong>When to still use time partitions (<code>epoch_day</code> / <code>epoch_month</code>):</strong> Only when your dominant operation is dropping whole expired time windows by partition or strictly isolating each day’s ingest files from older history.</p></li>
+</ul>
+</section>
+<section id="trade-slowbatch-transactions-for-maximum-query-performance" class="level3">
+<h3 class="anchored" data-anchor-id="trade-slowbatch-transactions-for-maximum-query-performance">4. Trade slow/batch transactions for maximum query performance</h3>
+<p>When you can batch writes (minutes/hours) to maximize read speed:</p>
+<ol type="1">
+<li><strong>Ingest in batches and sort + compress heavily:</strong> Accumulate batches rather than committing tiny files. Either insert pre-sorted batches (<code>SORTED BY (...)</code> with <code>parquet_compression = 'zstd'</code> and <code>parquet_compression_level = 9</code> to <code>19</code>), or set <code>sort_on_insert = false</code> during fast micro-batch ingest and let the batch compaction step sort the merged output.</li>
+<li><strong>Compact and rewrite before serving:</strong> Run <code>ducklake_flush_inlined_data</code>, <code>ducklake_merge_adjacent_files</code> (which merges small files into sorted <code>target_file_size</code> Parquet files without losing snapshot history), and <code>ducklake_rewrite_data_files</code> with a low <code>delete_threshold</code> so readers pay <strong>zero</strong> merge-on-read positional-delete overhead.</li>
+<li><strong>Pre-compute rollups or seal a native database when joins dominate:</strong> Parquet lacks DuckDB’s internal HyperLogLog cardinality statistics. For complex multi-table joins, either materialize batch rollup/denormalized tables in DuckLake, or build a read-mostly native DuckDB database on <a href="../object-storage-results.html">ObjFS</a> and <strong>cleanly close the writer</strong> (<code>CHECKPOINT</code> + <code>writer.close()</code>), which flushes SlateDB memtables and cut 1 GiB fresh selective reads <strong>6×</strong> (313 ms → 52.6 ms) and full scans <strong>2.2×</strong> (1,026 ms → 476 ms) in our benchmark.</li>
+</ol>
+<p>Run this executable skewed-hotspot 24-bit hierarchical Hilbert sort + fixed-32 hash + wide-column + batch-compaction recipe in the same DuckLake session:</p>
+<!-- verify:lake-spatiotemporal -->
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode sql code-with-copy"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> MACRO lake.hilbert64(rx, ry) <span class="kw">AS</span> (</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    list_extract([</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>         <span class="dv">0</span>,  <span class="dv">1</span>, <span class="dv">14</span>, <span class="dv">15</span>, <span class="dv">16</span>, <span class="dv">19</span>, <span class="dv">20</span>, <span class="dv">21</span>,</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>         <span class="dv">3</span>,  <span class="dv">2</span>, <span class="dv">13</span>, <span class="dv">12</span>, <span class="dv">17</span>, <span class="dv">18</span>, <span class="dv">23</span>, <span class="dv">22</span>,</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>         <span class="dv">4</span>,  <span class="dv">7</span>,  <span class="dv">8</span>, <span class="dv">11</span>, <span class="dv">30</span>, <span class="dv">29</span>, <span class="dv">24</span>, <span class="dv">25</span>,</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>         <span class="dv">5</span>,  <span class="dv">6</span>,  <span class="dv">9</span>, <span class="dv">10</span>, <span class="dv">31</span>, <span class="dv">28</span>, <span class="dv">27</span>, <span class="dv">26</span>,</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        <span class="dv">58</span>, <span class="dv">57</span>, <span class="dv">54</span>, <span class="dv">53</span>, <span class="dv">32</span>, <span class="dv">35</span>, <span class="dv">36</span>, <span class="dv">37</span>,</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        <span class="dv">59</span>, <span class="dv">56</span>, <span class="dv">55</span>, <span class="dv">52</span>, <span class="dv">33</span>, <span class="dv">34</span>, <span class="dv">39</span>, <span class="dv">38</span>,</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>        <span class="dv">60</span>, <span class="dv">61</span>, <span class="dv">50</span>, <span class="dv">51</span>, <span class="dv">46</span>, <span class="dv">45</span>, <span class="dv">40</span>, <span class="dv">41</span>,</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>        <span class="dv">63</span>, <span class="dv">62</span>, <span class="dv">49</span>, <span class="dv">48</span>, <span class="dv">47</span>, <span class="dv">44</span>, <span class="dv">43</span>, <span class="dv">42</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    ], ((rx:<span class="ch">:INTEGER</span> &amp; <span class="dv">7</span>) <span class="op">*</span> <span class="dv">8</span> <span class="op">+</span> (ry:<span class="ch">:INTEGER</span> &amp; <span class="dv">7</span>)) <span class="op">+</span> <span class="dv">1</span>):<span class="ch">:BIGINT</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> lake.spatiotemporal (</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> BIGINT,</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    customer_id <span class="dt">INTEGER</span>,</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    ts TIMESTAMPTZ,</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    lat <span class="dt">DOUBLE</span>,</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>    lon <span class="dt">DOUBLE</span>,</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    hilbert_id BIGINT,</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    wide_payload <span class="dt">VARCHAR</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>SORTED <span class="kw">BY</span> (hilbert_id, ts);</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> lake.set_option(<span class="st">'skip_stats_columns'</span>, [<span class="st">'wide_payload'</span>], table_name <span class="op">=&gt;</span> <span class="st">'spatiotemporal'</span>);</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> lake.set_option(<span class="st">'parquet_row_group_size_bytes'</span>, <span class="st">'1MB'</span>, table_name <span class="op">=&gt;</span> <span class="st">'spatiotemporal'</span>);</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> lake.set_option(<span class="st">'parquet_compression'</span>, <span class="st">'zstd'</span>, table_name <span class="op">=&gt;</span> <span class="st">'spatiotemporal'</span>);</span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> lake.set_option(<span class="st">'parquet_compression_level'</span>, <span class="dv">9</span>, table_name <span class="op">=&gt;</span> <span class="st">'spatiotemporal'</span>);</span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> lake.spatiotemporal</span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> grid <span class="kw">AS</span> (</span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> i <span class="kw">AS</span> <span class="kw">id</span>, (i % <span class="dv">500</span>):<span class="ch">:INTEGER</span> <span class="kw">AS</span> customer_id,</span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>           TIMESTAMPTZ <span class="st">'2026-10-01 00:00:00+00'</span> <span class="op">+</span> i <span class="op">*</span> <span class="dt">INTERVAL</span> <span class="st">'1 minute'</span> <span class="kw">AS</span> ts,</span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>           <span class="cf">CASE</span> <span class="cf">WHEN</span> i % <span class="dv">10</span> <span class="op">&lt;</span> <span class="dv">9</span> <span class="cf">THEN</span> <span class="fl">40.70</span> <span class="op">+</span> (i % <span class="dv">1000</span>) <span class="op">*</span> <span class="fl">0.0001</span> <span class="cf">ELSE</span> <span class="fl">25.0</span> <span class="op">+</span> (i % <span class="dv">10000</span>) <span class="op">*</span> <span class="fl">0.0025</span> <span class="cf">END</span> <span class="kw">AS</span> lat,</span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>           <span class="cf">CASE</span> <span class="cf">WHEN</span> i % <span class="dv">10</span> <span class="op">&lt;</span> <span class="dv">9</span> <span class="cf">THEN</span> <span class="op">-</span><span class="fl">74.02</span> <span class="op">+</span> ((i <span class="op">//</span> <span class="dv">1000</span>) % <span class="dv">100</span>) <span class="op">*</span> <span class="fl">0.0001</span> <span class="cf">ELSE</span> <span class="op">-</span><span class="fl">125.0</span> <span class="op">+</span> ((i <span class="op">//</span> <span class="dv">1000</span>) % <span class="dv">100</span>) <span class="op">*</span> <span class="fl">0.055</span> <span class="cf">END</span> <span class="kw">AS</span> lon,</span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>           repeat(md5(i:<span class="ch">:VARCHAR</span>), <span class="dv">8</span>) <span class="kw">AS</span> wide_payload</span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> <span class="kw">range</span>(<span class="dv">20000</span>) <span class="kw">AS</span> t(i)</span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>),</span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>quantized <span class="kw">AS</span> (</span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> <span class="op">*</span>,</span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>           ((lat <span class="op">-</span> <span class="fl">25.0</span>) <span class="op">/</span> <span class="fl">25.0</span> <span class="op">*</span> <span class="dv">4095</span>):<span class="ch">:INTEGER</span> <span class="kw">AS</span> gx,</span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>           ((lon <span class="op">+</span> <span class="fl">125.0</span>) <span class="op">/</span> <span class="fl">55.0</span> <span class="op">*</span> <span class="dv">4095</span>):<span class="ch">:INTEGER</span> <span class="kw">AS</span> gy</span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> grid</span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">id</span>, customer_id, ts, lat, lon,</span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>       (lake.hilbert64(gx <span class="op">&gt;&gt;</span> <span class="dv">9</span>, gy <span class="op">&gt;&gt;</span> <span class="dv">9</span>) <span class="op">&lt;&lt;</span> <span class="dv">18</span>)</span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>       | (lake.hilbert64(gx <span class="op">&gt;&gt;</span> <span class="dv">6</span>, gy <span class="op">&gt;&gt;</span> <span class="dv">6</span>) <span class="op">&lt;&lt;</span> <span class="dv">12</span>)</span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>       | (lake.hilbert64(gx <span class="op">&gt;&gt;</span> <span class="dv">3</span>, gy <span class="op">&gt;&gt;</span> <span class="dv">3</span>) <span class="op">&lt;&lt;</span> <span class="dv">6</span>)</span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>       | lake.hilbert64(gx, gy) <span class="kw">AS</span> hilbert_id,</span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>       wide_payload</span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> quantized;</span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> lake.spatiotemporal</span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> grid <span class="kw">AS</span> (</span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> i <span class="op">+</span> <span class="dv">20000</span> <span class="kw">AS</span> <span class="kw">id</span>, (i % <span class="dv">500</span>):<span class="ch">:INTEGER</span> <span class="kw">AS</span> customer_id,</span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a>           TIMESTAMPTZ <span class="st">'2027-03-01 00:00:00+00'</span> <span class="op">+</span> i <span class="op">*</span> <span class="dt">INTERVAL</span> <span class="st">'1 minute'</span> <span class="kw">AS</span> ts,</span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>           <span class="cf">CASE</span> <span class="cf">WHEN</span> i % <span class="dv">10</span> <span class="op">&lt;</span> <span class="dv">9</span> <span class="cf">THEN</span> <span class="fl">40.70</span> <span class="op">+</span> (i % <span class="dv">1000</span>) <span class="op">*</span> <span class="fl">0.0001</span> <span class="cf">ELSE</span> <span class="fl">25.0</span> <span class="op">+</span> (i % <span class="dv">10000</span>) <span class="op">*</span> <span class="fl">0.0025</span> <span class="cf">END</span> <span class="kw">AS</span> lat,</span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>           <span class="cf">CASE</span> <span class="cf">WHEN</span> i % <span class="dv">10</span> <span class="op">&lt;</span> <span class="dv">9</span> <span class="cf">THEN</span> <span class="op">-</span><span class="fl">74.02</span> <span class="op">+</span> ((i <span class="op">//</span> <span class="dv">1000</span>) % <span class="dv">100</span>) <span class="op">*</span> <span class="fl">0.0001</span> <span class="cf">ELSE</span> <span class="op">-</span><span class="fl">125.0</span> <span class="op">+</span> ((i <span class="op">//</span> <span class="dv">1000</span>) % <span class="dv">100</span>) <span class="op">*</span> <span class="fl">0.055</span> <span class="cf">END</span> <span class="kw">AS</span> lon,</span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>           repeat(md5((i <span class="op">+</span> <span class="dv">20000</span>):<span class="ch">:VARCHAR</span>), <span class="dv">8</span>) <span class="kw">AS</span> wide_payload</span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> <span class="kw">range</span>(<span class="dv">20000</span>) <span class="kw">AS</span> t(i)</span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>),</span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a>quantized <span class="kw">AS</span> (</span>
+<span id="cb8-63"><a href="#cb8-63" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> <span class="op">*</span>,</span>
+<span id="cb8-64"><a href="#cb8-64" aria-hidden="true" tabindex="-1"></a>           ((lat <span class="op">-</span> <span class="fl">25.0</span>) <span class="op">/</span> <span class="fl">25.0</span> <span class="op">*</span> <span class="dv">4095</span>):<span class="ch">:INTEGER</span> <span class="kw">AS</span> gx,</span>
+<span id="cb8-65"><a href="#cb8-65" aria-hidden="true" tabindex="-1"></a>           ((lon <span class="op">+</span> <span class="fl">125.0</span>) <span class="op">/</span> <span class="fl">55.0</span> <span class="op">*</span> <span class="dv">4095</span>):<span class="ch">:INTEGER</span> <span class="kw">AS</span> gy</span>
+<span id="cb8-66"><a href="#cb8-66" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> grid</span>
+<span id="cb8-67"><a href="#cb8-67" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb8-68"><a href="#cb8-68" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">id</span>, customer_id, ts, lat, lon,</span>
+<span id="cb8-69"><a href="#cb8-69" aria-hidden="true" tabindex="-1"></a>       (lake.hilbert64(gx <span class="op">&gt;&gt;</span> <span class="dv">9</span>, gy <span class="op">&gt;&gt;</span> <span class="dv">9</span>) <span class="op">&lt;&lt;</span> <span class="dv">18</span>)</span>
+<span id="cb8-70"><a href="#cb8-70" aria-hidden="true" tabindex="-1"></a>       | (lake.hilbert64(gx <span class="op">&gt;&gt;</span> <span class="dv">6</span>, gy <span class="op">&gt;&gt;</span> <span class="dv">6</span>) <span class="op">&lt;&lt;</span> <span class="dv">12</span>)</span>
+<span id="cb8-71"><a href="#cb8-71" aria-hidden="true" tabindex="-1"></a>       | (lake.hilbert64(gx <span class="op">&gt;&gt;</span> <span class="dv">3</span>, gy <span class="op">&gt;&gt;</span> <span class="dv">3</span>) <span class="op">&lt;&lt;</span> <span class="dv">6</span>)</span>
+<span id="cb8-72"><a href="#cb8-72" aria-hidden="true" tabindex="-1"></a>       | lake.hilbert64(gx, gy) <span class="kw">AS</span> hilbert_id,</span>
+<span id="cb8-73"><a href="#cb8-73" aria-hidden="true" tabindex="-1"></a>       wide_payload</span>
+<span id="cb8-74"><a href="#cb8-74" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> quantized;</span>
+<span id="cb8-75"><a href="#cb8-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-76"><a href="#cb8-76" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> ducklake_merge_adjacent_files(<span class="st">'lake'</span>, <span class="st">'spatiotemporal'</span>);</span>
+<span id="cb8-77"><a href="#cb8-77" aria-hidden="true" tabindex="-1"></a><span class="kw">DELETE</span> <span class="kw">FROM</span> lake.spatiotemporal <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">&lt;</span> <span class="dv">4000</span>;</span>
+<span id="cb8-78"><a href="#cb8-78" aria-hidden="true" tabindex="-1"></a><span class="kw">CALL</span> ducklake_rewrite_data_files(<span class="st">'lake'</span>, <span class="st">'spatiotemporal'</span>, delete_threshold <span class="op">=&gt;</span> <span class="fl">0.05</span>);</span>
+<span id="cb8-79"><a href="#cb8-79" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-80"><a href="#cb8-80" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> lake.events_hash32 (</span>
+<span id="cb8-81"><a href="#cb8-81" aria-hidden="true" tabindex="-1"></a>    customer_id <span class="dt">INTEGER</span>, <span class="kw">id</span> BIGINT, ts TIMESTAMPTZ</span>
+<span id="cb8-82"><a href="#cb8-82" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb8-83"><a href="#cb8-83" aria-hidden="true" tabindex="-1"></a>PARTITIONED <span class="kw">BY</span> (bucket(<span class="dv">32</span>, customer_id))</span>
+<span id="cb8-84"><a href="#cb8-84" aria-hidden="true" tabindex="-1"></a>SORTED <span class="kw">BY</span> (ts, <span class="kw">id</span>);</span>
+<span id="cb8-85"><a href="#cb8-85" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-86"><a href="#cb8-86" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> lake.events_hash32</span>
+<span id="cb8-87"><a href="#cb8-87" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> customer_id, <span class="kw">id</span>, ts <span class="kw">FROM</span> lake.spatiotemporal;</span>
+<span id="cb8-88"><a href="#cb8-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-89"><a href="#cb8-89" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> matched <span class="kw">AS</span> (</span>
+<span id="cb8-90"><a href="#cb8-90" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> <span class="kw">id</span>, hilbert_id</span>
+<span id="cb8-91"><a href="#cb8-91" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> lake.spatiotemporal</span>
+<span id="cb8-92"><a href="#cb8-92" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> (hilbert_id <span class="op">&gt;&gt;</span> <span class="dv">18</span>) <span class="op">=</span> lake.hilbert64(<span class="dv">5</span>, <span class="dv">7</span>)</span>
+<span id="cb8-93"><a href="#cb8-93" aria-hidden="true" tabindex="-1"></a>      <span class="kw">AND</span> lat <span class="kw">BETWEEN</span> <span class="fl">40.7100</span> <span class="kw">AND</span> <span class="fl">40.7199</span></span>
+<span id="cb8-94"><a href="#cb8-94" aria-hidden="true" tabindex="-1"></a>      <span class="kw">AND</span> lon <span class="kw">BETWEEN</span> <span class="op">-</span><span class="fl">74.0200</span> <span class="kw">AND</span> <span class="op">-</span><span class="fl">74.0100</span></span>
+<span id="cb8-95"><a href="#cb8-95" aria-hidden="true" tabindex="-1"></a>      <span class="kw">AND</span> ts <span class="op">&gt;=</span> TIMESTAMPTZ <span class="st">'2026-10-01 00:00:00+00'</span></span>
+<span id="cb8-96"><a href="#cb8-96" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb8-97"><a href="#cb8-97" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> <span class="kw">rows</span>,</span>
+<span id="cb8-98"><a href="#cb8-98" aria-hidden="true" tabindex="-1"></a>       <span class="fu">max</span>(<span class="fu">length</span>(s.wide_payload)) <span class="kw">AS</span> payload_bytes,</span>
+<span id="cb8-99"><a href="#cb8-99" aria-hidden="true" tabindex="-1"></a>       (<span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> lake.events_hash32 <span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">42</span>) <span class="kw">AS</span> customer_rows</span>
+<span id="cb8-100"><a href="#cb8-100" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> matched <span class="kw">AS</span> m</span>
+<span id="cb8-101"><a href="#cb8-101" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> lake.spatiotemporal <span class="kw">AS</span> s <span class="kw">USING</span> (<span class="kw">id</span>);</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><strong>Expected:</strong> <code>3240 | 256 | 72</code>. Even though 90% of the 40,000 rows are concentrated inside a tiny <code>0.10° × 0.01°</code> NYC hotspot across <code>2026</code> and <code>2027</code>, sorting by the 24-bit hierarchical <code>hilbert_id</code> (4 levels of <code>lake.hilbert64</code> across a <span class="math inline">\(4,096 \times 4,096 = 16.7\text{M}\)</span>-cell grid) subdivides the dense hotspot into tight 1 MB row groups without creating empty ocean files, merges the two batches into one sorted ZSTD file, rewrites the deleted slice, suppresses <code>min_value</code>/<code>max_value</code> catalog stats on <code>wide_payload</code>, and verifies the 32-bucket hash table (<code>72</code> rows).</p>
+<p>DuckLake maintenance (merge/rewrite, expire snapshots, clean old/orphan files), pgvs3 reaping and PostgreSQL vacuum are <strong>three distinct stages</strong>. <code>DROP TABLE</code> is not remote space reclamation. Use the installed extension’s maintenance reference and a retention window longer than active readers/writers and recovery needs; zero-age cleanup examples from benchmarks are not a production policy. Coordinate catalog, data database and any external origin backups.</p>
+</section>
+</section>
+<section id="verification-and-cleanup" class="level2">
+<h2 class="anchored" data-anchor-id="verification-and-cleanup">Verification and cleanup</h2>
+<p><code>just guides</code> executes these snippets, reopens the catalog through another gateway, demonstrates inlining/flush and proves a later source change does not update the existing extract. <a href="../guides/validation.html">Recorded scope</a>. For tuning acceptance use the <a href="../benchmarks.html#paired-acceptance">paired runner</a>, not these functional timings. Keep the demo data for jobs, then use <a href="../guides/observe-recover.html#safe-demo-cleanup">owned-data cleanup</a>.</p>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/adonm\.github\.io\/pgvs3");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="../guides/postgres.html" class="pagination-link" aria-label="1. Protect OLTP &amp; Partitioning">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text">1. Protect OLTP &amp; Partitioning</span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="../guides/cache.html" class="pagination-link" aria-label="3. Shared Cache &amp; Write-Back Staging">
+        <span class="nav-page-text">3. Shared Cache &amp; Write-Back Staging</span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+<footer class="footer"><div class="nav-footer"><div class="nav-footer-center"><div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/guides/analytics.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div></div></footer><script src="../site_libs/quarto-html/zenscroll-min.js"></script>
+</body></html>

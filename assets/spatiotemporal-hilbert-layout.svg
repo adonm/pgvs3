@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 600" role="img" aria-labelledby="hilbert-title hilbert-desc">
+  <title id="hilbert-title">DuckLake Fixed Hash Buckets, 24-Bit Hierarchical Hilbert Curve and Density-Adaptive Row Groups</title>
+  <desc id="hilbert-desc">Visual comparison showing why equal-area spatial buckets and (lat, lon) sorting fail under urban density skew, and how sorting by a 24-bit hierarchical Hilbert curve automatically slices dense hotspots into tight equal-row/byte Parquet row groups while late materialization skips wide payload columns.</desc>
+  <defs>
+    <linearGradient id="bg4" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#090d16"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+  </defs>
+  <style>
+    .bg { fill: url(#bg4); }
+    .panel { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10; }
+    .bad-box { fill: #1f1215; stroke: #ef4444; stroke-width: 1.6; rx: 8; }
+    .good-box { fill: #0f172a; stroke: #10b981; stroke-width: 1.8; rx: 8; }
+    .rg-sparse { fill: #1e3a8a; stroke: #60a5fa; stroke-width: 1.4; rx: 5; }
+    .rg-dense { fill: #065f46; stroke: #34d399; stroke-width: 1.4; rx: 5; }
+    .title { fill: #f8fafc; font: 700 17px 'Inter', system-ui, sans-serif; }
+    .h2 { fill: #e2e8f0; font: 700 13.5px 'Inter', system-ui, sans-serif; }
+    .txt { fill: #cbd5e1; font: 500 11.2px 'Inter', system-ui, sans-serif; }
+    .mono { fill: #7dd3fc; font: 600 10.8px 'JetBrains Mono', monospace; }
+    .hilbert-path { stroke: #fbbf24; stroke-width: 2.6; fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 12 6; animation: trace 2.2s linear infinite; }
+    .flow-prune { stroke: #34d399; stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; animation: trace 1.4s linear infinite; }
+    @keyframes trace { to { stroke-dashoffset: -36; } }
+    @media (prefers-reduced-motion: reduce) {
+      .hilbert-path, .flow-prune { animation: none; }
+    }
+  </style>
+
+  <rect width="1080" height="600" class="bg" rx="14"/>
+  <text x="28" y="34" class="title">Billion-Row DuckLake Modeling: Fixed Buckets, Density-Adaptive Hilbert &amp; Wide Columns</text>
+  <text x="28" y="54" class="txt">Why equal-area grid partitions skew on hotspots · How 1D Hilbert + row/byte-bounded row groups auto-adapt like a quadtree</text>
+
+  <!-- Left Panel: Anti-Patterns -->
+  <rect x="28" y="72" width="380" height="238" class="bad-box"/>
+  <text x="44" y="96" class="h2" fill="#f87171">Anti-Pattern: Equal-Area Grid or Raw (lat, lon)</text>
+  <text x="44" y="116" class="txt">1. Rolling time DDL creates 1,000s of tiny partitions</text>
+  <text x="44" y="134" class="txt">2. Equal-area 8×8 grid under 90% NYC skew:</text>
+  <text x="56" y="151" class="mono" fill="#fca5a5">• 1 urban bucket gets 90% of all bytes</text>
+  <text x="56" y="167" class="mono" fill="#fca5a5">• 63 ocean/rural buckets write &lt;1 MiB files!</text>
+  <text x="44" y="187" class="txt">3. Raw SORTED BY (lat, lon) orders lat, but lon</text>
+  <text x="56" y="203" class="txt">spans [-180°, +180°] in every lat stripe (no lon prune)</text>
+  <text x="44" y="223" class="txt">4. Unbounded 122,880-row groups × 8 KiB wide row</text>
+  <text x="56" y="239" class="mono" fill="#fca5a5">= ~960 MiB buffered per writer thread + catalog bloat</text>
+  <rect x="44" y="254" width="348" height="40" rx="5" fill="#450a0a"/>
+  <text x="54" y="271" class="mono" fill="#fecaca">SELECT * downloads &amp; decompresses all 200 columns</text>
+  <text x="54" y="286" class="mono" fill="#fecaca">even when 99% of rows are filtered out</text>
+
+  <!-- Right Panel: 2D Hilbert Curve & Density-Adaptive Quantile Slicing -->
+  <rect x="428" y="72" width="624" height="238" class="good-box"/>
+  <text x="446" y="96" class="h2" fill="#34d399">Density-Adaptive Solution: 24-Bit Hierarchical Hilbert SORTED BY (hilbert_id, ts)</text>
+
+  <!-- 2D Grid with Hilbert Curve + Hotspot -->
+  <rect x="446" y="110" width="176" height="176" fill="#090d16" stroke="#475569" rx="6"/>
+  <!-- Grid lines -->
+  <path d="M 490 110 V 286 M 534 110 V 286 M 578 110 V 286 M 446 154 H 622 M 446 198 H 622 M 446 242 H 622" stroke="#1e293b" stroke-width="1"/>
+  <!-- Dense Hotspot Highlight (NYC) -->
+  <rect x="536" y="156" width="40" height="40" fill="#10b981" fill-opacity="0.28" stroke="#34d399" stroke-width="1.5" rx="3"/>
+  <text x="540" y="172" class="mono" fill="#6ee7b7">90%</text>
+  <text x="540" y="186" class="mono" fill="#6ee7b7">NYC</text>
+  <!-- Order-2 Hilbert path across the 4x4 visual grid -->
+  <path d="M 468 264 L 468 220 L 512 220 L 512 264 L 556 264 L 600 264 L 600 220 L 556 220 L 556 176 L 600 176 L 600 132 L 556 132 L 512 132 L 512 176 L 468 176 L 468 132" class="hilbert-path"/>
+  <text x="452" y="299" class="mono" fill="#fbbf24">lake.hilbert64 (4 levels = 4096²)</text>
+
+  <!-- 1D Sorted Stream -> Equal-Row/Byte Row Groups -->
+  <text x="642" y="122" class="mono" fill="#93c5fd">Parquet Row Groups Slice 1D Hilbert Stream by Equal Bytes/Rows:</text>
+
+  <rect x="642" y="132" width="392" height="32" class="rg-sparse"/>
+  <text x="652" y="152" class="mono" fill="#e0f2fe">RG 0 (10% Sparse US): lat [25.0°..49.9°], lon [-125.0°..-74.0°]</text>
+
+  <rect x="642" y="170" width="190" height="28" class="rg-dense"/>
+  <text x="650" y="188" class="mono" fill="#d1fae5">RG 1 (NYC): lat [40.70°..40.71°]</text>
+
+  <rect x="844" y="170" width="190" height="28" class="rg-dense"/>
+  <text x="852" y="188" class="mono" fill="#d1fae5">RG 2 (NYC): lat [40.71°..40.72°]</text>
+
+  <rect x="642" y="204" width="190" height="28" class="rg-dense"/>
+  <text x="650" y="222" class="mono" fill="#d1fae5">RG 3 (NYC): lat [40.72°..40.73°]</text>
+
+  <rect x="844" y="204" width="190" height="28" class="rg-dense"/>
+  <text x="852" y="222" class="mono" fill="#d1fae5">RG 4..9 (NYC): 6 more ~0.01° RGs</text>
+
+  <text x="642" y="252" class="txt">• Zero empty ocean files! Sparse areas pack into RG 0.</text>
+  <text x="642" y="269" class="txt">• Dense 90% hotspot auto-splits into 9 tight neighborhood row groups.</text>
+  <text x="642" y="286" class="mono" fill="#34d399">• For fixed buckets: PARTITIONED BY (bucket(32, customer_id))</text>
+  <text x="642" y="301" class="mono" fill="#34d399">  or PG RANGE (hilbert_id) on 32 empirical quantile cutpoints!</text>
+
+  <!-- Bottom Panel: Wide-Column Late Materialization & Batch Write-for-Read Pipeline -->
+  <rect x="28" y="328" width="1024" height="244" class="panel"/>
+  <text x="44" y="352" class="h2" fill="#38bdf8">Wide-Column Late Materialization &amp; Write-Amplified / Read-Optimal Compaction Pipeline</text>
+
+  <!-- Step 1 -->
+  <rect x="44" y="368" width="232" height="184" fill="#0f172a" stroke="#475569" rx="8"/>
+  <text x="56" y="388" class="mono" fill="#fbbf24">1. Byte-Bounded &amp; Stat-Pruned</text>
+  <text x="56" y="408" class="txt">• skip_stats_columns =</text>
+  <text x="64" y="424" class="mono" fill="#93c5fd">['wide_payload']</text>
+  <text x="56" y="442" class="txt">  keeps PG catalog table</text>
+  <text x="56" y="458" class="txt">  ducklake_file_column_stats</text>
+  <text x="56" y="474" class="txt">  small &amp; fast to plan.</text>
+  <text x="56" y="494" class="txt">• parquet_row_group_size_bytes</text>
+  <text x="64" y="510" class="mono" fill="#93c5fd">= '32MB'..'128MB'</text>
+  <text x="56" y="528" class="txt">  caps writer thread RAM.</text>
+
+  <!-- Step 2 -->
+  <rect x="304" y="368" width="242" height="184" fill="#0f172a" stroke="#475569" rx="8"/>
+  <text x="316" y="388" class="mono" fill="#38bdf8">2. Batch Sort, Merge &amp; Rewrite</text>
+  <text x="316" y="408" class="txt">• Batch ingest with ZSTD level 9–19</text>
+  <text x="316" y="426" class="txt">• ducklake_merge_adjacent_files</text>
+  <text x="316" y="442" class="txt">  compacts micro-batches into</text>
+  <text x="316" y="458" class="txt">  sorted target_file_size (256MB)</text>
+  <text x="316" y="474" class="txt">  files while keeping time travel.</text>
+  <text x="316" y="494" class="txt">• ducklake_rewrite_data_files</text>
+  <text x="316" y="510" class="txt">  bakes deletes into clean files</text>
+  <text x="316" y="528" class="mono" fill="#34d399">(0 delete-file overhead on read)</text>
+
+  <!-- Step 3 -->
+  <rect x="574" y="368" width="222" height="184" fill="#0f172a" stroke="#475569" rx="8"/>
+  <text x="586" y="388" class="mono" fill="#34d399">3. Narrow Filter CTE (Phase 1)</text>
+  <text x="586" y="408" class="txt">• Scans ONLY narrow columns</text>
+  <text x="594" y="424" class="mono" fill="#a7f3d0">(id, hilbert_id, lat, lon, ts)</text>
+  <text x="586" y="444" class="txt">• Zone maps skip 90%+ of row</text>
+  <text x="586" y="460" class="txt">  groups before reading pages.</text>
+  <text x="586" y="480" class="txt">• wide_payload column chunks</text>
+  <text x="586" y="496" class="txt">  are NOT transferred over S3</text>
+  <text x="586" y="512" class="txt">  for non-matching rows!</text>
+
+  <!-- Step 4 -->
+  <rect x="824" y="368" width="212" height="184" fill="#064e3b" stroke="#10b981" rx="8"/>
+  <text x="836" y="388" class="mono" fill="#6ee7b7">4. Late Materialize (Phase 2)</text>
+  <text x="836" y="408" class="txt">• JOIN back on matched `id`</text>
+  <text x="836" y="426" class="txt">• Fetches wide_payload 8,120 B</text>
+  <text x="836" y="442" class="txt">  chunks from pgvs3 ONLY for</text>
+  <text x="836" y="458" class="txt">  the surviving top-K / bbox rows.</text>
+  <text x="836" y="482" class="mono" fill="#fde68a">Heavy Multi-Table Joins?</text>
+  <text x="836" y="500" class="txt">Pre-join rollup or seal native</text>
+  <text x="836" y="516" class="txt">ObjFS writer (6× faster range</text>
+  <text x="836" y="532" class="txt">reads after writer.close()!)</text>
+
+  <path d="M 276 460 L 298 460" class="flow-prune" marker-end="url(#arr-b)"/>
+  <path d="M 546 460 L 568 460" class="flow-prune" marker-end="url(#arr-g)"/>
+  <path d="M 796 460 L 818 460" class="flow-prune" marker-end="url(#arr-g)"/>
+</svg>

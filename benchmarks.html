@@ -1,0 +1,2098 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.20">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>benchmarks – pgvs3</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="site_libs/quarto-nav/headroom.min.js"></script>
+<script src="site_libs/clipboard/clipboard.min.js"></script>
+<script src="site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="site_libs/quarto-search/fuse.min.js"></script>
+<script src="site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="./">
+<link href="./data-plane-results.html" rel="next">
+<link href="./roadmap.html" rel="prev">
+<script src="site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="site_libs/quarto-html/popper.min.js"></script>
+<script src="site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="site_libs/quarto-html/anchor.min.js"></script>
+<link href="site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-dark-c2d5e23be7e7628261be6023ad4f5e54.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-8f5b31fabbfcc58d7ce5b9632b5b7f7e.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="site_libs/bootstrap/bootstrap-dark-dc650676e3a330219d37e48c46543a39.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="site_libs/bootstrap/bootstrap-6315fca97fdc673e4844cb3311159464.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+<style>html{ scroll-behavior: smooth; }</style>
+
+
+</head>
+
+<body class="nav-sidebar docked nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="./index.html">
+    <span class="navbar-title">pgvs3</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="./index.html" aria-current="page"> 
+<span class="menu-text">Overview &amp; Atlas</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="./guides/index.html"> 
+<span class="menu-text">Workload Guides</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="./design.html"> 
+<span class="menu-text">Architecture &amp; Layout</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="./operations.html"> 
+<span class="menu-text">Operations</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="./benchmarks.html"> 
+<span class="menu-text">Benchmarks &amp; Evidence</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/adonm/pgvs3"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="./benchmarks.html">Benchmarks &amp; Qualification</a></li><li class="breadcrumb-item"><a href="./benchmarks.html">Paired Runner &amp; Capacity Method</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation docked overflow-auto">
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Home &amp; Visual Atlas</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">Workload &amp; Schema Guides</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Decision Tree &amp; Resource Trade-offs</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/postgres.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1. Protect OLTP &amp; Partitioning</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/analytics.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">2. DuckLake, Wide Columns &amp; Hilbert</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/cache.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">3. Shared Cache &amp; Write-Back Staging</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/jobs.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">4. Jobs, Outboxes &amp; Streams</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/observe-recover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">5. Observe, Diagnose &amp; Recover</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/sources.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Primary Research Ledger (44 Sources)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./guides/validation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Executable Validation Evidence</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">Architecture &amp; Data Layout</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./design.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">System Architecture &amp; Authority</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./performance.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">8 KiB Page Layout &amp; I/O Paths</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./partitioning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Why Chunks Are Unpartitioned</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./queue-stream.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Queue &amp; Stream Model (OJS + PgQue)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Operations &amp; Production</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./operations.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Deployment, Pools, Cache &amp; CLI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./roadmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Roadmap &amp; Priorities</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">Benchmarks &amp; Qualification</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./benchmarks.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Paired Runner &amp; Capacity Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./data-plane-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Replica Proof &amp; Capacity Ledger</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./modernization-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">v24/v25 Modernization Results</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./object-storage.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./object-storage-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SlateDB ObjFS Results (27 Cohorts)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./differential.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Method</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./differential-results.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">DuckDB Differential Results</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Historical Design Proposals</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./proposals/modernization-review.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Modernization Review</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./proposals/high-value-improvements.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">High-Value Improvements</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./proposals/hardening-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Hardening Options</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#benchmarks" id="toc-benchmarks" class="nav-link active" data-scroll-target="#benchmarks">Benchmarks</a>
+  <ul class="collapse">
+  <li><a href="#direct-s3-gateway-load-just-load" id="toc-direct-s3-gateway-load-just-load" class="nav-link" data-scroll-target="#direct-s3-gateway-load-just-load">Direct S3 gateway load (<code>just load</code>)</a>
+  <ul class="collapse">
+  <li><a href="#paired-acceptance" id="toc-paired-acceptance" class="nav-link" data-scroll-target="#paired-acceptance">Paired acceptance</a></li>
+  <li><a href="#capacity-evidence" id="toc-capacity-evidence" class="nav-link" data-scroll-target="#capacity-evidence">Capacity evidence</a></li>
+  <li><a href="#historical-exploratory-measurements" id="toc-historical-exploratory-measurements" class="nav-link" data-scroll-target="#historical-exploratory-measurements">Historical exploratory measurements</a></li>
+  <li><a href="#local-profile-snapshot" id="toc-local-profile-snapshot" class="nav-link" data-scroll-target="#local-profile-snapshot">2026-10-25 local profile snapshot</a></li>
+  </ul></li>
+  <li><a href="#duckdb-2.0-httpfs-just-bench-s3" id="toc-duckdb-2.0-httpfs-just-bench-s3" class="nav-link" data-scroll-target="#duckdb-2.0-httpfs-just-bench-s3">DuckDB 2.0 <code>httpfs</code> (<code>just bench s3</code>)</a></li>
+  <li><a href="#design-ablations" id="toc-design-ablations" class="nav-link" data-scroll-target="#design-ablations">Design ablations</a>
+  <ul class="collapse">
+  <li><a href="#kib-inline-threshold-vs-8-kib-chunking-6-vcpu-vm-1-worker" id="toc-kib-inline-threshold-vs-8-kib-chunking-6-vcpu-vm-1-worker" class="nav-link" data-scroll-target="#kib-inline-threshold-vs-8-kib-chunking-6-vcpu-vm-1-worker">64 KiB inline threshold vs 8 KiB chunking (6-vCPU VM, 1 worker)</a></li>
+  <li><a href="#single-table-vs-partitioned-s3p.chunks" id="toc-single-table-vs-partitioned-s3p.chunks" class="nav-link" data-scroll-target="#single-table-vs-partitioned-s3p.chunks">Single table vs partitioned <code>s3p.chunks</code></a></li>
+  <li><a href="#origin-cache-snapshot" id="toc-origin-cache-snapshot" class="nav-link" data-scroll-target="#origin-cache-snapshot">2026-10-26 origin-cache snapshot</a></li>
+  <li><a href="#latency-proxy-cache-snapshot" id="toc-latency-proxy-cache-snapshot" class="nav-link" data-scroll-target="#latency-proxy-cache-snapshot">2026-10-26 latency-proxy cache snapshot</a></li>
+  </ul></li>
+  <li><a href="#pgvs3-vs-aws-s3-express-one-zone" id="toc-pgvs3-vs-aws-s3-express-one-zone" class="nav-link" data-scroll-target="#pgvs3-vs-aws-s3-express-one-zone">pgvs3 vs AWS S3 Express One Zone</a>
+  <ul class="collapse">
+  <li><a href="#top-6-takeaways" id="toc-top-6-takeaways" class="nav-link" data-scroll-target="#top-6-takeaways">Top 6 takeaways</a></li>
+  </ul></li>
+  <li><a href="#reproduce" id="toc-reproduce" class="nav-link" data-scroll-target="#reproduce">Reproduce</a>
+  <ul class="collapse">
+  <li><a href="#shared-read-cache-and-durable-write-back" id="toc-shared-read-cache-and-durable-write-back" class="nav-link" data-scroll-target="#shared-read-cache-and-durable-write-back">2026-10-27 shared read cache and durable write-back</a></li>
+  <li><a href="#cache-maintainability-refactor" id="toc-cache-maintainability-refactor" class="nav-link" data-scroll-target="#cache-maintainability-refactor">2026-10-27 cache maintainability refactor</a></li>
+  <li><a href="#store-and-resp-refactor" id="toc-store-and-resp-refactor" class="nav-link" data-scroll-target="#store-and-resp-refactor">2026-10-27 store and RESP refactor</a></li>
+  <li><a href="#protocol-and-queue-consolidation" id="toc-protocol-and-queue-consolidation" class="nav-link" data-scroll-target="#protocol-and-queue-consolidation">2026-10-27 protocol and queue consolidation</a></li>
+  </ul></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/benchmarks.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="./benchmarks.html">Benchmarks &amp; Qualification</a></li><li class="breadcrumb-item"><a href="./benchmarks.html">Paired Runner &amp; Capacity Method</a></li></ol></nav></header>
+
+
+
+
+
+<section id="benchmarks" class="level1">
+<h1>Benchmarks</h1>
+<p>The primary workload is 10 MiB–1 GiB Parquet, in native PostgreSQL storage and origin-backed shared cache/staging roles. Current v24/v25 implementation evidence, including actual Parquet and incompressible fixtures, is recorded in <a href="./modernization-results.html">modernization-results.md</a>, with rejected trials, accepted per-path gates and remaining validation limits.</p>
+<p>This page describes the runners and retains historical measurements. Snapshots from different hosts, layouts and cache states are not one current capacity claim. The <a href="./roadmap.html">focused roadmap</a> ranks physical-replica and WAL/capacity evidence ahead of more protocol benchmarks.</p>
+<p>For workload selection, freshness, OLTP budgets and executable SQL/API recipes, use the <a href="./guides/index.html">workload guides</a>. <code>just guides</code> validates those recipes in the existing fixture; it is not a third benchmark or performance acceptance.</p>
+<p>Two benchmark harnesses are included in the repository:</p>
+<ul>
+<li><strong><code>just load</code></strong> runs <code>test/loadgen</code> directly against the HTTP gateway to measure raw S3 + PostgreSQL throughput and latency, or drives paired acceptance through the existing <code>compare.py</code> with isolated before/after fixtures.</li>
+<li><strong><code>just bench</code></strong> runs DuckDB 2.0 and DuckLake through <code>httpfs</code> to measure end-to-end client performance. Its opt-in <code>differential</code> part also measures Differential’s native-storage client through the C++ S3 SDK; <code>just differential</code> is the shortcut. See <a href="./differential.html">provisioning and comparison contracts</a>. <a href="./differential-results.html">Recorded findings</a> separate client performance from gateway retry avoidance and retain unsupported workloads explicitly. <code>just object-storage</code> uses the same cohort workflow for the signed SlateDB ObjFS client; <a href="./object-storage.html">its method</a> keeps cache/thread tuning, live-writer reads, sealing costs and read-only endpoint limits distinct. <a href="./object-storage-results.html">ObjFS results</a> retain both the sealing benefit and the lean profile’s per-path budget misses rather than declaring an aggregate win.</li>
+</ul>
+<p>Both harnesses start disposable PostgreSQL 18 containers on loopback. The direct matrix uses <code>shared_buffers=1GB</code> and pool 128; paired runs use pool 32 per binary with separate fresh PostgreSQL clusters so WAL/resource observations cannot mix the two sides. Different layouts never share a database. Each optional physical standby also has 1 GiB shared buffers. Numbers below are from a <strong>16-core local host</strong> (Intel Core Ultra X7 358H, 62 GiB RAM) alongside an earlier <strong>6-vCPU / 11 GiB VM</strong> baseline.</p>
+<section id="direct-s3-gateway-load-just-load" class="level2">
+<h2 class="anchored" data-anchor-id="direct-s3-gateway-load-just-load">Direct S3 gateway load (<code>just load</code>)</h2>
+<p>The exploratory matrix uses 5-second tests. 4 KiB tests use 2,000 keys; 8 MiB and 64 MiB tests use 16 and 8 objects; <code>ListObjectsV2</code> lists 1,000 keys per page from a 2,000-key bucket. Gateways hold no in-process cache; metadata and ≤64 KiB objects are served directly from PostgreSQL <code>shared_buffers</code>.</p>
+<section id="paired-acceptance" class="level3">
+<h3 class="anchored" data-anchor-id="paired-acceptance">Paired acceptance</h3>
+<p>Save a control binary before making changes, then run the current tree against it:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> .tmp</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mise</span> exec go <span class="at">--</span> go build <span class="at">-o</span> .tmp/pgvs3-before ./cmd/pgvs3</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Make the change, then:</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="ex">just</span> load <span class="at">--before-bin</span> .tmp/pgvs3-before <span class="at">--profile</span> native <span class="dt">\</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--payload</span> /path/to/10m.parquet <span class="at">--payload</span> /path/to/100m.parquet <span class="dt">\</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--ops</span> head,get,range,put <span class="at">--workers</span> 1,4 <span class="at">--repeats</span> 5</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="ex">just</span> load <span class="at">--before-bin</span> .tmp/pgvs3-before <span class="at">--profile</span> origin <span class="at">--cache-state</span> cold <span class="dt">\</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--payload</span> /path/to/10m.parquet <span class="at">--ops</span> get,range <span class="at">--workers</span> 1,4 <span class="dt">\</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--range-size</span> 65536 <span class="at">--repeats</span> 5</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>--after-bin</code> selects a saved candidate instead of building the current tree. <code>--out</code> selects a fresh output path; existing outputs are never overwritten. Otherwise artifacts and <code>paired.json</code> remain in the unique printed <code>.tmp/verify/</code> directory. <code>--no-small</code> omits the default 4 KiB case. <code>--requests</code> overrides the size/state-aware per-sample budget; all counts and raw samples are recorded.</p>
+<p><code>compare.py</code> is the only paired driver and still uses <code>test/loadgen</code>, not a second load engine. It alternates binary order, hashes frozen binaries and payloads, checks object/range sizes and bytes, checks persisted origin directory/namespace/ TTL/range settings, and rejects unexpected cache paths. Cold filesystem-origin fixtures use distinct keys with no prior cache bodies or metadata, and validate the completed fills. Loadgen’s opt-in <code>-unique-reads</code> shares one read sequence across workers; its default workload is unchanged. Cold here means cold gateway cache, not cleared operating-system page cache.</p>
+<p>Each case fails independently above +20% median p50 or below -20% median request rate, or on any request/fixture error. A valid report has <code>complete: true</code>; partial reports retain <code>complete: false</code>. <code>failed_gates</code> names regressions rather than hiding them in an aggregate. Range labels distinguish aligned chunks, whole-object cache ranges and pass-through. The exploratory matrix remains available without <code>--before-bin</code>, reports saturation errors instead of treating them as acceptance, and writes actual NDJSON. <code>PGVS3_BENCH_DURATION</code> shortens that matrix for fixture smoke tests only; use repeated paired runs for acceptance.</p>
+</section>
+<section id="capacity-evidence" class="level3">
+<h3 class="anchored" data-anchor-id="capacity-evidence">Capacity evidence</h3>
+<p>Use <strong>disposable isolated clusters only</strong>. Resource mode deletes its fixture keys, advances their committed-cache expiry deadlines, reaps and vacuums after each case. It refuses pending bodies at cleanup and never advances a pending body’s expiry.</p>
+<p>Generate reproducible inputs with the existing DuckDB tool, without a gateway:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mise</span> exec uv <span class="at">--</span> uv run <span class="at">--quiet</span> <span class="at">--no-project</span> <span class="at">--with</span> duckdb==2.0.0 <span class="dt">\</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  python deploy/bench/duck_bench.py <span class="at">--parts</span> fixtures <span class="at">--out</span> .tmp/capacity/fixtures.json</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>This produces approximately 10/100/1,024 MiB Snappy Parquet and exact-size binary fixtures under <code>.tmp/capacity/payloads/</code>. Actual sizes, generation SQL, seeds and SHA-256 hashes are recorded. Binary fixtures repeat a seeded 1 MiB block: they are incompressible at pgvs3’s 8,120-byte block size, not unique random streams across the entire file. <code>--fixture-mib</code> selects smaller smoke inputs; existing files are never overwritten.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">just</span> load <span class="at">--capacity</span> <span class="at">--after-bin</span> .tmp/pgvs3-candidate <span class="at">--profile</span> origin <span class="dt">\</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--payload</span> .tmp/capacity/payloads/parquet-100MiB.parquet <span class="at">--no-small</span> <span class="dt">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--ops</span> get,range,put,overwrite <span class="at">--workers</span> 1,4 <span class="at">--range-size</span> 65536 <span class="dt">\</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--replication</span> async <span class="at">--checkpoint-writes</span> <span class="at">--repeats</span> 5</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<ul>
+<li><code>--capacity</code> uses one candidate endpoint/cluster and the existing loadgen to capture resource costs. It sets <code>mode: capacity</code>, <code>performance_gates_evaluated: false</code> and <code>failed_gates: null</code>; completion means the fixtures/observations passed, <strong>not</strong> a before/after performance claim. Use ordinary uninstrumented paired runs for the regression gate. Separate clusters on one host still contend for the same physical disk.</li>
+<li><code>--resources</code> enables snapshots and observations on separate primary clusters. <code>--replication async|sync</code> adds a real physical standby per side and enables resources. <code>sync</code> selects one named synchronous standby; it does not mean <code>remote_apply</code>. Recovery state, system identifiers and replay positions are validated. Standbys use <code>hot_standby_feedback=on</code>; feedback/snapshots can hold back primary vacuum. No production replication policy is changed.</li>
+<li><code>overwrite</code> uses loadgen’s opt-in <code>-overwrite</code>: each worker reuses one prefilled key, retaining retired files for the lifecycle measurement. Ordinary PUT keeps its distinct-key behavior. Use <code>--cache-state cold --ops get,range</code> for empty origin-cache fills; otherwise reads are explicitly warmed and verified.</li>
+<li><code>--checkpoint-writes</code> prepares publication/cold-fill samples with a primary checkpoint, replay barrier and standby restartpoint outside timed work. The duration is recorded, not hidden as free work. Use a one-request sample budget for 1 GiB resource cohorts and retain several paired repetitions; larger bursts are a separate sustained-churn experiment, not a peak-throughput comparison.</li>
+<li><code>--isolate-origin-put</code> is a separate <strong>paired PUT-only</strong> filesystem fixture. After drain and byte verification it deletes only that sample’s origin keys; before the next sample it truncates the otherwise empty owned cache tables. It refuses pending bodies, incomplete multipart uploads or unrelated keys and cannot be combined with resource mode. This isolates fresh publication ACKs; it is not a retention/reaping or sustained-upload-throughput measurement.</li>
+<li>Each raw run records pre-run, post-loadgen and post-drain snapshots: logical object-row bytes, heap/index/total relation bytes, pending state, WAL insertion positions, checkpoint statistics, gateway metrics and standby replay. The post-loadgen snapshot is <strong>not the exact instant of the last HTTP ACK</strong>. Acknowledgement latency remains loadgen’s per-request measurement; after-loadgen drain is reported separately, not hidden inside ACK throughput.</li>
+<li>Lifecycle snapshots show delete, injected committed-row expiry, reaping and vacuum separately. Ordinary vacuum makes space reusable but need not shrink relation files. The logical count includes expired rows until reaped. Cleanup verifies the reaper actually drained rather than merely losing the maintenance-leader race, records reaping/vacuum time, and uses the explicit <code>--maintenance-timeout</code> deadline (default ten minutes).</li>
+<li>WAL bytes are isolated-cluster LSN advancement, including headers/padding, checkpoint/full-page-image and background work—not a per-table WAL counter. Observer <code>pg_settings</code> describe its psql session and cluster defaults, not the gateway’s connection-local <code>SET</code> policy.</li>
+<li>Gateway gauges use a 100 ms poll interval plus probe time, so their observed peaks are lower bounds. Cross-node WAL position gaps include probe skew; they are not simultaneous end-to-end lag measurements. <code>pgvs3_spool_peak_bytes</code> is exact reserved-payload high water since that gateway started, not a resettable per-case peak. Pool counter deltas also include metrics observations. Replay catch-up time includes SQL/polling overhead.</li>
+<li>Resource collection can perturb short measurements. Keep the same observations on both sides, retain raw records, and use uninstrumented paired runs to resolve performance-gate failures. Do not silently discard a failed resource comparison.</li>
+</ul>
+<p>The paired driver defaults to a five-minute S3 request timeout for large fixtures; <code>--request-timeout</code> changes it. Standalone loadgen keeps its one-minute default and exposes <code>-timeout</code>. A client deadline failure remains an error, not a retry or a successful sample; loadgen stdout/stderr are retained in the failure.</p>
+<p><code>resource_schema: 1</code> and <code>complete: true</code> identify finished observations. Only a paired report with <code>performance_gates_evaluated: true</code> and empty <code>failed_gates</code> also establishes its measured regression gate. Full configuration and binary/ payload hashes remain in the report. See <a href="./data-plane-results.html">data-plane-results.md</a> for recorded results and deployment-sizing limits.</p>
+</section>
+<section id="historical-exploratory-measurements" class="level3">
+<h3 class="anchored" data-anchor-id="historical-exploratory-measurements">Historical exploratory measurements</h3>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 17%">
+<col style="width: 17%">
+<col style="width: 17%">
+<col style="width: 17%">
+<col style="width: 17%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Workload</th>
+<th style="text-align: right;">Workers</th>
+<th style="text-align: right;">16-core host</th>
+<th style="text-align: right;">p50</th>
+<th style="text-align: right;">p99</th>
+<th style="text-align: right;">6-vCPU VM</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>RESP 4 KiB GET (pipeline 1)</strong></td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;"><strong>9,850 req/s</strong></td>
+<td style="text-align: right;"><strong>0.081 ms</strong></td>
+<td style="text-align: right;">0.32 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><strong>RESP 4 KiB GET (pipeline 1)</strong></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;"><strong>91,046 req/s</strong></td>
+<td style="text-align: right;"><strong>0.63 ms</strong></td>
+<td style="text-align: right;">1.96 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><strong>RESP 4 KiB GET (pipeline 16)</strong></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;"><strong>459,018 req/s (1.79 GiB/s)</strong></td>
+<td style="text-align: right;"><strong>0.13 ms</strong></td>
+<td style="text-align: right;">0.35 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><strong>RESP 4 KiB SET (pipeline 1)</strong></td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;"><strong>1,363 req/s</strong></td>
+<td style="text-align: right;"><strong>0.68 ms</strong></td>
+<td style="text-align: right;">1.40 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><strong>RESP 4 KiB SET (pipeline 1)</strong></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;"><strong>23,866 req/s</strong></td>
+<td style="text-align: right;"><strong>2.59 ms</strong></td>
+<td style="text-align: right;">5.22 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><strong>RESP 4 KiB SET (pipeline 16)</strong></td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;"><strong>110,222 req/s (431 MiB/s)</strong></td>
+<td style="text-align: right;"><strong>0.56 ms</strong></td>
+<td style="text-align: right;">1.13 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td>4 KiB GET (S3)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4,993 req/s</td>
+<td style="text-align: right;">0.17 ms</td>
+<td style="text-align: right;">0.63 ms</td>
+<td style="text-align: right;">1,970 req/s (0.47 ms)</td>
+</tr>
+<tr class="even">
+<td>4 KiB GET (S3)</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">20,556 req/s</td>
+<td style="text-align: right;">0.67 ms</td>
+<td style="text-align: right;">2.04 ms</td>
+<td style="text-align: right;">6,596 req/s (1.98 ms)</td>
+</tr>
+<tr class="odd">
+<td>4 KiB GET (S3)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">25,284 req/s</td>
+<td style="text-align: right;">2.27 ms</td>
+<td style="text-align: right;">6.80 ms</td>
+<td style="text-align: right;">8,243 req/s (6.91 ms)</td>
+</tr>
+<tr class="even">
+<td>4 KiB GET (S3)</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">35,458 req/s</td>
+<td style="text-align: right;">6.42 ms</td>
+<td style="text-align: right;">20.7 ms</td>
+<td style="text-align: right;">9,756 req/s</td>
+</tr>
+<tr class="odd">
+<td>HEAD (S3)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">5,878 req/s</td>
+<td style="text-align: right;">0.14 ms</td>
+<td style="text-align: right;">0.52 ms</td>
+<td style="text-align: right;">1,778 req/s (0.47 ms)</td>
+</tr>
+<tr class="even">
+<td>HEAD (S3)</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">17,397 req/s</td>
+<td style="text-align: right;">0.77 ms</td>
+<td style="text-align: right;">2.60 ms</td>
+<td style="text-align: right;">7,925 req/s (1.66 ms)</td>
+</tr>
+<tr class="odd">
+<td>HEAD (S3)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">30,009 req/s</td>
+<td style="text-align: right;">1.84 ms</td>
+<td style="text-align: right;">6.15 ms</td>
+<td style="text-align: right;">9,211 req/s (5.95 ms)</td>
+</tr>
+<tr class="even">
+<td>4 KiB PUT (S3)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1,114 req/s</td>
+<td style="text-align: right;">0.82 ms</td>
+<td style="text-align: right;">1.52 ms</td>
+<td style="text-align: right;">673 req/s (1.37 ms)</td>
+</tr>
+<tr class="odd">
+<td>4 KiB PUT (S3)</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">10,474 req/s</td>
+<td style="text-align: right;">1.39 ms</td>
+<td style="text-align: right;">2.61 ms</td>
+<td style="text-align: right;">3,610 req/s (3.93 ms)</td>
+</tr>
+<tr class="even">
+<td>4 KiB PUT (S3)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">17,801 req/s</td>
+<td style="text-align: right;">3.04 ms</td>
+<td style="text-align: right;">18.6 ms</td>
+<td style="text-align: right;">3,735 req/s (14.5 ms)</td>
+</tr>
+<tr class="odd">
+<td>4 KiB PUT (S3)</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">20,367 req/s</td>
+<td style="text-align: right;">11.0 ms</td>
+<td style="text-align: right;">37.9 ms</td>
+<td style="text-align: right;">1,635 req/s (153 ms)</td>
+</tr>
+<tr class="even">
+<td>8 MiB GET (S3)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1,450 MiB/s</td>
+<td style="text-align: right;">5.36 ms</td>
+<td style="text-align: right;">7.88 ms</td>
+<td style="text-align: right;">417 MiB/s (18.1 ms)</td>
+</tr>
+<tr class="odd">
+<td>8 MiB GET (S3)</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">3,496 MiB/s</td>
+<td style="text-align: right;">18.0 ms</td>
+<td style="text-align: right;">26.9 ms</td>
+<td style="text-align: right;">1,006 MiB/s (60.9 ms)</td>
+</tr>
+<tr class="even">
+<td>8 MiB GET (S3)</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3,753 MiB/s</td>
+<td style="text-align: right;">33.7 ms</td>
+<td style="text-align: right;">59.4 ms</td>
+<td style="text-align: right;">1,090 MiB/s (118 ms)</td>
+</tr>
+<tr class="odd">
+<td>64 MiB GET (S3)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1,269 MiB/s</td>
+<td style="text-align: right;">46.4 ms</td>
+<td style="text-align: right;">108 ms</td>
+<td style="text-align: right;">316 MiB/s (183 ms)</td>
+</tr>
+<tr class="even">
+<td>64 MiB GET (S3)</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">3,837 MiB/s</td>
+<td style="text-align: right;">129 ms</td>
+<td style="text-align: right;">219 ms</td>
+<td style="text-align: right;">971 MiB/s (530 ms)</td>
+</tr>
+<tr class="odd">
+<td>64 MiB GET (S3)</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4,262 MiB/s</td>
+<td style="text-align: right;">234 ms</td>
+<td style="text-align: right;">338 ms</td>
+<td style="text-align: right;">1,055 MiB/s (929 ms)</td>
+</tr>
+<tr class="even">
+<td>64 MiB PUT (S3)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">220 MiB/s</td>
+<td style="text-align: right;">183 ms</td>
+<td style="text-align: right;">223 ms</td>
+<td style="text-align: right;">86 MiB/s (577 ms)</td>
+</tr>
+<tr class="odd">
+<td>64 MiB PUT (S3)</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">509 MiB/s</td>
+<td style="text-align: right;">820 ms</td>
+<td style="text-align: right;">1,109 ms</td>
+<td style="text-align: right;">171 MiB/s (2,391 ms)</td>
+</tr>
+<tr class="even">
+<td>8 KiB range from 64 MiB</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">16,171 req/s</td>
+<td style="text-align: right;">3.57 ms</td>
+<td style="text-align: right;">9.67 ms</td>
+<td style="text-align: right;">6,397 req/s (9.07 ms)</td>
+</tr>
+<tr class="odd">
+<td>ListObjectsV2 (1,000 keys)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">2,019 req/s</td>
+<td style="text-align: right;">27.3 ms</td>
+<td style="text-align: right;">99.1 ms</td>
+<td style="text-align: right;">638 req/s (98.4 ms)</td>
+</tr>
+<tr class="even">
+<td><strong>RESP 4 KiB GET</strong></td>
+<td style="text-align: right;">1 / 64 / 64p16</td>
+<td style="text-align: right;"><strong>12,242 / 96,966 / 460,381 req/s</strong></td>
+<td style="text-align: right;"><strong>0.072 / 0.60 / 0.128 ms</strong></td>
+<td style="text-align: right;">0.21 / 1.74 / 0.34 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><strong>RESP 4 KiB SET (sync)</strong></td>
+<td style="text-align: right;">1 / 64 / 64p16</td>
+<td style="text-align: right;"><strong>5,018 / 48,215 / 213,603 req/s</strong></td>
+<td style="text-align: right;"><strong>0.183 / 1.12 / 0.284 ms</strong></td>
+<td style="text-align: right;">0.46 / 4.13 / 0.66 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><strong>Cache tier 4 KiB GET (warm)</strong></td>
+<td style="text-align: right;">1 / 16</td>
+<td style="text-align: right;"><strong>3,121 / 12,233 req/s</strong></td>
+<td style="text-align: right;"><strong>0.29 / 1.18 ms</strong></td>
+<td style="text-align: right;">0.71 / 2.98 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><strong>Cache tier 4 KiB PUT (write-through)</strong></td>
+<td style="text-align: right;">1 / 16</td>
+<td style="text-align: right;"><strong>974 / 5,326 req/s</strong></td>
+<td style="text-align: right;"><strong>0.92 / 2.56 ms</strong></td>
+<td style="text-align: right;">2.77 / 7.34 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><strong>Cache tier 64 MiB GET (warm)</strong></td>
+<td style="text-align: right;">1 / 16</td>
+<td style="text-align: right;"><strong>1,442 / 4,005 MiB/s</strong></td>
+<td style="text-align: right;">43.9 / 253 ms</td>
+<td style="text-align: right;">60.2 / 366 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><strong>Cache tier 64 MiB PUT (synchronous baseline)</strong></td>
+<td style="text-align: right;">1 / 16</td>
+<td style="text-align: right;"><strong>205 / 488 MiB/s</strong></td>
+<td style="text-align: right;">227 / 1,307 ms</td>
+<td style="text-align: right;">236 / 3,268 ms</td>
+<td style="text-align: right;">—</td>
+</tr>
+</tbody>
+</table>
+<p>The large-object rows predate the default write-back path; see the 2026-10-26 latency-proxy snapshot below for the current ack-first behavior.</p>
+<p>Key takeaways:</p>
+<ul>
+<li><strong>Sub-100 µs RESP reads &amp; 460k GET/s pipelined:</strong> a 1-worker 4 KiB <code>GET</code> completes in <strong><code>0.072 ms</code> (72 µs) p50</strong> (12.2k req/s), scales to <strong>97.0k <code>GET</code>/s</strong> unpipelined and <strong>460.4k <code>GET</code>/s (1.76 GiB/s)</strong> at pipeline 16 via <code>CacheMGet</code> coalescing.</li>
+<li><strong>213k/s durable pipelined RESP writes:</strong> pipelined <code>SET</code>s coalesce into one <code>CacheMSet</code> statement, reaching <strong>213.6k durable <code>SET</code>/s (834 MiB/s, <code>0.28 ms</code> p50)</strong> at pipeline 16 (48.2k unpipelined) with the previous LZ4 codec. Re-run <code>just load</code> after the Zstd switch for current numbers.</li>
+<li><strong>OJS queue benchmarks:</strong> the SQS rows were removed with the SQS protocol in the OJS v1 rewrite. Run <code>test/loadgen</code> with <code>-op ojs-enqueue</code> / <code>-op ojs-fetch</code> against a live PostgreSQL to measure the new path; no numbers are claimed here yet.</li>
+<li><strong>Sub-millisecond S3 small reads &amp; 20.9k/s durable S3 writes:</strong> S3 4 KiB <code>GET</code> reaches <strong>35.8k req/s</strong> (<code>0.17 ms</code> p50 at 1 worker) and durable 4 KiB <code>PUT</code> reaches <strong>20.9k req/s</strong>.</li>
+<li><strong>Cache tier:</strong> a warm 4 KiB <code>GET</code> through the cache proxy costs one PostgreSQL read and reaches <strong>12.2k req/s</strong>; 64 MiB reads reach <strong>4.0 GiB/s</strong> and write-through PUTs <strong>488 MiB/s</strong> (origin is a local filesystem).</li>
+<li><strong>Cache ranges are passed through:</strong> a cold 1 MiB range of a 256 MiB origin object returns in <strong>2.2 ms</strong> without caching the body; the first full read takes 0.90 s and the warm read 0.18 s.</li>
+<li><strong>Multi-GiB/s large-object reads:</strong> 64 MiB reads stream at <strong>1.30 GiB/s</strong> from 1 worker and <strong>4.17 GiB/s (4,275 MiB/s)</strong> across 16 workers.</li>
+<li><strong>Fast byte ranges and listings:</strong> 8 KiB range reads from 64 MiB objects reach 16.1k req/s (3.55 ms p50), and 1,000-key <code>ListObjectsV2</code> calls reach 1,840 req/s (~1.84M keys/s).</li>
+</ul>
+</section>
+<section id="local-profile-snapshot" class="level3">
+<h3 class="anchored" data-anchor-id="local-profile-snapshot">2026-10-25 local profile snapshot</h3>
+<p>This is a separate snapshot, not a replacement for the canonical 16-core table above. Host: AMD Ryzen 7 7700X (16 threads), 61 GiB RAM, PostgreSQL 18 with <code>shared_buffers=1GB</code>, gateway pool 128. All runs used <code>test/loadgen</code> for 5s.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 15%">
+<col style="width: 21%">
+<col style="width: 21%">
+<col style="width: 21%">
+<col style="width: 21%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Workload</th>
+<th style="text-align: right;">Workers</th>
+<th style="text-align: right;">Result</th>
+<th style="text-align: right;">p50</th>
+<th style="text-align: right;">p99</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>4 KiB GET</td>
+<td style="text-align: right;">1 / 16 / 64</td>
+<td style="text-align: right;">9.5k / 39.4k / 62.9k req/s</td>
+<td style="text-align: right;">0.10 / 0.37 / 0.88 ms</td>
+<td style="text-align: right;">0.19 / 0.93 / 2.87 ms</td>
+</tr>
+<tr class="even">
+<td>4 KiB PUT</td>
+<td style="text-align: right;">1 / 16 / 64</td>
+<td style="text-align: right;">4.9k / 27.3k / 33.3k req/s</td>
+<td style="text-align: right;">0.20 / 0.54 / 1.60 ms</td>
+<td style="text-align: right;">0.33 / 1.24 / 7.32 ms</td>
+</tr>
+<tr class="odd">
+<td>4 KiB HEAD</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">70.3k req/s</td>
+<td style="text-align: right;">0.73 ms</td>
+<td style="text-align: right;">2.89 ms</td>
+</tr>
+<tr class="even">
+<td>8 MiB GET</td>
+<td style="text-align: right;">1 / 8 / 16</td>
+<td style="text-align: right;">1.06 / 6.99 / 7.47 GiB/s</td>
+<td style="text-align: right;">7.5 / 9.2 / 16.5 ms</td>
+<td style="text-align: right;">9.3 / 11.9 / 29.8 ms</td>
+</tr>
+<tr class="odd">
+<td>64 MiB GET</td>
+<td style="text-align: right;">1 / 8 / 16</td>
+<td style="text-align: right;">1.01 / 6.83 / 5.97 GiB/s</td>
+<td style="text-align: right;">61 / 74 / 167 ms</td>
+<td style="text-align: right;">88 / 98 / 240 ms</td>
+</tr>
+<tr class="even">
+<td>64 MiB PUT</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1.31 GiB/s</td>
+<td style="text-align: right;">379 ms</td>
+<td style="text-align: right;">436 ms</td>
+</tr>
+<tr class="odd">
+<td>8 KiB range from 64 MiB</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">39.4k req/s</td>
+<td style="text-align: right;">1.45 ms</td>
+<td style="text-align: right;">4.31 ms</td>
+</tr>
+<tr class="even">
+<td>ListObjectsV2 (1,000 keys)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">5.08k req/s</td>
+<td style="text-align: right;">11.2 ms</td>
+<td style="text-align: right;">39.0 ms</td>
+</tr>
+<tr class="odd">
+<td>RESP 4 KiB SET (pipeline 16)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">96.5k req/s</td>
+<td style="text-align: right;">0.65 ms</td>
+<td style="text-align: right;">0.88 ms</td>
+</tr>
+<tr class="even">
+<td>RESP 4 KiB GET (pipeline 16)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">851k req/s</td>
+<td style="text-align: right;">0.067 ms</td>
+<td style="text-align: right;">0.19 ms</td>
+</tr>
+<tr class="odd">
+<td>OJS enqueue</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">27.8k req/s</td>
+<td style="text-align: right;">2.29 ms</td>
+<td style="text-align: right;">2.66 ms</td>
+</tr>
+<tr class="even">
+<td>OJS fetch+ack</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">20.2k req/s</td>
+<td style="text-align: right;">15.7 ms</td>
+<td style="text-align: right;">19.0 ms</td>
+</tr>
+<tr class="odd">
+<td>Warm cache 4 KiB GET</td>
+<td style="text-align: right;">1 / 16 / 64</td>
+<td style="text-align: right;">9.4k / 39.0k / 62.9k req/s</td>
+<td style="text-align: right;">0.10 / 0.37 / 0.88 ms</td>
+<td style="text-align: right;">0.21 / 0.92 / 2.92 ms</td>
+</tr>
+</tbody>
+</table>
+<p>CPU profiles (15s each, Go pprof):</p>
+<ul>
+<li><strong>4 KiB GET:</strong> <code>getObject</code> 53% cumulative; <code>metaRef</code> 33%; pgx query 22%; socket writes 34%. A dedicated inline-object read path was prototyped and benchmarked. It did not improve throughput (62.4k vs 63.1k req/s at 64 workers), so it was reverted. Query/transport latency, not metadata field decoding, dominates this path.</li>
+<li><strong>4 KiB PUT:</strong> <code>putObject</code> 44%; <code>putInlineRef</code> 33%; pgx query 22%; socket writes 19%; MD5/SHA ~5.1%; GC ~7%. Preallocating the inline body from <code>Content-Length</code> removed the <code>io.ReadAll</code> growth/copy path and improved the 16-worker PUT result from 24.2k to 26.7k req/s. Reusing the inline buffer from a bounded 64 KiB pool then improved a fresh three-sample mean from 26.3k to 27.3k req/s at 16 workers and 32.2k to 33.3k at 64 workers; the 64-worker p99 fell from about 7.9 ms to 7.3 ms.</li>
+<li><strong>64 MiB GET:</strong> syscalls 70%; <code>streamRows</code> 59%; pgx row decoding 44%; <code>appendRow</code> 14%; socket writes 33%. A direct-decode experiment skipped the decoded-row → response-buffer copy for unclipped full-object reads, but the result was flat to slightly worse (6.59 vs 6.83 GiB/s at 8 workers), so it was reverted. Large reads remain syscall- and transport-bound.</li>
+<li><strong>64 MiB PUT:</strong> the framer now writes full rows directly from the incoming buffer and retains only the trailing partial row, removing a full-write copy into <code>pending</code>. An 8-worker three-sample mean improved from 19.8 to 21.0 req/s (1.24 to 1.31 GiB/s); p50 fell from ~399 to ~379 ms and p99 from ~467 to ~436 ms. Parallel MD5/SHA changed throughput by at most about 2% and raised CPU; probes that skipped hashing or compression changed it by less than 1%. Neither path is the next target.</li>
+<li><strong>Warm cache 4 KiB GET:</strong> the warm-hit path was doing two metadata lookups (<code>MetaHeader</code> for the cache decision, then <code>GetBody</code> for the body). Reusing the first metadata row for the body read raised 1/16/64-worker throughput from 7.2k/33.9k/49.7k to 9.4k/39.0k/62.9k req/s, matching native inline GET. The canonical cache row above predates this change.</li>
+<li><strong>Query execution:</strong> the default pgx <code>cache_statement</code> path remains fastest. Switching the whole connection to <code>cache_describe</code>, <code>exec</code>, or <code>simple_protocol</code> reduced 4 KiB GET/PUT throughput by roughly 18–30% at 16 workers, so no query-mode change is retained.</li>
+</ul>
+<p>The ownership-aware large-PUT row feed was also built and rejected. It was correct, but the segment/reader path measured about 20.0 req/s versus 21.3 req/s for direct framing: removing the copy did not repay the extra per-row bookkeeping. Large PUT is left at direct framing. A <code>GOGC=200/400</code> experiment initially looked much faster, but the gain disappeared when the load generator was pinned to its own <code>GOGC=100</code>; the gateway GC target is not a retained change.</p>
+<p>The next measured slice is the native 4 KiB PUT query/bind path. The current profile is about 22% pgx query/bind, 19% socket writes, and 5% hashing. The first experiment is a narrow unconditional bucket inline-write path with fewer bound parameters and less server-side branching, benchmarked at 16 and 64 workers against the current 33.3k req/s. It will be kept only if it beats that result. Small GET is at its query/transport ceiling, warm cache GET matches native, and large reads are at the syscall ceiling.</p>
+</section>
+</section>
+<section id="duckdb-2.0-httpfs-just-bench-s3" class="level2">
+<h2 class="anchored" data-anchor-id="duckdb-2.0-httpfs-just-bench-s3">DuckDB 2.0 <code>httpfs</code> (<code>just bench s3</code>)</h2>
+<p>Measured on the 6-vCPU VM with 2,000 4 KiB objects and 128 8 MiB objects (<code>enable_external_file_cache = false</code>):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Workload</th>
+<th style="text-align: right;">Workers</th>
+<th style="text-align: right;">Result</th>
+<th style="text-align: right;">p50</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>4 KiB GET (steady state)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">1,838 req/s</td>
+<td style="text-align: right;">32.8 ms</td>
+</tr>
+<tr class="even">
+<td>4 KiB GET (first read)</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">1,467 req/s</td>
+<td style="text-align: right;">40.5 ms</td>
+</tr>
+<tr class="odd">
+<td>4 KiB PUT</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">668 req/s</td>
+<td style="text-align: right;">87.5 ms</td>
+</tr>
+<tr class="even">
+<td>8 MiB GET</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">674 MiB/s</td>
+<td style="text-align: right;">181 ms</td>
+</tr>
+<tr class="odd">
+<td>8 MiB PUT</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">120 MiB/s</td>
+<td style="text-align: right;">996 ms</td>
+</tr>
+</tbody>
+</table>
+<p>DuckDB’s <code>httpfs</code> adds its own request scheduling and connection pool; the direct numbers above show the gateway ceiling underneath it.</p>
+</section>
+<section id="design-ablations" class="level2">
+<h2 class="anchored" data-anchor-id="design-ablations">Design ablations</h2>
+<section id="kib-inline-threshold-vs-8-kib-chunking-6-vcpu-vm-1-worker" class="level3">
+<h3 class="anchored" data-anchor-id="kib-inline-threshold-vs-8-kib-chunking-6-vcpu-vm-1-worker">64 KiB inline threshold vs 8 KiB chunking (6-vCPU VM, 1 worker)</h3>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Object size &amp; op</th>
+<th style="text-align: right;">64 KiB inline (default)</th>
+<th style="text-align: right;">8 KiB cutoff (chunked)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>32 KiB PUT / GET</td>
+<td style="text-align: right;">509/s · 3,619/s</td>
+<td style="text-align: right;">227/s · 1,398/s</td>
+</tr>
+<tr class="even">
+<td>64 KiB PUT / GET</td>
+<td style="text-align: right;">356/s · 3,250/s</td>
+<td style="text-align: right;">200/s · 1,272/s</td>
+</tr>
+</tbody>
+</table>
+<p>Inlining up to 64 KiB in <code>s3p.objects</code> is 2–3× faster than splitting into <code>s3p.chunks</code> rows.</p>
+</section>
+<section id="single-table-vs-partitioned-s3p.chunks" class="level3">
+<h3 class="anchored" data-anchor-id="single-table-vs-partitioned-s3p.chunks">Single table vs partitioned <code>s3p.chunks</code></h3>
+<p>Hash-partitioning <code>s3p.chunks</code> into 16 or 64 partitions slowed 4 KiB <code>GET</code>s by 17–28% and <code>PUT</code>s by 5–21% due to planner overhead without spreading single-file reads. A two-level <code>8×8</code> hash/range layout improved single-worker 64 MiB <code>GET</code> from 441 to 556 MiB/s but regressed 4 KiB <code>GET</code>s by 21–32%. <code>s3p.chunks</code> therefore stays a single unpartitioned table; see <a href="./partitioning.html">partitioning.md</a>.</p>
+</section>
+<section id="origin-cache-snapshot" class="level3">
+<h3 class="anchored" data-anchor-id="origin-cache-snapshot">2026-10-26 origin-cache snapshot</h3>
+<p>This microbenchmark isolates the origin cache from the canonical direct-gateway table. Host: same Ryzen 7 7700X, embedded PostgreSQL 18.3, gateway pool 64, loopback, <code>rclone serve s3</code> over a local filesystem as the origin. 4 KiB objects and 5-second runs unless noted. It measures cache mechanics, not a remote S3 network path.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Workload</th>
+<th style="text-align: right;">Workers</th>
+<th style="text-align: right;">Result</th>
+<th style="text-align: right;">p99</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Warm cache GET 4 KiB</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">37.8k req/s</td>
+<td style="text-align: right;">0.95 ms</td>
+</tr>
+<tr class="even">
+<td>Direct rclone GET 4 KiB</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">38.0k req/s</td>
+<td style="text-align: right;">0.96 ms</td>
+</tr>
+<tr class="odd">
+<td>Cold cache GET 4 KiB, previous build</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1.51k req/s</td>
+<td style="text-align: right;">0.99 ms</td>
+</tr>
+<tr class="even">
+<td>Cold cache GET 4 KiB, one-GET fill</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">2.02k req/s</td>
+<td style="text-align: right;">0.74 ms</td>
+</tr>
+<tr class="odd">
+<td>Cache write-through PUT 4 KiB</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3.07k req/s</td>
+<td style="text-align: right;">16.9 ms</td>
+</tr>
+<tr class="even">
+<td>Direct rclone PUT 4 KiB</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3.14k req/s</td>
+<td style="text-align: right;">16.0 ms</td>
+</tr>
+<tr class="odd">
+<td>Warm cache GET 64 MiB</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">16.4 req/s (1.05 GiB/s)</td>
+<td style="text-align: right;">69 ms</td>
+</tr>
+<tr class="even">
+<td>Direct rclone GET 64 MiB</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">14.0 req/s (895 MiB/s)</td>
+<td style="text-align: right;">74 ms</td>
+</tr>
+<tr class="odd">
+<td>Cold cache GET 64 MiB</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">13.5 req/s</td>
+<td style="text-align: right;">292 ms</td>
+</tr>
+</tbody>
+</table>
+<p>The cold whole-object fill now asks the origin for the body and metadata in one GET instead of issuing a HEAD first. On the local origin that raised a single-worker cold read from 1.51k to 2.02k req/s. Warm reads are at local-origin parity because both sides are on the same host; the cache’s advantage appears when the origin is remote. Write-through is origin-bound at this concurrency. The first 64 MiB cache fill pays the PostgreSQL publication cost; subsequent reads avoid the origin body transfer.</p>
+</section>
+<section id="latency-proxy-cache-snapshot" class="level3">
+<h3 class="anchored" data-anchor-id="latency-proxy-cache-snapshot">2026-10-26 latency-proxy cache snapshot</h3>
+<p>To avoid measuring a cache against a zero-latency loopback origin, the origin can run in constrained mode:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pgvs3</span> serve <span class="at">--addr</span> 127.0.0.1:18030 <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--simulate-latency</span> 20ms <span class="at">--simulate-rps</span> 100 <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--simulate-bandwidth</span> 52428800</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>This snapshot used 20 ms one-way latency (40 ms RTT) and 50 MiB/s per request, with a local pgvs3 origin, embedded PostgreSQL 18.3, and one worker. It is a simulation, not a real S3 or Aurora measurement.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 16%">
+<col style="width: 16%">
+<col style="width: 22%">
+<col style="width: 22%">
+<col style="width: 22%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Object</th>
+<th>Operation</th>
+<th style="text-align: right;">Direct origin through proxy</th>
+<th style="text-align: right;">Cache</th>
+<th style="text-align: right;">Improvement</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>10 MiB</td>
+<td>first GET</td>
+<td style="text-align: right;">394 ms</td>
+<td style="text-align: right;">440 ms first fill</td>
+<td style="text-align: right;">one-time fill</td>
+</tr>
+<tr class="even">
+<td>10 MiB</td>
+<td>warm GET</td>
+<td style="text-align: right;">394 ms</td>
+<td style="text-align: right;">9.3 ms</td>
+<td style="text-align: right;">~42x</td>
+</tr>
+<tr class="odd">
+<td>100 MiB</td>
+<td>first GET</td>
+<td style="text-align: right;">3.59 s</td>
+<td style="text-align: right;">3.94 s first fill</td>
+<td style="text-align: right;">one-time fill</td>
+</tr>
+<tr class="even">
+<td>100 MiB</td>
+<td>warm GET</td>
+<td style="text-align: right;">3.59 s</td>
+<td style="text-align: right;">92 ms</td>
+<td style="text-align: right;">~39x</td>
+</tr>
+<tr class="odd">
+<td>1 GiB</td>
+<td>first GET</td>
+<td style="text-align: right;">36.3 s</td>
+<td style="text-align: right;">39.6 s first fill</td>
+<td style="text-align: right;">one-time fill</td>
+</tr>
+<tr class="even">
+<td>1 GiB</td>
+<td>warm GET</td>
+<td style="text-align: right;">36.3 s</td>
+<td style="text-align: right;">981 ms</td>
+<td style="text-align: right;">~37x</td>
+</tr>
+<tr class="odd">
+<td>10 MiB</td>
+<td>PUT</td>
+<td style="text-align: right;">403 ms</td>
+<td style="text-align: right;">38 ms</td>
+<td style="text-align: right;">~10x</td>
+</tr>
+<tr class="even">
+<td>100 MiB</td>
+<td>PUT</td>
+<td style="text-align: right;">3.61 s</td>
+<td style="text-align: right;">297 ms</td>
+<td style="text-align: right;">~12x</td>
+</tr>
+<tr class="odd">
+<td>1 GiB</td>
+<td>PUT</td>
+<td style="text-align: right;">36.1 s</td>
+<td style="text-align: right;">2.76 s</td>
+<td style="text-align: right;">~13x</td>
+</tr>
+</tbody>
+</table>
+<p>The PUT numbers use the default write-back path: the cache/outbox transaction completes first, then the origin upload proceeds asynchronously. A 1 GiB write-back was verified to clear its outbox row and become readable at the origin after the background upload. Without the proxy’s bandwidth limit, large warm reads are still faster than the direct origin, but the gap narrows because both sides use local storage.</p>
+</section>
+</section>
+<section id="pgvs3-vs-aws-s3-express-one-zone" class="level2">
+<h2 class="anchored" data-anchor-id="pgvs3-vs-aws-s3-express-one-zone">pgvs3 vs AWS S3 Express One Zone</h2>
+<p>S3 Express One Zone figures below are AWS’s published service specifications and <code>us-east-1</code> prices (<a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-performance.html">performance guide</a>, <a href="https://aws.amazon.com/s3/pricing/">pricing</a>, <a href="https://aws.amazon.com/blogs/aws/announcing-up-to-85-price-reductions-for-amazon-s3-express-one-zone/">2025 price reduction</a>).</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Dimension</th>
+<th>pgvs3 (16-core local / 6-vCPU VM)</th>
+<th>S3 Express One Zone (published)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>4 KiB GET / PUT p50 (1w)</td>
+<td>0.17 ms GET, 0.78 ms PUT (0.47 / 1.37 ms on 6 vCPU)</td>
+<td>Consistent single-digit ms</td>
+</tr>
+<tr class="even">
+<td>4 KiB GET throughput</td>
+<td>32.5k/s (9.8k/s on 6 vCPU)</td>
+<td>200k/s default, 2M/s max per bucket</td>
+</tr>
+<tr class="odd">
+<td>4 KiB PUT throughput</td>
+<td>17.5k/s durable at 64w (3.7k/s on 6 vCPU)</td>
+<td>100k/s default, 200k/s max per bucket</td>
+</tr>
+<tr class="even">
+<td>8–64 MiB GET</td>
+<td>1.1–3.45 GiB/s (0.3–1.1 GiB/s on 6 vCPU)</td>
+<td>Network/concurrency-bound; elastic</td>
+</tr>
+<tr class="odd">
+<td>64 MiB PUT</td>
+<td>188–458 MiB/s (86–171 MiB/s on 6 vCPU)</td>
+<td>Elastic, distributed</td>
+</tr>
+<tr class="even">
+<td>Capacity</td>
+<td>32 TiB per bucket; ~17.4 TB per object (at most 100 namespaces per database)</td>
+<td>Unlimited storage; 50 TB per object</td>
+</tr>
+<tr class="odd">
+<td>Availability / durability</td>
+<td>PostgreSQL replication/backups chosen by operator</td>
+<td>99.95% designed (99.9% SLA); 11 nines in one AZ</td>
+</tr>
+<tr class="even">
+<td>Price model (<code>us-east-1</code>)</td>
+<td>Hardware + gp3 ($0.08/GB-mo); $0 request/transfer fees</td>
+<td>$0.11/GB-mo + $1.13/M PUT + $0.03/M GET + $3.80/TB R+W</td>
+</tr>
+</tbody>
+</table>
+<section id="top-6-takeaways" class="level3">
+<h3 class="anchored" data-anchor-id="top-6-takeaways">Top 6 takeaways</h3>
+<ol type="1">
+<li><strong>Latency:</strong> pgvs3 serves a 4 KiB <code>GET</code> in <code>0.17 ms</code> and a durable <code>PUT</code> in <code>0.78 ms</code> p50, ~10× faster than S3 Express’s single-digit milliseconds.</li>
+<li><strong>Small-object reads:</strong> pgvs3 peaks at <code>32.5k GET/s</code> on one 16-core node, ~6× below S3 Express’s <code>200k/s</code> default bucket quota (<code>2M/s</code> max).</li>
+<li><strong>Small-object writes:</strong> pgvs3 reaches <code>17.5k</code> durable 4 KiB <code>PUT/s</code>, ~6× below S3 Express’s <code>100k/s</code> default quota (<code>200k/s</code> max).</li>
+<li><strong>Large-object bandwidth:</strong> pgvs3 streams 64 MiB reads at <code>3.45 GiB/s</code> and writes at <code>458 MiB/s</code> in cache/NVMe (<code>125–1,000 MiB/s</code> on cold EBS gp3), while S3 Express scales elastically with client network.</li>
+<li><strong>500 GB large-file cost (7,450 × 64 MiB, 1× W+R/mo):</strong> S3 Express costs ~$57/mo vs ~$100–200/mo for a dedicated pgvs3 node, or $40/mo in gp3 disk on an existing PostgreSQL.</li>
+<li><strong>500 GB small-object cost (122M × 4 KiB, 1× W+R/mo):</strong> S3 Express costs ~$199/mo due to <code>$1.13/M</code> <code>PUT</code> fees, while pgvs3 charges $0 per request and stays at ~$165/mo dedicated or $40/mo on an existing PostgreSQL.</li>
+</ol>
+</section>
+</section>
+<section id="reproduce" class="level2">
+<h2 class="anchored" data-anchor-id="reproduce">Reproduce</h2>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">just</span> contract   <span class="co"># run the correctness suite first</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">just</span> load       <span class="co"># exploratory matrix (isolated .tmp/verify/ artifacts)</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">just</span> bench s3   <span class="co"># DuckDB 2.0 httpfs matrix (.tmp/pgvs3/bench.json)</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">just</span> bench      <span class="co"># full DuckDB + DuckLake compatibility and row-group tuning</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<section id="shared-read-cache-and-durable-write-back" class="level3">
+<h3 class="anchored" data-anchor-id="shared-read-cache-and-durable-write-back">2026-10-27 shared read cache and durable write-back</h3>
+<p>Read-through fills now land in the WAL-logged, replicated <code>s3c_</code> namespace so primary and standby workers share the same warm cache; acknowledged write-back bodies remain in <code>s3w_</code>. This snapshot reran the large-object path against a self-hosted pgvs3 S3 origin constrained to 20 ms one-way latency and 50 MiB/s per request, on the same PostgreSQL 18 host. It is a local simulation, not an AWS measurement. This run used the primary; it did not exercise physical standby replay or promotion.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 17%">
+<col style="width: 17%">
+<col style="width: 17%">
+<col style="width: 17%">
+<col style="width: 17%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Object</th>
+<th style="text-align: right;">Direct origin GET</th>
+<th style="text-align: right;">Cold cache GET</th>
+<th style="text-align: right;">Warm cache GET</th>
+<th style="text-align: right;">Direct origin PUT</th>
+<th style="text-align: right;">Write-back ack</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>10 MiB</td>
+<td style="text-align: right;">0.279 s</td>
+<td style="text-align: right;">0.350 s</td>
+<td style="text-align: right;">0.005 s</td>
+<td style="text-align: right;">0.335 s</td>
+<td style="text-align: right;">0.068 s</td>
+</tr>
+<tr class="even">
+<td>100 MiB</td>
+<td style="text-align: right;">2.234 s</td>
+<td style="text-align: right;">2.821 s</td>
+<td style="text-align: right;">0.048 s</td>
+<td style="text-align: right;">2.753 s</td>
+<td style="text-align: right;">0.550 s</td>
+</tr>
+<tr class="odd">
+<td>1 GiB</td>
+<td style="text-align: right;">22.374 s</td>
+<td style="text-align: right;">28.709 s</td>
+<td style="text-align: right;">0.506 s</td>
+<td style="text-align: right;">28.083 s</td>
+<td style="text-align: right;">5.619 s</td>
+</tr>
+</tbody>
+</table>
+<p>Warm reads were about 52x faster on 10 MiB, 47x on 100 MiB and 44x on 1 GiB. Cold fills were 25%–28% slower than direct origin because the complete body is now written to the WAL-logged shared read cache. Write-back acknowledgement was about 5x faster than the constrained origin PUT. That is the cost of making fills visible to read-only replicas; warm reads themselves are unchanged.</p>
+</section>
+<section id="cache-maintainability-refactor" class="level3">
+<h3 class="anchored" data-anchor-id="cache-maintainability-refactor">2026-10-27 cache maintainability refactor</h3>
+<p>Compared the pre-refactor <code>766720e</code> binary with the reorganized cache layer on the same local PostgreSQL 18.6 primary (<code>synchronous_commit=on</code>, 128 MiB <code>shared_buffers</code>) and constrained S3 origin described above. No layout, chunk codec, SQL ingest or PostgreSQL body-streaming code changed. Production Go source in <code>internal/objcache</code> decreased from 3,556 to 3,131 lines (12%), without removing providers or protocol features. Fixtures were incompressible byte payloads, not a DuckDB query benchmark.</p>
+<p>The full sweep used three samples for each cold fill and write-back acknowledgement; 21/11/7 warm reads for 10 MiB/100 MiB/1 GiB; 12 requests with four concurrent readers per size; 21 HEADs; five cold aligned-range requests; and 31 warm 64 KiB range requests. The outbox was drained between writes and the cache truncated between cold samples. Medians are wall-clock HTTP request times, including body transfer.</p>
+<p>An initial +17.1% result on the 10 MiB cold fill prompted a reverse-order repeat with nine more cold samples per binary and repeats of the other 10 MiB paths. The table combines <strong>all</strong> samples, not the faster run: 12 cold fills, 42 warm GETs, 24 concurrent GETs, 42 HEADs, 10 cold ranges, 62 warm ranges and six write acknowledgements per binary for 10 MiB. Larger objects use the original sweep.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 20%">
+<col style="width: 26%">
+<col style="width: 26%">
+<col style="width: 26%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Object</th>
+<th style="text-align: right;">Cold GET before → after</th>
+<th style="text-align: right;">Warm GET before → after</th>
+<th style="text-align: right;">Write-back ack before → after</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>10 MiB</td>
+<td style="text-align: right;">335 → 336 ms</td>
+<td style="text-align: right;">4.94 → 4.91 ms</td>
+<td style="text-align: right;">59.8 → 61.7 ms</td>
+</tr>
+<tr class="even">
+<td>100 MiB</td>
+<td style="text-align: right;">2.718 → 2.644 s</td>
+<td style="text-align: right;">41.2 → 42.4 ms</td>
+<td style="text-align: right;">496 → 467 ms</td>
+</tr>
+<tr class="odd">
+<td>1 GiB</td>
+<td style="text-align: right;">27.869 → 27.466 s</td>
+<td style="text-align: right;">437 → 439 ms</td>
+<td style="text-align: right;">4.603 → 4.492 s</td>
+</tr>
+</tbody>
+</table>
+<p>All 21 measured paths stayed within the 20% latency/throughput budget. The largest combined median increase was a HEAD request (+11.4%, 0.282 → 0.314 ms). Body-transfer paths were at most 3.2% slower; four-reader GETs ranged from 0.2% slower to 4.9% faster, and warm ranges changed by less than 1%. Small differences on this shared host should not be treated as statistically significant improvements. This is not an AWS/Aurora or physical-standby result.</p>
+</section>
+<section id="store-and-resp-refactor" class="level3">
+<h3 class="anchored" data-anchor-id="store-and-resp-refactor">2026-10-27 store and RESP refactor</h3>
+<p>A second pass removed another 197 production Go lines from <code>store</code> and <code>resp</code> (622 across both passes). Metadata SELECT/COPY/DELETE decoding and optimistic cache mutations now have one implementation each. Narrow cache GET and batch MGET/MSET queries, chunk codecs, COPY ingest, and body-streaming internals remain specialized. The storage layout remains v23.</p>
+<p>The same local PostgreSQL 18.6 primary was used for before/after comparisons, with synchronous commit enabled. <code>BenchmarkCacheCommands</code> covers GET, SET, GETSET, APPEND, SETRANGE and GETDEL at 256 B, 64 KiB and 10 MiB; <code>BenchmarkCacheIncrement</code> covers serial and four-worker increments. Three 50-operation runs were measured per case with <code>GOMAXPROCS=4</code>. A near-budget 64 KiB GET result was repeated in reverse binary order with five 300-operation runs for 64 KiB and 10 MiB GETs. The figures below include all benchmark runs.</p>
+<p>Run the reusable store benchmarks against a disposable v23 database:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="va">PGVS3_TEST_DATABASE_URL</span><span class="op">=</span><span class="st">"</span><span class="va">$TEST_DATABASE_URL</span><span class="st">"</span> <span class="va">GOMAXPROCS</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="ex">go</span> test <span class="at">-tags</span><span class="op">=</span>integration <span class="at">-run</span> <span class="st">'^$'</span> <span class="at">-bench</span> BenchmarkCache <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-benchtime</span><span class="op">=</span>50x <span class="at">-count</span><span class="op">=</span>3 ./internal/store</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Store operation</th>
+<th style="text-align: right;">Before</th>
+<th style="text-align: right;">After</th>
+<th style="text-align: right;">Median change</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>64 KiB GET</td>
+<td style="text-align: right;">122 µs</td>
+<td style="text-align: right;">131 µs</td>
+<td style="text-align: right;">+7.6%</td>
+</tr>
+<tr class="even">
+<td>10 MiB GET</td>
+<td style="text-align: right;">5.57 ms</td>
+<td style="text-align: right;">5.50 ms</td>
+<td style="text-align: right;">−1.3%</td>
+</tr>
+<tr class="odd">
+<td>10 MiB APPEND</td>
+<td style="text-align: right;">49.32 ms</td>
+<td style="text-align: right;">45.55 ms</td>
+<td style="text-align: right;">−7.6%</td>
+</tr>
+<tr class="even">
+<td>10 MiB GETDEL</td>
+<td style="text-align: right;">8.93 ms</td>
+<td style="text-align: right;">7.95 ms</td>
+<td style="text-align: right;">−11.0%</td>
+</tr>
+<tr class="odd">
+<td>Four-worker INCR</td>
+<td style="text-align: right;">4.27 ms</td>
+<td style="text-align: right;">4.60 ms</td>
+<td style="text-align: right;">+7.8%</td>
+</tr>
+</tbody>
+</table>
+<p>A separate HTTP/RESP check compared the binaries against the same database and objects. HTTP samples were 21/11/7 whole reads at 10 MiB/100 MiB/1 GiB, twelve four-reader requests per size, and 41 HEADs and 64 KiB ranges per size. RESP GET, MGET, EXPIRE, PERSIST and past-deadline EXPIRE each used 101 samples, with setup outside timing. These are native gateway reads to guard the shared metadata path, not a repeat of the constrained-origin cold-fill measurement.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>HTTP operation</th>
+<th style="text-align: right;">Before</th>
+<th style="text-align: right;">After</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>10 MiB GET</td>
+<td style="text-align: right;">4.75 ms</td>
+<td style="text-align: right;">4.89 ms</td>
+</tr>
+<tr class="even">
+<td>100 MiB GET</td>
+<td style="text-align: right;">42.14 ms</td>
+<td style="text-align: right;">42.81 ms</td>
+</tr>
+<tr class="odd">
+<td>1 GiB GET</td>
+<td style="text-align: right;">444.00 ms</td>
+<td style="text-align: right;">440.44 ms</td>
+</tr>
+<tr class="even">
+<td>1 GiB GET, four readers</td>
+<td style="text-align: right;">602.79 ms</td>
+<td style="text-align: right;">602.01 ms</td>
+</tr>
+<tr class="odd">
+<td>64 KiB range of 100 MiB object</td>
+<td style="text-align: right;">357 µs</td>
+<td style="text-align: right;">397 µs</td>
+</tr>
+</tbody>
+</table>
+<p>All 37 comparisons stayed within the 20% budget: the largest median increase was the HTTP range above (+11.2%); store cases were at most 7.8% slower after combining repeat samples. RESP GET/MGET were slightly faster and expiration latencies were effectively unchanged. These local measurements do not establish AWS/Aurora or saturated mixed-workload performance.</p>
+</section>
+<section id="protocol-and-queue-consolidation" class="level3">
+<h3 class="anchored" data-anchor-id="protocol-and-queue-consolidation">2026-10-27 protocol and queue consolidation</h3>
+<p>The broader pass removes another <strong>987 production Go lines</strong>, bringing the total reduction to <strong>1,609</strong>. OJS production code falls from 2,265 to 1,805 lines (20%). It replaces endpoint-specific transport boilerplate, duplicate stream receivers, the job read/plan/update/reload claim pipeline, repetitive job mutation transactions and forwarding-only S3 adapters. No protocol feature, storage namespace, WAL guarantee or layout-v23 rule was removed.</p>
+<p>Before/after binaries were compared on the same local PostgreSQL 18.6 primary. The existing load generator now includes closed-loop <code>ojs-cycle</code> (enqueue/fetch/ACK) and <code>ojs-stream-cycle</code> (append/receive/ACK), avoiding a depleted prefill during receive benchmarks. Each case used 1 KiB payloads and four-second runs in <strong>before/after/after/before</strong> order, with fresh queues per run. Stream cycles use normal delivery with one worker and cooperative members with eight. Values below are medians of the per-run summaries; all runs had zero errors.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 20%">
+<col style="width: 26%">
+<col style="width: 26%">
+<col style="width: 26%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Operation</th>
+<th style="text-align: right;">Workers</th>
+<th style="text-align: right;">Throughput before → after</th>
+<th style="text-align: right;">p50 before → after</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Job enqueue</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">667 → 684 jobs/s</td>
+<td style="text-align: right;">1.419 → 1.487 ms</td>
+</tr>
+<tr class="even">
+<td>Job enqueue</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">3,318 → 3,093 jobs/s</td>
+<td style="text-align: right;">2.336 → 2.338 ms</td>
+</tr>
+<tr class="odd">
+<td>Job lifecycle</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">211 → 215 jobs/s</td>
+<td style="text-align: right;">4.678 → 4.528 ms</td>
+</tr>
+<tr class="even">
+<td>Job lifecycle</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1,084 → 1,075 jobs/s</td>
+<td style="text-align: right;">7.114 → 7.313 ms</td>
+</tr>
+<tr class="odd">
+<td>Stream lifecycle</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">172 → 172 messages/s</td>
+<td style="text-align: right;">5.558 → 5.509 ms</td>
+</tr>
+<tr class="even">
+<td>Cooperative stream lifecycle</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">332 → 336 messages/s</td>
+<td style="text-align: right;">27.528 → 27.192 ms</td>
+</tr>
+</tbody>
+</table>
+<p>Transport-only <code>BenchmarkHTTPBinding</code> cases used seven 300 ms runs against a stub store. Enqueue, fetch, ACK, NACK, stream receive and invalid requests changed by −1.0% to +2.4%. Live manifest/health checks were repeated in the same ABBA order with 3,001 requests per endpoint per run. The largest measured increase was the manifest: <strong>49.17 → 57.75 µs (+17.5%)</strong>, a deliberate small administrative path tradeoff from simpler response construction. Health increased 6.1%.</p>
+<p>The 17-case native HTTP/RESP large-object guard was rerun as well. Single-reader GETs were 5.04 → 4.98 ms at 10 MiB, 42.55 → 41.76 ms at 100 MiB and 441.66 → 438.92 ms at 1 GiB. Four-reader 1 GiB GETs were 611.50 → 598.05 ms. The largest increase in this guard was RESP MGET (+11.8%); all other cases were within +10.1%. Across the six transport cases, six live queue/stream cases, two administrative endpoints and 17 object/RESP cases, every comparison remained within the 20% latency/throughput budget. These are local measurements, not AWS/Aurora, failover or saturated mixed-workload guarantees.</p>
+
+
+</section>
+</section>
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/adonm\.github\.io\/pgvs3");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="./roadmap.html" class="pagination-link" aria-label="Roadmap &amp; Priorities">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text">Roadmap &amp; Priorities</span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="./data-plane-results.html" class="pagination-link" aria-label="Replica Proof &amp; Capacity Ledger">
+        <span class="nav-page-text">Replica Proof &amp; Capacity Ledger</span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+<footer class="footer"><div class="nav-footer"><div class="nav-footer-center"><div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/adonm/pgvs3/blob/main/benchmarks.md" class="toc-action"><i class="bi bi-github"></i>View source</a></li><li><a href="https://github.com/adonm/pgvs3/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div></div></footer><script src="site_libs/quarto-html/zenscroll-min.js"></script>
+</body></html>
