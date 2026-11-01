@@ -188,7 +188,7 @@ must use a writable object endpoint; gateway read-only protections remain intact
 
 ## How it works
 
-![FIG 01 — pgvs3 System Topology and Authority Lanes](docs/assets/architecture-flow.svg)
+![FIG 01 — System Topology & Parallel Authority Lanes](docs/assets/architecture-flow.svg)
 
 - **PostgreSQL-native byte layout.** Small objects are inline; larger objects
   use logical 8,120-byte blocks sized for one PostgreSQL page without TOAST.

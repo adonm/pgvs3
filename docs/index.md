@@ -7,7 +7,7 @@ not just a metadata index. pgvs3 uses its transactions, MVCC snapshots, WAL,
 physical replication and advisory locks instead of adding separate durability,
 cache-coherence and coordination services.
 
-![pgvs3 Data-Plane Architecture and Authority Flow](assets/architecture-flow.svg)
+![FIG 01 — System Topology & Parallel Authority Lanes](assets/architecture-flow.svg)
 
 > **Trusted networks only — permanently.** pgvs3 does not authenticate or
 > authorize clients, terminate inbound TLS, or validate S3 signatures or
@@ -34,7 +34,9 @@ cache-coherence and coordination services.
 
 ## Interactive Scaling, Partitioning & Resource Estimator
 
-Adjust your collection size, wide-column payload width, spatial hotspot skew, and gateway fleet below to compare **Naive (`SELECT *` + Equal-Area Grid)** against **Fixed Hash (`bucket(32, id)`)** and **24-Bit Hierarchical Hilbert (`SORTED BY (hilbert_id, ts)` + Late Materialization)**:
+Adjust your collection size, wide-column payload width, spatial hotspot skew, and gateway fleet below to compare **Naive (`SELECT *` + Equal-Area Grid)** with **column projection only** and **24-bit Hilbert (`SORTED BY (hilbert_id, ts)` + late materialization)**. Hash buckets help entity filters; they do not replace spatial pruning.
+
+<p class="pgvs3-sim-note"><strong>Heuristic model, not a benchmark.</strong> These are closed-form estimates from the sliders (ZSTD 0.42× narrow / 0.55× wide, 8–22% lat-stripe scan, 0.8% narrow + 0.15% wide Hilbert fetch). Re-measure with your own data; measured gates are in <a href="guides/validation.md">Executable Validation Evidence</a>.</p>
 
 ```{=html}
 <div class="pgvs3-sim" id="pgvs3-estimator">
@@ -56,7 +58,7 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
       <input type="range" id="sim-skew" min="10" max="95" step="5" value="90">
     </div>
     <div class="pgvs3-sim-ctrl">
-      <label for="sim-gw">Gateways × pool-max <span class="val" id="val-gw">4 × 32</span></label>
+      <label for="sim-gw">Gateway Replicas (pool-max 32) <span class="val" id="val-gw">4</span></label>
       <input type="range" id="sim-gw" min="1" max="12" step="1" value="4">
     </div>
     <div class="pgvs3-sim-ctrl">
@@ -65,7 +67,7 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
     </div>
   </div>
 
-  <div class="pgvs3-sim-kpis">
+  <div class="pgvs3-sim-kpis" aria-live="polite">
     <div class="pgvs3-kpi bad" id="kpi-ram-box">
       <div class="k-label">Writer Row-Group RAM / Thread</div>
       <div class="k-val" id="kpi-ram">246 MiB → 32 MiB</div>
@@ -73,23 +75,28 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
     </div>
     <div class="pgvs3-kpi good">
       <div class="k-label">Selective 2D Query I/O (0.1% Match)</div>
-      <div class="k-val" id="kpi-io">142 GiB → 1.1 GiB</div>
-      <div class="k-sub" id="kpi-io-sub">Hilbert pruning + late materialization</div>
+      <div class="k-val" id="kpi-io">220 GiB → 1.7 GiB</div>
+      <div class="k-sub" id="kpi-io-sub">128× less network &amp; decompression I/O</div>
     </div>
     <div class="pgvs3-kpi good">
-      <div class="k-label">Hotspot Partition Skew (64 Buckets)</div>
-      <div class="k-val" id="kpi-files">90% in 1 → Even 256MB</div>
-      <div class="k-sub" id="kpi-files-sub">Equal-byte Hilbert files avoid tiny ocean files</div>
+      <div class="k-label">Hotspot Row-Group Adaptation</div>
+      <div class="k-val" id="kpi-files">90% → 9 dense RGs</div>
+      <div class="k-sub" id="kpi-files-sub">Equal-byte RGs subdivide the hotspot; sparse rows share one</div>
     </div>
     <div class="pgvs3-kpi warn" id="kpi-conn-box">
       <div class="k-label">PostgreSQL Fleet Connections</div>
-      <div class="k-val" id="kpi-conn">292 conns</div>
-      <div class="k-sub" id="kpi-conn-sub">main + chunk pools + 36 app/scanner/admin</div>
+      <div class="k-val" id="kpi-conn">356 / 448 max</div>
+      <div class="k-sub" id="kpi-conn-sub">4 (+1 surge) × 64 + 36 app/scanner/admin</div>
     </div>
     <div class="pgvs3-kpi">
-      <div class="k-label">PG Storage + Outbox Stage</div>
-      <div class="k-val" id="kpi-disk">842 GiB + 22 GiB</div>
-      <div class="k-sub" id="kpi-disk-sub">ZSTD chunks (8,120B pages) + s3w_ buffer</div>
+      <div class="k-label">PG Compressed Storage</div>
+      <div class="k-val" id="kpi-disk">1068 GiB</div>
+      <div class="k-sub" id="kpi-disk-sub">≈ 4272 × 256MB Parquet files</div>
+    </div>
+    <div class="pgvs3-kpi">
+      <div class="k-label">Origin Outage Stage</div>
+      <div class="k-val" id="kpi-outbox">22.0 GiB</div>
+      <div class="k-sub" id="kpi-outbox-sub">15 min @ 25 MiB/s in s3w_</div>
     </div>
   </div>
 
@@ -97,7 +104,7 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
     <div class="pgvs3-bar-row">
       <div class="pgvs3-bar-hdr">
         <span><strong>Naive:</strong> <code>SELECT *</code> + Equal-Area Grid + <code>SORTED BY (lat, lon)</code> (no lon pruning)</span>
-        <span id="bar-naive-txt" style="color:var(--danger);font-family:monospace;font-weight:600;">142.0 GiB scanned</span>
+        <span id="bar-naive-txt" style="color:var(--danger);font-family:monospace;font-weight:600;">220 GiB scanned</span>
       </div>
       <div class="pgvs3-bar-track">
         <div class="pgvs3-bar-fill" id="bar-naive" style="width:100%;background:var(--danger);"></div>
@@ -106,19 +113,19 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
     <div class="pgvs3-bar-row">
       <div class="pgvs3-bar-hdr">
         <span><strong>Column Projection Only:</strong> Narrow + Wide fetched for entire lat stripe</span>
-        <span id="bar-proj-txt" style="color:var(--warning);font-family:monospace;font-weight:600;">28.4 GiB scanned</span>
+        <span id="bar-proj-txt" style="color:var(--warning);font-family:monospace;font-weight:600;">30.1 GiB scanned</span>
       </div>
       <div class="pgvs3-bar-track">
-        <div class="pgvs3-bar-fill" id="bar-proj" style="width:24%;background:var(--warning);"></div>
+        <div class="pgvs3-bar-fill" id="bar-proj" style="width:13.7%;background:var(--warning);"></div>
       </div>
     </div>
     <div class="pgvs3-bar-row">
       <div class="pgvs3-bar-hdr">
         <span><strong>pgvs3 + DuckLake Recommended:</strong> 24-Bit Hilbert <code>SORTED BY (hilbert_id, ts)</code> + Late Materialization</span>
-        <span id="bar-hilb-txt" style="color:var(--success);font-family:monospace;font-weight:600;">1.1 GiB scanned (129× less I/O)</span>
+        <span id="bar-hilb-txt" style="color:var(--success);font-family:monospace;font-weight:600;">1.7 GiB scanned (128× less I/O)</span>
       </div>
       <div class="pgvs3-bar-track">
-        <div class="pgvs3-bar-fill" id="bar-hilb" style="width:3%;background:var(--success);"></div>
+        <div class="pgvs3-bar-fill" id="bar-hilb" style="width:2%;background:var(--success);"></div>
       </div>
     </div>
   </div>
@@ -154,18 +161,20 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
     el('val-narrow').textContent = narrowB + ' B/row';
     el('val-wide').textContent = wideB + ' B/row';
     el('val-skew').textContent = skewPct + '%';
-    el('val-gw').textContent = gw + ' × 32';
+    el('val-gw').textContent = gw + ' gateways';
     el('val-outage').textContent = outageMin + ' min';
 
     // 1. Writer RAM per thread for 122,880 rows vs byte-bounded
     const defaultRgMiB = Math.round((122880 * totalRowB) / (1024 * 1024));
-    const boundedRgMiB = wideB >= 512 ? 32 : Math.min(64, Math.max(8, defaultRgMiB));
-    el('kpi-ram').textContent = defaultRgMiB + ' MiB → ' + boundedRgMiB + ' MiB';
-    el('kpi-ram-box').className = 'pgvs3-kpi ' + (defaultRgMiB > 128 ? 'bad' : 'good');
-    el('kpi-ram-sub').textContent = defaultRgMiB > 128
+    const boundedRgMiB = Math.min(defaultRgMiB, 32);
+    const reduced = boundedRgMiB < defaultRgMiB;
+    el('kpi-ram').textContent = reduced
+      ? defaultRgMiB + ' MiB → ' + boundedRgMiB + ' MiB'
+      : defaultRgMiB + ' MiB (fits)';
+    el('kpi-ram-box').className = 'pgvs3-kpi ' + (defaultRgMiB > 128 ? 'bad' : defaultRgMiB > 64 ? 'warn' : 'good');
+    el('kpi-ram-sub').textContent = reduced
       ? 'Set parquet_row_group_size_bytes = \'' + boundedRgMiB + 'MB\''
       : 'Default 122,880 rows fits comfortably';
-
     // 2. Compressed storage (approx 0.42x on narrow + 0.55x on wide with ZSTD level 9)
     const compNarrow = rows * narrowB * 0.42;
     const compWide = rows * wideB * 0.55;
@@ -191,8 +200,9 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
 
     // 4. File / partition balance
     const targetFileCount = Math.max(1, Math.ceil(totalCompBytes / (256 * 1024 * 1024)));
-    el('kpi-files').textContent = skewPct + '% in 1 → ' + targetFileCount + '×256MB';
-    el('kpi-files-sub').textContent = '0 empty ocean files; hotspot splits into equal-byte RGs';
+    const denseRgs = Math.max(1, Math.round(skewPct / 10));
+    el('kpi-files').textContent = skewPct + '% → ' + denseRgs + ' dense ' + (denseRgs === 1 ? 'RG' : 'RGs');
+    el('kpi-files-sub').textContent = 'Equal-byte RGs subdivide the hotspot; sparse rows share one';
 
     // 5. Connections
     const poolMax = 32;
@@ -200,18 +210,24 @@ Adjust your collection size, wide-column payload width, spatial hotspot skew, an
     const totalConns = gwConns + 36;
     const recMaxConns = Math.max(256, Math.ceil((totalConns + 32) / 64) * 64);
     el('kpi-conn').textContent = totalConns + ' / ' + recMaxConns + ' max';
-    el('kpi-conn-box').className = 'pgvs3-kpi ' + (totalConns > 240 ? 'warn' : 'good');
-    el('kpi-conn-sub').textContent = gw + ' (+1 surge) gateways × 64 + 36 app/scanner/admin';
+    el('kpi-conn-box').className = 'pgvs3-kpi ' + (totalConns > 512 ? 'bad' : totalConns > 240 ? 'warn' : 'good');
+    el('kpi-conn-sub').textContent = gw + ' (+1 surge) × (32 main + 32 chunk) + 36';
 
     // 6. Storage + Outbox buffer
     const outboxBytes = outageMin * 60 * 25 * 1024 * 1024;
-    el('kpi-disk').textContent = fmtGiB(totalCompBytes) + ' + ' + fmtGiB(outboxBytes);
-    el('kpi-disk-sub').textContent = 'Compressed s3b_ chunks + ' + outageMin + 'm s3w_ outage stage';
+    el('kpi-disk').textContent = fmtGiB(totalCompBytes);
+    el('kpi-disk-sub').textContent = '≈ ' + targetFileCount + ' × 256MB Parquet files';
+    el('kpi-outbox').textContent = outboxBytes === 0 ? '0 MiB' : fmtGiB(outboxBytes);
+    el('kpi-outbox-sub').textContent = outboxBytes === 0 ? 'no outage buffer' : outageMin + ' min @ 25 MiB/s in s3w_';
 
     // 7. Live SQL & Config snippet
-    const rgSetting = wideB >= 512
-      ? "CALL lake.set_option('parquet_row_group_size_bytes', '" + boundedRgMiB + "MB', table_name => 'events');\nCALL lake.set_option('skip_stats_columns', ['wide_payload'], table_name => 'events');"
+    const rgSetting = reduced
+      ? "CALL lake.set_option('parquet_row_group_size_bytes', '" + boundedRgMiB + "MB', table_name => 'events');" +
+        (wideB > 0 ? "\nCALL lake.set_option('skip_stats_columns', ['wide_payload'], table_name => 'events');" : "")
       : "CALL lake.set_option('parquet_row_group_size', 122880, table_name => 'events');";
+    const rgComment = reduced
+      ? "let 256MB files & " + boundedRgMiB + "MB row groups slice"
+      : "let 256MB files & 122,880-row row groups slice";
 
     el('sim-sql').textContent =
 `-- Tailored for ${el('val-rows').textContent} (${narrowB}B narrow + ${wideB}B wide, ${skewPct}% spatial hotspot skew):
@@ -219,14 +235,14 @@ CREATE TABLE lake.events (
     id BIGINT, customer_id INTEGER, ts TIMESTAMPTZ,
     lat DOUBLE, lon DOUBLE, hilbert_id BIGINT${wideB > 0 ? ", wide_payload VARCHAR" : ""}
 )
--- Omit equal-area spatial PARTITIONED BY under ${skewPct}% skew; let 256MB files & ${boundedRgMiB}MB row groups slice hilbert_id by quantiles:
+-- Omit equal-area spatial PARTITIONED BY under ${skewPct}% skew; ${rgComment} hilbert_id by quantiles:
 SORTED BY (hilbert_id, ts);
 
 CALL lake.set_option('parquet_compression', 'zstd', table_name => 'events');
 CALL lake.set_option('parquet_compression_level', 9, table_name => 'events');
 CALL lake.set_option('target_file_size', '256MB', table_name => 'events');
 ${rgSetting}
--- PostgreSQL connection budget: set max_connections >= ${recMaxConns} for ${gw} gateways (--pool-max ${poolMax}) + 1 rollout surge pod.`;
+-- PostgreSQL connection budget: set max_connections >= ${recMaxConns} for ${gw} gateway${gw === 1 ? '' : 's'} (--pool-max ${poolMax}) + 1 rollout surge pod.`;
   }
 
   inputs.forEach(id => el(id).addEventListener('input', update));
@@ -237,43 +253,45 @@ ${rgSetting}
 
 ---
 
-## Visual Atlas of Data Layouts & Movements
+## Visual Atlas of Data Layouts & Movements (FIG 03–06)
 
-### 1. 8,120-Byte Page Layout & Cut-Through Streaming I/O
+Figures use stable site-wide numbers, so the same diagram can be reused on a guide page without renumbering. FIG 01 (topology) and FIG 02 (decision tree) appear above; the four data-layout figures follow.
+
+### FIG 03 — 8,192-Byte Page Layout & Cut-Through Streaming I/O
 
 Small objects ($\le 64\text{ KiB}$ native, $\le 8,120\text{ B}$ cache/RESP) live inline in `objects.inline_data`. Larger objects (10 MiB–1 GiB Parquet) split into fixed **8,120-byte logical blocks** compressed per block with Zstd *only when it shrinks*, fitting **one tuple per 8,192-byte PostgreSQL page** with `toast_tuple_target = 8160` and `STORAGE EXTERNAL` (zero out-of-line TOAST pointer chasing, and $O(1)$ byte-range offset seeking at $\text{offset} = \text{no} \times 8,120$).
 
-![PostgreSQL 8 KiB Page Layout, Binary COPY Ingest and Cut-Through Streaming Read Path](assets/page-layout-io.svg)
+![FIG 03 — 8,192-Byte Page, 8,120-Byte Chunks & Cut-Through Streaming I/O](assets/page-layout-io.svg)
 
 See [8 KiB Page Layout & I/O Paths](performance.md) and [Why Chunks Are Unpartitioned](partitioning.md).
 
 ---
 
-### 2. Origin-Backed Shared Cache (`s3c_`) & Durable Write-Back Stage (`s3w_`)
+### FIG 04 — Origin-Backed Shared Cache (`s3c_`) & Durable Write-Back Stage (`s3w_`)
 
 Cold misses coalesce behind a renewable 2-minute database lease (`s3p.cache_fill_leases`), spooling bodies $>8\text{ MiB}$ to local scratch outside a database transaction before publishing version-fenced chunks to `s3c_<namespace>`. Unconditional writes $>8\text{ MiB}$ and multipart completions commit atomically to WAL-logged `s3w_<namespace>` + `s3p.pending_uploads` (`expires_at IS NULL`) before returning `200 OK`, then drain asynchronously to the upstream origin under a session advisory key lock.
 
-![Shared Origin Cache, Coalesced Cold Fills and Ack-First Write-Back Outbox](assets/cache-writeback-lifecycle.svg)
+![FIG 04 — Shared Origin Cache (s3c_) & Ack-First Write-Back Outbox (s3w_)](assets/cache-writeback-lifecycle.svg)
 
 See [Shared Cache & Write-Back Staging](guides/cache.md) and [Operations: Cache Tier](operations.md#cache-tier-in-front-of-another-object-store).
 
 ---
 
-### 3. Billion-Row DuckLake: Fixed Buckets, Density-Adaptive Hilbert & Late Materialization
+### FIG 05 — Billion-Row DuckLake: Fixed Buckets, Density-Adaptive Hilbert & Late Materialization
 
 Instead of high-maintenance rolling time partitions or equal-area spatial grids that skew under urban hotspots, combine **fixed 32–64 hash buckets** (`bucket(32, customer_id)`) with **high-resolution 1D Hilbert sorting** (`SORTED BY (hilbert_id, ts)`). Because Parquet row groups (`parquet_row_group_size_bytes`) and DuckLake files (`target_file_size`) slice the sorted stream by **row/byte count (empirical quantiles)** rather than geographic area, sparse regions pack into one row group while dense hotspots automatically subdivide into tight neighborhood bounding boxes.
 
-![DuckLake Fixed Hash Buckets, 24-Bit Hierarchical Hilbert Curve and Density-Adaptive Row Groups](assets/spatiotemporal-hilbert-layout.svg)
+![FIG 05 — 24-Bit Hilbert Sorting, Equal-Byte Row Groups & Late Materialization](assets/spatiotemporal-hilbert-layout.svg)
 
 See [DuckLake, Wide Columns & Hilbert Modeling](guides/analytics.md#schema-wide-column-spatiotemporal-and-write-for-read-modeling).
 
 ---
 
-### 4. Transactional SQL Outbox, OJS Leases & 3-Segment `TRUNCATE` Streams
+### FIG 06 — Transactional SQL Outbox, OJS Leases & 3-Segment `TRUNCATE` Streams
 
 Each `s3q_<name>` schema provides two delivery views: **OJS competing jobs** (bridged from application SQL via an outbox, claimed lazily through a single `FOR UPDATE SKIP LOCKED` index on `(priority DESC, next_visible_at, seq)`, and fenced by `lease_token`) and **PgQue-shaped fan-out streams** (using `pg_snapshot` ticks to prevent late-commit sequence gaps and rotating three physical `stream_events_0..2` partitions via zero-bloat `TRUNCATE`).
 
-![Transactional SQL Outbox, OJS Lease Token State Machine and 3-Segment TRUNCATE Stream Rotation](assets/outbox-jobs-streams.svg)
+![FIG 06 — OJS Outbox Claim/ACK Boundaries & 3-Segment TRUNCATE Streams](assets/outbox-jobs-streams.svg)
 
 See [Jobs, Outboxes & Streams](guides/jobs.md) and [Queue & Stream Model](queue-stream.md).
 

@@ -28,18 +28,19 @@ are test fixture parameters, not alternative examples.
 | Streams | Oversized snapshot batch returns 413 without partial pagination; repeat receive returns the active batch; ACK advances it. |
 | Operations | PostgreSQL 18 diagnostic queries, optional statement statistics, CLI/probes/metric names and guarded demo cleanup. |
 
-## Verified 2026-10-31
+## Verified 2026-11-01
 
 Base pgvs3 `75802d0`, layout v25; Linux amd64, PostgreSQL/pgbench **18.6**, DuckDB
 **2.0.0**. Actual loaded extension versions/hashes are in the report: DuckLake
 `417a9117f5` (catalog format 1.1), httpfs `77392a7207`, PostgreSQL scanner
 `c0f5a3c0c4`. Normal signed/official extensions are used; no production Go, schema
-SQL or dependencies were changed.
+SQL or dependencies were changed. The 2026-11-01 rerun re-executed the guide gate
+after the Quarto/theme/SVG audit; it changed documentation only.
 
 ```text
 $ just guides
 guides: 35 bound snippets, 12 scenario checks passed
-guides ok (34s); artifacts: .tmp/verify/guides.htfvGk
+guides ok (35s); artifacts: .tmp/verify/guides.MPLHYo
 
 $ just docs
 Output created: _site/index.html
@@ -62,9 +63,11 @@ OK
 | Jobs | Rollback/no job, lost enqueue reconciliation, mismatched envelope refusal, effect-before-ACK redelivery and stale-token 409. Receipt/effect count stays one even after retained ID removal/reuse. | Permanent uniqueness or exactly-once external work. Retention age is advanced only on one owned fixture row. |
 | Streams | Ceiling 413, same active batch on repeat, ACK then empty receive. | Pagination, job leases on batches or a hard retention/disk cap. |
 
-Canonical report: `.tmp/verify/guides.htfvGk/guides.json`, SHA-256
-`d54cc76c63c56a9937667b1fbdcd0d3502c1a9f188712839a891592784deafc3`
-(superseding `.tmp/verify/guides.LO55Zg/guides.json`, SHA-256
+Canonical report: `.tmp/verify/guides.MPLHYo/guides.json`, SHA-256
+`375bf056b87755af7a04cb8657c2907bf35746d972e8119177f07f25de823db9`
+(superseding `.tmp/verify/guides.htfvGk/guides.json`, SHA-256
+`d54cc76c63c56a9937667b1fbdcd0d3502c1a9f188712839a891592784deafc3`,
+`.tmp/verify/guides.LO55Zg/guides.json`, SHA-256
 `c95072f77924f3ab8ee2ac514615a650f144c0c69415cba875f88c116ec2a31f`,
 `.tmp/verify/guides.dJ5kp4/guides.json`, SHA-256
 `04fa2c41f6ec1c7421e869e97c5becf8227c4b2296b83a2344fb57f774fe9ef4`,
@@ -89,21 +92,26 @@ the delivered sources. This validation page is excluded from document hashes to
 avoid a self-referential report-hash cycle. Reports/transcripts/data stay ignored;
 GitHub's existing failure upload includes the guide JSON and canary logs.
 
-The complete `just ci` also passed: format/modernizer/import/tidy/vet/staticcheck/
-vulnerability checks, race Go tests, **24 Python tooling tests**, uncached race
-integration, four fuzz targets, Helm/kind, the contract (including these guides
-and pinned ObjFS recovery), physical-replica/promotion/pending-restore fault checks,
-interop and s3t. ShellCheck and Python compilation were checked separately. This
-is a local gate result, not a claim that a hosted CI run or cloud deployment passed.
+The complete `just ci` passed on both the frozen source and the delivered tree:
+format/modernizer/import/tidy/vet/staticcheck/vulnerability checks, race Go tests,
+**24 Python tooling tests**, uncached race integration, four fuzz targets,
+Helm/kind, the contract (including these guides and pinned ObjFS recovery),
+physical-replica/promotion/pending-restore fault checks, interop and s3t.
+ShellCheck and Python compilation were checked separately. This is a local gate
+result, not a claim that a hosted CI run or cloud deployment passed.
 
-The frozen-source CI run retained integration (44 s), Helm/kind (72 s),
-contract (50 s), fault (91 s), interop (16 s) and s3t (13 s) artifacts. Its embedded
-guide report, `.tmp/verify/contract.E4QASf/guides.json` (SHA-256
-`76a9f5cf74317b49cc1c38e928da81313537ec97a127072611f06a94ffd709ce`), and the
-updated 35-snippet standalone run `.tmp/verify/guides.htfvGk/guides.json` both
-completed with matching source hashes. Full CI transcript:
-`.tmp/guidance-20261031/ci-frozen.log`, SHA-256
-`32c0e44297bde13dac56934b321f8521625a1292b9ba626c49b079bb5a8fc0bf`.
+The frozen-source run retained integration (44 s), Helm/kind (72 s), contract
+(50 s), fault (91 s), interop (16 s) and s3t (13 s) artifacts, including
+`.tmp/verify/contract.E4QASf/guides.json` (SHA-256
+`76a9f5cf74317b49cc1c38e928da81313537ec97a127072611f06a94ffd709ce`). The
+delivered-tree rerun passed integration (45 s), Helm/kind (79 s), contract
+(51 s), fault (92 s), interop (17 s) and s3t (16 s); its success-only contract
+artifacts were cleaned, so the canonical current guide report is the standalone
+`.tmp/verify/guides.MPLHYo/guides.json`. Transcripts:
+`.tmp/guidance-20261031/ci-frozen.log` (SHA-256
+`32c0e44297bde13dac56934b321f8521625a1292b9ba626c49b079bb5a8fc0bf`) and
+`.tmp/guidance-20261031/ci-coherent.log` (SHA-256
+`ee6290b90c1ea610d35775c60a7ef2dd3df02f637419d3557913087f02f284fd`).
 
 ## Research and retained failed trials
 

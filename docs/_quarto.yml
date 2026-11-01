@@ -117,6 +117,9 @@ format:
               : window.matchMedia('(prefers-color-scheme: dark)').matches;
             document.documentElement.style.colorScheme = isDark ? 'dark' : 'light';
             document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+            document.querySelectorAll('svg.oat-inline-svg').forEach((svg) => {
+              svg.style.colorScheme = isDark ? 'dark' : 'light';
+            });
           };
           syncScheme();
           window.addEventListener('DOMContentLoaded', () => {
@@ -130,8 +133,21 @@ format:
                 const doc = new DOMParser().parseFromString(txt, 'image/svg+xml');
                 const svg = doc.querySelector('svg');
                 if (svg) {
+                  const figure = img.closest('figure');
                   svg.classList.add('oat-inline-svg');
+                  svg.style.colorScheme = document.body.classList.contains('quarto-dark') ? 'dark' : 'light';
                   img.replaceWith(svg);
+                  const host = figure || svg.parentElement;
+                  if (host && !host.querySelector('.pgvs3-fullsize')) {
+                    const link = document.createElement('a');
+                    link.className = 'pgvs3-fullsize';
+                    link.href = img.src;
+                    link.target = '_blank';
+                    link.rel = 'noopener';
+                    link.textContent = 'Open full-size SVG ↗';
+                    link.setAttribute('aria-label', 'Open this diagram as a full-size SVG in a new tab');
+                    host.appendChild(link);
+                  }
                 }
               } catch (_) {}
             });

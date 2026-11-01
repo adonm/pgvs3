@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 460" role="img" aria-labelledby="fig1-title fig1-desc">
-  <title id="fig1-title">FIG 01 — pgvs3 System Topology and Authority Lanes</title>
-  <desc id="fig1-desc">Four-column, non-crossing architecture diagram showing Clients, Stateless Gateways, PostgreSQL 18 Primary, and Standbys/Origin with animated packets.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 480" role="img" aria-labelledby="fig1-title fig1-desc">
+  <title id="fig1-title">FIG 01 — System Topology and Parallel Authority Lanes</title>
+  <desc id="fig1-desc">Four-column topology: direct OLTP bypass, stateless writable and read-only gateways, PostgreSQL 18 primary, physical standbys and S3 origin. pgvs3 lanes are routed outside each other; direct SQL never enters a gateway.</desc>
   <defs>
     <marker id="f1-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
@@ -61,7 +61,7 @@
     }
   </style>
 
-  <rect width="1040" height="460" class="bg" rx="8"/>
+  <rect width="1040" height="480" class="bg" rx="8"/>
   <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
   <text x="24" y="27" class="fig">FIG 01</text>
   <text x="80" y="27" class="title">System Topology &amp; Parallel Authority Lanes</text>
@@ -85,18 +85,16 @@
   <rect x="828" y="58" width="192" height="384" class="col-bg"/>
   <text x="842" y="78" class="col-t">4. REPLICAS &amp; ORIGIN</text>
 
-  <!-- LANE 1: Direct OLTP & Catalog SQL -->
-  <rect x="32" y="92" width="172" height="62" class="box"/>
+  <!-- LANE 1: Direct OLTP & Catalog SQL (outside pgvs3) -->
+  <rect x="32" y="92" width="172" height="70" class="box"/>
   <text x="44" y="116" class="h4">OLTP &amp; DuckLake</text>
-  <text x="44" y="136" class="mono cb">:5432 / Pooler :6432</text>
+  <text x="44" y="134" class="mono cb">:5432 · :6432 pooler</text>
+  <text x="44" y="151" class="sub">never proxied by pgvs3</text>
 
-  <rect x="564" y="92" width="200" height="62" class="box-b"/>
+  <rect x="564" y="92" width="200" height="70" class="box-b"/>
   <text x="576" y="116" class="h4 cb">App &amp; Catalog DBs</text>
   <text x="576" y="136" class="mono">guide_app · ducklake</text>
-
-  <path id="p1-sql" d="M 204 123 L 558 123" class="ln-b" marker-end="url(#f1-b)"/>
-  <rect x="316" y="106" width="136" height="20" class="chip"/>
-  <text x="326" y="120" class="mono cb">Direct SQL Tx</text>
+  <text x="576" y="153" class="sub">clients connect directly</text>
 
   <!-- LANE 2: Writable Gateways & Native/Queue Schemas -->
   <rect x="32" y="174" width="172" height="84" class="box"/>
@@ -156,16 +154,16 @@
   <text x="852" y="406" class="mono">replay_lsn &gt;= flush_lsn</text>
 
   <path id="p1-r1" d="M 204 394 L 274 394" class="ln-g" marker-end="url(#f1-g)"/>
-  <path id="p1-r2" d="M 834 394 L 494 394" class="ln-g" marker-end="url(#f1-g)"/>
-  <rect x="596" y="384" width="144" height="20" class="chip"/>
-  <text x="606" y="398" class="mono cg">Replicated Page Hits</text>
+  <!-- Standby page hits run below the columns, then up into the read-only fleet. -->
+  <path id="p1-r2" d="M 976 426 L 976 462 L 384 462 L 384 432" class="ln-g" marker-end="url(#f1-g)"/>
+  <rect x="560" y="450" width="144" height="18" class="chip"/>
+  <text x="570" y="463" class="mono cg">Replicated Page Hits</text>
 
-  <!-- Vertical WAL Replication (Primary -> Standby) -->
-  <path id="p1-wal" d="M 664 340 L 664 370 L 834 370" class="ln-p" marker-end="url(#f1-p)"/>
-  <text x="674" y="363" class="mono cp">WAL Stream</text>
+  <!-- Horizontal WAL Replication (Primary -> Standby) -->
+  <path id="p1-wal" d="M 776 394 L 834 394" class="ln-p" marker-end="url(#f1-p)"/>
+  <text x="782" y="386" class="mono cp">WAL</text>
 
   <!-- Animated Packets -->
-  <circle r="4" class="cb pkt"><animateMotion dur="2.2s" repeatCount="indefinite"><mpath href="#p1-sql"/></animateMotion></circle>
   <circle r="4" class="cb pkt"><animateMotion dur="1.4s" repeatCount="indefinite"><mpath href="#p1-w2"/></animateMotion></circle>
   <circle r="4" class="ca pkt"><animateMotion dur="1.8s" repeatCount="indefinite"><mpath href="#p1-o2"/></animateMotion></circle>
   <circle r="4" class="cg pkt"><animateMotion dur="2.0s" repeatCount="indefinite"><mpath href="#p1-r2"/></animateMotion></circle>

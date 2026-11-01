@@ -81,11 +81,26 @@ def check_links():
     svgs = sorted(ASSETS.glob("*.svg"))
     if len(svgs) < 6:
         raise ValueError("Expected at least 6 SVG diagrams in docs/assets")
+    titles = {}
     for svg in svgs:
-        ET.parse(svg)
+        root = ET.parse(svg).getroot()
         body = svg.read_text()
         if "@keyframes" not in body or "prefers-reduced-motion" not in body or "light-dark(" not in body:
             raise ValueError(f"SVG {svg.relative_to(ROOT)} must include CSS animation, light-dark() tokens, and prefers-reduced-motion support")
+        title = root.find("{http://www.w3.org/2000/svg}title")
+        label = (title.text or "").strip() if title is not None else ""
+        match = re.match(r"^FIG (\d{2}) — ", label)
+        if not match:
+            raise ValueError(f"SVG {svg.relative_to(ROOT)} must have a <title> beginning 'FIG NN — '")
+        if match.group(1) in titles:
+            raise ValueError(f"Duplicate figure number FIG {match.group(1)} in {titles[match.group(1)]} and {svg.name}")
+        titles[match.group(1)] = svg.name
+    if set(titles) != {f"{number:02d}" for number in range(1, len(svgs) + 1)}:
+        raise ValueError(f"SVG figure numbers must be contiguous FIG 01..FIG {len(svgs):02d}, got {sorted(titles)}")
+    markdown = "\n".join(path.read_text() for path in paths)
+    for svg in svgs:
+        if svg.name not in markdown:
+            raise ValueError(f"SVG {svg.name} is not referenced from maintained Markdown")
     for source in paths:
         if any(token in source.read_text() for token in ("├──", "└──", "--WAL-->", "replaceable pgvs3 gateways -------")):
             raise ValueError(f"ASCII diagram remains in {source.relative_to(ROOT)}; use docs/assets/*.svg instead")

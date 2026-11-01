@@ -6,11 +6,13 @@ make arbitrary application SQL faster, implement CDC or turn PostgreSQL into a
 distributed columnar engine. Start with the path that removes your bottleneck,
 not with every interface enabled.
 
-![pgvs3 Data-Plane Architecture and Authority Flow](../assets/architecture-flow.svg)
+![FIG 01 — System Topology & Parallel Authority Lanes](../assets/architecture-flow.svg)
 
 ## Decision tree: choose the model and path
 
 ![FIG 02 — Workload, Schema and Partitioning Decision Tree](../assets/decision-tree.svg)
+
+Figure numbers are stable across the site: FIG 01 topology, FIG 02 decision tree, FIG 03 page I/O, FIG 04 cache/staging, FIG 05 Hilbert layout, FIG 06 queues. Guides reuse a figure rather than renumbering it.
 
 | I need to… | Start here | Success means |
 | --- | --- | --- |

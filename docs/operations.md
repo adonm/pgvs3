@@ -620,7 +620,7 @@ limit is `--s3-concurrency`.
 
 ## Cache tier in front of another object store
 
-![Shared Origin Cache, Coalesced Cold Fills and Ack-First Write-Back Outbox](assets/cache-writeback-lifecycle.svg)
+![FIG 04 — Shared Origin Cache (s3c_) & Ack-First Write-Back Outbox (s3w_)](assets/cache-writeback-lifecycle.svg)
 
 Origin configurations live inside PostgreSQL (`s3p.namespaces.attrs["origin"]`
 and `<schema>.meta.attrs`), so gateways remain stateless and need no local

@@ -8,7 +8,7 @@ system; DuckDB executes the analytical SQL; pgvs3 stores or caches the object
 bytes. This is application-managed materialization, **not built-in CDC**.
 [Research basis](sources.md#analytics-and-object-storage).
 
-![DuckLake Fixed Hash Buckets, 24-Bit Hierarchical Hilbert Curve and Density-Adaptive Row Groups](../assets/spatiotemporal-hilbert-layout.svg)
+![FIG 05 — 24-Bit Hilbert Sorting, Equal-Byte Row Groups & Late Materialization](../assets/spatiotemporal-hilbert-layout.svg)
 
 ## Choose an analytical storage format
 

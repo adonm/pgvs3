@@ -7,7 +7,7 @@ copy of record and allowed staleness explicit. pgvs3 is an object-byte cache and
 durable write stage, not an automatic query-result cache or refresh engine.
 [Research basis](sources.md#caches-are-not-interchangeable).
 
-![Shared Origin Cache, Coalesced Cold Fills and Ack-First Write-Back Outbox](../assets/cache-writeback-lifecycle.svg)
+![FIG 04 — Shared Origin Cache (s3c_) & Ack-First Write-Back Outbox (s3w_)](../assets/cache-writeback-lifecycle.svg)
 
 ## Select the contract before a TTL
 

@@ -8,7 +8,7 @@ If you need enqueue/completion **inside the caller's SQL transaction**, a librar
 with an explicit transaction API (for example River) is a better fit than
 writing pgvs3's internal tables. [Research and differences](sources.md#jobs-and-transaction-boundaries).
 
-![Transactional SQL Outbox, OJS Lease Token State Machine and 3-Segment TRUNCATE Stream Rotation](../assets/outbox-jobs-streams.svg)
+![FIG 06 — OJS Outbox Claim/ACK Boundaries & 3-Segment TRUNCATE Streams](../assets/outbox-jobs-streams.svg)
 
 ## Choose jobs or streams
 

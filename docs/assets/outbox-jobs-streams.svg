@@ -62,7 +62,7 @@
 
   <!-- Pipeline 1: OJS Jobs -->
   <rect x="20" y="56" width="1000" height="168" class="lane"/>
-  <text x="36" y="78" class="h3 cb">1. OJS Competing Jobs — 4 Separate Transaction Boundaries</text>
+  <text x="36" y="78" class="h3 cb">1. OJS Competing Jobs — 4 DB Commits, Then an HTTP ACK</text>
 
   <rect x="36" y="92" width="216" height="114" class="b-sql"/>
   <text x="48" y="114" class="h4 cb">Tx 1: Producer SQL</text>
@@ -86,7 +86,7 @@
   <text x="544" y="186" class="mono cg">Issues UUIDv7 lease_token</text>
 
   <rect x="780" y="92" width="224" height="114" class="b-ack"/>
-  <text x="792" y="114" class="h4 cg">Tx 4 → 5: Receipt &amp; ACK</text>
+  <text x="792" y="114" class="h4 cg">Tx 4: Receipt, then ACK</text>
   <text x="792" y="133" class="mono">INSERT INTO receipts</text>
   <text x="792" y="151" class="sub">Commits with SQL effect</text>
   <text x="792" y="167" class="sub">before POST /workers/ack</text>

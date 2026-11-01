@@ -9,7 +9,7 @@ For a quick start see [index.md](index.md#quick-start); for deployment see
 [operations.md](operations.md); for storage internals and query paths see
 [performance.md](performance.md).
 
-![pgvs3 Data-Plane Architecture and Authority Flow](assets/architecture-flow.svg)
+![FIG 01 — System Topology & Parallel Authority Lanes](assets/architecture-flow.svg)
 
 ## Product focus
 

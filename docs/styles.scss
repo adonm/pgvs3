@@ -198,6 +198,31 @@ p > img[src$=".svg"] {
   box-shadow: var(--shadow-small);
 }
 
+.pgvs3-fullsize {
+  display: block;
+  width: fit-content;
+  margin: -0.45rem auto 1.1rem;
+  padding: 0.22rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--faint);
+  text-align: center;
+  font-size: 0.76rem;
+  color: var(--muted-foreground);
+  text-decoration: none;
+}
+
+.pgvs3-fullsize:hover {
+  color: var(--foreground);
+  border-color: var(--muted-foreground);
+}
+
+.pgvs3-sim-note {
+  margin: -0.35rem 0 1rem;
+  font-size: 0.82rem;
+  color: var(--muted-foreground);
+}
+
 /* Interactive Estimator in Oat UI style */
 .pgvs3-sim {
   background-color: var(--card);
@@ -211,7 +236,7 @@ p > img[src$=".svg"] {
 
 .pgvs3-sim-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(225px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 0.85rem;
   margin-bottom: 1.15rem;
 }
@@ -265,7 +290,7 @@ p > img[src$=".svg"] {
 
 .pgvs3-sim-kpis {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 0.75rem;
   margin-bottom: 1.15rem;
 }

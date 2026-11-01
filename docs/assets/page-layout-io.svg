@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 420" role="img" aria-labelledby="fig3-title fig3-desc">
-  <title id="fig3-title">FIG 03 — 8,192-Byte PostgreSQL Heap Page and Cut-Through I/O Pipeline</title>
+  <title id="fig3-title">FIG 03 — 8,192-Byte PostgreSQL Page, 8,120-Byte Chunks and Cut-Through I/O</title>
   <desc id="fig3-desc">Visual byte-scale cross-section of a single 8,192-byte PostgreSQL page holding one 8,120-byte chunk without TOAST, flanked by 4 MiB binary COPY framing and parallel bitmap-scan snapshot readers.</desc>
   <defs>
     <marker id="f3-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
@@ -56,7 +56,7 @@
   <rect width="1040" height="420" class="bg" rx="8"/>
   <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
   <text x="24" y="27" class="fig">FIG 03</text>
-  <text x="80" y="27" class="title">8,120-Byte Page-Aligned Layout &amp; Cut-Through Streaming Pipeline</text>
+  <text x="80" y="27" class="title">8,192-Byte Page &amp; 8,120-Byte Chunk Pipeline</text>
   <text x="720" y="26" class="mono cg">offset = no × 8,120 · 0 TOAST tables</text>
 
   <!-- Stage 1: Write Slicer -->
@@ -103,7 +103,7 @@
 
   <rect x="352" y="318" width="336" height="64" class="box"/>
   <text x="368" y="340" class="mono cg">O(1) HTTP Range Mapping:</text>
-  <text x="368" y="360" class="mono">WHERE file_id = $1 AND no BETWEEN A/8120 AND B/8120</text>
+  <text x="368" y="360" class="mono">WHERE file_id = $1 · no BETWEEN A/8120 AND B/8120</text>
 
   <!-- Stage 3: Cut-Through Reader -->
   <rect x="752" y="60" width="268" height="340" class="stage"/>
@@ -120,7 +120,7 @@
   <text x="780" y="228" class="mono ca">TID Reorder + 32-Slot Ring</text>
   <text x="780" y="248" class="sub">Reorders bitmap TIDs to strict `no`</text>
   <rect x="780" y="258" width="212" height="32" class="bar-hdr"/>
-  <text x="790" y="278" class="mono cg">32 × 256 KiB Cut-Through Channel</text>
+  <text x="790" y="278" class="mono cg">32 × 256 KiB ring</text>
 
   <rect x="768" y="318" width="236" height="64" class="box"/>
   <text x="780" y="340" class="mono cp">Exported Snapshot Isolation</text>

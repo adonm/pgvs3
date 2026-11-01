@@ -64,7 +64,7 @@
 
   <text x="28" y="68" class="col-t">1. ACCESS &amp; LATENCY CONTRACT</text>
   <text x="316" y="68" class="col-t">2. ENGINE &amp; STATE BOUNDARY</text>
-  <text x="616" y="68" class="col-t">3. PHYSICAL SCHEMA &amp; PARTITIONING PATTERN</text>
+  <text x="616" y="68" class="col-t">3. PHYSICAL LAYOUT &amp; PRUNING</text>
 
   <!-- Branch 1: OLTP -->
   <rect x="24" y="82" width="244" height="74" class="box"/>
@@ -78,9 +78,9 @@
   <text x="322" y="142" class="mono">&gt;2 KiB TOAST / pgvs3 blobs</text>
 
   <rect x="608" y="82" width="408" height="74" class="box-b"/>
-  <text x="622" y="104" class="h4">Zero-Cron Fixed 32–64 Partitions:</text>
-  <text x="622" y="123" class="mono cb">• Entity key: PARTITION BY HASH (tenant_id) MODULUS 32</text>
-  <text x="622" y="141" class="mono">• 2D space: Quantile RANGE (hilbert_id) · Time RANGE only for DROP</text>
+  <text x="622" y="104" class="h4">Fixed 32–64 Partitions:</text>
+  <text x="622" y="123" class="mono cb">• Entity: PARTITION BY HASH(tenant_id) MODULUS 32</text>
+  <text x="622" y="141" class="mono">• Space: quantile RANGE(hilbert_id); time RANGE to DROP</text>
 
   <path d="M 268 119 L 302 119" class="ln-b" marker-end="url(#f2-b)"/>
   <path d="M 564 119 L 602 119" class="ln-b" marker-end="url(#f2-b)"/>
@@ -99,11 +99,11 @@
   <text x="322" y="254" class="mono cg">ZSTD 9–19 + merge / rewrite</text>
 
   <rect x="608" y="172" width="408" height="104" class="box-g"/>
-  <text x="622" y="194" class="h4">Prunable Layout &amp; Wide-Column Controls:</text>
-  <text x="622" y="213" class="mono cg">• Tenant/ID: PARTITIONED BY (bucket(32, id)) SORTED BY (ts, id)</text>
-  <text x="622" y="231" class="mono cg">• Skewed 2D: Unpartitioned SORTED BY (hilbert_id, ts) (auto-quantiles!)</text>
-  <text x="622" y="249" class="mono">• Wide cols: row_group_size_bytes='32MB' + skip_stats + late JOIN</text>
-  <text x="622" y="267" class="sub">• Heavy joins: pre-join rollup or sealed ObjFS (writer.close())</text>
+  <text x="622" y="194" class="h4">Prunable Parquet Layout:</text>
+  <text x="622" y="213" class="mono cg">• Tenant/ID: bucket(32,id) + SORTED BY(ts,id)</text>
+  <text x="622" y="231" class="mono cg">• Skewed 2D: SORTED BY(hilbert_id,ts), no PARTITION</text>
+  <text x="622" y="249" class="mono">• Wide: 32MB row groups + skip_stats + late JOIN</text>
+  <text x="622" y="267" class="sub">• Heavy joins: pre-join rollup or sealed ObjFS</text>
 
   <path d="M 268 224 L 302 224" class="ln-g" marker-end="url(#f2-g)"/>
   <path d="M 564 224 L 602 224" class="ln-g" marker-end="url(#f2-g)"/>
@@ -120,9 +120,9 @@
   <text x="322" y="350" class="mono">s3w_ durable pending writes</text>
 
   <rect x="608" y="292" width="408" height="68" class="box-a"/>
-  <text x="622" y="314" class="h4">Coalesced Fills &amp; Non-Expiring Outbox:</text>
-  <text x="622" y="332" class="mono ca">• --range-cache-chunk 1048576 for Parquet footers/columns</text>
-  <text x="622" y="350" class="mono">• &gt;8 MiB PUT commits to s3w_ + pending_uploads before 200 OK</text>
+  <text x="622" y="314" class="h4">Coalesced Fills &amp; Durable Outbox:</text>
+  <text x="622" y="332" class="mono ca">• 1MiB range cache for Parquet footers/columns</text>
+  <text x="622" y="350" class="mono">• &gt;8MiB PUT → s3w_ + pending_uploads before 200</text>
 
   <path d="M 268 326 L 302 326" class="ln-a" marker-end="url(#f2-a)"/>
   <path d="M 564 326 L 602 326" class="ln-a" marker-end="url(#f2-a)"/>
@@ -139,9 +139,9 @@
   <text x="322" y="434" class="mono">OJS Jobs + PgQue 3-Seg Streams</text>
 
   <rect x="608" y="376" width="408" height="68" class="box-p"/>
-  <text x="622" y="398" class="h4">Idempotent Producer &amp; Worker Pattern:</text>
-  <text x="622" y="416" class="mono cp">• Commit outbox w/ SQL → Relay POST /jobs (reconcile 409 via GET)</text>
-  <text x="622" y="434" class="mono">• Commit worker receipt w/ SQL effect before POST /workers/ack</text>
+  <text x="622" y="398" class="h4">Idempotent Producer &amp; Worker:</text>
+  <text x="622" y="416" class="mono cp">• Outbox + SQL → POST /jobs (409 → GET verify)</text>
+  <text x="622" y="434" class="mono">• SQL effect → receipt → POST /workers/ack</text>
 
   <path d="M 268 410 L 302 410" class="ln-p" marker-end="url(#f2-p)"/>
   <path d="M 564 410 L 602 410" class="ln-p" marker-end="url(#f2-p)"/>

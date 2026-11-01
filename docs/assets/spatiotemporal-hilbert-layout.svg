@@ -80,9 +80,9 @@
   <rect x="350" y="96" width="144" height="144" class="grid-bg"/>
   <path d="M 386 96 V 240 M 422 96 V 240 M 458 96 V 240 M 350 132 H 494 M 350 168 H 494 M 350 204 H 494" class="grid-ln"/>
   <rect x="423" y="133" width="34" height="34" fill="var(--success)" fill-opacity="0.25" stroke="var(--success)"/>
-  <path d="M 368 222 L 368 186 L 404 186 L 404 222 L 440 222 L 476 222 L 476 186 L 440 186 L 440 150 L 476 150 L 476 114 L 440 114 L 404 114 L 404 150 L 368 150 L 368 114" class="h-curve"/>
-  <text x="350" y="258" class="mono ca">lake.hilbert64 (4096²)</text>
-  <text x="350" y="274" class="sub">Unpartitioned or bucket(32)</text>
+  <path d="M 368 114 L 404 114 L 404 150 L 368 150 L 368 186 L 368 222 L 404 222 L 404 186 L 440 186 L 440 222 L 476 222 L 476 186 L 476 150 L 440 150 L 440 114 L 476 114" class="h-curve"/>
+  <text x="350" y="256" class="mono ca">4096² grid (24-bit)</text>
+  <text x="350" y="272" class="sub">4×6-bit · unpartitioned</text>
 
   <text x="516" y="110" class="mono cb">1D Hilbert Stream Sliced by Equal Bytes (32 MB Row Groups):</text>
 
