@@ -503,7 +503,7 @@ func collectRows(t *testing.T, r *chunkRowReader) ([]readRow, error) {
 
 func newTestReader(t *testing.T, rows *fakeRows, p piece, start, end int64) *chunkRowReader {
 	t.Helper()
-	r := newChunkRowReader(rows, p, start, end)
+	r := newChunkRowReader(rows, p, start, end, nil)
 	t.Cleanup(r.close)
 	return r
 }

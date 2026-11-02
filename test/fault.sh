@@ -57,3 +57,18 @@ for i in $(seq 1 200); do
   fi
 done
 [ "$(s3 "$A/$BUCKET/$RUN/churn")" = v200 ] || fail "churn object corrupt"
+
+# A slow multi-piece read must return the original bytes even after its object
+# is overwritten and the reaper runs with no grace while the read is in flight.
+: "${PGVS3_TEST_BIN:?}" "${PGVS3_TEST_DB_URL:?}"
+head -c 50331648 /dev/urandom > "$TMP/slow"
+[ "$(code -X PUT --data-binary @"$TMP/slow" "$A/$BUCKET/$RUN/slow")" = 200 ] || fail "slow PUT"
+s3 --limit-rate 8M -o "$TMP/slow.out" "$A/$BUCKET/$RUN/slow" & reader=$!
+sleep 1
+head -c 50331648 /dev/urandom > "$TMP/slow.next"
+[ "$(code -X PUT --data-binary @"$TMP/slow.next" "$A/$BUCKET/$RUN/slow")" = 200 ] || fail "slow overwrite"
+"$PGVS3_TEST_BIN" reap --url "$PGVS3_TEST_DB_URL" --grace 0s --all >/dev/null || fail "forced reap"
+wait "$reader" || fail "slow read failed during reap"
+cmp "$TMP/slow" "$TMP/slow.out" || fail "slow read torn by reap"
+s3 "$A/$BUCKET/$RUN/slow" -o "$TMP/slow.after"
+cmp "$TMP/slow.next" "$TMP/slow.after" || fail "overwritten object wrong after reap"

@@ -95,7 +95,7 @@ LIMIT 30;
 | --- | --- | --- |
 | `Lock`/blocker PIDs | Owner transaction, DDL, ordered per-key origin writes | Killing every connection or retrying mutations without reconciliation. |
 | `IO`, checkpoints or WAL pressure | Fills/ingest, storage saturation, archive/slot lag | Raising all concurrency limits together. |
-| `ClientWrite` | Slow reader/network/backpressure; snapshots stay open longer | Assuming PostgreSQL CPU is the bottleneck. |
+| `ClientWrite` | Slow reader/network/backpressure; read pins or standby snapshots stay open longer | Assuming PostgreSQL CPU is the bottleneck. |
 | Long idle transaction / old xmin | Leaked session, long extract, standby feedback | Shortening reaper grace or disabling vacuum to hide the symptom. |
 
 Use query text carefully; it can contain business data/secrets. Collect only

@@ -18,50 +18,81 @@ the remaining deployment-specific limits explicit.
 that bound it on the same host. The HTTP floor is a loopback server that only
 moves bytes. The PostgreSQL floor is a direct `COPY` (write) or 8-connection
 `SELECT` (read) of the identical 8,120-byte rows in a table with the same
-storage settings, assembled into 256 KiB chunks (the minimum any implementation
-must do). A perfectly pipelined gateway would approach `min(HTTP, PostgreSQL)`.
-Payloads are incompressible; caches are warm; each cell is the median of five
-interleaved trials.
+storage settings, using the gateway's chunk query and chunk-pool planner
+settings, assembled into 256 KiB chunks (the minimum any implementation must
+do). A perfectly pipelined gateway would approach `min(HTTP, PostgreSQL)`.
+Payloads are incompressible; caches are warm; the gateway-local read cache is
+off; each cell is the median of five interleaved trials.
 
 | Size | Op | pgvs3 MiB/s | HTTP floor | PG floor (1 conn) | % of floor | gateway CPU ns/B |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 10 MiB | PUT | 230 | 3,327 | 300 | 77% | 2.21 |
-| 10 MiB | GET | 2,111 | 3,386 | 3,675 (498) | 62% | 0.74 |
-| 10 MiB | 8 MiB range | 1,873 | 4,068 | 3,688 (583) | 51% | 0.70 |
-| 256 MiB | PUT | 346 | 3,666 | 372 | 93% | 1.78 |
-| 256 MiB | GET | 2,838 | 6,045 | 2,669 (468) | 106% | 0.52 |
-| 256 MiB | 8 MiB range | 1,964 | 4,839 | 3,937 (630) | 50% | 0.72 |
-| 1 GiB | PUT | 446 | 3,705 | 463 | 96% | 1.75 |
-| 1 GiB | GET | 2,830 | 5,979 | 1,451 (378) | 195% | 0.53 |
-| 1 GiB | 8 MiB range | 2,006 | 4,480 | 4,026 (665) | 50% | 0.73 |
+| 10 MiB | PUT | 188 | 3,455 | 330 | 57% | 2.97 |
+| 10 MiB | GET | 2,168 | 2,444 | 4,986 (1,009) | 89% | 0.56 |
+| 10 MiB | 8 MiB range | 1,982 | 3,717 | 5,121 (1,187) | 53% | 0.60 |
+| 256 MiB | PUT | 384 | 3,555 | 461 | 83% | 2.31 |
+| 256 MiB | GET | 3,311 | 4,011 | 5,767 (1,227) | 83% | 0.53 |
+| 256 MiB | 8 MiB range | 1,476 | 3,145 | 2,556 (873) | 58% | 0.76 |
+| 1 GiB | PUT | 309 | 4,063 | 406 | 76% | 2.98 |
+| 1 GiB | GET | 2,077 | 3,086 | 2,468 (811) | 84% | 0.74 |
+| 1 GiB | 8 MiB range | 984 | 2,978 | 1,777 (755) | 55% | 0.94 |
 
-AMD Ryzen 7 7700X (16 threads), NVMe, PostgreSQL 18.6 in Docker with
-`shared_buffers=1GB`, `max_wal_size=4GB`, gateway default pools. Report:
-`.tmp/verify/sol.UJETVe/sol.json`, SHA-256
-`1e54093e0ec00a98e148c71e52398ee8784b4a898cc4ebc4a412b1dcfc94da94`.
+Intel Core Ultra X7 358H laptop (16 hybrid cores, no SMT), NVMe, PostgreSQL 18
+in Docker with `shared_buffers=1GB`, `max_wal_size=4GB`, gateway default pools.
+Report: `.tmp/verify/sol.LTDw0T/sol.json`, SHA-256
+`61fc82be48534a0d463e047ed8bdb3e0e78f922e59cb1687fd283706b4820534`. Single runs
+on this host move by about ±15%; the loopback HTTP floor alone ranged from 2.4
+to 3.2 GiB/s for 10 MiB between runs. The 1 GiB rows exceed `shared_buffers`, so
+both pgvs3 and the floor read through the operating-system page cache there.
+
+Until 2026-11-02 the PostgreSQL read floor used `ORDER BY no` on an un-analyzed
+table. That planned an external merge sort spilling to disk and understated the
+floor about 2.5× (one connection ~0.45 GiB/s instead of ~0.8–1.3; eight ~2.5
+instead of 3.4–5.8). Earlier "% of floor" figures, including those above 100%,
+compare against that understated floor.
 
 What it says:
 
-- **Writes are at the floor.** PUT is 77–96% of a raw PostgreSQL `COPY`.
-  Faster single-stream writes need a faster PostgreSQL write path (WAL, disk),
-  not gateway work.
-- **Whole-object reads are fixed.** GET now reaches 2.1–2.8 GiB/s. The 10 MiB
-  result is 62% here and 62–76% across five-trial runs; 256 MiB and 1 GiB exceed
-  their PostgreSQL floor because that floor is limited by `shared_buffers` for
-  large objects. That is not a claim that pgvs3 beats PostgreSQL I/O.
-- **Ranges improved but remain below target.** An 8 MiB range now runs at
-  1.9–2.0 GiB/s (50–51% of floor), up from 1.1–1.2 GiB/s (26–28%). The remaining
-  ~1.5 ms is one exported snapshot plus a transaction per piece. That cost is
-  kept so a read cannot tear under the 1 s reap grace used by `just fault`. An
-  autocommit prototype reached 2.4–2.6 GiB/s (71% for the 8 MiB object) but was
-  dropped because it removed that guarantee; closing the range gap needs a read
-  lease or pin that makes autocommit pieces safe.
-- **Concurrency does not regress.** The [paired gate](benchmarks.md#paired-acceptance)
-  shows 8 MiB GET 0.3% faster at 8 workers and 0.8% faster at 16; 64 MiB GET
-  21% faster at 16. No read path regressed more than 20%.
+- **Writes are at the floor.** PUT is 57–83% of a raw PostgreSQL `COPY` here
+  (77–96% in the earlier desktop run). Faster single-stream writes need a
+  faster PostgreSQL write path (WAL, disk), not gateway work.
+- **Reads are bound by HTTP, not PostgreSQL.** Eight connections deliver
+  2.5–5.8 GiB/s and one ~0.8–1.2 GiB/s, so the loopback HTTP floor binds every
+  read. Whole-object GET reaches 2.1–3.3 GiB/s (83–89% of floor).
+- **Ranges pay fixed setup.** An 8 MiB range reaches 1.0–2.0 GiB/s (53–58%).
+  Metadata, the read guard and each worker's first rows cost about 1–1.5 ms
+  before the first byte on this host, a quarter to a third of the request.
+- **Under concurrency the ceiling is CPU per byte.** With 8 clients, uncached
+  reads plateau near 4.3 GiB/s here with either read guard. The gateway spends
+  ~0.8–0.9 ns/byte, mostly kernel socket reads from PostgreSQL and writes to
+  clients. Only the [gateway read cache](#gateway-read-cache) changes that.
 
 Run `just sol` (defaults `-sizes 10MiB,256MiB,1GiB -repeat 5 -range 8MiB
 -readers 8`) on your hardware before quoting any of these numbers.
+
+### Read-path changes, paired
+
+The [paired gate](benchmarks.md#paired-acceptance) against the previous binary
+(snapshot-per-piece window, unbuffered chunk connections) passes every case:
+native 10 MiB GET 11.7% faster at one worker and 15.8% at four; 100 MiB GET
+16.1% and 11.4% faster; HEAD, small, range and PUT cases within ±13%; the cold
+origin profile within ±9%. Reports: `.tmp/verify/load.n64lvy` and
+`.tmp/verify/load.F7vjJz`, both `complete: true` with no failed gates.
+
+A direct single-client loop on the same host (median of three interleaved
+rounds, MiB/s):
+
+| Read | Previous | Current | Current, warm read cache |
+| --- | ---: | ---: | ---: |
+| 10 MiB GET | 1,986 | 2,132 | 4,900 |
+| 8 MiB range of 10 MiB | 1,603 | 1,917 | 4,163 |
+| 64 MiB GET | 1,844 | 2,266 | 5,058 |
+| 8 MiB range of 256 MiB | 1,652 | 1,644 | 4,829 |
+| 256 MiB GET | 1,868 | 2,612 | 5,508 |
+
+With 8 concurrent clients the previous and current paths are equal within noise
+(10 MiB GET ~4.4 GiB/s, 64 MiB ~4.3 GiB/s, 1 MiB ranges 2.7 → 3.0 GiB/s); a warm
+read cache serves 15.7, 15.1 and 9.5 GiB/s respectively at ~0.3 ns of gateway
+CPU per byte and no PostgreSQL work.
 
 ![FIG 03 — 8,192-Byte PostgreSQL Page, 8,120-Byte Chunks & Cut-Through Streaming I/O](assets/page-layout-io.svg)
 
@@ -78,7 +109,7 @@ Run `just sol` (defaults `-sizes 10MiB,256MiB,1GiB -repeat 5 -range 8MiB
 | **No TOAST overhead** | `chunks` sets `toast_tuple_target = 8160` and `STORAGE EXTERNAL`, so PostgreSQL never detoasts or chases out-of-line pointers on read. |
 | **Immutable files** | Chunked writes allocate fresh `file_id`s from `s3p.file_ids`; overwrites swap object ownership and queue retired files for reaping. Chunk rows are never updated in place. |
 | **HTTP validators** | Ordinary native ETags are content MD5s and multipart ETags are composite values, not `file_id`s. Origin versions are retained separately for revalidation/conditions. Clients can reuse cached slices using the public validator. |
-| **Split connection pools** | The main pool keeps `enable_indexscan = on` for fast B-tree lookups on `objects` and `ListObjectsV2`; a dedicated `chunkPool` sets `enable_indexscan = off` so `chunks` range reads use PostgreSQL 18 bitmap heap scans with read-ahead (`effective_io_concurrency = 32`). |
+| **Split connection pools** | The main pool keeps `enable_indexscan = on` for fast B-tree lookups on `objects` and `ListObjectsV2`; a dedicated `chunkPool` sets `enable_indexscan = off` so `chunks` range reads use PostgreSQL 18 bitmap heap scans with read-ahead (`effective_io_concurrency = 32`), and reads its sockets through a 256 KiB buffer. |
 | **Unpartitioned chunks table per bucket** | Each bucket's `chunks` is a single table (capped at 32 TiB / ~31.7 TiB of payload). Partitioning within a bucket by hash or range was slower on point reads and writes; see [partitioning.md](partitioning.md). |
 | **Aggressive autovacuum** | Tuned to `autovacuum_vacuum_scale_factor = 0.01` and `analyze_scale_factor = 0.02` so freed pages are recycled quickly after whole-file deletes. |
 
@@ -89,24 +120,65 @@ Run `just sol` (defaults `-sizes 10MiB,256MiB,1GiB -repeat 5 -range 8MiB
    header columns and never transfers `inline_data`.
 2. **Small single-query reads:** spans up to 1 MiB, or any plan that gets one
    reader, run as one `chunks` range query
-   (`file_id = $1 AND no BETWEEN $2 AND $3`).
-3. **Ordered read window:** larger spans plan balanced pieces (1 MiB minimum,
-   ~8 MiB for large objects) and stream through up to eight workers under one
-   exported `REPEATABLE READ` snapshot. The window size reserves half the chunk
-   pool for other work and shrinks as reads overlap; any number of pieces can
-   stream in order with memory bounded by the window.
-4. **Synchronous vs cut-through streaming:** Reads up to 8 MiB stream
+   (`file_id = $1 AND no BETWEEN $2 AND $3`), consistent within its statement.
+3. **Ordered pull window:** larger spans plan balanced pieces (1 MiB minimum,
+   ~8 MiB for large objects). Up to eight workers pull pieces in order from a
+   shared counter and stream each into its own channel; the consumer drains the
+   channels in piece order, so output stays contiguous and memory is bounded by
+   the workers' buffers. The window reserves half the chunk pool for other work
+   and shrinks as reads overlap.
+4. **Read pins, with a snapshot fallback:** before workers start, one guard
+   connection takes shared advisory locks (`pg_try_advisory_lock_shared`) on
+   every file in the span. The reaper takes the exclusive lock before deleting a
+   file and skips pinned ones, so workers run plain autocommit queries and a pin
+   holds no MVCC snapshot back from vacuum. On a standby (`pg_is_in_recovery()`),
+   for spans over 64 files, or when a pin finds the reaper deleting that file,
+   the read exports one `REPEATABLE READ` snapshot that each worker imports once.
+   The exporting transaction ends when every worker has imported it, and worker
+   transactions lift `idle_in_transaction_session_timeout` locally, so a slow
+   client cannot get a stream cut off mid-object.
+5. **Synchronous vs cut-through streaming:** Reads up to 8 MiB stream
    synchronously on the HTTP goroutine. Above 8 MiB, a background fetcher feeds
    a bounded 32-buffer channel while `Body.WriteTo` streams 256 KiB buffers to
    the socket, overlapping database I/O with network writes and backpressuring
    slow clients.
-5. **TID-to-row-number reordering:** Bitmap heap scans return pages in physical
+6. **Buffered chunk connections:** chunk-pool connections read the socket
+   through a 256 KiB buffer under pgx's 8 KiB frame reader, so one read system
+   call carries ~32 rows instead of one. This is what lifted large GETs.
+7. **TID-to-row-number reordering:** Bitmap heap scans return pages in physical
    TID order; `streamRows` buffers any out-of-order rows in memory and emits
    strict `no` order.
-6. **Warm cache hit:** the cache tier reuses the metadata row it already read
+8. **Gateway read cache (opt-in):** see [below](#gateway-read-cache).
+9. **Warm cache hit:** the cache tier reuses the metadata row it already read
    for the TTL/lifecycle decision when opening the body, so a warm cache GET
    does not repeat the primary-key lookup. Inline cache objects are served
    directly from that row; larger ones start the normal chunk stream.
+
+## Gateway read cache
+
+`--read-cache-bytes` (default `0`, off) gives each gateway a bounded in-memory
+cache of decoded chunk blocks (32 rows, 253.75 KiB). It changes where hot bytes
+come from, not who owns them:
+
+- **No authority.** Every request still reads metadata from PostgreSQL first;
+  only bytes of the file that metadata currently references are served. Keys are
+  the namespace `objects` table OID plus `file_id` and block number. File IDs are
+  never reused within a table and the OID changes on drop/restore, so a key
+  never names different content and nothing needs invalidating.
+- **Fills while streaming.** Reads aligned to whole blocks store blocks as they
+  pass through. A fully cached span needs no chunk connection, pin or snapshot;
+  partly cached spans serve cached pieces in order and query the rest.
+- **Scan resistant.** Each shard runs S3-FIFO: new blocks enter a small queue
+  and only blocks read again move to the main queue, so one large scan cannot
+  flush hot footers and row groups.
+- **Per gateway.** Replicas do not share it; PostgreSQL remains the shared cache
+  across gateways and standbys. Count the budget inside `GOMEMLIMIT`.
+
+Measured above: warm whole-object reads 2.3–2.6× faster for one client and about
+3.5× higher aggregate for eight, with gateway CPU per byte falling from ~0.9 to
+~0.3 ns. It helps repeated reads of the same objects (Parquet footers, popular
+row groups, shared lake files) and does nothing for one-pass scans. Watch
+`pgvs3_read_cache_hit_bytes_total` against total read volume before sizing it up.
 
 ## Write path
 
@@ -173,7 +245,9 @@ for provider limits, TTLs, tombstones, retries and spool sizing.
   PostgreSQL decides what exists. Gateways sharing a primary read the same
   committed rows under MVCC, without a gateway invalidation bus. Each PostgreSQL
   instance has its own `shared_buffers`; standbys share the logged data through
-  WAL replay, subject to replication lag, not coherent distributed RAM.
+  WAL replay, subject to replication lag, not coherent distributed RAM. The
+  optional [read cache](#gateway-read-cache) holds only immutable chunk bytes
+  and is never consulted without fresh metadata, so it needs no invalidation.
 - **One maintenance leader:** a single writable gateway holds the maintenance
   advisory lock; the others skip the tick. If the leader exits, another elects
   itself on a later tick.
@@ -195,8 +269,10 @@ for provider limits, TTLs, tombstones, retries and spool sizing.
 
 - **Read grace window:** Deleted or overwritten files remain in their namespace's
   `chunks` table for `--reap-grace` (default 10 minutes), allowing metadata/body
-  lookups to bridge a concurrent overwrite. Multi-piece reads additionally hold
-  repeatable-read snapshots while streaming.
+  lookups to bridge a concurrent overwrite. Multi-piece reads additionally pin
+  their files (or hold an imported snapshot on a standby) until they finish, so
+  a read that outlives the grace window still completes. The reaper skips pinned
+  files and counts them in `pgvs3_reap_pinned_skips_total`.
 - **Bounded, chained GC passes:** Every minute, one **writable** gateway
   acquires a database-scoped `pg_try_advisory_lock` and deletes up to 65,536 chunk
   rows (~508 MiB) per pass; a saturated pass immediately chains another. If

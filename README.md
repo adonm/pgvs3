@@ -97,15 +97,15 @@ The DuckLake catalog and the pgvs3 objects share a cluster but commit in
   rows, one per 8 KiB PostgreSQL page with no TOAST, Zstd-compressed only when that
   shrinks them. Range offsets are `no × 8,120`.
 - **Immutable files, atomic publish.** Binary `COPY` writes a new `file_id`; one
-  transaction swaps the object pointer. Readers use MVCC snapshots, so no gateway
-  invalidation is needed.
+  transaction swaps the object pointer. Readers pin the files they stream (or use
+  MVCC snapshots on standbys), so no gateway invalidation is needed.
 - **Shared coordination.** Fills, the write-back outbox and maintenance coordinate
   through leases, fences and advisory locks in PostgreSQL. Gateway memory and
   scratch files are never the copy of record.
 - **Measured against the hardware.** Writes run at the raw PostgreSQL `COPY`
-  floor. Whole-object GETs reach 2.1–2.8 GiB/s and 8 MiB ranges ~2 GiB/s through
-  an ordered window of up to eight snapshot workers. See
-  [speed of light](docs/performance.md#speed-of-light).
+  floor. Whole-object GETs reach 83–89% of the loopback HTTP floor and 8 MiB
+  ranges 53–58%; an opt-in gateway cache of immutable blocks serves hot reads
+  several times faster. See [speed of light](docs/performance.md#speed-of-light).
 
 ## Operate it
 

@@ -10,6 +10,9 @@ gomemlimit: "3GiB"
 poolMax: 64
 # Leave 2 GiB between the spool payload budget and the emptyDir limit.
 spoolMaxBytes: 8589934592
+# Gateway-local memory for hot immutable chunk blocks (0 disables). Count it
+# inside gomemlimit; PostgreSQL stays the shared cache across replicas.
+readCacheBytes: 0
 # Spread stateless gateway replicas across zones.
 topologySpread:
   enabled: true

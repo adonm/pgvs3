@@ -31,6 +31,32 @@ The completed work and its limits are recorded in
 [modernization-results.md](modernization-results.md). Do not repeat the completed
 contract/benchmark consolidation as a new refactor merely to change file counts.
 
+## Delivered: read pins, slow-client fix and read cache (2026-11-02)
+
+Re-measuring the floor found two problems. The `just sol` PostgreSQL read floor
+used `ORDER BY no` on an un-analyzed table, which planned an on-disk sort and
+understated PostgreSQL about 2.5×; corrected, the loopback HTTP floor binds
+every read. And a multi-piece read kept its snapshot-exporting transaction idle
+for the whole stream, so `--db-idle-tx-timeout` (default 1 minute) cut off any
+large GET slower than that with a truncated `200`.
+
+- The floor uses the gateway's chunk query and planner settings.
+- Writable gateways pin streamed files with shared advisory locks; the reaper
+  skips pinned files. Standbys, spans over 64 files and pins that race the
+  reaper fall back to one snapshot imported once per worker. The export ends
+  after the imports and worker transactions lift the idle timeout locally.
+- Workers pull pieces in order instead of one task per piece, and chunk
+  connections read through a 256 KiB socket buffer.
+- `--read-cache-bytes` adds an opt-in gateway cache of immutable chunk blocks.
+- The paired gate passes every case (whole-object GET 11–16% faster).
+  `just fault` adds a slow read across an overwrite and a no-grace reap.
+
+Remaining: uncached ranges still spend ~1–1.5 ms before the first byte on the
+test laptop, and with eight clients uncached throughput is bounded by CPU per
+byte (~0.8–0.9 gateway ns/byte, mostly kernel socket copies). Repeated reads
+can use the read cache; one-pass scans cannot. See
+[performance.md](performance.md#speed-of-light).
+
 ## Delivered: ordered read window (2026-11-02)
 
 `just sol` before this change showed every read plateauing near 1.1–1.2 GiB/s
@@ -52,12 +78,8 @@ reserves half the chunk pool and shrinks as reads overlap. Results:
 - `just contract` and `just fault` pass, including overwrite/reap churn under
   the 1 s test reap grace.
 
-Remaining: 8 MiB ranges are still below the 70% target. The ~1.5 ms gap is one
-exported snapshot plus a transaction per piece, deliberately kept so a read
-cannot tear while the reaper runs. An autocommit prototype reached 2.4–2.6 GiB/s
-(71% for the 8 MiB object) but removed that guarantee. The next attempt should
-add a read lease or pin that makes autocommit pieces safe, then meet ≥70% for
-ranges without weakening `just fault`.
+Its percentages compared against the understated floor described above; the
+read pins it called for are now delivered.
 
 ## Delivered high-value work
 
@@ -178,7 +200,8 @@ limits, not reasons to add an HA controller or more protocols.
 ## What not to prioritize
 
 - Full S3/Redis/OJS parity, another protocol, or removing existing companions.
-- Authentication, gateway TLS, authoritative local caches, UNLOGGED staging,
+- Authentication, gateway TLS, authoritative local caches (the opt-in read cache
+  holds only immutable bytes behind fresh metadata), UNLOGGED staging,
   multi-primary writes, sharding or an in-process HA controller.
 - Replacing the page layout, streaming engine or S3 client merely to reduce line
   counts. Reopen such experiments only for a named maintenance burden or measured

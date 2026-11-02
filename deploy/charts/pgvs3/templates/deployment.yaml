@@ -50,6 +50,7 @@ spec:
                 secretKeyRef: { name: {{ .Values.urlSecretName | quote }}, key: url }
             - { name: PGVS3_POOL_MAX, value: {{ .Values.poolMax | quote }} }
             - { name: PGVS3_SPOOL_MAX_BYTES, value: {{ .Values.spoolMaxBytes | int64 | quote }} }
+            - { name: PGVS3_READ_CACHE_BYTES, value: {{ .Values.readCacheBytes | int64 | quote }} }
             - { name: GOMEMLIMIT, value: {{ .Values.gomemlimit | quote }} }
           ports:
             - { containerPort: 8014, name: s3 }

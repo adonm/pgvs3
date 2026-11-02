@@ -164,7 +164,14 @@ func run(ctx context.Context, cfg config) (report, error) {
 	}
 	defer stopFloor()
 
-	pool, err := pgxpool.New(ctx, cfg.db)
+	poolCfg, err := pgxpool.ParseConfig(cfg.db)
+	if err != nil {
+		return rep, err
+	}
+	// Same planner settings as the gateway's chunk pool (internal/store/store.go).
+	poolCfg.ConnConfig.RuntimeParams["enable_indexscan"] = "off"
+	poolCfg.ConnConfig.RuntimeParams["effective_io_concurrency"] = "32"
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return rep, err
 	}
@@ -469,7 +476,9 @@ func readChunks(ctx context.Context, pool *pgxpool.Pool, fileID, off, n int64, r
 		lo := first + span*int64(i)/int64(readers)
 		hi := first + span*int64(i+1)/int64(readers) - 1
 		wg.Go(func() {
-			rows, err := pool.Query(ctx, "SELECT data FROM sol_floor.chunks WHERE file_id = $1 AND no BETWEEN $2 AND $3 ORDER BY no", fileID, lo, hi)
+			// The gateway's chunk query: no ORDER BY, which on a freshly
+			// copied table plans an external sort that spills to disk.
+			rows, err := pool.Query(ctx, "SELECT no, data FROM sol_floor.chunks WHERE file_id = $1 AND no >= $2 AND no <= $3", fileID, lo, hi)
 			if err != nil {
 				errs[i] = err
 				return
@@ -481,7 +490,7 @@ func readChunks(ctx context.Context, pool *pgxpool.Pool, fileID, off, n int64, r
 			// would make the floor artificially cheap.
 			buf := make([]byte, 0, 256<<10+rowBytes)
 			for rows.Next() {
-				data := rows.RawValues()[0]
+				data := rows.RawValues()[1]
 				got += int64(len(data))
 				buf = append(buf, data...)
 				if len(buf) >= 256<<10 {

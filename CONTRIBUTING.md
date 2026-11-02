@@ -284,6 +284,8 @@ block encoding, streaming reads and COPY loops, not inside them.
 | `internal/store/store.go` | Connections, embedded schema, namespace lifecycle, transactions, quotas and maintenance |
 | `internal/store/handles.go` | Cache and queue namespace handles; each validates its name and resolves its schema once |
 | `internal/store/object.go` | Object/publication contracts, metadata, reads and block encoding |
+| `internal/store/readguard.go` | Read pins the reaper respects, and the imported-snapshot fallback for standbys |
+| `internal/store/blockcache.go` | Opt-in gateway cache of immutable chunk blocks (`--read-cache-bytes`) |
 | `internal/store/write.go` | Inline/COPY publication, multipart lifecycle and server-side copies |
 | `internal/store/cache.go` | Cache mutations, scoped locked writers, origin metadata, fill fences and durable outbox persistence |
 | `internal/store/ojs.go` | Job persistence, claims and state transitions |

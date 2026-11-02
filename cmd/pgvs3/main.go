@@ -145,6 +145,7 @@ type serveConfig struct {
 	cacheNamespace          string
 	fillConcurrency         int
 	rangeCacheChunk         int64
+	readCacheBytes          int64
 	s3Concurrency           int
 	s3QueueWait             time.Duration
 	queueConcurrency        int
@@ -184,6 +185,7 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.StringVar(&cfg.cacheNamespace, "cache-namespace", "origin", "cache namespace for origin objects")
 	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills and pending-upload workers")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
+	fs.Int64Var(&cfg.readCacheBytes, "read-cache-bytes", 0, "gateway-local memory for immutable chunk blocks of hot reads; metadata still comes from PostgreSQL on every request (0 disables)")
 	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown")
 	fs.DurationVar(&cfg.s3QueueWait, "s3-queue-wait", time.Second, "maximum S3 admission wait (0 rejects excess immediately)")
 	fs.IntVar(&cfg.queueConcurrency, "queue-concurrency", 16, "concurrent OJS queue requests")
@@ -205,6 +207,9 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	if cfg.spoolMaxBytes <= 0 || cfg.poolMax <= 0 || cfg.maxConns <= 0 || cfg.fillConcurrency <= 0 ||
 		cfg.s3Concurrency <= 0 || cfg.queueConcurrency <= 0 || cfg.respConcurrency <= 0 {
 		return serveConfig{}, fmt.Errorf("pool/connection/concurrency limits must be positive")
+	}
+	if cfg.readCacheBytes < 0 {
+		return serveConfig{}, fmt.Errorf("--read-cache-bytes must be non-negative")
 	}
 	if cfg.dbStatementTimeout < 0 || cfg.dbLockTimeout < 0 || cfg.dbIdleTxTimeout < 0 ||
 		cfg.dbMaxConnLifetime < 0 || cfg.dbMaxConnLifetimeJitter < 0 ||
@@ -283,6 +288,7 @@ func storeOpenOptions(cfg serveConfig) store.OpenOptions {
 		MaxConnLifetime:       cfg.dbMaxConnLifetime,
 		MaxConnLifetimeJitter: cfg.dbMaxConnLifetimeJitter,
 		Tracer:                telemetry.PGXTracer{},
+		ReadCacheBytes:        cfg.readCacheBytes,
 	}
 }
 

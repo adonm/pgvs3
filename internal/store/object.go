@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/ns"
@@ -97,6 +98,9 @@ type Meta struct {
 	PartEnds []int64
 
 	Inline []byte
+
+	// table is the objects relation OID, which keys the gateway block cache.
+	table uint32
 }
 
 type Segment struct {
@@ -364,7 +368,7 @@ func metadataColumns(body metadataBody) string {
 	return `COALESCE(file_id, 0), size, sha256, created_at, parts, part_ends,
 		etag, user_metadata, content_type, content_encoding, origin_modified,
 		COALESCE(checksum_name, ''), COALESCE(checksum_value, ''), COALESCE(checksum_type, ''),
-		` + inline + `, expires_at, COALESCE(origin_etag, '')`
+		` + inline + `, expires_at, COALESCE(origin_etag, ''), tableoid`
 }
 
 func scanMetadata(row pgx.Row, body metadataBody) (*Meta, error) {
@@ -374,7 +378,7 @@ func scanMetadata(row pgx.Row, body metadataBody) (*Meta, error) {
 	err := row.Scan(&m.FileID, &m.Size, &m.SHA256, &m.CreatedAt, &m.Parts, &m.PartEnds,
 		&m.ETag, &m.UserMetadata, &m.ContentType, &m.ContentEncoding, &modified,
 		&m.ChecksumName, &m.ChecksumValue, &m.ChecksumType,
-		&m.Inline, &hasInline, &m.ExpiresAt, &m.OriginETag)
+		&m.Inline, &hasInline, &m.ExpiresAt, &m.OriginETag, &m.table)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -593,14 +597,18 @@ func planPieces(m *Meta, start, end int64, parallel int) ([]piece, error) {
 }
 
 type result struct {
-	b   []byte
-	err error
+	b []byte
+	// shared marks cache-owned bytes that must not return to chunkBufPool.
+	shared bool
 }
 
 type Body struct {
 	cur    []byte
 	chunk  []byte
+	shared bool
 	ch     <-chan result
+	errc   <-chan error
+	parts  [][]byte
 	cancel context.CancelFunc
 	err    error
 	once   sync.Once
@@ -679,23 +687,33 @@ func (b *Body) nextStreamChunk() ([]byte, error) {
 		b.chunk = chunk
 		return chunk, nil
 	}
+	if b.ch == nil {
+		if len(b.parts) == 0 {
+			b.err = io.EOF
+			return nil, io.EOF
+		}
+		b.chunk, b.shared, b.parts = b.parts[0], true, b.parts[1:]
+		return b.chunk, nil
+	}
 	r, ok := <-b.ch
 	if !ok {
 		b.err = io.EOF
-		return nil, io.EOF
+		if err := <-b.errc; err != nil {
+			b.err = err
+		}
+		return nil, b.err
 	}
-	if r.err != nil {
-		b.err = r.err
-		return nil, r.err
-	}
-	b.chunk = r.b
+	b.chunk, b.shared = r.b, r.shared
 	return r.b, nil
 }
 
 func (b *Body) releaseChunk() {
 	if b.chunk != nil {
-		putChunkBuf(b.chunk)
+		if !b.shared {
+			putChunkBuf(b.chunk)
+		}
 		b.chunk = nil
+		b.shared = false
 		b.cur = nil
 	}
 }
@@ -837,7 +855,7 @@ func bytesBody(data []byte) *Body {
 	return &Body{cur: data, static: true}
 }
 
-func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc, schema string, p piece, start, end int64) (*Body, error) {
+func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc, schema string, table uint32, p piece, start, end int64) (*Body, error) {
 	conn, err := s.chunkPool.Acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -848,7 +866,7 @@ func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc
 		return nil, err
 	}
 	body := &Body{
-		reader: newChunkRowReader(rows, p, start, end),
+		reader: newChunkRowReader(rows, p, start, end, s.blocks.fill(table, p)),
 		conn:   conn, cancel: cancel,
 	}
 	chunk, err := body.nextChunk()
@@ -869,48 +887,61 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, ref 
 	if err != nil {
 		return nil, err
 	}
+	var table uint32
+	if s.blocks != nil {
+		table = m.table
+	}
+	if table != 0 {
+		pieces = alignPieces(pieces)
+		if parts, ok := s.cachedSpan(table, pieces, start, end); ok {
+			return &Body{parts: parts, cancel: cancel}, nil
+		}
+	}
 	if len(pieces) == 1 {
-		return s.startSingleStream(ctx, cancel, schema, pieces[0], start, end)
+		return s.startSingleStream(ctx, cancel, schema, table, pieces[0], start, end)
 	}
 	ch := make(chan result, 32)
-	body := &Body{ch: ch, cancel: cancel}
+	errc := make(chan error, 1)
 	go func() {
-		defer close(ch)
-		s.streamSpan(ctx, ch, schema, pieces, start, end)
+		errc <- s.streamWindow(ctx, ch, schema, table, pieces, start, end)
+		close(ch)
 	}()
 	first, ok := <-ch
 	if !ok {
+		if err := <-errc; err != nil {
+			return nil, err
+		}
 		return nil, io.ErrUnexpectedEOF
 	}
-	if first.err != nil {
-		body.Close()
-		return nil, first.err
-	}
-	body.chunk, body.cur = first.b, first.b
-	return body, nil
+	return &Body{ch: ch, errc: errc, cancel: cancel, chunk: first.b, cur: first.b, shared: first.shared}, nil
 }
 
-func sendStreamError(ctx context.Context, ch chan<- result, err error) {
-	select {
-	case ch <- result{err: err}:
-	case <-ctx.Done():
+// cachedSpan serves a whole span from the block cache, or reports a miss.
+func (s *Store) cachedSpan(table uint32, pieces []piece, start, end int64) ([][]byte, bool) {
+	for _, p := range pieces {
+		if !s.blocks.covered(table, p) {
+			return nil, false
+		}
 	}
+	var out [][]byte
+	for _, p := range pieces {
+		parts, ok := s.blocks.pieceParts(table, p, start, end)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, parts...)
+	}
+	return out, true
 }
 
-func (s *Store) streamSpan(ctx context.Context, ch chan<- result, schema string, pieces []piece, start, end int64) {
-	if err := s.streamWindow(ctx, ch, schema, pieces, start, end); err != nil {
-		sendStreamError(ctx, ch, err)
-	}
-}
-
-// readWorkers reserves one snapshot connection per in-flight read and shares the
+// readWorkers reserves one guard connection per in-flight read and shares the
 // rest of the chunk pool. The cap keeps one GET from starving concurrent reads.
 func (s *Store) readWorkers() int {
 	return readWorkersFor(int(s.chunkPool.Stat().MaxConns()), int(s.inflightReads.Load()))
 }
 
 // readWorkersFor reserves half the chunk pool for writes, maintenance and the
-// next read; one slot per in-flight read is its snapshot connection.
+// next read; one slot per in-flight read is its guard connection.
 func readWorkersFor(maxConns, inflight int) int {
 	inflight = max(inflight, 1)
 	budget := max(maxConns/2, 1)
@@ -923,110 +954,115 @@ func (s *Store) beginRead() func() {
 	return func() { s.inflightReads.Add(-1) }
 }
 
-// streamWindow reads arbitrary pieces through an ordered window: piece i is
-// dispatched only after an earlier slot frees, and the consumer drains piece
-// channels in order, so memory stays bounded by the window and output order is
-// preserved. One exported snapshot covers every worker.
-func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema string, pieces []piece, start, end int64) error {
+// streamWindow reads pieces through an ordered window. Workers pull pieces in
+// order from a shared counter and stream each into its own channel; the
+// consumer drains the channels in piece order, so output stays contiguous and
+// memory is bounded by the workers' channel buffers. Pieces already in the
+// block cache are emitted by the consumer without a query. A readGuard keeps
+// every streamed file from being reaped until the read ends.
+func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema string, table uint32, pieces []piece, start, end int64) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	exportConn, err := s.chunkPool.Acquire(runCtx)
-	if err != nil {
-		return err
+	cached := make([][][]byte, len(pieces))
+	var need []int
+	for i, p := range pieces {
+		if parts, ok := s.blocks.pieceParts(table, p, start, end); ok {
+			cached[i] = parts
+		} else {
+			need = append(need, i)
+		}
 	}
-	defer exportConn.Release()
-	exportTx, err := exportConn.BeginTx(runCtx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return err
-	}
-	defer exportTx.Rollback(context.WithoutCancel(runCtx))
-	var snapshot string
-	if err := exportTx.QueryRow(runCtx, "SELECT pg_export_snapshot()").Scan(&snapshot); err != nil {
-		return err
-	}
-
 	chans := make([]chan result, len(pieces))
-	for i := range chans {
+	for _, i := range need {
 		chans[i] = make(chan result, 4)
 	}
 	g, gctx := errgroup.WithContext(runCtx)
-	g.SetLimit(s.readWorkers())
-	dispatched := make(chan struct{})
-	go func() {
-		defer close(dispatched)
-		for i := range pieces {
-			if gctx.Err() != nil {
-				return
-			}
-			i := i
+	if workers := min(s.readWorkers(), len(need)); workers > 0 {
+		guarded := make([]piece, len(need))
+		for j, i := range need {
+			guarded[j] = pieces[i]
+		}
+		guard, err := s.openReadGuard(runCtx, guarded, workers)
+		if err != nil {
+			return err
+		}
+		defer guard.close()
+		var next atomic.Int64
+		for range workers {
 			g.Go(func() error {
-				defer close(chans[i])
-				return s.streamPieceSnapshot(gctx, chans[i], schema, pieces[i], snapshot, start, end)
+				q, done, err := guard.join(gctx)
+				if err != nil {
+					return err
+				}
+				defer done()
+				for {
+					if err := gctx.Err(); err != nil {
+						return err
+					}
+					j := int(next.Add(1) - 1)
+					if j >= len(need) {
+						return nil
+					}
+					i := need[j]
+					ch := chans[i]
+					send := func(b []byte) bool {
+						select {
+						case ch <- result{b: b}:
+							return true
+						case <-gctx.Done():
+							return false
+						}
+					}
+					if err := streamRows(gctx, q, schema, pieces[i], start, end, s.blocks.fill(table, pieces[i]), send); err != nil {
+						return err
+					}
+					close(ch)
+				}
 			})
 		}
-	}()
-
-	var failure error
-	for _, ch := range chans {
-		for r := range ch {
-			if r.err != nil {
-				failure = r.err
-				break
-			}
-			select {
-			case out <- r:
-			case <-runCtx.Done():
-				failure = runCtx.Err()
-			}
-			if failure != nil {
-				break
-			}
-		}
-		if failure != nil {
-			break
-		}
 	}
-	if failure != nil {
+
+	fail := func(err error) error {
 		cancel()
-		<-dispatched
-		_ = g.Wait()
-		return failure
-	}
-	<-dispatched
-	return g.Wait()
-}
-
-func (s *Store) streamPieceSnapshot(ctx context.Context, ch chan<- result, schema string, p piece, snapshot string, start, end int64) error {
-	conn, err := s.chunkPool.Acquire(ctx)
-	if err != nil {
-		sendStreamError(ctx, ch, err)
+		if werr := g.Wait(); werr != nil && !errors.Is(werr, context.Canceled) {
+			return werr
+		}
 		return err
 	}
-	defer conn.Release()
-	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
-		sendStreamError(ctx, ch, err)
-		return err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT '"+snapshot+"'"); err != nil {
-		sendStreamError(ctx, ch, err)
-		return err
-	}
-	send := func(b []byte) bool {
+	emit := func(r result) error {
 		select {
-		case ch <- result{b: b}:
-			return true
-		case <-ctx.Done():
-			return false
+		case out <- r:
+			return nil
+		case <-runCtx.Done():
+			return runCtx.Err()
 		}
 	}
-	if err := streamRows(ctx, tx, schema, p, start, end, send); err != nil {
-		sendStreamError(ctx, ch, err)
-		return err
+	for i := range pieces {
+		if parts := cached[i]; parts != nil {
+			for _, b := range parts {
+				if err := emit(result{b: b, shared: true}); err != nil {
+					return fail(err)
+				}
+			}
+			continue
+		}
+		for open := true; open; {
+			select {
+			case r, ok := <-chans[i]:
+				if !ok {
+					open = false
+					continue
+				}
+				if err := emit(r); err != nil {
+					return fail(err)
+				}
+			case <-gctx.Done():
+				return fail(context.Cause(gctx))
+			}
+		}
 	}
-	return tx.Commit(ctx)
+	return g.Wait()
 }
 
 type querier interface {
@@ -1038,12 +1074,12 @@ func getRangeSQL(schema string) string {
 WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3`
 }
 
-func streamRows(ctx context.Context, q querier, schema string, p piece, start, end int64, send func([]byte) bool) error {
+func streamRows(ctx context.Context, q querier, schema string, p piece, start, end int64, fill *blockFill, send func([]byte) bool) error {
 	rows, err := q.Query(ctx, getRangeSQL(schema), p.fileID, p.lo, p.hi)
 	if err != nil {
 		return err
 	}
-	r := newChunkRowReader(rows, p, start, end)
+	r := newChunkRowReader(rows, p, start, end, fill)
 	defer r.close()
 	capHint := int64(chunkSize + RowBytes)
 	if span := end - start + 1; span < capHint {
@@ -1236,13 +1272,14 @@ type chunkRowReader struct {
 	early     map[int32][]byte
 	decomp    []byte
 	decompPtr *[]byte
+	fill      *blockFill
 }
 
-func newChunkRowReader(rows pgx.Rows, p piece, start, end int64) *chunkRowReader {
+func newChunkRowReader(rows pgx.Rows, p piece, start, end int64, fill *blockFill) *chunkRowReader {
 	scratch := decompPool.Get().(*[]byte)
 	return &chunkRowReader{
 		rows: rows, piece: p, spanStart: start, spanEnd: end,
-		nextNo: p.lo, decomp: *scratch, decompPtr: scratch,
+		nextNo: p.lo, decomp: *scratch, decompPtr: scratch, fill: fill,
 	}
 }
 
@@ -1267,6 +1304,7 @@ func (r *chunkRowReader) next() (int32, []byte, error) {
 		}
 		delete(r.early, no)
 		r.nextNo++
+		r.fill.add(no, row)
 		return no, row, nil
 	}
 	for r.rows.Next() {
@@ -1290,6 +1328,7 @@ func (r *chunkRowReader) next() (int32, []byte, error) {
 			return 0, nil, err
 		}
 		r.nextNo++
+		r.fill.add(no, row)
 		return no, row, nil
 	}
 	if err := r.rows.Err(); err != nil {

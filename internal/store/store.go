@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bufio"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -24,7 +26,11 @@ import (
 const LayoutVersion = 25
 
 const (
-	chunkSize           = 256 << 10
+	chunkSize = 256 << 10
+	// chunkReadBuffer sits under pgx's 8 KiB frame reader on chunk connections
+	// so one socket read carries ~32 rows instead of one.
+	chunkReadBuffer     = 256 << 10
+	reapCandidates      = 32
 	ReapRows            = 65536
 	ExpireBatch         = 4096
 	DefaultJobRetention = 24 * time.Hour
@@ -50,6 +56,12 @@ type Store struct {
 	// inflightReads bounds per-GET chunk connections when many reads overlap.
 	inflightReads atomic.Int64
 
+	blocks             *blockCache
+	forceSnapshotReads bool
+	pinnedReads        atomic.Int64
+	snapshotReads      atomic.Int64
+	reapPinnedSkips    atomic.Int64
+
 	reapedRows      atomic.Int64
 	reapedFiles     atomic.Int64
 	expiredObjects  atomic.Int64
@@ -67,6 +79,9 @@ type OpenOptions struct {
 	MaxConnLifetimeJitter time.Duration
 	MinIdleConns          int32
 	Tracer                pgx.QueryTracer
+	// ReadCacheBytes bounds the gateway-local cache of immutable chunk blocks
+	// (0 disables it).
+	ReadCacheBytes int64
 }
 
 func defaultOpenOptions(maxConns int32) OpenOptions {
@@ -115,6 +130,7 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 	return &Store{
 		pool: pool, chunkPool: chunkPool, log: log,
 		jobRetention: DefaultJobRetention,
+		blocks:       newBlockCache(opts.ReadCacheBytes),
 	}, nil
 }
 
@@ -170,9 +186,19 @@ func newChunkPoolConfig(cfg *pgxpool.Config, opts OpenOptions) *pgxpool.Config {
 	chunkCfg.MaxConns = min(opts.MaxConns, 64)
 	chunkCfg.MinConns = min(opts.MaxConns, 4)
 	chunkCfg.MinIdleConns = min(opts.MinIdleConns, chunkCfg.MaxConns)
+	chunkCfg.ConnConfig.BuildFrontend = func(r io.Reader, w io.Writer) *pgproto3.Frontend {
+		return pgproto3.NewFrontend(bufio.NewReaderSize(r, chunkReadBuffer), w)
+	}
 	chunkCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, sessionSQL(opts, false, 0))
-		return err
+		if _, err := conn.Exec(ctx, sessionSQL(opts, false, 0)); err != nil {
+			return err
+		}
+		var recovery bool
+		if err := conn.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&recovery); err != nil {
+			return err
+		}
+		conn.PgConn().CustomData()[recoveryKey] = recovery
+		return nil
 	}
 	return chunkCfg
 }
@@ -406,6 +432,10 @@ func (s *Store) WriteMetrics(w io.Writer) {
 	fmt.Fprintf(w, "pgvs3_reaped_files_total %d\n", s.reapedFiles.Load())
 	fmt.Fprintf(w, "pgvs3_expired_objects_total %d\n", s.expiredObjects.Load())
 	fmt.Fprintf(w, "pgvs3_maintenance_runs_total %d\n", s.maintenanceRuns.Load())
+	fmt.Fprintf(w, "pgvs3_read_pinned_total %d\n", s.pinnedReads.Load())
+	fmt.Fprintf(w, "pgvs3_read_snapshot_total %d\n", s.snapshotReads.Load())
+	fmt.Fprintf(w, "pgvs3_reap_pinned_skips_total %d\n", s.reapPinnedSkips.Load())
+	s.blocks.writeMetrics(w)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	if live, dead, pendingBytes, oldest, err := s.PendingUploadStats(ctx); err == nil {
 		fmt.Fprintf(w, "pgvs3_pending_uploads_live %d\n", live)
@@ -1565,14 +1595,19 @@ func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, schema string, grac
 		return 0, false, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	var fileID int64
-	err = tx.QueryRow(ctx, `SELECT file_id FROM `+schema+`.garbage
+	rows, err := tx.Query(ctx, `SELECT file_id FROM `+schema+`.garbage
 		WHERE queued_at <= now() - make_interval(secs => $1)
-		ORDER BY queued_at, file_id LIMIT 1 FOR UPDATE SKIP LOCKED`, grace.Seconds()).Scan(&fileID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
-	}
+		ORDER BY queued_at, file_id LIMIT $2 FOR UPDATE SKIP LOCKED`, grace.Seconds(), reapCandidates)
 	if err != nil {
+		return 0, false, err
+	}
+	candidates, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return 0, false, err
+	}
+	fileID, ok, skipped, err := claimReapable(ctx, tx, candidates)
+	s.reapPinnedSkips.Add(int64(skipped))
+	if err != nil || !ok {
 		return 0, false, err
 	}
 	var referenced bool

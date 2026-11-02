@@ -223,7 +223,15 @@ application namespaces that need S3/OJS/RESP, and do not create a public
   - rising `pgvs3_pg_pool_empty_acquire_wait_seconds_total` or
     `pgvs3_chunk_pool_empty_acquire_wait_seconds_total` (pool exhaustion);
   - `pgvs3_s3_admission_rejected_total` and `pgvs3_spool_rejections_total`
-    (load shedding).
+    (load shedding);
+  - a `pgvs3_reap_pinned_skips_total` that keeps rising while garbage grows
+    (very long reads holding files past the reap grace).
+
+Multi-piece reads count as `pgvs3_read_pinned_total` on writable gateways and
+`pgvs3_read_snapshot_total` on standbys or when pins fall back. With
+`--read-cache-bytes` set, `pgvs3_read_cache_bytes` and the `hits`, `hit_bytes`,
+`fills` and `evictions` counters show whether hot reads stay in gateway memory;
+a hit ratio near zero means the budget is better spent elsewhere.
 
 TTL expiry counts include expired metadata-only origin parent records in layout
 v25. Range metadata is used only when range caching is enabled, never substitutes

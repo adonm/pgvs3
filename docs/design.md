@@ -116,8 +116,9 @@ API.
 - **Immutable files, atomic publish.** A write allocates a new `file_id` from
   the database sequence `s3p.file_ids`, streams 8,120-byte chunk rows, and
   publishes by swapping the object pointer in one transaction. Overwrites queue
-  the old `file_id` for the reaper; readers use MVCC snapshots, so an in-flight
-  read never observes a torn object.
+  the old `file_id` for the reaper; a multi-piece read pins its files with
+  shared advisory locks the reaper respects (an imported MVCC snapshot on a
+  standby), so an in-flight read never observes a torn object.
 - **Small objects inline, large objects chunked.** Native/write-cache objects
   can inline up to 64 KiB; read-cache/RESP values up to 8,120 bytes. Larger
   bodies use 8,120-byte logical blocks, with Zstd only when it shrinks. A full

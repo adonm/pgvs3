@@ -53,6 +53,7 @@ Run the S3/OJS/HTTP/RESP gateway (default when no command is given).
 | `--pprof-addr` | `PGVS3_PPROF_ADDR` | — | optional loopback address for net/http/pprof, e.g. 127.0.0.1:6060 |
 | `--queue-concurrency` | `PGVS3_QUEUE_CONCURRENCY` | `16` | concurrent OJS queue requests |
 | `--range-cache-chunk` | `PGVS3_RANGE_CACHE_CHUNK` | `0` | cache aligned ranges of large objects at this byte size (0 disables) |
+| `--read-cache-bytes` | `PGVS3_READ_CACHE_BYTES` | `0` | gateway-local memory for immutable chunk blocks of hot reads; metadata still comes from PostgreSQL on every request (0 disables) |
 | `--read-only` | `PGVS3_READ_ONLY` | `false` | reject writes and skip DDL, reaping, fills and origin retries (for standbys); pending write-back objects stay readable |
 | `--reap-grace` | `PGVS3_REAP_GRACE` | `10m0s` | how long overwritten or deleted files stay readable before garbage collection |
 | `--resp-concurrency` | `PGVS3_RESP_CONCURRENCY` | `32` | concurrent RESP batches |
@@ -208,6 +209,15 @@ No flags.
 | `pgvs3_pg_pool_max_lifetime_destroy_count_total` | counter | — |
 | `pgvs3_pg_pool_new_conns_count_total` | counter | — |
 | `pgvs3_pg_pool_total_conns` | gauge | — |
+| `pgvs3_read_cache_blocks` | gauge | — |
+| `pgvs3_read_cache_bytes` | gauge | — |
+| `pgvs3_read_cache_evictions_total` | counter | — |
+| `pgvs3_read_cache_fills_total` | counter | — |
+| `pgvs3_read_cache_hit_bytes_total` | counter | — |
+| `pgvs3_read_cache_hits_total` | counter | — |
+| `pgvs3_read_pinned_total` | counter | — |
+| `pgvs3_read_snapshot_total` | counter | — |
+| `pgvs3_reap_pinned_skips_total` | counter | — |
 | `pgvs3_reaped_files_total` | counter | — |
 | `pgvs3_reaped_rows_total` | counter | — |
 | `pgvs3_request_duration_seconds_bucket` | histogram | `le` |
