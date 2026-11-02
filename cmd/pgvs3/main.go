@@ -29,23 +29,30 @@ var version = "dev"
 func main() { os.Exit(run(os.Args[1:])) }
 
 type command struct {
-	name string
-	run  func([]string) int
+	name    string
+	summary string
+	run     func([]string) int
 }
 
 var commandTable = []command{
-	{name: "serve", run: serve},
-	{name: "health", run: health},
-	{name: "reap", run: reap},
-	{name: "doctor", run: doctor},
-	{name: "stat", run: stat},
-	{name: "clone", run: cloneNS},
-	{name: "drop", run: dropNS},
-	{name: "adopt", run: adoptNS},
-	{name: "origin", run: originCmd},
-	{name: "pending", run: pendingCmd},
-	{name: "version", run: func([]string) int { fmt.Println(version); return 0 }},
+	{name: "serve", summary: "Run the S3/OJS/HTTP/RESP gateway (default when no command is given).", run: serve},
+	{name: "health", summary: "Exit 0 when a gateway's readiness URL returns 200.", run: health},
+	{name: "reap", summary: "Run one bounded maintenance pass (or all passes) without a gateway.", run: reap},
+	{name: "doctor", summary: "Check the database, its settings and fleet connection capacity; print fixes.", run: doctor},
+	{name: "stat", summary: "Print namespace, object, chunk and storage-overhead counts.", run: stat},
+	{name: "clone", summary: "Copy a bucket or cache namespace inside PostgreSQL.", run: cloneNS},
+	{name: "drop", summary: "Delete a namespace and its schema.", run: dropNS},
+	{name: "adopt", summary: "Register existing s3b_/s3c_/s3w_/s3q_ schemas in the catalog.", run: adoptNS},
+	{name: "origin", summary: "Set, clear or list the origin a bucket (or every bucket) caches.", run: originCmd},
+	{name: "pending", summary: "List or retry write-back uploads that have not reached the origin.", run: pendingCmd},
+	{name: "version", summary: "Print the binary version.", run: func([]string) int { fmt.Println(version); return 0 }},
 }
+
+// describeFlags, when set, receives each command's flags instead of running it.
+// The reference test uses it to generate docs/reference.md from the real flag sets.
+var describeFlags func(command string, fs *flag.FlagSet)
+
+var errDescribed = errors.New("flags described")
 
 var commandByName = indexCommands(commandTable)
 
@@ -151,40 +158,44 @@ type serveConfig struct {
 func parseServeConfig(args []string) (serveConfig, error) {
 	var cfg serveConfig
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	fs.StringVar(&cfg.url, "url", "postgres://localhost/pgvs3", "PostgreSQL URL")
-	fs.StringVar(&cfg.addr, "addr", "0.0.0.0:8014", "S3/OJS/HTTP/RESP listen address")
-	fs.IntVar(&cfg.poolMax, "pool-max", 64, "PostgreSQL connections per gateway")
-	fs.StringVar(&cfg.spoolDir, "spool-dir", "", "scratch directory for large cache fills (empty uses the system temp dir)")
-	fs.Int64Var(&cfg.spoolMaxBytes, "spool-max-bytes", 8<<30, "process-wide disk spool payload byte budget")
-	fs.BoolVar(&cfg.cacheWriteBack, "cache-write-back", true, "acknowledge large unconditional cache writes before the origin upload completes")
-	fs.StringVar(&cfg.dbWorkMem, "db-work-mem", "16MB", "PostgreSQL work_mem per connection")
+	fs.StringVar(&cfg.url, "url", "postgres://localhost/pgvs3", "PostgreSQL URL: the writer endpoint, or a standby with --read-only (use sslmode for database TLS)")
+	fs.StringVar(&cfg.addr, "addr", "0.0.0.0:8014", "listen address for S3/HTTP/RESP2/OJS, /healthz, /readyz and /metrics")
+	fs.IntVar(&cfg.poolMax, "pool-max", 64, "main-pool PostgreSQL connections; the chunk pool adds up to min(pool-max, 64), so check the fleet with pgvs3 doctor --gateways N")
+	fs.StringVar(&cfg.spoolDir, "spool-dir", "", "scratch directory for cache fills over 8 MiB; use local disk, not a small tmpfs (empty uses the system temp dir)")
+	fs.Int64Var(&cfg.spoolMaxBytes, "spool-max-bytes", 8<<30, "process-wide spool byte budget for fills, foreground writes and pending uploads; busy admission returns 503")
+	fs.BoolVar(&cfg.cacheWriteBack, "cache-write-back", true, "acknowledge large unconditional cache writes after the logged write-back commit; the origin upload follows (conditional writes stay synchronous)")
+	fs.StringVar(&cfg.dbWorkMem, "db-work-mem", "16MB", "session work_mem per sort/hash operation (not a per-connection ceiling)")
 	fs.DurationVar(&cfg.dbStatementTimeout, "db-statement-timeout", 5*time.Minute, "PostgreSQL statement timeout (0 disables)")
 	fs.DurationVar(&cfg.dbLockTimeout, "db-lock-timeout", 5*time.Second, "PostgreSQL lock timeout (0 disables)")
 	fs.DurationVar(&cfg.dbIdleTxTimeout, "db-idle-tx-timeout", time.Minute, "PostgreSQL idle-in-transaction timeout (0 disables)")
 	fs.DurationVar(&cfg.dbMaxConnLifetime, "db-max-conn-lifetime", time.Hour, "PostgreSQL connection lifetime (0 disables)")
 	fs.DurationVar(&cfg.dbMaxConnLifetimeJitter, "db-max-conn-lifetime-jitter", 5*time.Minute, "Randomized PostgreSQL lifetime jitter")
-	fs.IntVar(&cfg.maxConns, "max-conns", 4096, "concurrent client connections")
+	fs.IntVar(&cfg.maxConns, "max-conns", 4096, "concurrent client connections before shedding load")
 	fs.DurationVar(&cfg.httpReadTimeout, "http-read-timeout", 30*time.Minute, "HTTP read deadline including request bodies (0 disables)")
 	fs.DurationVar(&cfg.httpWriteTimeout, "http-write-timeout", 30*time.Minute, "HTTP response write deadline (0 disables)")
 	fs.Int64Var(&cfg.maxDBBytes, "max-db-bytes", 0, "reject writes when pg_database_size exceeds this (0 = unlimited)")
-	fs.DurationVar(&cfg.reapGrace, "reap-grace", 10*time.Minute, "how long deleted files stay readable")
-	fs.BoolVar(&cfg.readOnly, "read-only", false, "reject mutating requests")
+	fs.DurationVar(&cfg.reapGrace, "reap-grace", 10*time.Minute, "how long overwritten or deleted files stay readable before garbage collection")
+	fs.BoolVar(&cfg.readOnly, "read-only", false, "reject writes and skip DDL, reaping, fills and origin retries (for standbys); pending write-back objects stay readable")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "optional loopback address for net/http/pprof, e.g. 127.0.0.1:6060")
-	fs.StringVar(&cfg.originConfig, "origin-config", "", "origin JSON config: serve S3 as a read-through cache")
-	fs.DurationVar(&cfg.cacheTTL, "cache-ttl", time.Minute, "origin revalidation interval")
+	fs.StringVar(&cfg.originConfig, "origin-config", "", "process-local fallback origin JSON; prefer pgvs3 origin set, which every gateway discovers")
+	fs.DurationVar(&cfg.cacheTTL, "cache-ttl", time.Minute, "origin revalidation interval (0 always revalidates)")
 	fs.DurationVar(&cfg.cacheRetention, "cache-retention", 24*time.Hour, "evict cached objects after this idle period")
 	fs.StringVar(&cfg.cacheNamespace, "cache-namespace", "origin", "cache namespace for origin objects")
-	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "concurrent origin cache fills")
+	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills and pending-upload workers")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
-	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "concurrent S3 requests")
-	fs.DurationVar(&cfg.s3QueueWait, "s3-queue-wait", time.Second, "maximum S3 admission wait (queue holds twice s3-concurrency; 0 rejects immediately)")
+	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown")
+	fs.DurationVar(&cfg.s3QueueWait, "s3-queue-wait", time.Second, "maximum S3 admission wait (0 rejects excess immediately)")
 	fs.IntVar(&cfg.queueConcurrency, "queue-concurrency", 16, "concurrent OJS queue requests")
 	fs.IntVar(&cfg.respConcurrency, "resp-concurrency", 32, "concurrent RESP batches")
 	fs.DurationVar(&cfg.jobRetention, "job-retention", store.DefaultJobRetention, "keep completed/cancelled/discarded OJS jobs this long (0 = forever)")
-	fs.DurationVar(&cfg.simulateLatency, "simulate-latency", 0, "benchmark-only one-way HTTP latency added to S3 requests")
-	fs.IntVar(&cfg.simulateRPS, "simulate-rps", 0, "benchmark-only maximum S3 requests per second (0 disables)")
+	fs.DurationVar(&cfg.simulateLatency, "simulate-latency", 0, "benchmark-only one-way delay added to S3 requests and responses (20ms is about a 40ms RTT)")
+	fs.IntVar(&cfg.simulateRPS, "simulate-rps", 0, "benchmark-only maximum S3 requests per second; probes and metrics are exempt (0 disables)")
 	fs.Int64Var(&cfg.simulateBandwidth, "simulate-bandwidth", 0, "benchmark-only per-request bandwidth in bytes/sec (0 disables)")
+	if describeFlags != nil {
+		describeFlags("serve", fs)
+		return cfg, errDescribed
+	}
 	if err := applyFlagEnv(fs); err != nil {
 		return serveConfig{}, err
 	}
@@ -404,6 +415,10 @@ func withStore(name string, args []string, timeout time.Duration, checkLayout bo
 	if setup != nil {
 		setup(fs)
 	}
+	if describeFlags != nil {
+		describeFlags(name, fs)
+		return 0
+	}
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -584,9 +599,9 @@ type originConfig struct {
 func registerOriginFlags(fs *flag.FlagSet, cfg *originConfig) {
 	fs.StringVar(&cfg.bucket, "bucket", "", "restrict origin passthrough to one bucket (default: global)")
 	fs.StringVar(&cfg.cacheNamespace, "cache-namespace", "origin", "cache namespace in PostgreSQL")
-	fs.DurationVar(&cfg.ttl, "cache-ttl", time.Minute, "origin revalidation interval")
+	fs.DurationVar(&cfg.ttl, "cache-ttl", time.Minute, "origin revalidation interval (0 always revalidates)")
 	fs.DurationVar(&cfg.retention, "cache-retention", 24*time.Hour, "idle eviction interval")
-	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "concurrent origin cache fills")
+	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills and pending-upload workers")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
 }
 
@@ -677,6 +692,10 @@ func originList(ctx context.Context, st *store.Store, _ []string, _ originConfig
 func health(args []string) int {
 	fs := flag.NewFlagSet("health", flag.ContinueOnError)
 	u := fs.String("url", env("PGVS3_HEALTH_URL", "http://127.0.0.1:8014/readyz"), "readiness URL")
+	if describeFlags != nil {
+		describeFlags("health", fs)
+		return 0
+	}
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -717,32 +736,6 @@ func reap(args []string) int {
 		}
 		fmt.Printf("garbage_files=%d reaped_rows=%d reaped_files=%d expired_objects=%d db=%d MiB\n",
 			after.GarbageFiles, st.ReapedRows(), st.ReapedFiles(), st.ExpiredObjects(), after.DatabaseBytes>>20)
-		return 0
-	})
-}
-
-func doctor(args []string) int {
-	return withStore("doctor", args, 30*time.Second, false, nil, func(ctx context.Context, st *store.Store, _ []string) int {
-		d, err := st.Diagnose(ctx)
-		if err != nil {
-			return fail(err)
-		}
-		fmt.Printf("server_version_num=%d aurora_version=%q layout=%d namespaces=%d over_supported_scale=%v buckets=%d queues=%d caches=%d configured=%v objects=%d garbage=%d garbage_referenced=%d orphan_schemas=%d missing_schemas=%d db=%d MiB\n",
-			d.ServerVersion, d.AuroraVersion, d.Layout, d.Namespaces, d.OverScale, d.Buckets, d.Queues, d.Caches,
-			d.ChunksConfigured, d.Objects, d.GarbageFiles, d.GarbageReferenced,
-			d.OrphanSchemas, d.MissingSchemas, d.DatabaseBytes>>20)
-		for _, issue := range d.FunctionIssues {
-			fmt.Fprintf(os.Stderr, "function contract: %s\n", issue)
-		}
-		if d.ServerVersion < 180000 || d.Layout != store.LayoutVersion || !d.ChunksConfigured ||
-			d.OrphanSchemas > 0 || d.MissingSchemas > 0 || d.GarbageReferenced > 0 || d.OverScale ||
-			len(d.FunctionIssues) > 0 {
-			return 1
-		}
-		if err := st.EnsureMaintenance(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "schema drift: %v\n", err)
-			return 1
-		}
 		return 0
 	})
 }

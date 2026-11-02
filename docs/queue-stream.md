@@ -1,5 +1,7 @@
 # Queue and stream model
 
+> **Scope: companion.** Supported within documented bounds for co-located services; not a goal to match a dedicated queue product. See [interfaces and scope](interfaces.md).
+
 pgvs3 has one queue namespace type, `s3q_<name>`, with two delivery views over
 the same PostgreSQL schema:
 

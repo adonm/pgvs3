@@ -118,7 +118,7 @@ analytics:
 guides:
     bash deploy/bench/stack.sh guides
 
-# Render the consolidated Quarto documentation site and animated SVG atlas into docs/_site.
+# Render the Quarto documentation site and static SVG figures into docs/_site.
 [group('dev')]
 docs:
     mise exec github:quarto-dev/quarto-cli -- quarto render docs
@@ -180,6 +180,18 @@ object-storage *args:
 [positional-arguments]
 load *args:
     bash deploy/bench/load.sh "$@"
+
+# Regenerate docs/reference.md: CLI flags from the binary, metrics from a live contract scrape.
+[group('dev')]
+reference:
+    mise exec go -- go test ./cmd/pgvs3 -run '^TestReferenceMatchesFlags$' -update
+    PGVS3_UPDATE_REFERENCE=1 bash deploy/bench/stack.sh contract
+
+# Speed-of-light table: pgvs3 PUT/GET/range vs loopback HTTP and direct PostgreSQL floors.
+[group('bench')]
+[positional-arguments]
+sol *args:
+    bash deploy/bench/stack.sh sol "$@"
 
 # Opt-in transport comparison; SDK prototypes never enter the gateway binary.
 [group('bench')]

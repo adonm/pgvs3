@@ -45,14 +45,9 @@
     .cg { fill: var(--success); }
     .ca { fill: var(--warning); }
     .cp { fill: var(--purple); }
-    .ln-b { stroke: var(--blue); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f4-d 1.3s linear infinite; }
-    .ln-g { stroke: var(--success); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f4-d 1.3s linear infinite; }
-    .ln-a { stroke: var(--warning); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f4-d 1.5s linear infinite; }
-    @keyframes f4-d { to { stroke-dashoffset: -24; } }
-    @media (prefers-reduced-motion: reduce) {
-      .ln-b, .ln-g, .ln-a { animation: none; }
-      .pkt { display: none; }
-    }
+    .ln-b { stroke: var(--blue); stroke-width: 2.2; fill: none; }
+    .ln-g { stroke: var(--success); stroke-width: 2.2; fill: none; }
+    .ln-a { stroke: var(--warning); stroke-width: 2.2; fill: none; }
   </style>
 
   <rect width="1040" height="440" class="bg" rx="8"/>

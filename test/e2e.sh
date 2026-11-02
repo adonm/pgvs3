@@ -590,3 +590,6 @@ mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python deploy/b
 
 # Workload guides are executable snippets, using this same disposable fixture.
 mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py guides
+
+# Every metric the gateways emitted during this contract is documented in docs/reference.md.
+python3 test/reference.py "$A" "$B"

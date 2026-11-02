@@ -44,12 +44,8 @@
     .cg { fill: var(--success); }
     .ca { fill: var(--warning); }
     .cr { fill: var(--danger); }
-    .h-curve { stroke: var(--warning); stroke-width: 2.5; fill: none; stroke-dasharray: 10 5; animation: f5-m 2s linear infinite; }
-    .f-arr { stroke: var(--success); stroke-width: 2.3; fill: none; stroke-dasharray: 7 5; animation: f5-m 1.3s linear infinite; }
-    @keyframes f5-m { to { stroke-dashoffset: -30; } }
-    @media (prefers-reduced-motion: reduce) {
-      .h-curve, .f-arr { animation: none; }
-    }
+    .h-curve { stroke: var(--warning); stroke-width: 2.5; fill: none; }
+    .f-arr { stroke: var(--success); stroke-width: 2.3; fill: none; }
   </style>
 
   <rect width="1040" height="440" class="bg" rx="8"/>

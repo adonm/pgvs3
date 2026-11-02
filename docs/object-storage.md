@@ -1,5 +1,7 @@
 # SlateDB ObjFS on pgvs3
 
+> **Scope: experimental.** A client-side benchmark harness, not a gateway feature; it can change or be removed. See [interfaces and scope](interfaces.md).
+
 [`duckdb_object_storage`](https://duckdb.org/community_extensions/extensions/duckdb_object_storage)
 is an optional native DuckDB filesystem backed by SlateDB/OpenDAL. It uses pgvs3's
 existing S3 interface; it does not replace the gateway's logged PostgreSQL layout,

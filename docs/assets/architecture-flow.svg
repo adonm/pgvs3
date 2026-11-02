@@ -50,15 +50,10 @@
     .cg { fill: var(--success); }
     .ca { fill: var(--warning); }
     .cp { fill: var(--purple); }
-    .ln-b { stroke: var(--blue); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f1-dash 1.2s linear infinite; }
-    .ln-g { stroke: var(--success); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f1-dash 1.2s linear infinite; }
-    .ln-p { stroke: var(--purple); stroke-width: 2.4; fill: none; stroke-dasharray: 7 5; animation: f1-dash 1.0s linear infinite; }
-    .ln-a { stroke: var(--warning); stroke-width: 2.2; fill: none; stroke-dasharray: 7 5; animation: f1-dash 1.4s linear infinite; }
-    @keyframes f1-dash { to { stroke-dashoffset: -24; } }
-    @media (prefers-reduced-motion: reduce) {
-      .ln-b, .ln-g, .ln-p, .ln-a { animation: none; }
-      .pkt { display: none; }
-    }
+    .ln-b { stroke: var(--blue); stroke-width: 2.2; fill: none; }
+    .ln-g { stroke: var(--success); stroke-width: 2.2; fill: none; }
+    .ln-p { stroke: var(--purple); stroke-width: 2.4; fill: none; }
+    .ln-a { stroke: var(--warning); stroke-width: 2.2; fill: none; }
   </style>
 
   <rect width="1040" height="480" class="bg" rx="8"/>
@@ -163,9 +158,4 @@
   <path id="p1-wal" d="M 776 394 L 834 394" class="ln-p" marker-end="url(#f1-p)"/>
   <text x="782" y="386" class="mono cp">WAL</text>
 
-  <!-- Animated Packets -->
-  <circle r="4" class="cb pkt"><animateMotion dur="1.4s" repeatCount="indefinite"><mpath href="#p1-w2"/></animateMotion></circle>
-  <circle r="4" class="ca pkt"><animateMotion dur="1.8s" repeatCount="indefinite"><mpath href="#p1-o2"/></animateMotion></circle>
-  <circle r="4" class="cg pkt"><animateMotion dur="2.0s" repeatCount="indefinite"><mpath href="#p1-r2"/></animateMotion></circle>
-  <circle r="4" class="cp pkt"><animateMotion dur="1.5s" repeatCount="indefinite"><mpath href="#p1-wal"/></animateMotion></circle>
 </svg>

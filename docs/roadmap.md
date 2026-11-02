@@ -31,6 +31,25 @@ The completed work and its limits are recorded in
 [modernization-results.md](modernization-results.md). Do not repeat the completed
 contract/benchmark consolidation as a new refactor merely to change file counts.
 
+## Next: close the read gap to the speed of light
+
+`just sol` (2026-11-02) shows writes at 81–106% of a raw PostgreSQL `COPY`, but
+whole-object reads at 25–48% of their floor below 1 GiB and 8 MiB ranges at
+26–28%, plateauing near 1.1–1.2 GiB/s with only ~0.6 gateway CPU ns/byte. Cause:
+spans up to 64 MiB read on one connection, and single-PUT objects above 64 MiB
+plan more than eight pieces and take the sequential path, so `streamParallel`
+never runs for them ([details](performance.md#speed-of-light)).
+
+Proposed change: one ordered sliding window of up to eight concurrent pieces for
+any plan, and splitting large single-file spans into pieces. Accept only if:
+
+- `just sol` reads reach at least 70% of floor for 10 MiB–1 GiB;
+- [paired acceptance](benchmarks.md#paired-acceptance) under concurrency shows no
+  path regressing more than 20%, since each large GET would hold up to nine
+  chunk-pool connections instead of one;
+- `just contract` and `just fault` keep snapshot consistency, including reads
+  across overwrite and reap.
+
 ## Delivered high-value work
 
 | Priority | Delivered work | Evidence |

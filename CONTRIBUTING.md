@@ -69,7 +69,14 @@ just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-stor
 just analytics  # same README SQL and two-role scenario used by the contract
 just guides     # bound workload-guide snippets and failure-window scenarios
 just interop    # rclone, restic, boto3, and DuckLake
+just sol        # speed-of-light table: pgvs3 vs loopback HTTP and direct PostgreSQL floors
+just reference  # regenerate docs/reference.md (flags from the binary, metrics from a contract scrape)
 ```
+
+`go test ./cmd/pgvs3` fails when a flag changes without `just reference`, and
+`just contract` fails when the gateway emits a metric that `docs/reference.md`
+does not list. Quote performance as a percentage of the `just sol` floor for the
+same host, not as a bare MiB/s number.
 
 `just ci` is the same complete entry point locally and in GitHub: hk (including
 `govulncheck`), integration-tagged vet, race tests, uncached race-enabled

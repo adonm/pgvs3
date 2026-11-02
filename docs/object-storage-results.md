@@ -1,5 +1,7 @@
 # ObjFS performance and operating results
 
+> **Scope: experimental.** Results for a client-side harness, not a gateway feature. See [interfaces and scope](interfaces.md).
+
 Date: 2026-10-31. Base pgvs3 `1fdd1a2`, layout v25. Linux amd64, Ryzen 7 7700X,
 16 threads and approximately 62 GiB RAM; loopback PostgreSQL 18.6 / DuckDB 2.0.0.
 ObjFS is the checksum-pinned 0.2.0 community release, not a modified fork.

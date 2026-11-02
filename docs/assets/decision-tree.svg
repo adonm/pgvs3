@@ -47,14 +47,10 @@
     .cg { fill: var(--success); }
     .ca { fill: var(--warning); }
     .cp { fill: var(--purple); }
-    .ln-b { stroke: var(--blue); stroke-width: 2; fill: none; stroke-dasharray: 6 5; animation: f2-d 1.3s linear infinite; }
-    .ln-g { stroke: var(--success); stroke-width: 2; fill: none; stroke-dasharray: 6 5; animation: f2-d 1.3s linear infinite; }
-    .ln-a { stroke: var(--warning); stroke-width: 2; fill: none; stroke-dasharray: 6 5; animation: f2-d 1.3s linear infinite; }
-    .ln-p { stroke: var(--purple); stroke-width: 2; fill: none; stroke-dasharray: 6 5; animation: f2-d 1.3s linear infinite; }
-    @keyframes f2-d { to { stroke-dashoffset: -22; } }
-    @media (prefers-reduced-motion: reduce) {
-      .ln-b, .ln-g, .ln-a, .ln-p { animation: none; }
-    }
+    .ln-b { stroke: var(--blue); stroke-width: 2; fill: none; }
+    .ln-g { stroke: var(--success); stroke-width: 2; fill: none; }
+    .ln-a { stroke: var(--warning); stroke-width: 2; fill: none; }
+    .ln-p { stroke: var(--purple); stroke-width: 2; fill: none; }
   </style>
 
   <rect width="1040" height="460" class="bg" rx="8"/>

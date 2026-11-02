@@ -1,5 +1,7 @@
 # Differential on the PostgreSQL object data plane
 
+> **Scope: experimental.** A client-side benchmark harness, not a gateway feature; it can change or be removed. See [interfaces and scope](interfaces.md).
+
 [DuckDB Differential](https://github.com/tobilg/duckdb-differential) is an
 **experimental client option**, not a new pgvs3 storage backend or a replacement
 for DuckLake. The standard disposable benchmark includes it with `just differential`.

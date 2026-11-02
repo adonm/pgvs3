@@ -12,6 +12,53 @@ per-path evidence and the [data-plane proof/capacity ledger](data-plane-results.
 for replica, recovery and resource measurements. The [roadmap](roadmap.md) keeps
 the remaining deployment-specific limits explicit.
 
+## Speed of light
+
+`just sol` measures one client stream through the gateway against the floors
+that bound it on the same host. The HTTP floor is a loopback server that only
+moves bytes. The PostgreSQL floor is a direct `COPY` (write) or 8-connection
+`SELECT` (read) of the identical 8,120-byte rows in a table with the same
+storage settings. A perfectly pipelined gateway would approach
+`min(HTTP, PostgreSQL)`. Payloads are incompressible; caches are warm; each
+cell is the median of three interleaved trials.
+
+| Size | Op | pgvs3 MiB/s | HTTP floor | PG floor (1 conn) | % of floor | gateway CPU ns/B |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 10 MiB | PUT | 231 | 3,348 | 287 | 81% | 2.74 |
+| 10 MiB | GET | 867 | 3,405 | 3,517 (549) | 25% | 0.89 |
+| 10 MiB | 8 MiB range | 1,118 | 3,985 | 3,926 (576) | 28% | 0.60 |
+| 256 MiB | PUT | 318 | 3,713 | 335 | 95% | 1.77 |
+| 256 MiB | GET | 1,213 | 6,362 | 2,518 (429) | 48% | 0.64 |
+| 256 MiB | 8 MiB range | 1,139 | 4,308 | 4,517 (596) | 26% | 0.59 |
+| 1 GiB | PUT | 472 | 3,874 | 448 | 106% | 1.75 |
+| 1 GiB | GET | 1,156 | 6,354 | 1,331 (373) | 87% | 0.66 |
+| 1 GiB | 8 MiB range | 1,159 | 5,477 | 4,429 (618) | 26% | 0.56 |
+
+AMD Ryzen 7 7700X (16 threads), NVMe, PostgreSQL 18.6 in Docker with
+`shared_buffers=1GB`, `max_wal_size=4GB`, gateway default pools. Report:
+`.tmp/verify/sol.q4V9uq/sol.json`, SHA-256
+`0ce808f77fff0ec988b84abcefe4940aaa7ba63796b0e3ea1157b1d3ffb0cc36`.
+
+What it says:
+
+- **Writes are at the floor.** PUT is 81–106% of a raw PostgreSQL `COPY`.
+  The 1 GiB result above 100% is within trial noise. Faster single-stream
+  writes need a faster PostgreSQL write path (WAL, disk), not gateway work.
+- **Reads are not.** Every read tops out near 1.1–1.2 GiB/s, which is 25–50%
+  of the floor below 1 GiB, while the gateway spends only ~0.6 ns of CPU per
+  byte. The ceiling is serialization, not compute: spans up to 64 MiB are one
+  range query on one connection, and a single-PUT object above 64 MiB plans
+  more than eight 8 MiB pieces, so it takes the sequential snapshot path. The
+  2–8 piece parallel path below applies only to multipart objects whose plan
+  stays within eight pieces. A bounded sliding window over all pieces is the
+  next read-path change; it must pass [paired acceptance](benchmarks.md#paired-acceptance)
+  because it holds up to nine chunk-pool connections per large GET.
+- **The 1 GiB read floor drops** because the object exceeds `shared_buffers`;
+  pgvs3 is close to it there for that reason, not because the path is fast.
+
+Run `just sol` (defaults `-sizes 10MiB,256MiB,1GiB -repeat 3 -range 8MiB
+-readers 8`) on your hardware before quoting any of these numbers.
+
 ![FIG 03 — 8,192-Byte PostgreSQL Page, 8,120-Byte Chunks & Cut-Through Streaming I/O](assets/page-layout-io.svg)
 
 ## Storage layout

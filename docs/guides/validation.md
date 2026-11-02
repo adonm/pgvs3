@@ -28,28 +28,30 @@ are test fixture parameters, not alternative examples.
 | Streams | Oversized snapshot batch returns 413 without partial pagination; repeat receive returns the active batch; ACK advances it. |
 | Operations | PostgreSQL 18 diagnostic queries, optional statement statistics, CLI/probes/metric names and guarded demo cleanup. |
 
-## Verified 2026-11-01
+## Verified 2026-11-02
 
-Base pgvs3 `75802d0`, layout v25; Linux amd64, PostgreSQL/pgbench **18.6**, DuckDB
+Base pgvs3 `4c39cd0` plus this change set, layout v25; Linux amd64, PostgreSQL/pgbench **18.6**, DuckDB
 **2.0.0**. Actual loaded extension versions/hashes are in the report: DuckLake
 `417a9117f5` (catalog format 1.1), httpfs `77392a7207`, PostgreSQL scanner
-`c0f5a3c0c4`. Normal signed/official extensions are used; no production Go, schema
-SQL or dependencies were changed. The 2026-11-01 rerun re-executed the guide gate
-after the Quarto/theme/SVG audit; it changed documentation only.
+`c0f5a3c0c4`. Normal signed/official extensions are used. The 2026-11-02 pass
+changed CLI and test tooling only: `pgvs3 doctor` checks, a read-only
+`ServerFacts` query, flag help text, the `just sol` harness and generated
+`docs/reference.md`. No storage layout, schema SQL, object read/write path or
+dependency changed.
 
 ```text
 $ just guides
 guides: 35 bound snippets, 12 scenario checks passed
-guides ok (35s); artifacts: .tmp/verify/guides.MPLHYo
+guides ok (35s); artifacts: .tmp/verify/guides.f84hII
 
 $ just docs
 Output created: _site/index.html
 
 $ python3 test/documentation.py
-{'documents': 24, 'local_links': 203, 'snippets': 35, 'svgs': 6}
+{'documents': 26, 'local_links': 206, 'snippets': 35, 'svgs': 6}
 
 $ mise exec python -- python -m unittest discover -s deploy/bench -p '*_test.py'
-Ran 24 tests
+Ran 27 tests
 OK
 ```
 
@@ -63,9 +65,11 @@ OK
 | Jobs | Rollback/no job, lost enqueue reconciliation, mismatched envelope refusal, effect-before-ACK redelivery and stale-token 409. Receipt/effect count stays one even after retained ID removal/reuse. | Permanent uniqueness or exactly-once external work. Retention age is advanced only on one owned fixture row. |
 | Streams | Ceiling 413, same active batch on repeat, ACK then empty receive. | Pagination, job leases on batches or a hard retention/disk cap. |
 
-Canonical report: `.tmp/verify/guides.MPLHYo/guides.json`, SHA-256
-`375bf056b87755af7a04cb8657c2907bf35746d972e8119177f07f25de823db9`
-(superseding `.tmp/verify/guides.htfvGk/guides.json`, SHA-256
+Canonical report: `.tmp/verify/guides.f84hII/guides.json`, SHA-256
+`6368026609cc85667c8b2713d86e489f88088d1700bec2e41faf29bc3f3a81f8`
+(superseding `.tmp/verify/guides.MPLHYo/guides.json`, SHA-256
+`375bf056b87755af7a04cb8657c2907bf35746d972e8119177f07f25de823db9`,
+`.tmp/verify/guides.htfvGk/guides.json`, SHA-256
 `d54cc76c63c56a9937667b1fbdcd0d3502c1a9f188712839a891592784deafc3`,
 `.tmp/verify/guides.LO55Zg/guides.json`, SHA-256
 `c95072f77924f3ab8ee2ac514615a650f144c0c69415cba875f88c116ec2a31f`,
@@ -94,7 +98,7 @@ GitHub's existing failure upload includes the guide JSON and canary logs.
 
 The complete `just ci` passed on both the frozen source and the delivered tree:
 format/modernizer/import/tidy/vet/staticcheck/vulnerability checks, race Go tests,
-**24 Python tooling tests**, uncached race integration, four fuzz targets,
+**27 Python tooling tests**, the generated CLI reference test, the live metric-reference check, uncached race integration, four fuzz targets,
 Helm/kind, the contract (including these guides and pinned ObjFS recovery),
 physical-replica/promotion/pending-restore fault checks, interop and s3t.
 ShellCheck and Python compilation were checked separately. This is a local gate
@@ -104,14 +108,14 @@ The frozen-source run retained integration (44 s), Helm/kind (72 s), contract
 (50 s), fault (91 s), interop (16 s) and s3t (13 s) artifacts, including
 `.tmp/verify/contract.E4QASf/guides.json` (SHA-256
 `76a9f5cf74317b49cc1c38e928da81313537ec97a127072611f06a94ffd709ce`). The
-delivered-tree rerun passed integration (45 s), Helm/kind (79 s), contract
-(51 s), fault (92 s), interop (17 s) and s3t (16 s); its success-only contract
+delivered-tree rerun passed integration (50 s), Helm/kind (97 s), contract
+(51 s), fault (91 s), interop (16 s) and s3t (19 s); its success-only contract
 artifacts were cleaned, so the canonical current guide report is the standalone
-`.tmp/verify/guides.MPLHYo/guides.json`. Transcripts:
+`.tmp/verify/guides.f84hII/guides.json`. Transcripts:
 `.tmp/guidance-20261031/ci-frozen.log` (SHA-256
 `32c0e44297bde13dac56934b321f8521625a1292b9ba626c49b079bb5a8fc0bf`) and
-`.tmp/guidance-20261031/ci-coherent.log` (SHA-256
-`ee6290b90c1ea610d35775c60a7ef2dd3df02f637419d3557913087f02f284fd`).
+`.tmp/guidance-20261031/ci-v3.log` (SHA-256
+`5e86a52ec88b03c8123d7718e3e8e5c07e81398a06badcb191d7cf6799845d82`).
 
 ## Research and retained failed trials
 

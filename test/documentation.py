@@ -85,8 +85,10 @@ def check_links():
     for svg in svgs:
         root = ET.parse(svg).getroot()
         body = svg.read_text()
-        if "@keyframes" not in body or "prefers-reduced-motion" not in body or "light-dark(" not in body:
-            raise ValueError(f"SVG {svg.relative_to(ROOT)} must include CSS animation, light-dark() tokens, and prefers-reduced-motion support")
+        if "light-dark(" not in body or "color-scheme: light dark" not in body:
+            raise ValueError(f"SVG {svg.relative_to(ROOT)} must use light-dark() tokens with color-scheme: light dark")
+        if any(token in body for token in ("@keyframes", "animation:", "<animate", "<script")):
+            raise ValueError(f"SVG {svg.relative_to(ROOT)} must be static: no CSS/SMIL animation or script")
         title = root.find("{http://www.w3.org/2000/svg}title")
         label = (title.text or "").strip() if title is not None else ""
         match = re.match(r"^FIG (\d{2}) — ", label)

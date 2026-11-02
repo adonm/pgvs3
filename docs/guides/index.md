@@ -23,7 +23,7 @@ Figure numbers are stable across the site: FIG 01 topology, FIG 02 decision tree
 | Diagnose latency, capacity or recovery trouble | [Observe and recover](observe-recover.md) | Identify the constrained resource, preserve acknowledged data and verify recovery before routing traffic. |
 
 For setup use the [quick start](../index.md#quick-start) and the
-[interactive scaling, partitioning & resource estimator](../index.md#interactive-scaling-partitioning--resource-estimator).
+[sizing section](../index.md#sizing-measure-dont-estimate).
 For flags/API and topology details use [operations](../operations.md), not a copied deployment
 preset. [Sources](sources.md) records the research behind these decisions;
 [validation](validation.md) separates executable evidence from deployment advice.

@@ -1,5 +1,7 @@
 # Differential evaluation and S3 burst admission
 
+> **Scope: experimental.** Results for a client-side harness, not a gateway feature. See [interfaces and scope](interfaces.md).
+
 Date: 2026-10-31. PostgreSQL 18.6, DuckDB 2.0.0, layout **v25**.
 
 **Keep DuckLake and the existing storage roles as the default.** Differential is

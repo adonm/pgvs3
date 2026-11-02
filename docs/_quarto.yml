@@ -25,6 +25,8 @@ website:
         href: design.md
       - text: "Operations"
         href: operations.md
+      - text: "Reference"
+        href: reference.md
       - text: "Benchmarks & Evidence"
         href: benchmarks.md
     right:
@@ -70,6 +72,10 @@ website:
         contents:
           - text: "Deployment, Pools, Cache & CLI"
             href: operations.md
+          - text: "CLI & Metrics Reference (generated)"
+            href: reference.md
+          - text: "Interfaces & Scope"
+            href: interfaces.md
           - text: "Roadmap & Priorities"
             href: roadmap.md
       - section: "Benchmarks & Qualification"
@@ -107,50 +113,4 @@ format:
     toc-depth: 3
     code-copy: true
     smooth-scroll: true
-    include-in-header:
-      text: |
-        <script>
-        (function() {
-          const syncScheme = () => {
-            const isDark = document.body
-              ? document.body.classList.contains('quarto-dark')
-              : window.matchMedia('(prefers-color-scheme: dark)').matches;
-            document.documentElement.style.colorScheme = isDark ? 'dark' : 'light';
-            document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
-            document.querySelectorAll('svg.oat-inline-svg').forEach((svg) => {
-              svg.style.colorScheme = isDark ? 'dark' : 'light';
-            });
-          };
-          syncScheme();
-          window.addEventListener('DOMContentLoaded', () => {
-            syncScheme();
-            new MutationObserver(syncScheme).observe(document.body, { attributes: true, attributeFilter: ['class'] });
-            document.querySelectorAll('img[src$=".svg"]').forEach(async (img) => {
-              try {
-                const res = await fetch(img.src);
-                if (!res.ok) return;
-                const txt = await res.text();
-                const doc = new DOMParser().parseFromString(txt, 'image/svg+xml');
-                const svg = doc.querySelector('svg');
-                if (svg) {
-                  const figure = img.closest('figure');
-                  svg.classList.add('oat-inline-svg');
-                  svg.style.colorScheme = document.body.classList.contains('quarto-dark') ? 'dark' : 'light';
-                  img.replaceWith(svg);
-                  const host = figure || svg.parentElement;
-                  if (host && !host.querySelector('.pgvs3-fullsize')) {
-                    const link = document.createElement('a');
-                    link.className = 'pgvs3-fullsize';
-                    link.href = img.src;
-                    link.target = '_blank';
-                    link.rel = 'noopener';
-                    link.textContent = 'Open full-size SVG ↗';
-                    link.setAttribute('aria-label', 'Open this diagram as a full-size SVG in a new tab');
-                    host.appendChild(link);
-                  }
-                }
-              } catch (_) {}
-            });
-          });
-        })();
-        </script>
+    lightbox: true

@@ -78,6 +78,9 @@ headroom for rollouts and other clients:
 max_connections > sum(worker PGVS3_POOL_MAX + min(PGVS3_POOL_MAX, 64)) + operational headroom
 ```
 
+`pgvs3 doctor --gateways N --pool-max P --other-connections C` evaluates this
+against the live server, including reserved slots and one rollout surge worker.
+
 Also count application, DuckDB scanner and catalog pools, HA/monitoring clients,
 reserved PostgreSQL slots and rollout surge workers. This is a connection
 envelope, not memory/CPU isolation. Runtime connections need direct or
@@ -211,17 +214,16 @@ application namespaces that need S3/OJS/RESP, and do not create a public
 - `GET /readyz` — checks PostgreSQL connectivity and schema layout **v25**;
   returns `503` while draining or if the database is unreachable. It does not
   check whether the endpoint is a primary or standby.
-- `GET /metrics` — Prometheus metrics:
-  - `pgvs3_requests_total{method,code}` and S3 request duration/bytes
-  - `pgvs3_ojs_requests_total{method,code}` and OJS request duration/bytes
-  - `pgvs3_resp_requests_total{command,status}`
-  - `pgvs3_pg_pool_*` / `pgvs3_chunk_pool_*`, including acquire counts,
-    acquire duration, empty-acquire wait, connection creation and recycling
-  - `pgvs3_pending_uploads_live`, `pgvs3_pending_uploads_dead`,
-    `pgvs3_pending_uploads_bytes` and
-    `pgvs3_pending_uploads_oldest_seconds`; alert on dead rows, unbounded pending
-    bytes, or an oldest age that is not draining
-  - reaper and maintenance pass counters
+- `GET /metrics` — Prometheus text. Every emitted name, type and label is in the
+  generated [reference](reference.md#metrics), which `just contract` checks
+  against a live scrape. Alert first on:
+  - `pgvs3_pending_uploads_dead > 0`, growing `pgvs3_pending_uploads_bytes`, or a
+    `pgvs3_pending_uploads_oldest_seconds` that is not draining (acknowledged
+    bodies that only PostgreSQL holds);
+  - rising `pgvs3_pg_pool_empty_acquire_wait_seconds_total` or
+    `pgvs3_chunk_pool_empty_acquire_wait_seconds_total` (pool exhaustion);
+  - `pgvs3_s3_admission_rejected_total` and `pgvs3_spool_rejections_total`
+    (load shedding).
 
 TTL expiry counts include expired metadata-only origin parent records in layout
 v25. Range metadata is used only when range caching is enabled, never substitutes
@@ -253,7 +255,7 @@ tracing is a no-op. Successful requests expose the trace ID in `X-Trace-Id`.
 ## CLI diagnostics and maintenance
 
 ```sh
-pgvs3 doctor --url "$PGVS3_URL"                         # PG 18+, layout v25, drift, scale and reaper checks
+pgvs3 doctor --url "$PGVS3_URL" --gateways 4           # PASS/WARN/FAIL with a fix per finding (see below)
 pgvs3 stat   --url "$PGVS3_URL" [--kind K] [--name N] --json
 pgvs3 reap   --url "$PGVS3_URL" --all                   # reconcile schemas + garbage + TTL sweep
 pgvs3 clone  --url "$PGVS3_URL" [--kind bucket|cache] <src> <dst>
@@ -261,6 +263,15 @@ pgvs3 drop   --url "$PGVS3_URL" [--kind bucket|cache|queue] [--force] <name>
 pgvs3 origin --url "$PGVS3_URL" [--bucket B] set|clear|list [origin.json]
 pgvs3 pending --url "$PGVS3_URL" [--namespace N] list|retry
 ```
+
+`doctor` checks PostgreSQL 18+, layout v25, chunk settings and function
+contracts, orphan/missing schemas, referenced garbage, namespace scale,
+`fsync`/`full_page_writes` (FAIL when off), `synchronous_commit` (WARN when
+acknowledged writes can be lost), `max_wal_size` below 2 GB (WARN), dead pending
+uploads (WARN), and, with `--gateways N [--pool-max P --surge 1
+--other-connections C]`, whether `max_connections` covers
+`(N + surge) × (P + min(P, 64)) + C`. It exits 1 on any FAIL; `--json` prints the
+raw facts. Flags: [reference](reference.md#pgvs3-doctor).
 
 In normal operation, one **writable** gateway per cluster runs background
 maintenance every minute, coordinated via `pg_try_advisory_lock`. It reconciles

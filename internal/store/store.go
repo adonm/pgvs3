@@ -1631,6 +1631,70 @@ type Diagnosis struct {
 	FunctionIssues    []string `json:"function_contract_issues,omitempty"`
 }
 
+// ServerFacts are the live settings and backlog that `pgvs3 doctor` judges.
+type ServerFacts struct {
+	Settings          map[string]string `json:"settings"`
+	MaxWALBytes       int64             `json:"max_wal_bytes"`
+	InRecovery        bool              `json:"in_recovery"`
+	ClientBackends    int64             `json:"client_backends"`
+	PendingUploads    int64             `json:"pending_uploads"`
+	PendingBytes      int64             `json:"pending_bytes"`
+	DeadUploads       int64             `json:"dead_uploads"`
+	OldestPendingSecs float64           `json:"oldest_pending_seconds"`
+	Standbys          int64             `json:"standbys"`
+	MaxReplayLagBytes int64             `json:"max_replay_lag_bytes"`
+}
+
+var doctorSettings = []string{
+	"server_version", "max_connections", "superuser_reserved_connections", "reserved_connections",
+	"shared_buffers", "max_wal_size", "fsync", "full_page_writes", "synchronous_commit",
+	"synchronous_standby_names", "io_method", "wal_level",
+}
+
+func (s *Store) ServerFacts(ctx context.Context) (ServerFacts, error) {
+	f := ServerFacts{Settings: map[string]string{}}
+	rows, err := s.pool.Query(ctx, "SELECT name, current_setting(name) FROM pg_settings WHERE name = ANY($1)", doctorSettings)
+	if err != nil {
+		return f, err
+	}
+	for rows.Next() {
+		var name, value string
+		if err := rows.Scan(&name, &value); err != nil {
+			rows.Close()
+			return f, err
+		}
+		f.Settings[name] = value
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return f, err
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT pg_size_bytes(current_setting('max_wal_size')), pg_is_in_recovery(),
+		(SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend')`).
+		Scan(&f.MaxWALBytes, &f.InRecovery, &f.ClientBackends); err != nil {
+		return f, err
+	}
+	var hasPending bool
+	if err := s.pool.QueryRow(ctx, "SELECT to_regclass('s3p.pending_uploads') IS NOT NULL").Scan(&hasPending); err != nil {
+		return f, err
+	}
+	if hasPending {
+		if err := s.pool.QueryRow(ctx, `SELECT count(*), COALESCE(sum(size), 0), count(*) FILTER (WHERE dead),
+			COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0)::float8 FROM s3p.pending_uploads`).
+			Scan(&f.PendingUploads, &f.PendingBytes, &f.DeadUploads, &f.OldestPendingSecs); err != nil {
+			return f, err
+		}
+	}
+	if !f.InRecovery {
+		if err := s.pool.QueryRow(ctx, `SELECT count(*),
+			COALESCE(max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)), 0)::int8 FROM pg_stat_replication`).
+			Scan(&f.Standbys, &f.MaxReplayLagBytes); err != nil {
+			return f, err
+		}
+	}
+	return f, nil
+}
+
 func (s *Store) Diagnose(ctx context.Context) (Diagnosis, error) {
 	var d Diagnosis
 	if err := s.diagnoseServer(ctx, &d); err != nil {

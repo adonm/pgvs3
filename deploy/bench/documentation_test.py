@@ -39,7 +39,7 @@ class DocumentationTests(unittest.TestCase):
 
     def test_ojs_curl_examples_keep_array_arguments(self):
         checked = 0
-        for name in ("README.md", "docs/operations.md"):
+        for name in ("README.md", "docs/operations.md", "docs/interfaces.md"):
             text = (documentation.ROOT / name).read_text()
             for body in re.findall(r"-d '([^']+)'", text):
                 value = json.loads(body)

@@ -57,6 +57,8 @@ most directly strengthens or proves this model.
 | **Security** | Trusted network only. Authentication, authorization, TLS termination, audit logging, and per-tenant isolation are permanent non-goals. |
 | **Layout** | Current layout is **v25** (logged parent metadata for range caching, renewable owner-fenced fills, and consolidated PostgreSQL 18 publication SQL, retaining the v23 logged `s3c_`/`s3w_` split and segmented streams). There is no in-place migration path; a layout change requires a fresh database and a re-import. |
 | **Coordination** | PostgreSQL catalog, advisory locks, database leases, conditional writes, token fences, and sequences. No local process state is authoritative. |
+| **Bucket capacity** | Each bucket's `chunks` table has PostgreSQL's 32 TiB relation limit (~31.7 TiB of payload) and ~17.4 TB per object from chunk indexing. These are format ceilings, not measured production capacity targets. |
+| **Disk reclamation** | Dropping a bucket unlinks its relations. In a live bucket, reaping/vacuum make dead space reusable; ordinary vacuum may truncate an empty tail but does not guarantee compaction. Use `VACUUM FULL` or `pg_repack` when compaction is required. |
 
 ## Trust model (permanent)
 

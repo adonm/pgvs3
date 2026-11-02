@@ -46,13 +46,9 @@
     .ca { fill: var(--warning); }
     .cr { fill: var(--danger); }
     .cp { fill: var(--purple); }
-    .fc { stroke: var(--blue); stroke-width: 2.3; fill: none; stroke-dasharray: 7 5; animation: f6-q 1.3s linear infinite; }
-    .fp { stroke: var(--purple); stroke-width: 2.3; fill: none; stroke-dasharray: 7 5; animation: f6-q 1.3s linear infinite; }
-    .fg { stroke: var(--success); stroke-width: 2.3; fill: none; stroke-dasharray: 7 5; animation: f6-q 1.3s linear infinite; }
-    @keyframes f6-q { to { stroke-dashoffset: -24; } }
-    @media (prefers-reduced-motion: reduce) {
-      .fc, .fp, .fg { animation: none; }
-    }
+    .fc { stroke: var(--blue); stroke-width: 2.3; fill: none; }
+    .fp { stroke: var(--purple); stroke-width: 2.3; fill: none; }
+    .fg { stroke: var(--success); stroke-width: 2.3; fill: none; }
   </style>
 
   <rect width="1040" height="430" class="bg" rx="8"/>

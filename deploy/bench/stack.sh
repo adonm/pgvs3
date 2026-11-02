@@ -3,9 +3,9 @@ set -euo pipefail
 # shellcheck source=test/harness.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../test/harness.sh"
 mode=${1:-contract}
-case "$mode" in contract | analytics | guides | fault | interop | s3t | bench) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
+case "$mode" in contract | analytics | guides | fault | interop | s3t | bench | sol) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
 test_run "$mode"
-if [ "$mode" = analytics ] || [ "$mode" = guides ]; then test_keep_artifacts=true; fi
+if [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = sol ]; then test_keep_artifacts=true; fi
 parts=${2:-s3,compat,tuning}
 if [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then test_keep_artifacts=true; fi
 
@@ -13,7 +13,7 @@ shared_buffers=1GB
 [ "$mode" = fault ] && shared_buffers=256MB
 if [ "$mode" = guides ] || [ "$mode" = contract ]; then
   test_postgres "$shared_buffers" "" -c shared_preload_libraries=pg_stat_statements
-elif [ "$mode" = bench ] && [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then
+elif [ "$mode" = sol ] || { [ "$mode" = bench ] && [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; }; then
   test_postgres "$shared_buffers" "" -c max_wal_size=4GB
 else
   test_postgres "$shared_buffers"
@@ -27,7 +27,7 @@ export PGVS3_TEST_DB_URL="postgres://postgres:postgres@$pg/pgvs3?sslmode=disable
 export PGVS3_ACCESS_KEY="pgvs3-$mode"
 PGVS3_SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
 export PGVS3_SECRET_KEY
-if [ "$mode" != bench ]; then export PGVS3_POOL_MAX=8; fi
+if [ "$mode" != bench ] && [ "$mode" != sol ]; then export PGVS3_POOL_MAX=8; fi
 
 test_build_gateway
 
@@ -96,6 +96,11 @@ fault)
 interop)
   bash test/interop.sh
   ;;
+sol)
+  if [ "$#" -ge 1 ]; then shift; fi
+  mise exec go -- go run ./test/sol -endpoint "$PGVS3_TEST_ENDPOINT_A" -db "$PGVS3_TEST_DB_URL" \
+    -gateway-pid "$PGVS3_TEST_PID_A" -out "$PGVS3_TEST_RUN_DIR/sol.json" "$@"
+  ;;
 s3t)
   PGVS3_S3_HOST=127.0.0.1 PGVS3_S3_PORT="$port_a" bash test/s3t.sh
   ;;
@@ -116,4 +121,4 @@ bench)
     python deploy/bench/duck_bench.py --parts "$parts" --out "$out" "$@"
   ;;
 esac > "$PGVS3_TEST_RUN_DIR/suite.log" 2>&1
-if [ "$mode" = analytics ] || [ "$mode" = guides ] || [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi
+if [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = sol ] || [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi
