@@ -18,45 +18,49 @@ the remaining deployment-specific limits explicit.
 that bound it on the same host. The HTTP floor is a loopback server that only
 moves bytes. The PostgreSQL floor is a direct `COPY` (write) or 8-connection
 `SELECT` (read) of the identical 8,120-byte rows in a table with the same
-storage settings. A perfectly pipelined gateway would approach
-`min(HTTP, PostgreSQL)`. Payloads are incompressible; caches are warm; each
-cell is the median of three interleaved trials.
+storage settings, assembled into 256 KiB chunks (the minimum any implementation
+must do). A perfectly pipelined gateway would approach `min(HTTP, PostgreSQL)`.
+Payloads are incompressible; caches are warm; each cell is the median of five
+interleaved trials.
 
 | Size | Op | pgvs3 MiB/s | HTTP floor | PG floor (1 conn) | % of floor | gateway CPU ns/B |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 10 MiB | PUT | 231 | 3,348 | 287 | 81% | 2.74 |
-| 10 MiB | GET | 867 | 3,405 | 3,517 (549) | 25% | 0.89 |
-| 10 MiB | 8 MiB range | 1,118 | 3,985 | 3,926 (576) | 28% | 0.60 |
-| 256 MiB | PUT | 318 | 3,713 | 335 | 95% | 1.77 |
-| 256 MiB | GET | 1,213 | 6,362 | 2,518 (429) | 48% | 0.64 |
-| 256 MiB | 8 MiB range | 1,139 | 4,308 | 4,517 (596) | 26% | 0.59 |
-| 1 GiB | PUT | 472 | 3,874 | 448 | 106% | 1.75 |
-| 1 GiB | GET | 1,156 | 6,354 | 1,331 (373) | 87% | 0.66 |
-| 1 GiB | 8 MiB range | 1,159 | 5,477 | 4,429 (618) | 26% | 0.56 |
+| 10 MiB | PUT | 230 | 3,327 | 300 | 77% | 2.21 |
+| 10 MiB | GET | 2,111 | 3,386 | 3,675 (498) | 62% | 0.74 |
+| 10 MiB | 8 MiB range | 1,873 | 4,068 | 3,688 (583) | 51% | 0.70 |
+| 256 MiB | PUT | 346 | 3,666 | 372 | 93% | 1.78 |
+| 256 MiB | GET | 2,838 | 6,045 | 2,669 (468) | 106% | 0.52 |
+| 256 MiB | 8 MiB range | 1,964 | 4,839 | 3,937 (630) | 50% | 0.72 |
+| 1 GiB | PUT | 446 | 3,705 | 463 | 96% | 1.75 |
+| 1 GiB | GET | 2,830 | 5,979 | 1,451 (378) | 195% | 0.53 |
+| 1 GiB | 8 MiB range | 2,006 | 4,480 | 4,026 (665) | 50% | 0.73 |
 
 AMD Ryzen 7 7700X (16 threads), NVMe, PostgreSQL 18.6 in Docker with
 `shared_buffers=1GB`, `max_wal_size=4GB`, gateway default pools. Report:
-`.tmp/verify/sol.q4V9uq/sol.json`, SHA-256
-`0ce808f77fff0ec988b84abcefe4940aaa7ba63796b0e3ea1157b1d3ffb0cc36`.
+`.tmp/verify/sol.UJETVe/sol.json`, SHA-256
+`1e54093e0ec00a98e148c71e52398ee8784b4a898cc4ebc4a412b1dcfc94da94`.
 
 What it says:
 
-- **Writes are at the floor.** PUT is 81–106% of a raw PostgreSQL `COPY`.
-  The 1 GiB result above 100% is within trial noise. Faster single-stream
-  writes need a faster PostgreSQL write path (WAL, disk), not gateway work.
-- **Reads are not.** Every read tops out near 1.1–1.2 GiB/s, which is 25–50%
-  of the floor below 1 GiB, while the gateway spends only ~0.6 ns of CPU per
-  byte. The ceiling is serialization, not compute: spans up to 64 MiB are one
-  range query on one connection, and a single-PUT object above 64 MiB plans
-  more than eight 8 MiB pieces, so it takes the sequential snapshot path. The
-  2–8 piece parallel path below applies only to multipart objects whose plan
-  stays within eight pieces. A bounded sliding window over all pieces is the
-  next read-path change; it must pass [paired acceptance](benchmarks.md#paired-acceptance)
-  because it holds up to nine chunk-pool connections per large GET.
-- **The 1 GiB read floor drops** because the object exceeds `shared_buffers`;
-  pgvs3 is close to it there for that reason, not because the path is fast.
+- **Writes are at the floor.** PUT is 77–96% of a raw PostgreSQL `COPY`.
+  Faster single-stream writes need a faster PostgreSQL write path (WAL, disk),
+  not gateway work.
+- **Whole-object reads are fixed.** GET now reaches 2.1–2.8 GiB/s. The 10 MiB
+  result is 62% here and 62–76% across five-trial runs; 256 MiB and 1 GiB exceed
+  their PostgreSQL floor because that floor is limited by `shared_buffers` for
+  large objects. That is not a claim that pgvs3 beats PostgreSQL I/O.
+- **Ranges improved but remain below target.** An 8 MiB range now runs at
+  1.9–2.0 GiB/s (50–51% of floor), up from 1.1–1.2 GiB/s (26–28%). The remaining
+  ~1.5 ms is one exported snapshot plus a transaction per piece. That cost is
+  kept so a read cannot tear under the 1 s reap grace used by `just fault`. An
+  autocommit prototype reached 2.4–2.6 GiB/s (71% for the 8 MiB object) but was
+  dropped because it removed that guarantee; closing the range gap needs a read
+  lease or pin that makes autocommit pieces safe.
+- **Concurrency does not regress.** The [paired gate](benchmarks.md#paired-acceptance)
+  shows 8 MiB GET 0.3% faster at 8 workers and 0.8% faster at 16; 64 MiB GET
+  21% faster at 16. No read path regressed more than 20%.
 
-Run `just sol` (defaults `-sizes 10MiB,256MiB,1GiB -repeat 3 -range 8MiB
+Run `just sol` (defaults `-sizes 10MiB,256MiB,1GiB -repeat 5 -range 8MiB
 -readers 8`) on your hardware before quoting any of these numbers.
 
 ![FIG 03 — 8,192-Byte PostgreSQL Page, 8,120-Byte Chunks & Cut-Through Streaming I/O](assets/page-layout-io.svg)
@@ -83,12 +87,14 @@ Run `just sol` (defaults `-sizes 10MiB,256MiB,1GiB -repeat 3 -range 8MiB
 1. **Inline fast path:** metadata and `inline_data` come from one primary-key
    lookup on `objects`, within the namespace's inline limit. `HEAD` queries only
    header columns and never transfers `inline_data`.
-2. **Single-query chunk reads:** a single-file span up to 64 MiB runs as one
-   `chunks` range query (`file_id = $1 AND no BETWEEN $2 AND $3`).
-3. **Snapshot reads (>64 MiB and multipart):** Larger/multipart spans plan roughly
-   8 MiB pieces. Two to eight pieces run concurrently on separate connections
-   under one exported `REPEATABLE READ` snapshot; larger plans run sequentially
-   inside one repeatable-read transaction. Connections and buffering stay bounded.
+2. **Small single-query reads:** spans up to 1 MiB, or any plan that gets one
+   reader, run as one `chunks` range query
+   (`file_id = $1 AND no BETWEEN $2 AND $3`).
+3. **Ordered read window:** larger spans plan balanced pieces (1 MiB minimum,
+   ~8 MiB for large objects) and stream through up to eight workers under one
+   exported `REPEATABLE READ` snapshot. The window size reserves half the chunk
+   pool for other work and shrinks as reads overlap; any number of pieces can
+   stream in order with memory bounded by the window.
 4. **Synchronous vs cut-through streaming:** Reads up to 8 MiB stream
    synchronously on the HTTP goroutine. Above 8 MiB, a background fetcher feeds
    a bounded 32-buffer channel while `Body.WriteTo` streams 256 KiB buffers to

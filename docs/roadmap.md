@@ -31,24 +31,33 @@ The completed work and its limits are recorded in
 [modernization-results.md](modernization-results.md). Do not repeat the completed
 contract/benchmark consolidation as a new refactor merely to change file counts.
 
-## Next: close the read gap to the speed of light
+## Delivered: ordered read window (2026-11-02)
 
-`just sol` (2026-11-02) shows writes at 81–106% of a raw PostgreSQL `COPY`, but
-whole-object reads at 25–48% of their floor below 1 GiB and 8 MiB ranges at
-26–28%, plateauing near 1.1–1.2 GiB/s with only ~0.6 gateway CPU ns/byte. Cause:
-spans up to 64 MiB read on one connection, and single-PUT objects above 64 MiB
-plan more than eight pieces and take the sequential path, so `streamParallel`
-never runs for them ([details](performance.md#speed-of-light)).
+`just sol` before this change showed every read plateauing near 1.1–1.2 GiB/s
+(25–50% of floor below 1 GiB) with ~0.6 gateway CPU ns/byte. The cause was
+serialization: spans up to 64 MiB used one query, and single-PUT objects above
+64 MiB planned more than eight pieces and took the sequential path.
 
-Proposed change: one ordered sliding window of up to eight concurrent pieces for
-any plan, and splitting large single-file spans into pieces. Accept only if:
+The read path now plans balanced pieces for any span and streams them through
+an ordered window of up to eight workers under one exported snapshot. The window
+reserves half the chunk pool and shrinks as reads overlap. Results:
 
-- `just sol` reads reach at least 70% of floor for 10 MiB–1 GiB;
-- [paired acceptance](benchmarks.md#paired-acceptance) under concurrency shows no
-  path regressing more than 20%, since each large GET would hold up to nine
-  chunk-pool connections instead of one;
-- `just contract` and `just fault` keep snapshot consistency, including reads
-  across overwrite and reap.
+- Whole-object GET: 2.1–2.8 GiB/s (10 MiB 62–76% of floor; 256 MiB 106%;
+  1 GiB 195%). Large-size percentages above 100% reflect the floor's
+  `shared_buffers` limit, not a claim of beating PostgreSQL I/O.
+- 8 MiB range: 1.9–2.0 GiB/s (50–51% of floor), up from 1.1–1.2 (26–28%).
+- [Paired gate](benchmarks.md#paired-acceptance): 8 MiB GET 0.3% faster at 8
+  workers and 0.8% faster at 16; 64 MiB GET 21% faster at 16; no read path
+  regressed more than 20%.
+- `just contract` and `just fault` pass, including overwrite/reap churn under
+  the 1 s test reap grace.
+
+Remaining: 8 MiB ranges are still below the 70% target. The ~1.5 ms gap is one
+exported snapshot plus a transaction per piece, deliberately kept so a read
+cannot tear while the reaper runs. An autocommit prototype reached 2.4–2.6 GiB/s
+(71% for the 8 MiB object) but removed that guarantee. The next attempt should
+add a read lease or pin that makes autocommit pieces safe, then meet ≥70% for
+ranges without weakening `just fault`.
 
 ## Delivered high-value work
 

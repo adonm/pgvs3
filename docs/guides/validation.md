@@ -34,21 +34,20 @@ Base pgvs3 `4c39cd0` plus this change set, layout v25; Linux amd64, PostgreSQL/p
 **2.0.0**. Actual loaded extension versions/hashes are in the report: DuckLake
 `417a9117f5` (catalog format 1.1), httpfs `77392a7207`, PostgreSQL scanner
 `c0f5a3c0c4`. Normal signed/official extensions are used. The 2026-11-02 pass
-changed CLI and test tooling only: `pgvs3 doctor` checks, a read-only
-`ServerFacts` query, flag help text, the `just sol` harness and generated
-`docs/reference.md`. No storage layout, schema SQL, object read/write path or
-dependency changed.
+changed CLI/test tooling (`pgvs3 doctor`, `ServerFacts`, flag help, `just sol`,
+generated `docs/reference.md`) and the object read path (ordered piece window).
+No storage layout, schema SQL, write path or dependency changed.
 
 ```text
 $ just guides
 guides: 35 bound snippets, 12 scenario checks passed
-guides ok (35s); artifacts: .tmp/verify/guides.f84hII
+guides ok (36s); artifacts: .tmp/verify/guides.6k844Q
 
 $ just docs
 Output created: _site/index.html
 
 $ python3 test/documentation.py
-{'documents': 26, 'local_links': 206, 'snippets': 35, 'svgs': 6}
+{'documents': 26, 'local_links': 205, 'snippets': 35, 'svgs': 6}
 
 $ mise exec python -- python -m unittest discover -s deploy/bench -p '*_test.py'
 Ran 27 tests
@@ -65,9 +64,13 @@ OK
 | Jobs | Rollback/no job, lost enqueue reconciliation, mismatched envelope refusal, effect-before-ACK redelivery and stale-token 409. Receipt/effect count stays one even after retained ID removal/reuse. | Permanent uniqueness or exactly-once external work. Retention age is advanced only on one owned fixture row. |
 | Streams | Ceiling 413, same active batch on repeat, ACK then empty receive. | Pagination, job leases on batches or a hard retention/disk cap. |
 
-Canonical report: `.tmp/verify/guides.f84hII/guides.json`, SHA-256
-`6368026609cc85667c8b2713d86e489f88088d1700bec2e41faf29bc3f3a81f8`
-(superseding `.tmp/verify/guides.MPLHYo/guides.json`, SHA-256
+Canonical report: `.tmp/verify/guides.6k844Q/guides.json`, SHA-256
+`c0ec6fb6c593526f05e6b28a68c401d2ed593d3e5ad7f4832939a7c634a0e360`
+(superseding `.tmp/verify/guides.op1nSl/guides.json`, SHA-256
+`b9e16e2ab98a01bb5e1d4a9828f94d810105f18197987e297206482f07ab16da`,
+`.tmp/verify/guides.f84hII/guides.json`, SHA-256
+`6368026609cc85667c8b2713d86e489f88088d1700bec2e41faf29bc3f3a81f8`,
+`.tmp/verify/guides.MPLHYo/guides.json`, SHA-256
 `375bf056b87755af7a04cb8657c2907bf35746d972e8119177f07f25de823db9`,
 `.tmp/verify/guides.htfvGk/guides.json`, SHA-256
 `d54cc76c63c56a9937667b1fbdcd0d3502c1a9f188712839a891592784deafc3`,
@@ -108,14 +111,14 @@ The frozen-source run retained integration (44 s), Helm/kind (72 s), contract
 (50 s), fault (91 s), interop (16 s) and s3t (13 s) artifacts, including
 `.tmp/verify/contract.E4QASf/guides.json` (SHA-256
 `76a9f5cf74317b49cc1c38e928da81313537ec97a127072611f06a94ffd709ce`). The
-delivered-tree rerun passed integration (50 s), Helm/kind (97 s), contract
-(51 s), fault (91 s), interop (16 s) and s3t (19 s); its success-only contract
+delivered-tree rerun passed integration (50 s), Helm/kind (68 s), contract
+(52 s), fault (91 s), interop (17 s) and s3t (13 s); its success-only contract
 artifacts were cleaned, so the canonical current guide report is the standalone
-`.tmp/verify/guides.f84hII/guides.json`. Transcripts:
+`.tmp/verify/guides.6k844Q/guides.json`. Transcripts:
 `.tmp/guidance-20261031/ci-frozen.log` (SHA-256
 `32c0e44297bde13dac56934b321f8521625a1292b9ba626c49b079bb5a8fc0bf`) and
-`.tmp/guidance-20261031/ci-v3.log` (SHA-256
-`5e86a52ec88b03c8123d7718e3e8e5c07e81398a06badcb191d7cf6799845d82`).
+`.tmp/guidance-20261031/ci-readwindow3.log` (SHA-256
+`0d78f16e2969da01f7e53b7690f2870b84a05667713d22e25a0bc67f726e7832`).
 
 ## Research and retained failed trials
 

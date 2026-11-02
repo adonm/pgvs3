@@ -102,7 +102,7 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&cfg.db, "db", "", "PostgreSQL URL of the gateway's database")
 	fs.StringVar(&sizes, "sizes", "10MiB,256MiB,1GiB", "comma-separated object sizes")
 	fs.StringVar(&rangeSize, "range", "8MiB", "range GET size")
-	fs.IntVar(&cfg.repeat, "repeat", 3, "timed trials per measurement (median reported)")
+	fs.IntVar(&cfg.repeat, "repeat", 5, "timed trials per measurement (median reported)")
 	fs.IntVar(&cfg.readers, "readers", 8, "PostgreSQL floor read connections (pgvs3 streams up to 8 pieces)")
 	fs.IntVar(&cfg.gatewayPID, "gateway-pid", 0, "gateway process ID for CPU accounting (0 skips)")
 	fs.StringVar(&cfg.out, "out", "", "write JSON report here")
@@ -476,8 +476,17 @@ func readChunks(ctx context.Context, pool *pgxpool.Pool, fileID, off, n int64, r
 			}
 			defer rows.Close()
 			var got int64
+			// Assemble rows into 256 KiB chunks, the minimum any implementation
+			// must do to hand bytes to an HTTP writer; counting lengths alone
+			// would make the floor artificially cheap.
+			buf := make([]byte, 0, 256<<10+rowBytes)
 			for rows.Next() {
-				got += int64(len(rows.RawValues()[0]))
+				data := rows.RawValues()[0]
+				got += int64(len(data))
+				buf = append(buf, data...)
+				if len(buf) >= 256<<10 {
+					buf = buf[:0]
+				}
 			}
 			if err := rows.Err(); err != nil {
 				errs[i] = err

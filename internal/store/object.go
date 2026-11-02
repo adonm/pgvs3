@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sync/errgroup"
 )
 
 type ObjectRef struct {
@@ -537,27 +538,55 @@ type piece struct {
 	lo, hi int32
 }
 
-func planPieces(m *Meta, start, end int64, wholeMax int64) ([]piece, error) {
+const (
+	readPieceBytes    = 8 << 20
+	minReadPieceBytes = 1 << 20
+	oneQueryReadBytes = 1 << 20
+	maxParallelPieces = 8
+)
+
+// planPieces splits a byte span into ordered 8,120-byte-row pieces. Small spans
+// use one query; spans up to 64 MiB split across the available readers; larger
+// spans use 8 MiB pieces and an ordered sliding window.
+func planPieces(m *Meta, start, end int64, parallel int) ([]piece, error) {
 	segments, err := m.Segments()
 	if err != nil {
 		return nil, err
 	}
-
-	if m.Parts == nil && end-start+1 <= wholeMax {
-		seg := segments[0]
-		lo := int32((max(start, seg.Base) - seg.Base) / RowBytes)
-		hi := int32((min(end, seg.Base+seg.Length-1) - seg.Base) / RowBytes)
-		return []piece{{fileID: seg.FileID, base: seg.Base, segLen: seg.Length, lo: lo, hi: hi}}, nil
-	}
-	var out []piece
+	span := end - start + 1
+	parallel = max(parallel, 1)
+	var overlapping []Segment
 	for _, seg := range segments {
-		if seg.Length <= 0 || seg.Base+seg.Length-1 < start || seg.Base > end {
-			continue
+		if seg.Length > 0 && seg.Base+seg.Length-1 >= start && seg.Base <= end {
+			overlapping = append(overlapping, seg)
 		}
+	}
+	if len(overlapping) == 0 {
+		return nil, fmt.Errorf("range [%d,%d] outside object size %d", start, end, m.Size)
+	}
+	share := max(parallel/len(overlapping), 1)
+	var out []piece
+	for _, seg := range overlapping {
 		lo := int32((max(start, seg.Base) - seg.Base) / RowBytes)
 		hi := int32((min(end, seg.Base+seg.Length-1) - seg.Base) / RowBytes)
-		for r := lo; r <= hi; r += partRows {
-			out = append(out, piece{fileID: seg.FileID, base: seg.Base, segLen: seg.Length, lo: r, hi: min(r+partRows-1, hi)})
+		rows := int64(hi-lo) + 1
+		count := int64(1)
+		switch {
+		case span <= oneQueryReadBytes || parallel <= 1:
+			// One query.
+		case span <= int64(maxParallelPieces)*readPieceBytes:
+			if len(overlapping) == 1 {
+				target := max((span+int64(parallel)-1)/int64(parallel), minReadPieceBytes)
+				count = min(rows, (span+target-1)/target)
+			} else {
+				count = min(rows, int64(share))
+			}
+		default:
+			count = min(rows, max(rows*RowBytes/readPieceBytes, 1))
+		}
+		step := int32((rows + count - 1) / count)
+		for r := lo; r <= hi; r += step {
+			out = append(out, piece{fileID: seg.FileID, base: seg.Base, segLen: seg.Length, lo: r, hi: min(r+step-1, hi)})
 		}
 	}
 	return out, nil
@@ -791,9 +820,14 @@ func (s *Store) bodyFromMeta(ctx context.Context, ref ObjectRef, m *Meta, rng By
 		return sm, bytesBody(m.Inline[sm.Start : sm.End+1]), nil
 	}
 	streamCtx, cancel := context.WithCancel(ctx)
-	body, err := s.startStream(streamCtx, cancel, ref, m, mstart, mend)
-	if err != nil {
+	endRead := s.beginRead()
+	release := sync.OnceFunc(func() {
 		cancel()
+		endRead()
+	})
+	body, err := s.startStream(streamCtx, release, ref, m, mstart, mend)
+	if err != nil {
+		release()
 		return nil, nil, err
 	}
 	return sm, body, nil
@@ -831,29 +865,25 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, ref 
 	if err != nil {
 		return nil, err
 	}
-	pieces, err := planPieces(m, start, end, wholeReadMax)
+	pieces, err := planPieces(m, start, end, s.readWorkers())
 	if err != nil {
 		return nil, err
 	}
-
-	if len(pieces) == 1 && end-start+1 <= 8<<20 {
-		body, err := s.startSingleStream(ctx, cancel, schema, pieces[0], start, end)
-		if err != nil {
-			return nil, err
-		}
-		return body, nil
+	if len(pieces) == 1 {
+		return s.startSingleStream(ctx, cancel, schema, pieces[0], start, end)
 	}
 	ch := make(chan result, 32)
 	body := &Body{ch: ch, cancel: cancel}
 	go func() {
 		defer close(ch)
-		s.streamSpan(ctx, ch, schema, ref.Key, m.FileID, pieces, start, end)
+		s.streamSpan(ctx, ch, schema, pieces, start, end)
 	}()
 	first, ok := <-ch
 	if !ok {
 		return nil, io.ErrUnexpectedEOF
 	}
 	if first.err != nil {
+		body.Close()
 		return nil, first.err
 	}
 	body.chunk, body.cur = first.b, first.b
@@ -867,49 +897,40 @@ func sendStreamError(ctx context.Context, ch chan<- result, err error) {
 	}
 }
 
-func (s *Store) streamSpan(ctx context.Context, ch chan<- result, schema, key string, rootID int64, pieces []piece, start, end int64) {
-	send := func(b []byte) bool {
-		select {
-		case ch <- result{b: b}:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
-	if len(pieces) > 1 && len(pieces) <= maxParallelPieces {
-		if err := s.streamParallel(ctx, ch, schema, key, rootID, pieces, start, end); err != nil {
-			sendStreamError(ctx, ch, err)
-		}
-		return
-	}
-	if len(pieces) > 1 {
-		tx, err := s.chunkPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-		if err != nil {
-			sendStreamError(ctx, ch, err)
-			return
-		}
-		defer tx.Rollback(context.WithoutCancel(ctx))
-		for _, p := range pieces {
-			if err := streamRows(ctx, tx, schema, p, start, end, send); err != nil {
-				sendStreamError(ctx, ch, err)
-				return
-			}
-		}
-		return
-	}
-	for _, p := range pieces {
-		if err := s.streamPiece(ctx, ch, schema, key, rootID, p, start, end, send); err != nil {
-			sendStreamError(ctx, ch, err)
-			return
-		}
+func (s *Store) streamSpan(ctx context.Context, ch chan<- result, schema string, pieces []piece, start, end int64) {
+	if err := s.streamWindow(ctx, ch, schema, pieces, start, end); err != nil {
+		sendStreamError(ctx, ch, err)
 	}
 }
 
-const maxParallelPieces = 8
+// readWorkers reserves one snapshot connection per in-flight read and shares the
+// rest of the chunk pool. The cap keeps one GET from starving concurrent reads.
+func (s *Store) readWorkers() int {
+	return readWorkersFor(int(s.chunkPool.Stat().MaxConns()), int(s.inflightReads.Load()))
+}
 
-func (s *Store) streamParallel(ctx context.Context, out chan<- result, schema, _ string, _ int64, pieces []piece, start, end int64) error {
+// readWorkersFor reserves half the chunk pool for writes, maintenance and the
+// next read; one slot per in-flight read is its snapshot connection.
+func readWorkersFor(maxConns, inflight int) int {
+	inflight = max(inflight, 1)
+	budget := max(maxConns/2, 1)
+	available := max(budget-inflight, 0)
+	return min(max(available/inflight, 1), maxParallelPieces)
+}
+
+func (s *Store) beginRead() func() {
+	s.inflightReads.Add(1)
+	return func() { s.inflightReads.Add(-1) }
+}
+
+// streamWindow reads arbitrary pieces through an ordered window: piece i is
+// dispatched only after an earlier slot frees, and the consumer drains piece
+// channels in order, so memory stays bounded by the window and output order is
+// preserved. One exported snapshot covers every worker.
+func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema string, pieces []piece, start, end int64) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
 	exportConn, err := s.chunkPool.Acquire(runCtx)
 	if err != nil {
 		return err
@@ -924,69 +945,88 @@ func (s *Store) streamParallel(ctx context.Context, out chan<- result, schema, _
 	if err := exportTx.QueryRow(runCtx, "SELECT pg_export_snapshot()").Scan(&snapshot); err != nil {
 		return err
 	}
+
 	chans := make([]chan result, len(pieces))
 	for i := range chans {
 		chans[i] = make(chan result, 4)
 	}
-	var wg sync.WaitGroup
-	for i, p := range pieces {
-		wg.Add(1)
-		go func(p piece, ch chan result) {
-			defer wg.Done()
-			defer close(ch)
-			conn, err := s.chunkPool.Acquire(runCtx)
-			if err != nil {
-				sendStreamError(runCtx, ch, err)
+	g, gctx := errgroup.WithContext(runCtx)
+	g.SetLimit(s.readWorkers())
+	dispatched := make(chan struct{})
+	go func() {
+		defer close(dispatched)
+		for i := range pieces {
+			if gctx.Err() != nil {
 				return
 			}
-			defer conn.Release()
-			tx, err := conn.BeginTx(runCtx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-			if err != nil {
-				sendStreamError(runCtx, ch, err)
-				return
-			}
-			defer tx.Rollback(context.WithoutCancel(runCtx))
-			if _, err := tx.Exec(runCtx, "SET TRANSACTION SNAPSHOT '"+snapshot+"'"); err != nil {
-				sendStreamError(runCtx, ch, err)
-				return
-			}
-			send := func(b []byte) bool {
-				select {
-				case ch <- result{b: b}:
-					return true
-				case <-runCtx.Done():
-					return false
-				}
-			}
-			if err := streamRows(runCtx, tx, schema, p, start, end, send); err != nil {
-				sendStreamError(runCtx, ch, err)
-				return
-			}
-			_ = tx.Commit(runCtx)
-		}(p, chans[i])
-	}
+			i := i
+			g.Go(func() error {
+				defer close(chans[i])
+				return s.streamPieceSnapshot(gctx, chans[i], schema, pieces[i], snapshot, start, end)
+			})
+		}
+	}()
+
+	var failure error
 	for _, ch := range chans {
 		for r := range ch {
 			if r.err != nil {
-				cancel()
-				wg.Wait()
-				return r.err
+				failure = r.err
+				break
 			}
 			select {
 			case out <- r:
 			case <-runCtx.Done():
-				cancel()
-				wg.Wait()
-				return runCtx.Err()
+				failure = runCtx.Err()
+			}
+			if failure != nil {
+				break
 			}
 		}
+		if failure != nil {
+			break
+		}
 	}
-	wg.Wait()
-	return nil
+	if failure != nil {
+		cancel()
+		<-dispatched
+		_ = g.Wait()
+		return failure
+	}
+	<-dispatched
+	return g.Wait()
 }
 
-func (s *Store) streamPiece(ctx context.Context, _ chan<- result, schema string, _ string, _ int64, p piece, start, end int64, send func([]byte) bool) error {
-	return streamRows(ctx, s.chunkPool, schema, p, start, end, send)
+func (s *Store) streamPieceSnapshot(ctx context.Context, ch chan<- result, schema string, p piece, snapshot string, start, end int64) error {
+	conn, err := s.chunkPool.Acquire(ctx)
+	if err != nil {
+		sendStreamError(ctx, ch, err)
+		return err
+	}
+	defer conn.Release()
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		sendStreamError(ctx, ch, err)
+		return err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT '"+snapshot+"'"); err != nil {
+		sendStreamError(ctx, ch, err)
+		return err
+	}
+	send := func(b []byte) bool {
+		select {
+		case ch <- result{b: b}:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	if err := streamRows(ctx, tx, schema, p, start, end, send); err != nil {
+		sendStreamError(ctx, ch, err)
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 type querier interface {

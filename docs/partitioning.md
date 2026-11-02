@@ -42,6 +42,5 @@ insert contention to spread across tables.
 
 Each bucket's `chunks` table therefore remains a single unpartitioned relation
 (up to PostgreSQL's 32 TiB single-relation limit), while ≤64 KiB objects live
-inline in that schema's `objects` table and large reads use 8 MiB snapshot
-pieces (parallel only for multipart plans of up to eight pieces; see
-[speed of light](performance.md#speed-of-light)).
+inline in that schema's `objects` table and large reads use an ordered window of
+up to eight snapshot pieces (see [speed of light](performance.md#speed-of-light)).

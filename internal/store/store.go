@@ -24,9 +24,6 @@ import (
 const LayoutVersion = 25
 
 const (
-	smallMax            = 8 << 20
-	wholeReadMax        = 64 << 20
-	partRows            = smallMax/RowBytes + 2
 	chunkSize           = 256 << 10
 	ReapRows            = 65536
 	ExpireBatch         = 4096
@@ -49,6 +46,9 @@ type Store struct {
 	fileIDMu    sync.Mutex
 	fileIDBlock []int64
 	fileIDPos   int
+
+	// inflightReads bounds per-GET chunk connections when many reads overlap.
+	inflightReads atomic.Int64
 
 	reapedRows      atomic.Int64
 	reapedFiles     atomic.Int64

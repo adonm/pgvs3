@@ -103,8 +103,9 @@ The DuckLake catalog and the pgvs3 objects share a cluster but commit in
   through leases, fences and advisory locks in PostgreSQL. Gateway memory and
   scratch files are never the copy of record.
 - **Measured against the hardware.** Writes run at the raw PostgreSQL `COPY`
-  floor. Reads reach 25–50% of their floor below 1 GiB because one-piece and
-  many-piece reads are serialized. See [speed of light](docs/performance.md#speed-of-light).
+  floor. Whole-object GETs reach 2.1–2.8 GiB/s and 8 MiB ranges ~2 GiB/s through
+  an ordered window of up to eight snapshot workers. See
+  [speed of light](docs/performance.md#speed-of-light).
 
 ## Operate it
 
