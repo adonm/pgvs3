@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from collections import Counter
 from contextlib import ExitStack, contextmanager
-from datetime import date
+from datetime import date, timedelta
 import hashlib
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -114,7 +114,12 @@ def gateway(label, database, read_only=False):
 
 
 class OriginProxy:
-    def __init__(self):
+    def __init__(self, latency=0.0, keep_alive=False):
+        """latency: seconds added before every forwarded request, standing in
+        for an object store's time to first byte. keep_alive: reuse client
+        connections, as an object store does, instead of closing each one."""
+        self.latency = latency
+        self.keep_alive = keep_alive
         self.writes_blocked = False
         self.counts = Counter()
         self.lock = threading.Lock()
@@ -122,6 +127,7 @@ class OriginProxy:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            disable_nagle_algorithm = True
 
             def log_message(self, *args):
                 pass
@@ -147,6 +153,8 @@ class OriginProxy:
                 if blocked:
                     status, headers, data = 503, {}, b"origin fixture temporarily unavailable"
                 else:
+                    if owner.latency:
+                        time.sleep(owner.latency)
                     target = urlsplit(ORIGIN)
                     connection = HTTPConnection(target.hostname, target.port, timeout=120)
                     try:
@@ -163,7 +171,8 @@ class OriginProxy:
                         self.send_header(key, value)
                 length = headers.get("Content-Length", "0") if self.command == "HEAD" else str(len(data))
                 self.send_header("Content-Length", length)
-                self.send_header("Connection", "close")
+                if not owner.keep_alive:
+                    self.send_header("Connection", "close")
                 self.end_headers()
                 if self.command != "HEAD":
                     try:
@@ -173,7 +182,10 @@ class OriginProxy:
 
             do_GET = do_HEAD = do_PUT = do_POST = do_DELETE = serve
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class Server(ThreadingHTTPServer):
+            request_queue_size = 128
+
+        self.server = Server(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.endpoint = f"http://127.0.0.1:{self.server.server_port}"
 
@@ -191,12 +203,23 @@ class OriginProxy:
         with self.lock:
             return sum(self.counts[(method, path)] for method in ("GET", "HEAD"))
 
+    def reads_under(self, prefix):
+        with self.lock:
+            return sum(n for (method, path), n in self.counts.items() if method in ("GET", "HEAD") and path.startswith(prefix))
 
-def configure_origin(proxy, bucket, namespace, endpoints=(A, B), database=DATABASE, upstream="upstream"):
+
+def configure_origin(proxy, bucket, namespace, endpoints=(A, B), database=DATABASE, upstream="upstream", strip=False):
+    """strip: the cache bucket maps onto a same-named origin bucket with
+    identical keys (strip_bucket), as when fronting an existing bucket."""
+    if strip:
+        upstream = bucket
     request(ORIGIN, f"/{upstream}", "PUT", b"")
-    request(ORIGIN, f"/{upstream}/{bucket}/probe", "PUT", b"probe")
+    request(ORIGIN, f"/{upstream}/probe" if strip else f"/{upstream}/{bucket}/probe", "PUT", b"probe")
     config = RUN / f"{namespace}-origin.json"
-    config.write_text(json.dumps({"type": "s3", "config": {"bucket": upstream, "endpoint": proxy.endpoint, "access_key": "test", "secret_key": "test", "bucket_lookup_type": "path"}}))
+    s3 = {"bucket": upstream, "endpoint": proxy.endpoint, "access_key": "test", "secret_key": "test", "bucket_lookup_type": "path"}
+    if strip:
+        s3["strip_bucket"] = True
+    config.write_text(json.dumps({"type": "s3", "config": s3}))
     command("origin", "--url", database, "--bucket", bucket, "--cache-namespace", namespace,
             "--cache-ttl", "1h", "--range-cache-chunk", "65536", "set", str(config))
     for endpoint in endpoints:
@@ -1002,7 +1025,126 @@ def ortho():
           f"write-through match the local oracle", flush=True)
 
 
+ICEBERG_ROWS = 20000
+
+
+def iceberg_batch(day):
+    import pyarrow as pa
+    ids = range(day * ICEBERG_ROWS, (day + 1) * ICEBERG_ROWS)
+    return pa.table({"id": pa.array(ids, pa.int64()), "day": pa.array([date(2026, 1, 1) + timedelta(day)] * ICEBERG_ROWS, pa.date32()),
+                     "kind": pa.array([f"k{i % 7}" for i in ids]), "value": pa.array([float(i % 1000) for i in ids])})
+
+
+def iceberg_expected(days):
+    ids = range(days * ICEBERG_ROWS)
+    totals = {}
+    for i in ids:
+        count, value = totals.get(f"k{i % 7}", (0, 0.0))
+        totals[f"k{i % 7}"] = (count + 1, value + i % 1000)
+    last = range((days - 1) * ICEBERG_ROWS, days * ICEBERG_ROWS)
+    return {"count": [(len(ids),)], "partition": [(ICEBERG_ROWS, float(sum(i % 1000 for i in last)))],
+            "aggregate": [(kind, *totals[kind]) for kind in sorted(totals)]}
+
+
+def iceberg_queries(location, days):
+    scan = f"iceberg_scan('{location}')"
+    return [("snapshots", f"SELECT count(*) FROM iceberg_snapshots('{location}')"),
+            ("count", f"SELECT count(*) FROM {scan}"),
+            ("partition", f"SELECT count(*), sum(value) FROM {scan} WHERE day = DATE '{date(2026, 1, 1) + timedelta(days - 1)}'"),
+            ("aggregate", f"SELECT kind, count(*), sum(value) FROM {scan} GROUP BY kind ORDER BY kind")]
+
+
+def iceberg():
+    """An Iceberg table with one snapshot per daily append, read by DuckDB
+    straight from a latency-injected origin and through the cache tier."""
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.partitioning import PartitionField, PartitionSpec
+    from pyiceberg.schema import Schema
+    from pyiceberg.transforms import IdentityTransform
+    from pyiceberg.types import DateType, DoubleType, LongType, NestedField, StringType
+    days = int(os.environ.get("PGVS3_ICEBERG_COMMITS", "100"))
+    latency = float(os.environ.get("PGVS3_ICEBERG_ORIGIN_MS", "20")) / 1000
+    repeat = int(os.environ.get("PGVS3_ICEBERG_REPEAT", "3"))
+    bucket, identifier = "ice", "bench.events"
+
+    def catalog(endpoint):
+        return SqlCatalog("pgvs3", uri=f"sqlite:///{RUN / 'iceberg-catalog.db'}", warehouse=f"s3://{bucket}/warehouse",
+                          **{"s3.endpoint": endpoint, "s3.access-key-id": "test", "s3.secret-access-key": "test", "s3.region": "us-east-1"})
+
+    def run(role, endpoint, location, days, proxy):
+        """Per query: rows, client GETs, origin reads and wall time of each
+        repetition (the first is the cold one on a fresh cache)."""
+        import duckdb
+        connection, _ = duckdb_session(endpoint, bucket)
+        observed = {}
+        with connection:
+            connection.execute("INSTALL iceberg; LOAD iceberg; CALL enable_logging('HTTP')")
+            for name, query in iceberg_queries(location, days):
+                times, reads = [], proxy.reads_under(f"/{bucket}/")
+                for _ in range(repeat):
+                    connection.execute("CALL truncate_duckdb_logs()")
+                    started = time.perf_counter()
+                    rows = connection.execute(query).fetchall()
+                    times.append(round((time.perf_counter() - started) * 1000, 1))
+                    if len(times) == 1:
+                        gets = connection.execute("SELECT count(*) FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET'").fetchone()[0]
+                        first_reads = proxy.reads_under(f"/{bucket}/") - reads
+                observed[name] = {"rows": rows, "gets": gets, "origin_reads": first_reads, "ms": times}
+        expected = iceberg_expected(days)
+        for name, result in observed.items():
+            want = [(days,)] if name == "snapshots" else expected[name]
+            assert result["rows"] == want, (role, name, result["rows"], want)
+            del result["rows"]
+        return observed
+
+    with OriginProxy(latency, keep_alive=True) as proxy:
+        configure_origin(proxy, bucket, "ice-origin", strip=True)
+        writer = catalog(ORIGIN)
+        writer.create_namespace("bench")
+        table = writer.create_table(identifier, partition_spec=PartitionSpec(PartitionField(2, 1000, IdentityTransform(), "day")),
+                                    schema=Schema(NestedField(1, "id", LongType()), NestedField(2, "day", DateType()),
+                                                  NestedField(3, "kind", StringType()), NestedField(4, "value", DoubleType())))
+        started = time.monotonic()
+        for day in range(days):
+            table.append(iceberg_batch(day))
+        build_s = round(time.monotonic() - started, 1)
+        location = table.metadata_location
+        records = [{"role": "direct", "queries": run("direct", proxy.endpoint, location, days, proxy)}]
+        cold = run("origin-cache cold", B, location, days, proxy)
+        warm = run("origin-cache warm", A, location, days, proxy)
+        for name in warm:
+            assert warm[name]["origin_reads"] == 0, ("gateway A re-read the origin", name, warm[name])
+            assert cold[name]["gets"] == warm[name]["gets"] == records[0]["queries"][name]["gets"], name
+        records += [{"role": "origin-cache cold", "queries": cold}, {"role": "origin-cache warm", "queries": warm}]
+
+        def appends(endpoint, first, count):
+            table = catalog(endpoint).load_table(identifier)
+            times = []
+            for day in range(first, first + count):
+                started = time.perf_counter()
+                table.append(iceberg_batch(day))
+                times.append(round((time.perf_counter() - started) * 1000, 1))
+            return table.metadata_location, times
+
+        location, through = appends(A, days, 3)
+        written = run("write-through", B, location, days + 3, proxy)
+        assert all(q["origin_reads"] == 0 for q in written.values()), ("write-through snapshot was pulled from the origin", written)
+        records.append({"role": "write-through", "append_ms": through, "queries": written})
+        eventually("iceberg write-back drain", lambda: pending("ice-origin") == 0)
+        _, direct = appends(proxy.endpoint, days + 3, 3)
+        records.append({"role": "direct append", "append_ms": direct})
+    (RUN / "iceberg.json").write_text(json.dumps({"complete": True, "commits": days, "rows_per_commit": ICEBERG_ROWS,
+                                                   "origin_latency_ms": latency * 1000, "build_s": build_s,
+                                                   "records": records}, indent=2) + "\n")
+    median = lambda values: sorted(values)[len(values) // 2]
+    summary = "; ".join(f"{name} {records[0]['queries'][name]['ms'][0]:.0f}/{cold[name]['ms'][0]:.0f}/{median(warm[name]['ms']):.0f} ms"
+                        for name in warm)
+    print(f"iceberg: {days} snapshots, {latency * 1000:.0f} ms origin latency; direct/cold/warm {summary}; "
+          f"append direct {median(direct):.0f} ms vs through pgvs3 {median(through):.0f} ms; all roles match", flush=True)
+
+
 if __name__ == "__main__":
-    scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet, "ortho": ortho}
+    scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet, "ortho": ortho,
+                 "iceberg": iceberg}
     for name in sys.argv[1:]:
         scenarios[name]()

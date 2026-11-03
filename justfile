@@ -120,6 +120,13 @@ analytics:
 ortho:
     PGVS3_ANALYTICS=ortho bash deploy/bench/stack.sh analytics
 
+# Iceberg (pyiceberg writer, DuckDB reader) straight from an origin with injected
+# latency versus through the cache tier. PGVS3_ICEBERG_COMMITS=100 snapshots,
+# PGVS3_ICEBERG_ORIGIN_MS=20 per origin request, PGVS3_ICEBERG_REPEAT=3.
+[group('dev')]
+iceberg:
+    PGVS3_ANALYTICS=iceberg bash deploy/bench/stack.sh analytics
+
 # Bound SQL/API workload recipes and failure windows in the existing disposable fixture.
 [group('test')]
 guides:

@@ -410,7 +410,48 @@ one 22 MB point lookup makes about 315 origin requests, and a cold scan holds
 S3 admission slots long enough that the default 1 s `--s3-queue-wait` returns
 503 `SlowDown` to some of DuckDB's 64 parallel GETs (DuckDB retries them; with
 `PGVS3_S3_QUEUE_WAIT=30s` there are none). Raster origins want a larger range
-chunk.
+chunk. These cold figures predate a fix to the test origin proxy, whose 5-entry
+listen backlog stalled bursts of new connections for about 1 s; they overstate
+cold time and should be re-measured.
+
+## Iceberg through the cache tier (`just iceberg`)
+
+Iceberg on S3 is latency-bound: planning reads `metadata.json`, the manifest
+list and every manifest in turn, and each is a separate object-store round
+trip. `just iceberg` writes a table with pyiceberg 0.12 (SQLite catalog,
+identity-partitioned by day, one 20,000-row append and one snapshot per day,
+`PGVS3_ICEBERG_COMMITS=100`) straight to the origin. DuckDB 2.0's `iceberg`
+extension then reads it in three ways: directly from the origin through a proxy
+that adds `PGVS3_ICEBERG_ORIGIN_MS` to every request, through gateway B on a
+cold cache, and through gateway A warm. The cache bucket maps 1:1 onto the
+origin bucket (`strip_bucket`), so the table's absolute `s3://` paths resolve
+unchanged; clients only switch endpoints. Three more appends then go through
+gateway A and are read back through B. Every role must match the generated
+data, and the warm and write-through reads must cause zero origin reads.
+
+Measured 2026-11-03 on the 16-thread Intel Core Ultra laptop (median of 5
+runs; cold is the first run on gateway B; default `--fill-concurrency 8`):
+
+| Query (client GETs) | Direct, 20 ms | Cold, 20 ms | Warm | Direct, 60 ms | Cold, 60 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `iceberg_snapshots` (3) | 95 ms | 94 ms | 6 ms | 255 ms | 208 ms |
+| `count(*)` (4) | 115 ms | 34 ms | 6 ms | 316 ms | 78 ms |
+| One-partition filter (7) | 190 ms | 93 ms | 12 ms | 510 ms | 208 ms |
+| Group-by over all 100 snapshots (304) | 434 ms | 816 ms | 67 ms | 1,079 ms | 1,934 ms |
+| pyiceberg append | 500 ms | | 160 ms | 1,240 ms | 245 ms |
+
+Warm reads don't depend on origin latency: planning-bound queries are 16–50x
+faster and the full scan 6–15x. Write-through appends are 3–5x faster although
+every file (all under the 8 MiB write-back threshold) still reaches the origin
+before its PUT returns; the writer's own reads and existence checks hit the
+cache. With zero injected latency, direct and warm reads are within 25 ms of
+each other, so the proxy itself adds little.
+
+A cold full scan is about 2x slower than reading the origin directly, because
+the default eight concurrent fills per tier and per process queue DuckDB's
+parallel GETs. With `--fill-concurrency 32` on both `origin set` and `serve`,
+the cold scan at 20 ms fell from 855 ms to 531 ms against 428 ms direct.
+Lakehouse origins want a higher fill concurrency.
 
 ## Design ablations
 

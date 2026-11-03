@@ -197,18 +197,26 @@ type keyChecker interface {
 }
 
 type origin struct {
-	kind   string
-	caps   originCapabilities
-	prefix originPrefix
-	keyFn  func(string) string
-	driver originDriver
+	kind        string
+	caps        originCapabilities
+	prefix      originPrefix
+	stripBucket bool
+	driver      originDriver
 }
 
 func (o *origin) physicalKey(key string) string {
-	if o.keyFn != nil {
-		key = o.keyFn(key)
+	if o.stripBucket {
+		_, key = splitBucket(key)
 	}
 	return o.prefix.key(key)
+}
+
+func splitBucket(key string) (string, string) {
+	key = strings.TrimPrefix(key, "/")
+	if i := strings.IndexByte(key, '/'); i >= 0 {
+		return key[:i+1], key[i+1:]
+	}
+	return key, ""
 }
 
 func (o *origin) Capabilities() originCapabilities {
@@ -288,6 +296,10 @@ func (o *origin) Iter(ctx context.Context, dir string) iter.Seq2[originObject, e
 	if !o.Supports(capList) {
 		return func(func(originObject, error) bool) {}
 	}
+	bucket := ""
+	if o.stripBucket {
+		bucket, _ = splitBucket(dir)
+	}
 	return func(yield func(originObject, error) bool) {
 		for obj, err := range o.driver.Iter(ctx, o.physicalKey(dir)) {
 			if err != nil {
@@ -296,7 +308,7 @@ func (o *origin) Iter(ctx context.Context, dir string) iter.Seq2[originObject, e
 				}
 				continue
 			}
-			obj.Key = o.prefix.logical(obj.Key)
+			obj.Key = bucket + o.prefix.logical(obj.Key)
 			if !yield(obj, nil) {
 				return
 			}
@@ -342,6 +354,7 @@ type s3Config struct {
 	SessionToken     string `json:"session_token"`
 	Insecure         bool   `json:"insecure"`
 	BucketLookupType string `json:"bucket_lookup_type"`
+	StripBucket      bool   `json:"strip_bucket"`
 }
 
 type s3Bucket struct {
@@ -349,7 +362,7 @@ type s3Bucket struct {
 }
 
 func newS3Bucket(c Config) (*origin, error) {
-	cfg, err := parseS3Config(c)
+	cfg, strip, err := parseS3Config(c)
 	if err != nil {
 		return nil, err
 	}
@@ -357,13 +370,13 @@ func newS3Bucket(c Config) (*origin, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &origin{kind: "s3", caps: originCapabilitiesAll, prefix: newOriginPrefix(c.Prefix), driver: &s3Bucket{client: client}}, nil
+	return &origin{kind: "s3", caps: originCapabilitiesAll, prefix: newOriginPrefix(c.Prefix), stripBucket: strip, driver: &s3Bucket{client: client}}, nil
 }
 
-func parseS3Config(c Config) (s3client.Config, error) {
+func parseS3Config(c Config) (s3client.Config, bool, error) {
 	var sc s3Config
 	if err := decodeConfig(c, &sc); err != nil {
-		return s3client.Config{}, err
+		return s3client.Config{}, false, err
 	}
 	pathStyle := false
 	switch strings.ToLower(sc.BucketLookupType) {
@@ -371,14 +384,14 @@ func parseS3Config(c Config) (s3client.Config, error) {
 		pathStyle = true
 	case "", "auto":
 	default:
-		return s3client.Config{}, fmt.Errorf("s3 origin: unsupported bucket_lookup_type %q", sc.BucketLookupType)
+		return s3client.Config{}, false, fmt.Errorf("s3 origin: unsupported bucket_lookup_type %q", sc.BucketLookupType)
 	}
 
 	return s3client.Config{
 		Endpoint: sc.Endpoint, Region: sc.Region, Bucket: sc.Bucket,
 		AccessKey: sc.AccessKey, SecretKey: sc.SecretKey, SessionToken: sc.SessionToken,
 		Insecure: sc.Insecure, PathStyle: pathStyle,
-	}, nil
+	}, sc.StripBucket, nil
 }
 
 func (b *s3Bucket) Upload(ctx context.Context, key string, r io.Reader, size int64, in originUpload) (originAttrs, error) {
@@ -576,18 +589,8 @@ func openHTTPBucket(c Config, hc httpConfig, u *url.URL) *origin {
 	if !readOnly {
 		caps |= capWrite
 	}
-	keyFn := func(key string) string { return key }
-	if hc.StripBucket {
-		keyFn = func(key string) string {
-			key = strings.TrimPrefix(key, "/")
-			if i := strings.IndexByte(key, '/'); i >= 0 {
-				return key[i+1:]
-			}
-			return ""
-		}
-	}
 	return &origin{
-		kind: "http", caps: caps, prefix: newOriginPrefix(c.Prefix), keyFn: keyFn,
+		kind: "http", caps: caps, prefix: newOriginPrefix(c.Prefix), stripBucket: hc.StripBucket,
 		driver: b,
 	}
 }

@@ -90,10 +90,22 @@ func normalizeSpec(bucket string, spec Spec) (Spec, TierOptions, error) {
 	if err := ValidateConfig([]byte(spec.Config)); err != nil {
 		return spec, opts, fmt.Errorf("invalid origin config: %w", err)
 	}
+	if bucket == "" && s3StripsBucket([]byte(spec.Config)) {
+		return spec, opts, fmt.Errorf("invalid origin config: s3 strip_bucket requires a bucket-scoped origin")
+	}
 	spec.TTL, spec.Retention = ttl.String(), ret.String()
 	opts.Namespace, opts.TTL, opts.Retention = spec.Namespace, ttl, ret
 	opts.MaxFills, opts.RangeChunk = spec.MaxFills, spec.RangeChunk
 	return spec, opts, nil
+}
+
+func s3StripsBucket(config []byte) bool {
+	c, err := parseConfig(config)
+	if err != nil || !strings.EqualFold(c.Type, "s3") {
+		return false
+	}
+	_, strip, err := parseS3Config(c)
+	return err == nil && strip
 }
 
 func ValidateConfig(config []byte) error {
@@ -103,7 +115,7 @@ func ValidateConfig(config []byte) error {
 	}
 	switch strings.ToLower(c.Type) {
 	case "s3":
-		cfg, err := parseS3Config(c)
+		cfg, _, err := parseS3Config(c)
 		if err != nil {
 			return err
 		}

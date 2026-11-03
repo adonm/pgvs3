@@ -813,6 +813,27 @@ HTTP origins are read-only by default and map the cache bucket path onto a base 
 }
 ```
 
+S3 origins store cache bucket `b` key `k` as origin key `b/k` by default. To
+front an existing bucket whose objects hold absolute `s3://` paths, such as an
+Iceberg warehouse, set `"strip_bucket": true` and name the pgvs3 bucket after
+the origin bucket. Then `s3://warehouse/k` resolves to origin key `k`, and
+clients only change endpoint. Because every cache bucket would otherwise share
+one origin key space, S3 `strip_bucket` is accepted only on a bucket-scoped
+origin (`pgvs3 origin --bucket`):
+
+```json
+{
+  "type": "s3",
+  "config": {
+    "bucket": "warehouse",
+    "region": "us-east-1",
+    "access_key": "...",
+    "secret_key": "...",
+    "strip_bucket": true
+  }
+}
+```
+
 Use `pgvs3 origin --range-cache-chunk 1048576 set origin.json` to persist range
 caching for a stored origin, or pass `--range-cache-chunk 1048576` to
 `pgvs3 serve` for a process-local `--origin-config`. The HTTP origin returns an
@@ -848,7 +869,10 @@ For database-side query and wait analysis, run
 `--s3-concurrency` (default 32), `--queue-concurrency` (default 16) and
 `--resp-concurrency` (default 32) bound in-flight protocol work.
 `--fill-concurrency` (default 8) is a process-wide budget for cache fills and
-pending-upload workers.
+pending-upload workers. Cold scans by parallel engines such as DuckDB queue on
+it; for lakehouse origins, raise it on both `serve` and `origin set` (32 cut a
+cold Iceberg scan by about 40% in
+[benchmarks](benchmarks.md#iceberg-through-the-cache-tier-just-iceberg)).
 
 S3 keeps the immediate acquisition fast path. A brief burst above the active
 limit waits in a bounded per-gateway queue: at most **twice `--s3-concurrency`**

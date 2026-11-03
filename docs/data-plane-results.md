@@ -81,6 +81,17 @@ drained origin copy must match the file. Evidence, including per-query HTTP
 status counts, is kept in `ortho.json`. Once the file is cached, a run takes
 about 90 s at 4 sheets and 4 minutes at 8.
 
+`just iceberg` writes a 100-snapshot Iceberg table with pyiceberg to an S3
+origin and reads it with DuckDB's `iceberg` extension straight from the origin
+(with injected per-request latency), cold through gateway B and warm through
+gateway A. The cache bucket maps onto the origin bucket with `strip_bucket`, so
+the table's absolute paths are unchanged. Snapshot count, row count, a
+one-partition filter and a full group-by must match the generated data in every
+role, with the same client GETs. The warm gateway must cause zero origin reads,
+and three appends written through gateway A must be readable through gateway B
+with zero origin reads. Evidence is kept in `iceberg.json`; a run takes about
+a minute. Timings are in [benchmarks](benchmarks.md#iceberg-through-the-cache-tier-just-iceberg).
+
 ## Resource method
 
 The existing `test/loadgen` remains the only paired load engine. Resource mode

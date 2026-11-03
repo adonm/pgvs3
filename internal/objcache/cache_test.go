@@ -2348,6 +2348,53 @@ func TestS3OriginMapping(t *testing.T) {
 	}
 }
 
+func TestS3OriginStripBucket(t *testing.T) {
+	fake := newFakeS3()
+	server := httptest.NewServer(fake)
+	defer server.Close()
+	origin, err := newS3Bucket(Config{Type: "s3", Config: map[string]any{
+		"bucket": "warehouse", "endpoint": server.URL, "access_key": "AKID", "secret_key": "SECRET",
+		"bucket_lookup_type": "path", "strip_bucket": true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer origin.Close()
+	ctx := context.Background()
+	for _, key := range []string{"warehouse/t/metadata/v1.json", "warehouse/t/data/a.parquet"} {
+		if _, err := origin.Upload(ctx, key, strings.NewReader(key), int64(len(key)), originUpload{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake.mu.Lock()
+	_, physical := fake.objects["t/metadata/v1.json"]
+	fake.mu.Unlock()
+	if !physical {
+		t.Fatalf("strip_bucket kept the bucket segment in the origin key")
+	}
+	if got := conformanceGet(t, ctx, origin, "warehouse/t/metadata/v1.json"); got != "warehouse/t/metadata/v1.json" {
+		t.Fatalf("Get = %q", got)
+	}
+	var keys []string
+	for obj, err := range origin.Iter(ctx, "warehouse/t/") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, obj.Key)
+	}
+	if want := []string{"warehouse/t/data/a.parquet", "warehouse/t/metadata/v1.json"}; !slices.Equal(keys, want) {
+		t.Fatalf("iter keys = %#v, want %#v", keys, want)
+	}
+
+	config := `{"type":"s3","config":{"bucket":"warehouse","endpoint":"http://127.0.0.1:1","access_key":"a","secret_key":"s","bucket_lookup_type":"path","strip_bucket":true}}`
+	if _, _, err := normalizeSpec("warehouse", Spec{Config: config}); err != nil {
+		t.Fatalf("bucket-scoped strip_bucket: %v", err)
+	}
+	if _, _, err := normalizeSpec("", Spec{Config: config}); err == nil || !strings.Contains(err.Error(), "bucket-scoped") {
+		t.Fatalf("global strip_bucket = %v, want bucket-scoped error", err)
+	}
+}
+
 func TestRegistryRefreshLifetime(t *testing.T) {
 	r := NewRegistry(nil, nil, NewRuntime(RuntimeOptions{}), TierOptions{})
 	ctx := t.Context()
