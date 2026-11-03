@@ -10,6 +10,8 @@ Parts:
           measured by DuckDB httpfs with its HTTP request log.
   compat  DuckLake lifecycle on pgvs3: writer on gateway A, reader on B.
   tuning  DuckLake Parquet row group size / file size vs load and query time.
+  raquet  RaQuet raster point lookups (sparse ranged GETs), region and scan;
+          set PGVS3_READ_CACHE_BYTES to compare the gateway read cache.
   differential  opt-in Differential snapshot/sync-WAL comparison with DuckLake.
   object-storage  SlateDB ObjFS default/lean profiles and sealed-read comparison.
 """
@@ -67,7 +69,8 @@ def requests(con, *methods: str) -> dict:
     clear the log."""
     rows = con.sql(
         "SELECT request.duration_ms, "
-        "CASE WHEN request.type = 'GET' THEN TRY_CAST(response.headers['content-length'] AS BIGINT) END "
+        "CASE WHEN request.type = 'GET' THEN TRY_CAST(coalesce(response.headers['Content-Length'], "
+        "response.headers['content-length']) AS BIGINT) END "
         "FROM duckdb_logs_parsed('HTTP') WHERE list_contains(?, request.type)",
         params=[list(methods)],
     ).fetchall()
@@ -286,6 +289,66 @@ def tuning(args, run: str) -> dict:
     return {"results": results}
 
 
+# --- raquet ------------------------------------------------------------------
+
+
+def raquet(args, run: str) -> dict:
+    """Sparse RaQuet raster reads: each point lookup is a footer plus a few
+    small ranged GETs, so it measures per-request latency rather than bandwidth."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "test"))
+    import raquet_fixture as fixture
+    from urllib.request import Request, urlopen
+
+    a = os.environ["PGVS3_TEST_ENDPOINT_A"]
+    path = Path(args.out).parent / f"raquet-{run}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta = fixture.write(path, args.raquet_tiles, args.raquet_row_group)
+    body = path.read_bytes()
+    path.unlink()
+    for target, data in (("/raquet", b""), (f"/raquet/{run}.parquet", body)):
+        urlopen(Request(a + target, data=data, method="PUT"), timeout=300).close()
+    url = f"s3://raquet/{run}.parquet"
+
+    con = connect(os.environ["PGVS3_TEST_ENDPOINT_B"])
+    con.sql("INSTALL raquet FROM community")
+    con.sql("LOAD raquet")
+    con.sql("SET parquet_metadata_cache=false")
+    west, south, east, north = meta["bounds"]
+    rng = random.Random(20261103)
+    points = [(rng.uniform(west, east), rng.uniform(south, north)) for _ in range(args.raquet_points)]
+    point_sql = [f"SELECT ST_RasterValue(block, band_1, ST_Point({lon}, {lat}), metadata) "
+                 f"FROM read_raquet_at('{url}', {lon}, {lat})" for lon, lat in points]
+    for (lon, lat), sql in list(zip(points, point_sql))[:20]:
+        got = con.execute(sql).fetchall()
+        assert got == [(fixture.value(lon, lat),)], (lon, lat, got)
+    con.sql("CALL truncate_duckdb_logs()")
+
+    out = {"bytes": len(body), "tiles": meta["tiling"]["num_blocks"], "row_group_tiles": args.raquet_row_group,
+           "gateway_read_cache_bytes": int(os.environ.get("PGVS3_READ_CACHE_BYTES", "0"))}
+    for workers in (1, args.raquet_workers):
+        result = concurrent(con, point_sql, workers)
+        gets = requests(con, "GET")
+        result["gets_per_query"] = round(gets["count"] / len(point_sql), 1)
+        result["kib_per_query"] = round(gets.get("get_bytes", 0) / len(point_sql) / 1024, 1)
+        result["get_p50_ms"], result["get_p99_ms"] = gets.get("p50_ms"), gets.get("p99_ms")
+        out[f"point_w{workers}"] = result
+        print(json.dumps({f"point_w{workers}": result}), flush=True)
+    region = (f"'POLYGON(({west + (east - west) * 0.3} {south + (north - south) * 0.3}, {west + (east - west) * 0.6} {south + (north - south) * 0.3}, "
+              f"{west + (east - west) * 0.6} {south + (north - south) * 0.6}, {west + (east - west) * 0.3} {south + (north - south) * 0.6}, "
+              f"{west + (east - west) * 0.3} {south + (north - south) * 0.3}))'::GEOMETRY")
+    for name, sql in (("region", f"SELECT unnest(ST_RegionStats(band_1, block, {region}, metadata)) FROM read_raquet('{url}', {region})"),
+                      ("scan", f"SELECT count(*), sum((ST_RasterSummaryStats(band_1, metadata)).sum) FROM read_raquet('{url}')")):
+        times = [timed(con, sql)[0] for _ in range(args.passes)]
+        gets = requests(con, "GET")
+        out[name] = {"median_s": round(statistics.median(times), 3), "gets_per_pass": gets["count"] // args.passes,
+                     "mib_per_pass": round(gets.get("get_bytes", 0) / args.passes / MIB, 1)}
+        print(json.dumps({name: out[name]}), flush=True)
+    pixels = meta["width"] * meta["height"]
+    assert con.execute(f"SELECT count(*), sum((ST_RasterSummaryStats(band_1, metadata)).sum) FROM read_raquet('{url}')").fetchall() == \
+        [(meta["tiling"]["num_blocks"], meta["bands"][0]["STATISTICS_MEAN"] * pixels)]
+    return out
+
+
 def fixture_select(rows, start=0):
     return f"SELECT i,md5(i::VARCHAR) AS id,hash(i)::DOUBLE/18446744073709551615.0 AS value FROM range({start},{start + rows}) t(i)"
 
@@ -344,6 +407,10 @@ def main() -> int:
     p.add_argument("--row-groups", type=lambda s: [int(x) for x in s.split(",")],
                    default=[30_720, 122_880, 491_520, 1_966_080])
     p.add_argument("--passes", type=int, default=3)
+    p.add_argument("--raquet-tiles", type=int, default=32, help="raster edge in 256x256 tiles")
+    p.add_argument("--raquet-row-group", type=int, default=8, help="tiles per Parquet row group")
+    p.add_argument("--raquet-points", type=int, default=400)
+    p.add_argument("--raquet-workers", type=int, default=16)
     p.add_argument("--fixture-mib", type=lambda s: [int(x) for x in s.split(",")], default=[10, 100, 1024])
     p.add_argument("--differential-extension", default=os.environ.get("PGVS3_DIFFERENTIAL_EXTENSION"))
     p.add_argument("--differential-mib", type=lambda s: [int(x) for x in s.split(",")], default=[10, 100, 1024])
@@ -359,7 +426,7 @@ def main() -> int:
     p.add_argument("--object-storage-timeout", type=int, default=1800)
     args = p.parse_args()
     run = "r" + uuid.uuid4().hex[:12]
-    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures, "differential": differential, "object-storage": object_storage}
+    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures, "raquet": raquet, "differential": differential, "object-storage": object_storage}
     record = {"duckdb": duckdb.__version__, "cores": os.cpu_count(), "run": run}
     if set(args.parts.split(",")) & {"differential", "object-storage"} and Path(args.out).exists():
         p.error("Native-client evidence must use a fresh --out path; existing trials are never overwritten")

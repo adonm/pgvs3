@@ -839,5 +839,93 @@ def guides():
         raise
 
 
+RAQUET_POINTS = ((-3.7038, 40.4168), (-3.9, 40.2), (-3.5, 40.6), (-9.0, 37.0))
+RAQUET_REGION = "'POLYGON((-4 40, -3.5 40, -3.5 40.5, -4 40.5, -4 40))'::GEOMETRY"
+
+
+def raquet_queries(url):
+    """(name, sql) pairs: sparse point lookups, one region and a full scan."""
+    points = [(f"point {lon},{lat}", f"SELECT ST_RasterValue(block, band_1, ST_Point({lon}, {lat}), metadata) "
+                                     f"FROM read_raquet_at('{url}', {lon}, {lat})") for lon, lat in RAQUET_POINTS]
+    return points + [
+        ("region", f"SELECT unnest(ST_RegionStats(band_1, block, {RAQUET_REGION}, metadata)) FROM read_raquet('{url}', {RAQUET_REGION})"),
+        ("scan", f"SELECT count(*), sum((ST_RasterSummaryStats(band_1, metadata)).sum) FROM read_raquet('{url}')"),
+    ]
+
+
+def raquet_run(connection, url):
+    """Results and HTTP GET count/bytes per query, from DuckDB's HTTP log."""
+    out = {}
+    connection.execute("CALL enable_logging('HTTP')")
+    for name, query in raquet_queries(url):
+        connection.execute("CALL truncate_duckdb_logs()")
+        rows = connection.execute(query).fetchall()
+        gets, received = connection.execute(
+            "SELECT count(*), coalesce(sum(TRY_CAST(response.headers['Content-Length'] AS BIGINT)), 0) "
+            "FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET'").fetchone()
+        out[name] = {"rows": rows, "gets": gets, "bytes": received}
+    return out
+
+
+def raquet():
+    import duckdb
+    import raquet_fixture
+    path = RUN / "raster.parquet"
+    metadata = raquet_fixture.write(path, count=8, row_group=4)
+    body = path.read_bytes()
+    with duckdb.connect() as local:
+        local.execute("INSTALL raquet FROM community; LOAD raquet")
+        oracle = {name: local.execute(query).fetchall() for name, query in raquet_queries(str(path))}
+    for (lon, lat), (name, _) in zip(RAQUET_POINTS, raquet_queries("")):
+        assert oracle[name] == [(raquet_fixture.value(lon, lat),)], (name, oracle[name])
+    pixels = metadata["width"] * metadata["height"]
+    assert oracle["scan"] == [(metadata["tiling"]["num_blocks"], metadata["bands"][0]["STATISTICS_MEAN"] * pixels)], oracle["scan"]
+
+    def session(endpoint, bucket):
+        connection, _ = duckdb_session(endpoint, bucket)
+        connection.execute("INSTALL raquet FROM community; LOAD raquet")
+        return connection
+
+    def check(role, endpoint, bucket, key):
+        with session(endpoint, bucket) as connection:
+            observed = raquet_run(connection, f"s3://{bucket}/{key}")
+        for name, result in observed.items():
+            assert result["rows"] == oracle[name], (role, name, result["rows"], oracle[name])
+        for name, _ in raquet_queries("")[:len(RAQUET_POINTS)]:
+            assert 0 < observed[name]["bytes"] < len(body) // 4, (role, name, observed[name], len(body))
+        return observed
+
+    records = []
+    request(A, "/raster", "PUT", b"")
+    request(A, "/raster/raster.parquet", "PUT", body, {"Content-Type": "application/vnd.apache.parquet"})
+    native = check("native", B, "raster", "raster.parquet")
+    records.append({"role": "native", "queries": native})
+    with OriginProxy() as proxy:
+        configure_origin(proxy, "edge-raster", "raster-origin")
+        request(ORIGIN, "/upstream/edge-raster/raster.parquet", "PUT", body, {"Content-Type": "application/vnd.apache.parquet"})
+        cold = check("origin-cache cold", A, "edge-raster", "raster.parquet")
+        reads = proxy.reads("edge-raster", "raster.parquet")
+        assert reads > 0
+        warm = check("origin-cache warm", B, "edge-raster", "raster.parquet")
+        assert proxy.reads("edge-raster", "raster.parquet") == reads, "gateway B re-read the origin"
+        for name in native:
+            sequence = [(role[name]["gets"], role[name]["bytes"]) for role in (native, cold, warm)]
+            assert len(set(sequence)) == 1, ("cache tier changed the client's ranged reads", name, sequence)
+        records.append({"role": "origin-cache", "origin_reads_cold": reads, "origin_reads_after_warm": 0, "queries": warm})
+        request(A, "/edge-raster/written.parquet", "PUT", body, {"Content-Type": "application/vnd.apache.parquet"})
+        written = check("write-through", B, "edge-raster", "written.parquet")
+        assert proxy.reads("edge-raster", "written.parquet") == 0, "write-through object was pulled from the origin"
+        eventually("raquet write-back drain", lambda: pending("raster-origin") == 0)
+        check_body(ORIGIN, "/upstream/edge-raster/written.parquet", body)
+        records.append({"role": "write-through", "origin_reads": 0, "queries": written})
+    point = native[raquet_queries("")[0][0]]
+    (RUN / "raquet.json").write_text(json.dumps({"complete": True, "bytes": len(body), "tiling": metadata["tiling"],
+                                                  "records": records}, indent=2, default=str) + "\n")
+    print(f"raquet: {len(body)}-byte raster, {metadata['tiling']['num_blocks']} tiles; point lookup {point['gets']} GETs / "
+          f"{point['bytes']} bytes; native, origin-cache (zero origin reads on B) and write-through match the local oracle", flush=True)
+
+
 if __name__ == "__main__":
-    {"analytics": analytics, "replication": replication, "guides": guides}[sys.argv[1]]()
+    scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet}
+    for name in sys.argv[1:]:
+        scenarios[name]()

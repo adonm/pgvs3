@@ -66,7 +66,7 @@ just race       # unit tests with race detector
 just integration # store/queue/cache integration against disposable PostgreSQL 18
 just s3t        # fast s3t allow-list (Go port of ceph/s3-tests) against a running gateway
 just contract   # end-to-end S3, boto3, DuckDB 2.0, DuckLake, duckdb-object-storage
-just analytics  # same README SQL and two-role scenario used by the contract
+just analytics  # same README SQL and two-role scenario used by the contract, plus RaQuet rasters
 just guides     # bound workload-guide snippets and failure-window scenarios
 just interop    # rclone, restic, boto3, and DuckLake
 just sol        # speed-of-light table: pgvs3 vs loopback HTTP and direct PostgreSQL floors

@@ -56,6 +56,18 @@ then verifies the origin copy and stable ETag after drain. DuckLake tables reope
 through another gateway in each role. Data inlining is disabled for that example
 so the table exercises object files; catalog/object commits remain separate.
 
+`just analytics` then runs a [RaQuet](https://www.raquet.io/) raster scenario
+(not part of `just contract`, because DuckDB's `raquet` community extension is
+downloaded at run time and its version can't be pinned). `test/raquet_fixture.py`
+generates a 3.7 MB, 64-tile float32 raster whose pixel values follow a formula,
+so point lookups have exact expected values. Point, region and scan queries run
+through DuckDB's `raquet` extension on gateway B, against a native bucket, a
+cold-then-warm read-through cache and a write-through cache object. Each must
+match the local-file result. Each point lookup must read under a quarter of the
+file, and each query must make the same ranged GETs in every role. The second gateway must cause zero origin reads, and the
+write-through object must never be fetched from the origin. Evidence is kept in
+`raquet.json`.
+
 ## Resource method
 
 The existing `test/loadgen` remains the only paired load engine. Resource mode

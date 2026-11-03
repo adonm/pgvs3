@@ -339,6 +339,32 @@ Measured on the 6-vCPU VM with 2,000 4 KiB objects and 128 8 MiB objects
 DuckDB's `httpfs` adds its own request scheduling and connection pool; the
 direct numbers above show the gateway ceiling underneath it.
 
+## RaQuet raster lookups (`just bench raquet`)
+
+[RaQuet](https://www.raquet.io/) stores rasters in Parquet: one row per
+256x256 tile keyed by QUADBIN cell, so a point lookup through DuckDB's
+`raquet` extension is a footer read plus one row group, not a scan. The part
+generates a deterministic 58.9 MB, 1,024-tile float32 raster
+(`test/raquet_fixture.py`, 8 tiles per row group), checks lookups against the
+generator, then times 400 random point lookups through gateway B, plus one
+region query and a full scan. Set `PGVS3_READ_CACHE_BYTES` to measure the
+gateway read cache.
+
+Measured 2026-11-03 on the 16-thread Intel Core Ultra laptop (±15% between runs):
+
+| Workload | Read cache | Result | p50 | p99 |
+| --- | --- | ---: | ---: | ---: |
+| Point lookup, 1 worker | off | 58 q/s | 17.2 ms | 22.1 ms |
+| Point lookup, 1 worker | 1 GiB | 69 q/s | 14.4 ms | 19.4 ms |
+| Point lookup, 16 workers | off | 287 q/s | 54.3 ms | 85.7 ms |
+| Point lookup, 16 workers | 1 GiB | 360 q/s | 42.6 ms | 73.3 ms |
+
+Each lookup makes 9 ranged GETs totalling 645 KiB, with per-GET p50 of 0–3 ms,
+so most of the per-query time is spent in DuckDB rather than the gateway. The
+region query (9% of the area) reads 34.8 MiB in 160 GETs in about 0.3 s. Most of its bytes
+come from Morton-order row groups that only partly overlap the polygon, which
+is a file-layout property, not a gateway one.
+
 ## Design ablations
 
 ### 64 KiB inline threshold vs 8 KiB chunking (6-vCPU VM, 1 worker)
@@ -463,6 +489,7 @@ S3 Express One Zone figures below are AWS's published service specifications and
 just contract   # run the correctness suite first
 just load       # exploratory matrix (isolated .tmp/verify/ artifacts)
 just bench s3   # DuckDB 2.0 httpfs matrix (.tmp/pgvs3/bench.json)
+just bench raquet  # RaQuet raster point lookups; PGVS3_READ_CACHE_BYTES=... for the cache
 just bench      # full DuckDB + DuckLake compatibility and row-group tuning
 ```
 

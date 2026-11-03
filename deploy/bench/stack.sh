@@ -7,6 +7,7 @@ case "$mode" in contract | analytics | guides | fault | interop | s3t | bench | 
 test_run "$mode"
 if [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = sol ]; then test_keep_artifacts=true; fi
 parts=${2:-s3,compat,tuning}
+raquet_deps=(--with quadbin==0.2.2 --with pyarrow==26.0.0 --with numpy==2.5.4)
 if [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then test_keep_artifacts=true; fi
 
 shared_buffers=1GB
@@ -74,7 +75,7 @@ contract)
   bash test/e2e.sh
   ;;
 analytics)
-  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py analytics
+  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 "${raquet_deps[@]}" python test/data_plane.py analytics raquet
   ;;
 guides)
   mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py guides
@@ -117,7 +118,7 @@ bench)
   out=.tmp/pgvs3/bench.json
   if [[ ",$parts," = *,differential,* ]]; then out="$PGVS3_TEST_RUN_DIR/differential.json"; fi
   if [[ ",$parts," = *,object-storage,* ]]; then out="$PGVS3_TEST_RUN_DIR/object-storage.json"; fi
-  mise exec uv -- uv run --quiet --no-project --with "duckdb==${DUCKDB_PY:-2.0.0}" \
+  mise exec uv -- uv run --quiet --no-project --with "duckdb==${DUCKDB_PY:-2.0.0}" "${raquet_deps[@]}" \
     python deploy/bench/duck_bench.py --parts "$parts" --out "$out" "$@"
   ;;
 esac > "$PGVS3_TEST_RUN_DIR/suite.log" 2>&1
