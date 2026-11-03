@@ -1251,8 +1251,8 @@ def trino():
             lines.append("fs.cache.enabled=true")
         (etc / "catalog" / f"{name}.properties").write_text("\n".join(lines) + "\n")
 
-    def table(name, kind="lineitem"):
-        return f"{name}.bench.{kind}"
+    def table(name, kind="lineitem", schema="bench"):
+        return f"{name}.{schema}.{kind}"
 
     def oracle(months, kind):
         if kind == "big":
@@ -1265,14 +1265,14 @@ def trino():
                             f"WHERE shipdate >= DATE '{month}' AND shipdate < DATE '{month}' + INTERVAL '1' MONTH")
         return round((time.perf_counter() - started) * 1000, 1)
 
-    def run(role, name, expected, runs=repeat):
+    def run(role, name, expected, runs=repeat, schema="bench"):
         """Per query: coordinator milliseconds of each run (the first is the
         cold one for a fresh cache) and origin reads during the first."""
         observed = {}
         for query, kind, template in TRINO_QUERIES:
             times, reads = [], proxy.reads_under(f"/{bucket}/")
             for _ in range(runs):
-                rows, elapsed = trino_query(server, template.format(t=table(name, kind)))
+                rows, elapsed = trino_query(server, template.format(t=table(name, kind, schema)))
                 assert rows == expected[query], (role, query, rows, expected[query])
                 times.append(elapsed)
                 if len(times) == 1:
@@ -1347,22 +1347,42 @@ def trino():
         final = expect(TRINO_MONTHS)
         run("final direct", "direct", final, runs=1)
         run("final cache", "via_b", final, runs=1)
+
+        # Layout: the commit log compacted into one snapshot and manifest, and
+        # the large table sorted by the month filter's column so row-group
+        # statistics prune it. Gateway B has not read these files yet.
+        trino_query(server, "CREATE SCHEMA direct.tuned")
+        started = time.monotonic()
+        trino_query(server, f"CREATE TABLE {table('direct', schema='tuned')} WITH (partitioning = ARRAY['month(shipdate)']) "
+                            f"AS SELECT * FROM {table('direct')}")
+        trino_query(server, f"CREATE TABLE {table('direct', 'big', 'tuned')} WITH (sorted_by = ARRAY['shipdate']) "
+                            f"AS SELECT * FROM tpch.{scale}.lineitem")
+        tuned_s = round(time.monotonic() - started, 1)
+        tuned = {"direct": run("tuned direct", "direct", final, schema="tuned"),
+                 "cold": run("tuned cold", "via_b", final, schema="tuned"),
+                 "warm": run("tuned warm", "via_a", final, schema="tuned")}
+        assert all(q["origin_reads"] == 0 for q in tuned["warm"].values()), ("tuned warm read the origin", tuned["warm"])
+        records += [{"role": f"tuned {role}", "queries": queries} for role, queries in tuned.items()]
         nessie_rows = int(sql("SELECT count(*) FROM objs2", DATABASE.replace("/pgvs3?", "/nessie?")))
     (RUN / "trino.json").write_text(json.dumps({"complete": True, "months": len(TRINO_MONTHS), "big_scale": scale,
                                                  "files": {kind: {"count": n, "bytes": total, "max_bytes": largest}
                                                            for kind, (n, total, largest) in layout.items()},
                                                  "origin_latency_ms": latency * 1000, "range_chunk": range_chunk,
-                                                 "build_s": build_s, "big_build_s": big_s, "nessie_objects": nessie_rows,
+                                                 "build_s": build_s, "big_build_s": big_s, "tuned_build_s": tuned_s,
+                                                 "nessie_objects": nessie_rows,
                                                  "records": records}, indent=2) + "\n")
     median = lambda values: sorted(values)[len(values) // 2]
     roles = {record["role"]: record["queries"] for record in records if "queries" in record}
     summary = "; ".join(f"{query} {median(roles['direct'][query]['ms']):.0f}/{cold[query]['ms'][0]:.0f}/"
                         f"{median(warm[query]['ms']):.0f}/{median(roles['alluxio'][query]['ms']):.0f} ms"
                         for query, _, _ in TRINO_QUERIES)
+    tuned_summary = "; ".join(f"{query} {median(tuned['direct'][query]['ms']):.0f}/{tuned['cold'][query]['ms'][0]:.0f}/"
+                              f"{median(tuned['warm'][query]['ms']):.0f} ms" for query, _, _ in TRINO_QUERIES)
     files = ", ".join(f"{kind} {n} files / {total / (1 << 20):.0f} MiB" for kind, (n, total, _) in layout.items())
     print(f"trino: {len(TRINO_MONTHS)} Nessie commits; {files}; "
           f"{latency * 1000:.0f} ms origin latency; direct/cold/warm/alluxio {summary}; insert direct "
-          f"{median(direct_ms):.0f} ms vs through pgvs3 {median(through_ms):.0f} ms; all roles match TPC-H", flush=True)
+          f"{median(direct_ms):.0f} ms vs through pgvs3 {median(through_ms):.0f} ms; compacted and sorted "
+          f"direct/cold/warm {tuned_summary}; all roles match TPC-H", flush=True)
 
 
 if __name__ == "__main__":

@@ -245,6 +245,32 @@ func (c *blockCache) pieceParts(table uint32, p piece, start, end int64) ([][]by
 	return parts, true
 }
 
+// wholeFile is the block number of an entry holding a whole file that is only
+// ever read whole (ReadMany), so a hit needs no assembly copy.
+const wholeFile = -1
+
+func (s *Store) cachedFile(table uint32, file, size int64) ([]byte, bool) {
+	if s.blocks == nil || table == 0 {
+		return nil, false
+	}
+	data, ok := s.blocks.get(blockKey{table: table, file: file, block: wholeFile})
+	if !ok || int64(len(data)) != size {
+		return nil, false
+	}
+	s.blocks.hits.Add(1)
+	s.blocks.hitBytes.Add(size)
+	return data, true
+}
+
+// cacheFile stores a whole file; data then belongs to the cache and must not
+// be modified.
+func (s *Store) cacheFile(table uint32, file int64, data []byte) {
+	if s.blocks == nil || table == 0 {
+		return
+	}
+	s.blocks.put(blockKey{table: table, file: file, block: wholeFile}, data)
+}
+
 // blockFill assembles complete blocks from rows streamed in order and stores
 // those not already cached. Rows outside complete blocks are ignored.
 type blockFill struct {

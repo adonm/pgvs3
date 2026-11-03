@@ -129,12 +129,14 @@ iceberg:
 
 # Trino 484 + Nessie 0.109 (JDBC version store in the same PostgreSQL) on TPC-H
 # lineitem committed month by month plus one large-file CTAS: direct origin,
-# cache tier, Trino's Alluxio cache. PGVS3_TRINO_ORIGIN_MS=20, PGVS3_TRINO_REPEAT=3,
-# PGVS3_TRINO_BIG_SCALE=sf10, PGVS3_TRINO_RANGE_CHUNK=1048576,
-# PGVS3_TRINO_FILL_CONCURRENCY (per tier). Pulls two container images.
+# cache tier, Trino's Alluxio cache, then a compacted and sorted layout.
+# PGVS3_TRINO_ORIGIN_MS=20, PGVS3_TRINO_REPEAT=3, PGVS3_TRINO_BIG_SCALE=sf10,
+# PGVS3_TRINO_RANGE_CHUNK=1048576, PGVS3_TRINO_FILL_CONCURRENCY (per tier),
+# PGVS3_READ_CACHE_BYTES=3221225472 and PGVS3_POOL_MAX=8 (cache gateways).
+# Pulls two container images.
 [group('dev')]
 trino:
-    PGVS3_ANALYTICS=trino bash deploy/bench/stack.sh analytics
+    PGVS3_READ_CACHE_BYTES=${PGVS3_READ_CACHE_BYTES:-3221225472} PGVS3_ANALYTICS=trino bash deploy/bench/stack.sh analytics
 
 # Bound SQL/API workload recipes and failure windows in the existing disposable fixture.
 [group('test')]

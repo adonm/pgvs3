@@ -1352,6 +1352,7 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 		t.Fatalf("metadata became a body: %v", err)
 	}
 
+	f.tier.stores.Wait()
 	ro, err := New(nil, []byte(`{"type":"ephemeral"}`), testStore, f.tier.runtime, TierOptions{
 		Namespace: f.tier.namespace, TTL: time.Hour, Retention: time.Hour, MaxFills: 1, ReadOnly: true, RangeChunk: 64 << 10,
 	})

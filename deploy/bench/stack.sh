@@ -29,7 +29,7 @@ export PGVS3_TEST_DB_URL="postgres://postgres:postgres@$pg/pgvs3?sslmode=disable
 export PGVS3_ACCESS_KEY="pgvs3-$mode"
 PGVS3_SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
 export PGVS3_SECRET_KEY
-if [ "$mode" != bench ] && [ "$mode" != sol ]; then export PGVS3_POOL_MAX=8; fi
+if [ "$mode" != bench ] && [ "$mode" != sol ]; then export PGVS3_POOL_MAX=${PGVS3_POOL_MAX:-8}; fi
 
 test_build_gateway
 
@@ -48,6 +48,8 @@ for entry in "a:$port_a" "b:$port_b"; do
   if [ "$mode" = contract ] || [ "$mode" = fault ] || [ "$mode" = interop ]; then
     args+=(--reap-grace 1s)
   fi
+  pprof_var="PGVS3_TEST_PPROF_${label^^}"
+  if [ -n "${!pprof_var:-}" ]; then args+=(--pprof-addr "${!pprof_var}"); fi
   test_start_gateway "$label" "$PGVS3_TEST_DB_URL" "$port" "${args[@]}"
 done
 export PGVS3_TEST_ENDPOINT_A="http://127.0.0.1:$port_a"
@@ -66,7 +68,7 @@ if [ "$mode" = contract ] || [ "$mode" = analytics ] || [ "$mode" = guides ] || 
   test_postgres 128MB origin
   export PGVS3_TEST_ORIGIN_DB_URL=$PGVS3_TEST_DATABASE_URL
   origin_port=$(test_port)
-  test_start_gateway origin "$PGVS3_TEST_ORIGIN_DB_URL" "$origin_port" --pool-max 8 --log-level warn
+  test_start_gateway origin "$PGVS3_TEST_ORIGIN_DB_URL" "$origin_port" --pool-max 8 --read-cache-bytes 0 --log-level warn
   export PGVS3_TEST_ORIGIN_ENDPOINT="http://127.0.0.1:$origin_port"
   PGVS3_TEST_PG_CONTAINER=$primary_container PGVS3_TEST_PG_PORT=$primary_port PGVS3_TEST_DATABASE_URL=$primary_url
 fi

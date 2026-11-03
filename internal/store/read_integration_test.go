@@ -5,6 +5,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	mathrand "math/rand"
 	"os"
@@ -209,38 +210,49 @@ func TestChunkedWriteOnSingleConnectionPool(t *testing.T) {
 }
 
 func TestCacheReadManyAssemblesUnorderedRows(t *testing.T) {
-	ctx := testCtx
-	name := unique("read-many")
-	ref := ns.CacheRef(name)
-	dropOnCleanup(t, ns.Cache, name)
-	want := map[string][]byte{
-		"inline": []byte("small"),
-		"empty":  {},
-		"one":    randomBytes(3*RowBytes+17, 9),
-		"two":    randomBytes(40*RowBytes, 10),
-	}
-	for key, data := range want {
-		obj := ObjectRef{NS: ref, Key: key}
-		if key == "inline" {
-			_, err := testStore.PutInline(ctx, obj, data, WriteOptions{})
-			testutil.Must(t, err)
-			continue
-		}
-		putChunked(t, testStore, obj, data)
-	}
-	keys := []string{"two", "missing", "inline", "one", "empty", "two"}
-	got, err := testStore.Cache(name).ReadMany(ctx, keys)
-	testutil.Must(t, err)
-	for i, key := range keys {
-		if key == "missing" {
-			if got[i] != nil {
-				t.Fatalf("missing key returned %d bytes", len(got[i]))
+	for _, cacheBytes := range []int64{0, 64 << 20} {
+		t.Run(fmt.Sprintf("read-cache-%d", cacheBytes), func(t *testing.T) {
+			ctx := testCtx
+			st := openReadStore(t, func(o *OpenOptions) { o.ReadCacheBytes = cacheBytes })
+			name := unique("read-many")
+			ref := ns.CacheRef(name)
+			dropOnCleanup(t, ns.Cache, name)
+			want := map[string][]byte{
+				"inline": []byte("small"),
+				"empty":  {},
+				"one":    randomBytes(3*RowBytes+17, 9),
+				"two":    randomBytes(40*RowBytes, 10),
+				"three":  randomBytes(130*RowBytes+5, 11),
 			}
-			continue
-		}
-		if got[i] == nil || !bytes.Equal(got[i], want[key]) {
-			t.Fatalf("%s (position %d): got %d bytes, want %d", key, i, len(got[i]), len(want[key]))
-		}
+			for key, data := range want {
+				obj := ObjectRef{NS: ref, Key: key}
+				if key == "inline" {
+					_, err := st.PutInline(ctx, obj, data, WriteOptions{})
+					testutil.Must(t, err)
+					continue
+				}
+				putChunked(t, st, obj, data)
+			}
+			keys := []string{"two", "missing", "inline", "one", "three", "empty", "two"}
+			for pass := range 2 {
+				got, err := st.Cache(name).ReadMany(ctx, keys)
+				testutil.Must(t, err)
+				for i, key := range keys {
+					if key == "missing" {
+						if got[i] != nil {
+							t.Fatalf("missing key returned %d bytes", len(got[i]))
+						}
+						continue
+					}
+					if got[i] == nil || !bytes.Equal(got[i], want[key]) {
+						t.Fatalf("pass %d, %s (position %d): got %d bytes, want %d", pass, key, i, len(got[i]), len(want[key]))
+					}
+				}
+			}
+			if cacheBytes > 0 && st.blocks.hits.Load() == 0 {
+				t.Fatal("second pass was not served from the read cache")
+			}
+		})
 	}
 }
 

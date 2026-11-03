@@ -464,8 +464,9 @@ by month); `big` is one CTAS of SF10 (10 files / 1,448 MiB, up to 180 MiB
 each). Each catalog reads the same tables directly from a 20 ms origin, cold
 through gateway B, warm through gateway A, and through Trino's own Alluxio
 file cache; every result must match Trino's `tpch` connector, and warm and
-write-through reads must cause zero origin reads. Gateways run with
-`--pool-max 8` and a 1 MiB `--range-cache-chunk`.
+write-through reads must cause zero origin reads. Cache gateways run with
+`--pool-max 8`, a 1 MiB `--range-cache-chunk` and a 3 GiB `--read-cache-bytes`
+(the origin gateway has no read cache).
 
 Measured 2026-11-03 on the 16-thread Intel Core Ultra laptop (coordinator
 milliseconds, median of 3; cold is the first run on gateway B; the last two
@@ -473,20 +474,54 @@ columns keep Trino's metadata cache):
 
 | Query | Direct | Cold | Warm | Alluxio | Direct, metadata cache | Warm, metadata cache |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `count(*)` | 235 | 553 | 94 | 120 | 65 | 67 |
-| One month | 180 | 134 | 62 | 96 | 44 | 47 |
-| One `orderkey` | 358 | 719 | 178 | 150 | 95 | 104 |
-| TPC-H Q1 | 389 | 177 | 237 | 177 | 122 | 105 |
-| `big` one `orderkey` | 287 | 503 | 204 | 184 | 201 | 179 |
-| `big` one month | 520 | 1,198 | 457 | 237 | 475 | 431 |
-| `big` Q1 | 982 | 1,011 | 874 | 670 | 981 | 929 |
+| `count(*)` | 232 | 457 | 74 | 122 | 61 | 68 |
+| One month | 173 | 125 | 62 | 95 | 44 | 43 |
+| One `orderkey` | 367 | 665 | 145 | 153 | 98 | 98 |
+| TPC-H Q1 | 385 | 138 | 168 | 177 | 105 | 116 |
+| `big` one `orderkey` | 274 | 423 | 144 | 161 | 199 | 126 |
+| `big` one month | 531 | 1,034 | 250 | 239 | 436 | 236 |
+| `big` Q1 | 916 | 784 | 652 | 638 | 879 | 652 |
 
-Queries on the many-commit table are 1.6–2.9x faster warm than direct and on
-par with Alluxio's local cache. Large scans of `big` are bound by reading chunk
-rows rather than by origin latency, so warm is 10–30% faster than direct and
-Alluxio's tmpfs cache stays ahead. Month-by-month `INSERT`s through
-the write-through tier take about as long as direct ones (1.15 s against
-1.16 s) because each commit's files reach the origin before the PUT returns.
+Warm reads are 1.4–3.1x faster than direct and level with Alluxio's local
+tmpfs cache on every query. A first cold read costs up to 2x direct for
+selective lookups and the large one-month scan, which wait on fills, but is
+faster than direct for the one-month filter and both Q1 scans. Month-by-month
+`INSERT`s through the write-through tier take about as long as direct ones
+(1.15 s against 1.18 s) because each commit's files reach the origin before the
+PUT returns.
+
+Run-to-run noise on the laptop is 20–30% even for roles that never touch the
+cache gateways, so only ratios within one run are meaningful. Raising
+`--pool-max` from 8 to 32 changed no ratio; once the deadlocks below were
+fixed, the pool was not the limit. A 4 MiB range chunk moved time from warm to
+cold reads without a net gain.
+
+Table layout matters as much as the cache. The benchmark then copies
+`lineitem` into one snapshot (one CTAS instead of 84 commits) and rewrites
+`big` with `sorted_by = ARRAY['shipdate']`:
+
+| Query | Direct | Cold | Warm | Warm, original layout |
+| --- | ---: | ---: | ---: | ---: |
+| `count(*)` | 125 | 155 | 40 | 74 |
+| One `orderkey` | 269 | 736 | 85 | 145 |
+| TPC-H Q1 | 294 | 90 | 110 | 168 |
+| `big` one `orderkey` | 429 | 807 | 189 | 144 |
+| `big` one month | 333 | 518 | 105 | 250 |
+| `big` Q1 | 737 | 818 | 453 | 652 |
+
+Compaction speeds every `lineitem` query on every endpoint (`count(*)` falls
+from 81 origin reads to 4). Sorting by `shipdate` lets row-group statistics
+prune the one-month scan, 2.4x faster warm, but loses the `orderkey`
+clustering the original CTAS had, so the key lookup gets slower. Sort by the
+columns that queries filter on.
+
+Warm gains came from three changes. `ReadMany` serves files whose bytes are in
+the gateway read cache from memory (metadata still comes from PostgreSQL) and
+splits the rest across chunk connections. Range responses stream the cached
+chunk slices instead of copying them into one buffer; a CPU profile had
+`memmove` and `memclr` at 45% of the warm gateway's time. Cold fills return
+the origin bytes at once and store the chunks behind the response, serving
+them from memory until stored.
 
 The first runs of this benchmark found two connection-pool deadlocks that
 only a burst of concurrent large reads exposes. Cold `big` one-month took

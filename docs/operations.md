@@ -873,6 +873,12 @@ pending-upload workers. Cold scans by parallel engines such as DuckDB queue on
 it; for lakehouse origins, raise it on both `serve` and `origin set` (32 cut a
 cold Iceberg scan by about 40% in
 [benchmarks](benchmarks.md#iceberg-through-the-cache-tier-just-iceberg)).
+Lakehouse gateways also want `--read-cache-bytes`: warm range-cache reads of
+files already in gateway memory skip PostgreSQL chunk reads, which brought
+warm Trino scans level with Trino's own local cache in
+[benchmarks](benchmarks.md#trino-and-nessie-through-the-cache-tier-just-trino).
+Compacting many-commit tables and sorting large ones by their filter columns
+helped those queries as much as the cache did.
 
 S3 keeps the immediate acquisition fast path. A brief burst above the active
 limit waits in a bounded per-gateway queue: at most **twice `--s3-concurrency`**

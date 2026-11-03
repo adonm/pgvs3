@@ -18,6 +18,7 @@ import (
 	"github.com/adonm/pgvs3/internal/work"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"golang.org/x/sync/errgroup"
 )
 
 var ErrNotInteger = errors.New("value is not an integer or out of range")
@@ -289,9 +290,22 @@ func (c Cache) MGet(ctx context.Context, keys []string) ([][]byte, error) {
 	return out, nil
 }
 
-// ReadMany returns the bodies of live single-file or inline objects in one
-// statement, so the object rows and their chunks come from one snapshot and
-// need no reaper pin. Missing, expired, multipart and pending keys are nil.
+// readManyFile is one chunked file that ReadMany fetches from PostgreSQL.
+type readManyFile struct {
+	table        uint32
+	id, size     int64
+	buf          []byte
+	filled       int64
+	destinations []int
+}
+
+// ReadMany returns the bodies of live single-file or inline objects. Missing,
+// expired, multipart and pending keys are nil. Metadata always comes from
+// PostgreSQL; a file whose blocks are all in the gateway read cache is served
+// from memory, the rest from chunk queries spread over the chunk pool. A file
+// reaped between the two statements comes back incomplete and reads as
+// missing. Returned slices may be shared with the read cache and with other
+// positions of the same key, so callers must not modify them.
 func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
 	out := make([][]byte, len(keys))
 	if len(keys) == 0 {
@@ -300,10 +314,11 @@ func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
 	if c.err != nil {
 		return nil, c.err
 	}
-	rows, err := c.s.chunkPool.Query(ctx, `SELECT k.ord, o.size, o.inline_data, c.no, c.data
+	endRead := c.s.beginRead()
+	defer endRead()
+	rows, err := c.s.chunkPool.Query(ctx, `SELECT k.ord, o.size, o.inline_data, o.file_id, o.tableoid
 		FROM unnest($1::text[]) WITH ORDINALITY AS k(key, ord)
 		JOIN `+c.sc+`.objects o ON o.key = k.key
-		LEFT JOIN `+c.sc+`.chunks c ON o.inline_data IS NULL AND c.file_id = o.file_id
 		WHERE (o.expires_at IS NULL OR o.expires_at > now()) AND o.parts IS NULL
 		  AND (o.inline_data IS NOT NULL OR o.file_id IS NOT NULL OR o.size = 0)
 		  AND (o.origin_etag IS NULL OR (o.origin_etag NOT LIKE 'deleted:%' AND o.origin_etag NOT LIKE 'pending:%'))`, keys)
@@ -313,56 +328,112 @@ func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	// Rows arrive unordered (sorting wide rows spills to disk); each lands at
-	// its row offset and the filled byte count proves the object complete.
-	sizes, filled := make([]int64, len(keys)), make([]int64, len(keys))
+	var files []*readManyFile
+	byID := map[int64]*readManyFile{}
 	for rows.Next() {
 		var ord, size int64
-		var inline, data []byte
-		var no *int32
-		if err := rows.Scan(&ord, &size, &inline, &no, &data); err != nil {
+		var inline []byte
+		var fileID *int64
+		var table uint32
+		if err := rows.Scan(&ord, &size, &inline, &fileID, &table); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		idx := int(ord - 1)
 		if idx < 0 || idx >= len(out) {
 			continue
 		}
-		sizes[idx] = size
 		switch {
 		case inline != nil:
 			raw, err := decompressBlock(nil, inline, int(size))
 			if err != nil {
+				rows.Close()
 				return nil, err
 			}
-			out[idx], filled[idx] = raw, size
-		case no == nil:
+			out[idx] = raw
+		case fileID == nil || size == 0:
 			out[idx] = []byte{}
+		case byID[*fileID] != nil:
+			byID[*fileID].destinations = append(byID[*fileID].destinations, idx)
 		default:
-			off := int64(*no) * RowBytes
-			if off < 0 || off >= size {
+			if b, ok := c.s.cachedFile(table, *fileID, size); ok {
+				out[idx] = b
 				continue
 			}
-			if out[idx] == nil {
-				out[idx] = make([]byte, size)
-			}
-			end := min(off+RowBytes, size)
-			row, err := decodeRow(out[idx][off:off:end], size, *no, data)
-			if err != nil {
-				return nil, err
-			}
-			filled[idx] += int64(copy(out[idx][off:end], row))
+			f := &readManyFile{table: table, id: *fileID, size: size, destinations: []int{idx}}
+			byID[f.id] = f
+			files = append(files, f)
 		}
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	for i := range out {
-		if out[i] != nil && (int64(len(out[i])) != sizes[i] || filled[i] != sizes[i]) {
-			out[i] = nil
+	if err := c.fetchFiles(ctx, files); err != nil {
+		return nil, err
+	}
+	for _, f := range files {
+		if f.filled != f.size {
+			continue
+		}
+		c.s.cacheFile(f.table, f.id, f.buf)
+		for _, idx := range f.destinations {
+			out[idx] = f.buf
 		}
 	}
 	return out, nil
+}
+
+// fetchFiles reads the chunk rows of files, split across up to readWorkers
+// chunk connections. Rows arrive unordered (sorting wide rows spills to disk);
+// each lands at its row offset and the filled count proves a file complete.
+func (c Cache) fetchFiles(ctx context.Context, files []*readManyFile) error {
+	if len(files) == 0 {
+		return nil
+	}
+	workers := min(c.s.readWorkers(), len(files))
+	g, gctx := errgroup.WithContext(ctx)
+	for w := range workers {
+		var mine []*readManyFile
+		var ids []int64
+		for i := w; i < len(files); i += workers {
+			files[i].buf = make([]byte, files[i].size)
+			mine = append(mine, files[i])
+			ids = append(ids, files[i].id)
+		}
+		g.Go(func() error {
+			byID := make(map[int64]*readManyFile, len(mine))
+			for _, f := range mine {
+				byID[f.id] = f
+			}
+			rows, err := c.s.chunkPool.Query(gctx, `SELECT file_id, no, data FROM `+c.sc+`.chunks WHERE file_id = ANY($1)`, ids)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id int64
+				var no int32
+				var data []byte
+				if err := rows.Scan(&id, &no, &data); err != nil {
+					return err
+				}
+				f := byID[id]
+				off := int64(no) * RowBytes
+				if f == nil || off < 0 || off >= f.size {
+					continue
+				}
+				end := min(off+RowBytes, f.size)
+				row, err := decodeRow(f.buf[off:off:end], f.size, no, data)
+				if err != nil {
+					return err
+				}
+				f.filled += int64(copy(f.buf[off:end], row))
+			}
+			return rows.Err()
+		})
+	}
+	return g.Wait()
 }
 
 func (c Cache) Del(ctx context.Context, keys []string) (int64, error) {
