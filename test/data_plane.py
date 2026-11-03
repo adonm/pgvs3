@@ -853,17 +853,18 @@ def raquet_queries(url):
     ]
 
 
-def raquet_run(connection, url):
+def raquet_run(connection, queries):
     """Results and HTTP GET count/bytes per query, from DuckDB's HTTP log."""
     out = {}
     connection.execute("CALL enable_logging('HTTP')")
-    for name, query in raquet_queries(url):
+    for name, query in queries:
         connection.execute("CALL truncate_duckdb_logs()")
         rows = connection.execute(query).fetchall()
-        gets, received = connection.execute(
-            "SELECT count(*), coalesce(sum(TRY_CAST(response.headers['Content-Length'] AS BIGINT)), 0) "
+        gets, received, statuses = connection.execute(
+            "SELECT count(*), coalesce(sum(TRY_CAST(response.headers['Content-Length'] AS BIGINT)), 0), "
+            "histogram(response.status::VARCHAR) "
             "FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET'").fetchone()
-        out[name] = {"rows": rows, "gets": gets, "bytes": received}
+        out[name] = {"rows": rows, "gets": gets, "bytes": received, "statuses": dict(statuses or {})}
     return out
 
 
@@ -888,7 +889,7 @@ def raquet():
 
     def check(role, endpoint, bucket, key):
         with session(endpoint, bucket) as connection:
-            observed = raquet_run(connection, f"s3://{bucket}/{key}")
+            observed = raquet_run(connection, raquet_queries(f"s3://{bucket}/{key}"))
         for name, result in observed.items():
             assert result["rows"] == oracle[name], (role, name, result["rows"], oracle[name])
         for name, _ in raquet_queries("")[:len(RAQUET_POINTS)]:
@@ -925,7 +926,83 @@ def raquet():
           f"{point['bytes']} bytes; native, origin-cache (zero origin reads on B) and write-through match the local oracle", flush=True)
 
 
+def check_file(base, path, digest, size):
+    """Stream an object and compare it with a local file's SHA-256."""
+    with urlopen(Request(base + path), timeout=600) as response:
+        assert response.status == 200 and int(response.headers["Content-Length"]) == size, (path, response.headers)
+        received = hashlib.sha256()
+        while chunk := response.read(1 << 20):
+            received.update(chunk)
+    assert received.hexdigest() == digest, path
+
+
+def ortho():
+    """The RaQuet queries on a real multi-GB orthophoto (test/raquet_ortho.py)."""
+    import duckdb
+    import raquet_ortho
+    sheets = int(os.environ.get("PGVS3_ORTHO_SHEETS", "4"))
+    path = raquet_ortho.build(sheets)
+    meta, size = raquet_ortho.metadata(path), path.stat().st_size
+    digest = raquet_ortho.sha256(path)
+    queries = lambda url: raquet_ortho.queries(url, meta)
+    point_names = [name for name, _ in queries("") if name.startswith(("point", "overview"))]
+    with duckdb.connect() as local:
+        local.execute("INSTALL raquet FROM community; LOAD raquet")
+        oracle = {name: local.execute(query).fetchall() for name, query in queries(str(path))}
+    assert all(len(oracle[name]) == 1 and None not in oracle[name][0] for name in point_names), oracle
+
+    def check(role, endpoint, bucket, key, proxy=None):
+        """Every query matches the local oracle; returns per-query GETs,
+        bytes and (with a proxy) origin reads."""
+        connection, _ = duckdb_session(endpoint, bucket)
+        observed = {}
+        with connection:
+            connection.execute("INSTALL raquet FROM community; LOAD raquet")
+            for name, query in queries(f"s3://{bucket}/{key}"):
+                before = proxy.reads(bucket, key) if proxy else 0
+                observed[name] = raquet_run(connection, [(name, query)])[name]
+                observed[name]["origin_reads"] = (proxy.reads(bucket, key) - before) if proxy else 0
+        for name, result in observed.items():
+            assert raquet_ortho.same(result["rows"], oracle[name]), (role, name, result["rows"], oracle[name])
+            del result["rows"]
+        for name in point_names:
+            assert 0 < observed[name]["bytes"] < size // 20, (role, name, observed[name], size)
+        return observed
+
+    records = []
+    started = time.monotonic()
+    request(A, "/ortho", "PUT", b"")
+    raquet_ortho.upload(A, "/ortho/ortho.parquet", path)
+    check_file(B, "/ortho/ortho.parquet", digest, size)
+    records.append({"role": "native", "upload_and_verify_s": round(time.monotonic() - started, 1),
+                    "queries": check("native", B, "ortho", "ortho.parquet")})
+    with OriginProxy() as proxy:
+        configure_origin(proxy, "edge-ortho", "ortho-origin")
+        raquet_ortho.upload(ORIGIN, "/upstream/edge-ortho/ortho.parquet", path)
+        cold = check("origin-cache cold", A, "edge-ortho", "ortho.parquet", proxy)
+        assert sum(q["origin_reads"] for q in cold.values()) > 0
+        warm = check("origin-cache warm", B, "edge-ortho", "ortho.parquet", proxy)
+        for name in point_names:
+            assert warm[name]["origin_reads"] == 0, ("gateway B re-read the origin", name, warm[name])
+            assert (warm[name]["gets"], warm[name]["bytes"]) == (cold[name]["gets"], cold[name]["bytes"]), name
+        records.append({"role": "origin-cache cold", "queries": cold})
+        records.append({"role": "origin-cache warm", "queries": warm})
+        raquet_ortho.upload(A, "/edge-ortho/written.parquet", path)
+        written = check("write-through", B, "edge-ortho", "written.parquet", proxy)
+        assert all(q["origin_reads"] == 0 for q in written.values()), ("write-through object was pulled from the origin", written)
+        eventually("ortho write-back drain", lambda: pending("ortho-origin") == 0, seconds=600)
+        check_file(ORIGIN, "/upstream/edge-ortho/written.parquet", digest, size)
+        records.append({"role": "write-through", "queries": written})
+    (RUN / "ortho.json").write_text(json.dumps({"complete": True, "sheets": sheets, "bytes": size, "sha256": digest,
+                                                 "tiling": meta["tiling"], "records": records}, indent=2) + "\n")
+    point = records[0]["queries"]["point 0"]
+    print(f"ortho: {sheets}x{sheets} LINZ sheets, {size / (1 << 30):.2f} GiB RaQuet, {meta['tiling']['num_blocks']} native tiles; "
+          f"point lookup {point['gets']} GETs / {point['bytes']} bytes; warm origin reads "
+          f"region={warm['region']['origin_reads']} scan={warm['scan']['origin_reads']}; native, origin-cache and "
+          f"write-through match the local oracle", flush=True)
+
+
 if __name__ == "__main__":
-    scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet}
+    scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet, "ortho": ortho}
     for name in sys.argv[1:]:
         scenarios[name]()

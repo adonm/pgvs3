@@ -113,6 +113,13 @@ contract:
 analytics:
     bash deploy/bench/stack.sh analytics
 
+# RaQuet queries on a real LINZ orthophoto in native, origin-cache and write-through
+# roles. Downloads and converts once into ~/.cache/pgvs3/ortho; PGVS3_ORTHO_SHEETS=4
+# (1..16 sheets per edge, about 1.1 GB at 4 and 4.5 GB at 8).
+[group('dev')]
+ortho:
+    PGVS3_ANALYTICS=ortho bash deploy/bench/stack.sh analytics
+
 # Bound SQL/API workload recipes and failure windows in the existing disposable fixture.
 [group('test')]
 guides:

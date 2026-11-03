@@ -75,7 +75,8 @@ contract)
   bash test/e2e.sh
   ;;
 analytics)
-  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 "${raquet_deps[@]}" python test/data_plane.py analytics raquet
+  # shellcheck disable=SC2086 # PGVS3_ANALYTICS is a word list of scenarios
+  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 "${raquet_deps[@]}" python test/data_plane.py ${PGVS3_ANALYTICS:-analytics raquet}
   ;;
 guides)
   mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py guides

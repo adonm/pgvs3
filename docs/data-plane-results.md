@@ -68,6 +68,19 @@ file, and each query must make the same ranged GETs in every role. The second ga
 write-through object must never be fetched from the origin. Evidence is kept in
 `raquet.json`.
 
+`just ortho` runs the same three roles on real imagery: a block of LINZ
+Wellington 2021 0.075 m aerial sheets converted with `raquet-io`
+(`test/raquet_ortho.py`; 1.14 GB at the default `PGVS3_ORTHO_SHEETS=4`,
+4.48 GB at 8). The file is uploaded with streamed multipart and its SHA-256
+checked through gateway B. RGB point lookups at native zoom, one lookup per
+overview zoom, a region and a scan must match DuckDB on the local file (floats
+to 1e-9, since parallel sums reorder). On the warm second gateway, point and
+overview lookups must cause zero origin reads and the same ranged GETs as the
+cold pass. The write-through object must cause no origin reads at all, and its
+drained origin copy must match the file. Evidence, including per-query HTTP
+status counts, is kept in `ortho.json`. Once the file is cached, a run takes
+about 90 s at 4 sheets and 4 minutes at 8.
+
 ## Resource method
 
 The existing `test/loadgen` remains the only paired load engine. Resource mode

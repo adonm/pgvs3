@@ -365,6 +365,53 @@ region query (9% of the area) reads 34.8 MiB in 160 GETs in about 0.3 s. Most of
 come from Morton-order row groups that only partly overlap the polygon, which
 is a file-layout property, not a gateway one.
 
+## RaQuet on a real orthophoto (`just bench ortho`)
+
+The same queries on real imagery: an N x N block of the LINZ Wellington 2021
+0.075 m urban aerial sheets (CC BY 4.0, Toitū Te Whenua LINZ, AAM NZ and
+Wellington City Council), RGBA uint8. `test/raquet_ortho.py` downloads the
+sheets, checks each against its STAC checksum, and converts the mosaic with
+CARTO's `raquet-io` 0.9.0 in a GDAL container (`deploy/bench/raquet-io/`),
+keeping its default full overview pyramid, gzip and 200 tiles per row group.
+The result is cached in `~/.cache/pgvs3/ortho`; `PGVS3_ORTHO_SHEETS` picks
+the block (default 8) and `PGVS3_ORTHO_FILE` benchmarks any other RaQuet file.
+Each part times 400 RGB point lookups at native zoom, 50 lookups per overview
+zoom, a region over the central 9% and a `band_1` scan, all through gateway B
+and all checked against DuckDB on the local file.
+
+| Block | Source | RaQuet | Native tiles | Zooms | Conversion |
+| --- | ---: | ---: | ---: | --- | ---: |
+| 4x4 sheets (0.96 x 1.44 km) | 0.36 GiB | 1.14 GB | 7,140 | 14–21 | 3 min 20 s, one core |
+| 8x8 sheets (1.92 x 2.88 km) | 1.38 GiB | 4.48 GB | 28,495 | 13–21 | 21 min, ~14 GiB RAM |
+
+The converter runs on one core and its memory grows with the raster even with
+`--streaming`, so 16x16 (18 GB) needs `--overviews none` or a larger machine.
+
+Measured 2026-11-03 on the 16-thread Intel Core Ultra laptop, read cache off
+(±15% between runs), 4x4 block:
+
+| Workload | 200 tiles/row group (default) | 16 tiles/row group |
+| --- | ---: | ---: |
+| RGB point lookup, 1 worker | 18 q/s, p50 54 ms | 25 q/s, p50 39 ms |
+| RGB point lookup, 16 workers | 68 q/s, p50 225 ms | 111 q/s, p50 142 ms |
+| Bytes per point lookup | 22 MB in 17 GETs | 4.1 MB in 10 GETs |
+| Overview lookup, per zoom 14–20 | 20–26 q/s, 23–28 MB | 31–38 q/s, 2.7–3.8 MB |
+| Region, central 9% | 1.25 s, 124 MiB | 0.92 s, 117 MiB |
+| `band_1` scan, all zooms | 2.0 s, 364 MiB | 1.7 s, 365 MiB |
+
+DuckDB on the local file (page cache) takes 28 ms per point lookup, 1.18 s for
+the region and 1.39 s for the scan with the default layout. The region is
+bound by tile decoding in DuckDB; point lookups pay about 26 ms to move 22 MB,
+because each lookup fetches one row group's column chunk for each of three
+bands. Row-group size, not the gateway, is the main lever for raster lookups.
+
+On a cold read-through cache with the contract's 64 KiB `--range-cache-chunk`,
+one 22 MB point lookup makes about 315 origin requests, and a cold scan holds
+S3 admission slots long enough that the default 1 s `--s3-queue-wait` returns
+503 `SlowDown` to some of DuckDB's 64 parallel GETs (DuckDB retries them; with
+`PGVS3_S3_QUEUE_WAIT=30s` there are none). Raster origins want a larger range
+chunk.
+
 ## Design ablations
 
 ### 64 KiB inline threshold vs 8 KiB chunking (6-vCPU VM, 1 worker)
@@ -490,6 +537,7 @@ just contract   # run the correctness suite first
 just load       # exploratory matrix (isolated .tmp/verify/ artifacts)
 just bench s3   # DuckDB 2.0 httpfs matrix (.tmp/pgvs3/bench.json)
 just bench raquet  # RaQuet raster point lookups; PGVS3_READ_CACHE_BYTES=... for the cache
+just bench ortho   # the same on a real LINZ orthophoto; PGVS3_ORTHO_SHEETS=4|8|...
 just bench      # full DuckDB + DuckLake compatibility and row-group tuning
 ```
 

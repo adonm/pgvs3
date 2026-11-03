@@ -12,6 +12,8 @@ Parts:
   tuning  DuckLake Parquet row group size / file size vs load and query time.
   raquet  RaQuet raster point lookups (sparse ranged GETs), region and scan;
           set PGVS3_READ_CACHE_BYTES to compare the gateway read cache.
+  ortho   the same RaQuet reads on a real multi-GB LINZ orthophoto, converted
+          once with raquet-io and cached (test/raquet_ortho.py).
   differential  opt-in Differential snapshot/sync-WAL comparison with DuckLake.
   object-storage  SlateDB ObjFS default/lean profiles and sealed-read comparison.
 """
@@ -349,6 +351,67 @@ def raquet(args, run: str) -> dict:
     return out
 
 
+def ortho(args, run: str) -> dict:
+    """RaQuet reads on a real LINZ orthophoto (test/raquet_ortho.py): native RGB
+    point lookups at 1 and N workers, zoomed-out lookups per overview zoom, a
+    central region and a band_1 scan, each checked against a local DuckDB."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "test"))
+    import raquet_ortho
+    from urllib.request import Request, urlopen
+
+    path = raquet_ortho.build(args.ortho_sheets)
+    meta, size = raquet_ortho.metadata(path), path.stat().st_size
+    a = os.environ["PGVS3_TEST_ENDPOINT_A"]
+    urlopen(Request(a + "/ortho", data=b"", method="PUT"), timeout=60).close()
+    t0 = time.perf_counter()
+    raquet_ortho.upload(a, f"/ortho/{run}.parquet", path)
+    upload_s = time.perf_counter() - t0
+    url = f"s3://ortho/{run}.parquet"
+
+    con = connect(os.environ["PGVS3_TEST_ENDPOINT_B"])
+    local = duckdb.connect()
+    for c in (con, local):
+        c.sql("INSTALL raquet FROM community")
+        c.sql("LOAD raquet")
+    con.sql("SET parquet_metadata_cache=false")
+    lookup = lambda u, lon, lat, z="": f"SELECT {raquet_ortho.rgb(lon, lat)} FROM read_raquet_at('{u}', {lon}, {lat}{z})"
+    points = raquet_ortho.points(meta, args.raquet_points)
+    for lon, lat in points[:20]:
+        assert con.execute(lookup(url, lon, lat)).fetchall() == local.execute(lookup(path, lon, lat)).fetchall(), (lon, lat)
+    con.sql("CALL truncate_duckdb_logs()")
+
+    tiling = meta["tiling"]
+    out = {"sheets": args.ortho_sheets, "bytes": size, "native_tiles": tiling["num_blocks"],
+           "zooms": [tiling["min_zoom"], tiling["max_zoom"]], "upload_mib_s": round(size / MIB / upload_s, 1),
+           "gateway_read_cache_bytes": int(os.environ.get("PGVS3_READ_CACHE_BYTES", "0"))}
+
+    def lookups(key, sql, workers):
+        result = concurrent(con, sql, workers)
+        gets = requests(con, "GET")
+        result["gets_per_query"] = round(gets["count"] / len(sql), 1)
+        result["kib_per_query"] = round(gets.get("get_bytes", 0) / len(sql) / 1024, 1)
+        result["get_p50_ms"], result["get_p99_ms"] = gets.get("p50_ms"), gets.get("p99_ms")
+        out[key] = result
+        print(json.dumps({key: result}), flush=True)
+
+    for workers in (1, args.raquet_workers):
+        lookups(f"point_w{workers}", [lookup(url, lon, lat) for lon, lat in points], workers)
+    for z in range(tiling["min_zoom"], tiling["max_zoom"]):
+        lookups(f"overview_z{z}", [lookup(url, lon, lat, f", {z}") for lon, lat in points[:50]], 1)
+    for name, query in raquet_ortho.queries(url, meta)[-2:]:
+        times = []
+        for _ in range(args.passes):
+            secs, rows = timed(con, query)
+            times.append(secs)
+        assert raquet_ortho.same(rows, local.execute(query.replace(url, str(path))).fetchall()), name
+        gets = requests(con, "GET")
+        out[name] = {"median_s": round(statistics.median(times), 3), "gets_per_pass": gets["count"] // args.passes,
+                     "mib_per_pass": round(gets.get("get_bytes", 0) / args.passes / MIB, 1),
+                     "mib_s": round(gets.get("get_bytes", 0) / args.passes / MIB / statistics.median(times), 1)}
+        print(json.dumps({name: out[name]}), flush=True)
+    return out
+
+
 def fixture_select(rows, start=0):
     return f"SELECT i,md5(i::VARCHAR) AS id,hash(i)::DOUBLE/18446744073709551615.0 AS value FROM range({start},{start + rows}) t(i)"
 
@@ -411,6 +474,8 @@ def main() -> int:
     p.add_argument("--raquet-row-group", type=int, default=8, help="tiles per Parquet row group")
     p.add_argument("--raquet-points", type=int, default=400)
     p.add_argument("--raquet-workers", type=int, default=16)
+    p.add_argument("--ortho-sheets", type=int, default=int(os.environ.get("PGVS3_ORTHO_SHEETS", "8")),
+                   help="ortho block edge in LINZ sheets (1..16; 8 is about 4.5 GB)")
     p.add_argument("--fixture-mib", type=lambda s: [int(x) for x in s.split(",")], default=[10, 100, 1024])
     p.add_argument("--differential-extension", default=os.environ.get("PGVS3_DIFFERENTIAL_EXTENSION"))
     p.add_argument("--differential-mib", type=lambda s: [int(x) for x in s.split(",")], default=[10, 100, 1024])
@@ -426,7 +491,7 @@ def main() -> int:
     p.add_argument("--object-storage-timeout", type=int, default=1800)
     args = p.parse_args()
     run = "r" + uuid.uuid4().hex[:12]
-    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures, "raquet": raquet, "differential": differential, "object-storage": object_storage}
+    parts = {"s3": s3, "compat": compat, "tuning": tuning, "fixtures": fixtures, "raquet": raquet, "ortho": ortho, "differential": differential, "object-storage": object_storage}
     record = {"duckdb": duckdb.__version__, "cores": os.cpu_count(), "run": run}
     if set(args.parts.split(",")) & {"differential", "object-storage"} and Path(args.out).exists():
         p.error("Native-client evidence must use a fresh --out path; existing trials are never overwritten")
