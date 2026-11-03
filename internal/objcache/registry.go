@@ -213,6 +213,7 @@ type Registry struct {
 	runtime     *Runtime
 	options     TierOptions
 	checked     atomic.Int64
+	loaded      atomic.Bool
 	tiers       map[string]*registeredTier
 	closed      bool
 	cancel      context.CancelFunc
@@ -357,7 +358,14 @@ func (r *Registry) refreshIfStale(ctx context.Context) {
 	if last := r.checked.Load(); last != 0 && time.Since(time.Unix(0, last)) < time.Second {
 		return
 	}
-	r.refreshMu.Lock()
+	// Once a snapshot is loaded, requests keep using it while another
+	// goroutine refreshes rather than queueing behind that query.
+	if !r.refreshMu.TryLock() {
+		if r.loaded.Load() {
+			return
+		}
+		r.refreshMu.Lock()
+	}
 	defer r.refreshMu.Unlock()
 	if last := r.checked.Load(); last != 0 && time.Since(time.Unix(0, last)) < time.Second {
 		return
@@ -367,6 +375,7 @@ func (r *Registry) refreshIfStale(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	defer r.loaded.Store(true)
 	wanted := make(map[string]Spec, len(specs))
 	for _, sp := range specs {
 		if sp.Scope == "bucket" || sp.Bucket != "" {

@@ -20,7 +20,7 @@ elif [ "$mode" = sol ] || { [ "$mode" = bench ] && [[ ",$parts," = *,differentia
 else
   test_postgres "$shared_buffers"
 fi
-for db in pgvs3 ducklake_catalog; do
+for db in pgvs3 ducklake_catalog nessie; do
   docker exec "$PGVS3_TEST_PG_CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db" \
     >> "$PGVS3_TEST_RUN_DIR/postgres-start.log" 2>&1
 done

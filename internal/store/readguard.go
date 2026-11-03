@@ -96,8 +96,19 @@ func (g *readGuard) exportSnapshot(ctx context.Context) error {
 	return tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&g.snap)
 }
 
-// join gives a worker its query session on a fresh chunk connection. Every
-// worker must call join exactly once, even if it is about to give up.
+// lead gives the first worker the guard's own session, so a read never holds
+// its guard while waiting on the pool for a worker connection. It counts as
+// that worker's join.
+func (g *readGuard) lead() (querier, func()) {
+	if g.export != nil {
+		return g.export, g.joined
+	}
+	return g.conn, g.joined
+}
+
+// join gives a further worker its query session on a fresh chunk connection.
+// Every worker but the lead must call join exactly once, even if it is about
+// to give up.
 func (g *readGuard) join(ctx context.Context) (querier, func(), error) {
 	defer g.joined()
 	if err := ctx.Err(); err != nil {

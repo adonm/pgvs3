@@ -92,6 +92,15 @@ and three appends written through gateway A must be readable through gateway B
 with zero origin reads. Evidence is kept in `iceberg.json`; a run takes about
 a minute. Timings are in [benchmarks](benchmarks.md#iceberg-through-the-cache-tier-just-iceberg).
 
+`just trino` runs Trino 484 with a Nessie 0.109 catalog (JDBC version store in
+the same PostgreSQL) over TPC-H `lineitem` committed month by month and one
+SF10 CTAS, read directly from a latency-injected origin, cold through gateway
+B, warm through gateway A and through Trino's Alluxio cache. Every query must
+match Trino's `tpch` connector in every role; warm reads and reads after
+write-through `INSERT`s must cause zero origin reads, and the write-back queue
+must drain. Evidence is kept in `trino.json`; a run takes about 4.5 minutes.
+Timings are in [benchmarks](benchmarks.md#trino-and-nessie-through-the-cache-tier-just-trino).
+
 ## Resource method
 
 The existing `test/loadgen` remains the only paired load engine. Resource mode

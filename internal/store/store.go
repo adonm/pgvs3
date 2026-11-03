@@ -282,7 +282,9 @@ func (s *Store) SetJobRetention(d time.Duration) {
 	s.jobRetention = d
 }
 
-func (s *Store) nextFileID(ctx context.Context) (int64, error) {
+// nextFileID refills its block through the caller's own session: a writer
+// that waits on the pool while holding a connection can exhaust it.
+func (s *Store) nextFileID(ctx context.Context, q querier) (int64, error) {
 	s.fileIDMu.Lock()
 	defer s.fileIDMu.Unlock()
 	if s.fileIDPos < len(s.fileIDBlock) {
@@ -290,7 +292,7 @@ func (s *Store) nextFileID(ctx context.Context) (int64, error) {
 		s.fileIDPos++
 		return id, nil
 	}
-	rows, err := s.pool.Query(ctx, "SELECT nextval('s3p.file_ids') FROM generate_series(1,64)")
+	rows, err := q.Query(ctx, "SELECT nextval('s3p.file_ids') FROM generate_series(1,64)")
 	if err != nil {
 		return 0, err
 	}
@@ -1045,7 +1047,13 @@ type quotaState struct {
 }
 
 func (s *Store) checkQuota(ctx context.Context, kind ns.Kind, name string, add int64) bool {
-	if s.overDBBudget(ctx, add) {
+	return s.checkQuotaOn(ctx, s.pool, kind, name, add)
+}
+
+// checkQuotaOn queries through db, so a caller inside a transaction passes it
+// instead of waiting on the pool while holding a connection.
+func (s *Store) checkQuotaOn(ctx context.Context, db rowQuerier, kind ns.Kind, name string, add int64) bool {
+	if s.overDBBudget(ctx, db, add) {
 		return true
 	}
 	key := ns.Ref{Kind: kind, Name: name}.Key()
@@ -1055,7 +1063,7 @@ func (s *Store) checkQuota(ctx context.Context, kind ns.Kind, name string, add i
 	}
 	if st.checked.IsZero() || time.Since(st.checked) > time.Second {
 		var q pgtype.Int8
-		err := s.pool.QueryRow(ctx,
+		err := db.QueryRow(ctx,
 			"SELECT quota_bytes FROM s3p.namespaces WHERE kind = $1 AND name = $2",
 			string(kind), name).Scan(&q)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1065,7 +1073,7 @@ func (s *Store) checkQuota(ctx context.Context, kind ns.Kind, name string, add i
 			s.quota.Store(key, quotaState{checked: time.Now()})
 			return false
 		}
-		st = quotaState{checked: time.Now(), quota: q.Int64, size: s.namespaceSize(ctx, kind, name)}
+		st = quotaState{checked: time.Now(), quota: q.Int64, size: namespaceSize(ctx, db, kind, name)}
 		s.quota.Store(key, st)
 	}
 	if st.quota <= 0 {
@@ -1102,14 +1110,14 @@ func namespaceSizeQuery(kind ns.Kind, quotedSchema string) (string, []any) {
 	return query.String(), args
 }
 
-func (s *Store) namespaceSize(ctx context.Context, kind ns.Kind, name string) int64 {
+func namespaceSize(ctx context.Context, db rowQuerier, kind ns.Kind, name string) int64 {
 	sc, err := kind.Schema(name)
 	if err != nil {
 		return 0
 	}
 	query, args := namespaceSizeQuery(kind, quoteIdent(sc))
 	var size int64
-	if err := s.pool.QueryRow(ctx, query, args...).Scan(&size); err != nil {
+	if err := db.QueryRow(ctx, query, args...).Scan(&size); err != nil {
 		return 0
 	}
 	return size
@@ -1119,7 +1127,7 @@ func (s *Store) setQuotaState(kind ns.Kind, name string, size, quota int64) {
 	s.quota.Store(ns.Ref{Kind: kind, Name: name}.Key(), quotaState{checked: time.Now(), size: size, quota: quota})
 }
 
-func (s *Store) overDBBudget(ctx context.Context, add int64) bool {
+func (s *Store) overDBBudget(ctx context.Context, db rowQuerier, add int64) bool {
 	if s.maxDBBytes <= 0 {
 		return false
 	}
@@ -1127,7 +1135,7 @@ func (s *Store) overDBBudget(ctx context.Context, add int64) bool {
 	size := s.dbSize.Load()
 	if size == 0 || now-s.dbSizeAt.Load() > int64(5*time.Second) {
 		var n int64
-		if err := s.pool.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&n); err != nil {
+		if err := db.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&n); err != nil {
 			return false
 		}
 		size = n

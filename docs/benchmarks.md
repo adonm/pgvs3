@@ -453,6 +453,52 @@ parallel GETs. With `--fill-concurrency 32` on both `origin set` and `serve`,
 the cold scan at 20 ms fell from 855 ms to 531 ms against 428 ms direct.
 Lakehouse origins want a higher fill concurrency.
 
+## Trino and Nessie through the cache tier (`just trino`)
+
+`just trino` runs Trino 484 against a Nessie 0.109 catalog whose JDBC version
+store lives in the same PostgreSQL, configured as in the
+[Nessie Trino guide](https://projectnessie.org/iceberg/trino/) with Trino's
+native S3 file system pointed at each endpoint. `lineitem` is TPC-H SF1
+committed month by month (78 Nessie commits, 78 files / 136 MiB, partitioned
+by month); `big` is one CTAS of SF10 (10 files / 1,448 MiB, up to 180 MiB
+each). Each catalog reads the same tables directly from a 20 ms origin, cold
+through gateway B, warm through gateway A, and through Trino's own Alluxio
+file cache; every result must match Trino's `tpch` connector, and warm and
+write-through reads must cause zero origin reads. Gateways run with
+`--pool-max 8` and a 1 MiB `--range-cache-chunk`.
+
+Measured 2026-11-03 on the 16-thread Intel Core Ultra laptop (coordinator
+milliseconds, median of 3; cold is the first run on gateway B; the last two
+columns keep Trino's metadata cache):
+
+| Query | Direct | Cold | Warm | Alluxio | Direct, metadata cache | Warm, metadata cache |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `count(*)` | 235 | 553 | 94 | 120 | 65 | 67 |
+| One month | 180 | 134 | 62 | 96 | 44 | 47 |
+| One `orderkey` | 358 | 719 | 178 | 150 | 95 | 104 |
+| TPC-H Q1 | 389 | 177 | 237 | 177 | 122 | 105 |
+| `big` one `orderkey` | 287 | 503 | 204 | 184 | 201 | 179 |
+| `big` one month | 520 | 1,198 | 457 | 237 | 475 | 431 |
+| `big` Q1 | 982 | 1,011 | 874 | 670 | 981 | 929 |
+
+Queries on the many-commit table are 1.6–2.9x faster warm than direct and on
+par with Alluxio's local cache. Large scans of `big` are bound by reading chunk
+rows rather than by origin latency, so warm is 10–30% faster than direct and
+Alluxio's tmpfs cache stays ahead. Month-by-month `INSERT`s through
+the write-through tier take about as long as direct ones (1.15 s against
+1.16 s) because each commit's files reach the origin before the PUT returns.
+
+The first runs of this benchmark found two connection-pool deadlocks that
+only a burst of concurrent large reads exposes. Cold `big` one-month took
+139 s: range-chunk writers held a main-pool connection while `nextFileID`
+waited on the pool for another, so the fills stalled until their 2-minute
+timeout. Separately, a multi-piece read held its guard connection while its
+workers waited on the pool, which stalled the native origin for over 2 minutes.
+File IDs are now allocated on the writer's own session, and the guard session
+does the read's first share of work. A warm `big` lookup also lost 2 s to
+`ReadMany` sorting wide chunk rows into temporary files; it now assembles rows
+by offset without `ORDER BY`.
+
 ## Design ablations
 
 ### 64 KiB inline threshold vs 8 KiB chunking (6-vCPU VM, 1 worker)

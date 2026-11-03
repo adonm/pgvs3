@@ -2449,7 +2449,7 @@ func TestStreamStatAndSizeIncludeSegments(t *testing.T) {
 	if st.Events != 2 || st.PhysicalBytes <= 0 {
 		t.Fatalf("stats = %+v; want 2 events and nonzero physical bytes", st)
 	}
-	if size := testStore.namespaceSize(ctx, ns.Queue, q); size <= 0 {
+	if size := namespaceSize(ctx, testStore.pool, ns.Queue, q); size <= 0 {
 		t.Fatalf("namespace size = %d", size)
 	}
 	conn, err := testStore.pool.Acquire(ctx)

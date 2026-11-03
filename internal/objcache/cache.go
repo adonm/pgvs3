@@ -19,6 +19,7 @@ import (
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
@@ -602,61 +603,74 @@ func rangeChunkKey(ck string, offset int64, version string) string {
 	return fmt.Sprintf("%s.__range__.%016x.%s", ck, offset, version)
 }
 
+func (t *Tier) rangeChunkLen(v readView, off int64) int64 { return min(t.rangeSize, v.Size-off) }
+
 func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Object, error) {
 	start, end := v.start, v.end
-	length := end - start + 1
-	body := make([]byte, 0, length)
+	var offsets []int64
+	for off := start - start%t.rangeSize; off <= end; off += t.rangeSize {
+		offsets = append(offsets, off)
+	}
+	keys := make([]string, len(offsets))
+	for i, off := range offsets {
+		keys[i] = rangeChunkKey(ck, off, v.ETag)
+	}
+	chunks, err := t.store.Cache(t.namespace).ReadMany(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	present := func(i int) bool { return chunks[i] != nil && int64(len(chunks[i])) == t.rangeChunkLen(v, offsets[i]) }
 	hit := true
-	first := start - start%t.rangeSize
-	last := first + ((end-first)/t.rangeSize)*t.rangeSize
-	for off := first; off <= end; off += t.rangeSize {
-		chunk, cached, err := t.rangeChunk(ctx, ck, key, v, off)
+	for i := 0; i < len(offsets); {
+		if present(i) {
+			i++
+			continue
+		}
+		if t.readOnly {
+			return nil, errFillBusy
+		}
+		j := i
+		for j+1 < len(offsets) && !present(j+1) {
+			j++
+		}
+		filled, err := t.fillRangeRun(ctx, ck, key, v, offsets[i], offsets[j])
 		if err != nil {
 			return nil, err
 		}
-		hit = hit && cached
-		from := int64(0)
-		if off == first && start > off {
-			from = start - off
-		}
-		to := int64(len(chunk))
-		if off == last && end < off+to-1 {
-			to = end - off + 1
-		}
-		if from < to {
-			body = append(body, chunk[from:to]...)
-		}
+		copy(chunks[i:j+1], filled)
+		hit = false
+		i = j + 1
 	}
-	if int64(len(body)) != length {
-		return nil, fmt.Errorf("range cache assembled %d bytes, wanted %d", len(body), length)
+	body := make([]byte, 0, end-start+1)
+	for i, off := range offsets {
+		body = append(body, chunks[i][max(start-off, 0):min(end-off+1, int64(len(chunks[i])))]...)
+	}
+	if int64(len(body)) != end-start+1 {
+		return nil, fmt.Errorf("range cache assembled %d bytes, wanted %d", len(body), end-start+1)
 	}
 	v.hit = hit
 	return newObject(v, io.NopCloser(bytes.NewReader(body))), nil
 }
 
-func (t *Tier) rangeChunk(ctx context.Context, ck, key string, v readView, off int64) ([]byte, bool, error) {
-	length := t.rangeSize
-	if off+length > v.Size {
-		length = v.Size - off
-	}
-	version, ct, lastModified := v.ETag, v.ContentType, v.CreatedAt
-	chunkKey := rangeChunkKey(ck, off, version)
-	if m, err := t.store.MetaHeader(ctx, t.cacheRef(chunkKey)); err == nil && m.OriginETag == version && m.Size == length {
-		_, body, err := t.store.GetBody(ctx, t.cacheRef(chunkKey), store.WholeObjectRange(), nil)
-		if err == nil {
-			b, rerr := io.ReadAll(body)
-			_ = body.Close()
-			if rerr == nil && int64(len(b)) == length {
-				return b, true, nil
-			}
+// fillRangeRun fetches the aligned chunks first..last (offsets) with one
+// origin GET and stores each as its own cache object. Chunk keys carry the
+// origin version, so a concurrent fill elsewhere writes identical bytes and
+// needs no fill lease.
+func (t *Tier) fillRangeRun(ctx context.Context, ck, key string, v readView, first, last int64) ([][]byte, error) {
+	version := v.ETag
+	length := last + t.rangeChunkLen(v, last) - first
+	ch := t.group.DoChan(fmt.Sprintf("range:%s:%x:%x:%s", ck, first, length, version), func() (any, error) {
+		fillCtx, cancel := context.WithTimeout(t.baseContext(), 2*time.Minute)
+		defer cancel()
+		if !acquireProcess(t.runtime.fills, fillCtx) {
+			return nil, fillCtx.Err()
 		}
-	}
-	if t.readOnly {
-		return nil, false, errFillBusy
-	}
-
-	m, err := t.coalesceFill(ctx, chunkKey, 2*time.Minute, func(fillCtx context.Context) (*store.Meta, error) {
-		rc, err := t.origin.GetRange(fillCtx, ck, off, length, version)
+		defer func() { <-t.runtime.fills }()
+		if !acquireProcess(t.fills, fillCtx) {
+			return nil, fillCtx.Err()
+		}
+		defer func() { <-t.fills }()
+		rc, err := t.origin.GetRange(fillCtx, ck, first, length, version)
 		if err != nil {
 			if errors.Is(err, errOriginPrecondition) {
 				_ = t.store.Cache(t.namespace).ForgetOriginMetadata(fillCtx, ck, version)
@@ -667,39 +681,40 @@ func (t *Tier) rangeChunk(ctx context.Context, ck, key string, v readView, off i
 			}
 			return nil, err
 		}
-		sp, cleanup, err := t.runtime.spoolStream(fillCtx, io.LimitReader(rc, length), length)
+		buf := make([]byte, length)
+		_, err = io.ReadFull(rc, buf)
 		_ = rc.Close()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("origin range %s at %d: %w", key, first, err)
 		}
-		defer cleanup()
-		if sp.size != length {
-			return nil, fmt.Errorf("origin range %s at %d returned %d bytes, wanted %d", key, off, sp.size, length)
+		var chunks [][]byte
+		g, gctx := errgroup.WithContext(fillCtx)
+		g.SetLimit(4)
+		for off := first; off <= last; off += t.rangeSize {
+			chunk := buf[off-first : off-first+t.rangeChunkLen(v, off)]
+			chunks = append(chunks, chunk)
+			chunkKey := rangeChunkKey(ck, off, version)
+			g.Go(func() error {
+				_, err := t.storeSpooled(gctx, t.cacheRef(chunkKey), spooled{r: bytes.NewReader(chunk), data: chunk, size: int64(len(chunk))},
+					store.WriteOptions{ContentType: v.ContentType, OriginModified: v.CreatedAt,
+						Publication: store.FillPublication(version, version, nil)}, nil)
+				return err
+			})
 		}
-		return t.storeSpooled(fillCtx, t.cacheRef(chunkKey), sp, store.WriteOptions{
-			ContentType: ct, OriginModified: lastModified,
-			Publication: fillPublication(fillCtx, version, version),
-		}, nil)
+		if err := g.Wait(); err != nil {
+			t.log.Debug("range chunk store failed", "key", key, "offset", first, "err", err)
+		}
+		return chunks, nil
 	})
-	if err != nil {
-		return nil, false, err
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.([][]byte), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	if m.OriginETag != version || m.Size != length {
-		return nil, false, errFillBusy
-	}
-	_, body, err := t.store.GetBody(ctx, t.cacheRef(chunkKey), store.WholeObjectRange(), nil)
-	if err != nil {
-		return nil, false, err
-	}
-	defer body.Close()
-	b, err := io.ReadAll(body)
-	if err != nil {
-		return nil, false, err
-	}
-	if int64(len(b)) != length {
-		return nil, false, fmt.Errorf("cached range chunk %s has %d bytes, wanted %d", chunkKey, len(b), length)
-	}
-	return b, false, nil
 }
 
 func (t *Tier) lookupCached(ctx context.Context, ck string, withInline bool) (*store.Meta, store.ObjectRef, error) {

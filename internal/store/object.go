@@ -988,37 +988,53 @@ func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema stri
 			return err
 		}
 		defer guard.close()
+		// Helpers wait on the pool only until every piece is claimed; the
+		// lead works on the guard's session, so the read always progresses.
+		claimCtx, allClaimed := context.WithCancel(gctx)
+		defer allClaimed()
 		var next atomic.Int64
-		for range workers {
+		work := func(q querier) error {
+			for {
+				if err := gctx.Err(); err != nil {
+					return err
+				}
+				j := int(next.Add(1) - 1)
+				if j >= len(need) {
+					allClaimed()
+					return nil
+				}
+				i := need[j]
+				ch := chans[i]
+				send := func(b []byte) bool {
+					select {
+					case ch <- result{b: b}:
+						return true
+					case <-gctx.Done():
+						return false
+					}
+				}
+				if err := streamRows(gctx, q, schema, pieces[i], start, end, s.blocks.fill(table, pieces[i]), send); err != nil {
+					return err
+				}
+				close(ch)
+			}
+		}
+		g.Go(func() error {
+			q, done := guard.lead()
+			defer done()
+			return work(q)
+		})
+		for range workers - 1 {
 			g.Go(func() error {
-				q, done, err := guard.join(gctx)
+				q, done, err := guard.join(claimCtx)
 				if err != nil {
+					if gctx.Err() == nil && claimCtx.Err() != nil {
+						return nil
+					}
 					return err
 				}
 				defer done()
-				for {
-					if err := gctx.Err(); err != nil {
-						return err
-					}
-					j := int(next.Add(1) - 1)
-					if j >= len(need) {
-						return nil
-					}
-					i := need[j]
-					ch := chans[i]
-					send := func(b []byte) bool {
-						select {
-						case ch <- result{b: b}:
-							return true
-						case <-gctx.Done():
-							return false
-						}
-					}
-					if err := streamRows(gctx, q, schema, pieces[i], start, end, s.blocks.fill(table, pieces[i]), send); err != nil {
-						return err
-					}
-					close(ch)
-				}
+				return work(q)
 			})
 		}
 	}

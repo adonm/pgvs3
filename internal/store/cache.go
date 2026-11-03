@@ -289,6 +289,82 @@ func (c Cache) MGet(ctx context.Context, keys []string) ([][]byte, error) {
 	return out, nil
 }
 
+// ReadMany returns the bodies of live single-file or inline objects in one
+// statement, so the object rows and their chunks come from one snapshot and
+// need no reaper pin. Missing, expired, multipart and pending keys are nil.
+func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
+	out := make([][]byte, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	if c.err != nil {
+		return nil, c.err
+	}
+	rows, err := c.s.chunkPool.Query(ctx, `SELECT k.ord, o.size, o.inline_data, c.no, c.data
+		FROM unnest($1::text[]) WITH ORDINALITY AS k(key, ord)
+		JOIN `+c.sc+`.objects o ON o.key = k.key
+		LEFT JOIN `+c.sc+`.chunks c ON o.inline_data IS NULL AND c.file_id = o.file_id
+		WHERE (o.expires_at IS NULL OR o.expires_at > now()) AND o.parts IS NULL
+		  AND (o.inline_data IS NOT NULL OR o.file_id IS NOT NULL OR o.size = 0)
+		  AND (o.origin_etag IS NULL OR (o.origin_etag NOT LIKE 'deleted:%' AND o.origin_etag NOT LIKE 'pending:%'))`, keys)
+	if missingNamespace(ctx, c.s.pool, c.sc, err) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	// Rows arrive unordered (sorting wide rows spills to disk); each lands at
+	// its row offset and the filled byte count proves the object complete.
+	sizes, filled := make([]int64, len(keys)), make([]int64, len(keys))
+	for rows.Next() {
+		var ord, size int64
+		var inline, data []byte
+		var no *int32
+		if err := rows.Scan(&ord, &size, &inline, &no, &data); err != nil {
+			return nil, err
+		}
+		idx := int(ord - 1)
+		if idx < 0 || idx >= len(out) {
+			continue
+		}
+		sizes[idx] = size
+		switch {
+		case inline != nil:
+			raw, err := decompressBlock(nil, inline, int(size))
+			if err != nil {
+				return nil, err
+			}
+			out[idx], filled[idx] = raw, size
+		case no == nil:
+			out[idx] = []byte{}
+		default:
+			off := int64(*no) * RowBytes
+			if off < 0 || off >= size {
+				continue
+			}
+			if out[idx] == nil {
+				out[idx] = make([]byte, size)
+			}
+			end := min(off+RowBytes, size)
+			row, err := decodeRow(out[idx][off:off:end], size, *no, data)
+			if err != nil {
+				return nil, err
+			}
+			filled[idx] += int64(copy(out[idx][off:end], row))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if out[i] != nil && (int64(len(out[i])) != sizes[i] || filled[i] != sizes[i]) {
+			out[i] = nil
+		}
+	}
+	return out, nil
+}
+
 func (c Cache) Del(ctx context.Context, keys []string) (int64, error) {
 	return c.s.DeleteMany(ctx, ns.CacheRef(c.name), keys)
 }

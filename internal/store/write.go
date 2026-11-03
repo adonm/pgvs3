@@ -373,7 +373,7 @@ func (s *Store) beginWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 			t.checksumAl = *alg
 		}
 	}
-	fileID, err := s.nextFileID(ctx)
+	fileID, err := s.nextFileID(ctx, tx)
 	if err != nil {
 		return fail(err)
 	}
@@ -1008,7 +1008,7 @@ func (s *Store) completeUploadRef(ctx context.Context, ref ObjectRef, uploadID s
 	if err != nil {
 		return nil, err
 	}
-	if s.checkQuota(ctx, ref.NS.Kind, ref.NS.Name, plan.size) {
+	if s.checkQuotaOn(ctx, tx, ref.NS.Kind, ref.NS.Name, plan.size) {
 		return nil, ErrQuotaExceeded
 	}
 	if err := applyMultipartPlan(ctx, tx, sc, ref.NS.Name, rec.key, uploadID, rec, plan, opts, pending); err != nil {
@@ -1240,7 +1240,7 @@ func (s *Store) copyObject(ctx context.Context, src, dst ObjectRef, srcSchema, d
 	if err != nil {
 		return nil, err
 	}
-	if s.checkQuota(ctx, ns.Bucket, dst.NS.Name, srcMeta.Size) {
+	if s.checkQuotaOn(ctx, tx, ns.Bucket, dst.NS.Name, srcMeta.Size) {
 		return nil, ErrQuotaExceeded
 	}
 	dest, err := readCopyDest(ctx, tx, dstSchema, dst.Key, opts.Dest)
@@ -1396,7 +1396,7 @@ func (s *Store) prepareDestFiles(ctx context.Context, tx pgx.Tx, srcSchema, dstS
 		if newID, ok := idMap[oldID]; ok {
 			return newID, nil
 		}
-		newID, err := s.nextFileID(ctx)
+		newID, err := s.nextFileID(ctx, tx)
 		if err != nil {
 			return 0, err
 		}

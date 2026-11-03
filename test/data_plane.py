@@ -185,6 +185,10 @@ class OriginProxy:
         class Server(ThreadingHTTPServer):
             request_queue_size = 128
 
+            def handle_error(self, request, client_address):
+                if not isinstance(sys.exc_info()[1], ConnectionError):
+                    super().handle_error(request, client_address)
+
         self.server = Server(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.endpoint = f"http://127.0.0.1:{self.server.server_port}"
@@ -208,7 +212,8 @@ class OriginProxy:
             return sum(n for (method, path), n in self.counts.items() if method in ("GET", "HEAD") and path.startswith(prefix))
 
 
-def configure_origin(proxy, bucket, namespace, endpoints=(A, B), database=DATABASE, upstream="upstream", strip=False):
+def configure_origin(proxy, bucket, namespace, endpoints=(A, B), database=DATABASE, upstream="upstream", strip=False,
+                     range_chunk=65536, extra=()):
     """strip: the cache bucket maps onto a same-named origin bucket with
     identical keys (strip_bucket), as when fronting an existing bucket."""
     if strip:
@@ -221,7 +226,7 @@ def configure_origin(proxy, bucket, namespace, endpoints=(A, B), database=DATABA
         s3["strip_bucket"] = True
     config.write_text(json.dumps({"type": "s3", "config": s3}))
     command("origin", "--url", database, "--bucket", bucket, "--cache-namespace", namespace,
-            "--cache-ttl", "1h", "--range-cache-chunk", "65536", "set", str(config))
+            "--cache-ttl", "1h", "--range-cache-chunk", str(range_chunk), *extra, "set", str(config))
     for endpoint in endpoints:
         def visible():
             try:
@@ -1143,8 +1148,225 @@ def iceberg():
           f"append direct {median(direct):.0f} ms vs through pgvs3 {median(through):.0f} ms; all roles match", flush=True)
 
 
+TRINO_IMAGE = "trinodb/trino:484"
+NESSIE_IMAGE = "ghcr.io/projectnessie/nessie:0.109.0"
+TRINO_MONTHS = [date(1992 + m // 12, m % 12 + 1, 1) for m in range(84)]
+TRINO_MONTH = ("SELECT count(*), sum(CAST(extendedprice AS DECIMAL(18,2))) FROM {t} "
+               "WHERE shipdate >= DATE '1995-06-01' AND shipdate < DATE '1995-07-01'")
+TRINO_Q1 = ("SELECT returnflag, linestatus, count(*), sum(CAST(quantity AS DECIMAL(18,2))), "
+            "sum(CAST(extendedprice AS DECIMAL(18,2))) FROM {t} WHERE shipdate <= DATE '1998-09-02' "
+            "GROUP BY 1, 2 ORDER BY 1, 2")
+# (name, table, query): "lineitem" is the month-by-month commit log of small
+# files, "big" one CTAS of large files.
+TRINO_QUERIES = [
+    ("count", "lineitem", "SELECT count(*) FROM {t}"),
+    ("month", "lineitem", TRINO_MONTH),
+    ("order", "lineitem", "SELECT count(*), sum(CAST(quantity AS DECIMAL(18,2))) FROM {t} WHERE orderkey = 3000000"),
+    ("q1", "lineitem", TRINO_Q1),
+    ("big order", "big", "SELECT count(*), sum(CAST(quantity AS DECIMAL(18,2))) FROM {t} WHERE orderkey = 30000000"),
+    ("big month", "big", TRINO_MONTH),
+    ("big q1", "big", TRINO_Q1),
+]
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@contextmanager
+def container(name, image, *args):
+    """A host-network container, so it reaches the gateways and the origin
+    proxy on 127.0.0.1; its log is kept in the run directory."""
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    subprocess.check_output(["docker", "run", "-d", "--name", name, "--network", "host", *args, image], text=True)
+    try:
+        yield
+    finally:
+        with (RUN / f"{name.rsplit('-', 1)[-1]}.log").open("wb") as log:
+            subprocess.run(["docker", "logs", name], stdout=log, stderr=subprocess.STDOUT)
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+def trino_query(server, statement):
+    """Runs one statement over Trino's client protocol; returns the rows and
+    the coordinator's elapsed milliseconds."""
+    headers = {"X-Trino-User": "pgvs3"}
+    response = json.load(urlopen(Request(server + "/v1/statement", statement.encode(), headers), timeout=600))
+    rows = []
+    while True:
+        rows += response.get("data", [])
+        if "error" in response:
+            raise AssertionError((statement, response["error"]["message"]))
+        if "nextUri" not in response:
+            return rows, response["stats"]["elapsedTimeMillis"]
+        response = json.load(urlopen(Request(response["nextUri"], headers=headers), timeout=600))
+
+
+def trino():
+    """Trino 484 with a Nessie catalog whose version store is the same
+    PostgreSQL: a TPC-H lineitem table committed month by month (many
+    snapshots, small files) and one CTAS of a larger scale (large files), read
+    straight from a latency-injected origin, through the cache tier, and through
+    Trino's own Alluxio cache."""
+    latency = float(os.environ.get("PGVS3_TRINO_ORIGIN_MS", "20")) / 1000
+    repeat = int(os.environ.get("PGVS3_TRINO_REPEAT", "3"))
+    scale = os.environ.get("PGVS3_TRINO_BIG_SCALE", "sf10")
+    range_chunk = int(os.environ.get("PGVS3_TRINO_RANGE_CHUNK", str(1 << 20)))
+    fill = os.environ.get("PGVS3_TRINO_FILL_CONCURRENCY")
+    bucket, prefix = "trino", f"pgvs3-{RUN.name}"
+    build, through, appended = TRINO_MONTHS[:78], TRINO_MONTHS[78:81], TRINO_MONTHS[81:]
+    pg = urlsplit(DATABASE)
+    nessie_port, trino_port = free_port(), free_port()
+    server = f"http://127.0.0.1:{trino_port}"
+    etc = RUN / "trino-etc"
+    (etc / "catalog").mkdir(parents=True, exist_ok=True)
+    (etc / "config.properties").write_text(
+        f"coordinator=true\nnode-scheduler.include-coordinator=true\nhttp-server.http.port={trino_port}\n"
+        f"discovery.uri={server}\n"
+        "cache-manager.config-files=etc/cache-manager-alluxio.properties,etc/cache-manager-memory.properties\n")
+    (etc / "cache-manager-alluxio.properties").write_text(
+        "cache-manager.name=alluxio\nfs.cache.directories=/cache\nfs.cache.max-sizes=4GB\n")
+    (etc / "cache-manager-memory.properties").write_text("cache-manager.name=memory\nfs.memory-cache.max-size=1GB\n")
+    (etc / "node.properties").write_text("node.environment=pgvs3\nnode.data-dir=/data/trino\n")
+    (etc / "jvm.config").write_text("\n".join([
+        "-server", "-Xmx8G", "-XX:G1HeapRegionSize=32M", "-XX:+ExplicitGCInvokesConcurrent", "-XX:+ExitOnOutOfMemoryError",
+        "-XX:-OmitStackTraceInFastThrow", "-XX:ReservedCodeCacheSize=256M", "-Djdk.attach.allowAttachSelf=true",
+        "-Djdk.nio.maxCachedBufferSize=2000000"]) + "\n")
+    (etc / "catalog" / "tpch.properties").write_text("connector.name=tpch\n")
+
+    def catalog(name, endpoint, cache=None):
+        """cache: None reads storage on every query (a fresh coordinator),
+        "trino" keeps Trino's default metadata cache, "alluxio" adds its
+        node-local data cache."""
+        lines = ["connector.name=iceberg", "iceberg.catalog.type=nessie",
+                 f"iceberg.nessie-catalog.uri=http://127.0.0.1:{nessie_port}/api/v2", "iceberg.nessie-catalog.ref=main",
+                 f"iceberg.nessie-catalog.default-warehouse-dir=s3://{bucket}/warehouse", "fs.native-s3.enabled=true",
+                 f"s3.endpoint={endpoint}", "s3.region=us-east-1", "s3.path-style-access=true",
+                 "s3.aws-access-key=test", "s3.aws-secret-key=test"]
+        if cache is None:
+            lines.append("iceberg.metadata-cache.enabled=false")
+        if cache == "alluxio":
+            lines.append("fs.cache.enabled=true")
+        (etc / "catalog" / f"{name}.properties").write_text("\n".join(lines) + "\n")
+
+    def table(name, kind="lineitem"):
+        return f"{name}.bench.{kind}"
+
+    def oracle(months, kind):
+        if kind == "big":
+            return f"tpch.{scale}.lineitem"
+        return f"(SELECT * FROM tpch.sf1.lineitem WHERE shipdate < DATE '{months[-1] + timedelta(days=31):%Y-%m-01}')"
+
+    def insert(name, month):
+        started = time.perf_counter()
+        trino_query(server, f"INSERT INTO {table(name)} SELECT * FROM tpch.sf1.lineitem "
+                            f"WHERE shipdate >= DATE '{month}' AND shipdate < DATE '{month}' + INTERVAL '1' MONTH")
+        return round((time.perf_counter() - started) * 1000, 1)
+
+    def run(role, name, expected, runs=repeat):
+        """Per query: coordinator milliseconds of each run (the first is the
+        cold one for a fresh cache) and origin reads during the first."""
+        observed = {}
+        for query, kind, template in TRINO_QUERIES:
+            times, reads = [], proxy.reads_under(f"/{bucket}/")
+            for _ in range(runs):
+                rows, elapsed = trino_query(server, template.format(t=table(name, kind)))
+                assert rows == expected[query], (role, query, rows, expected[query])
+                times.append(elapsed)
+                if len(times) == 1:
+                    first_reads = proxy.reads_under(f"/{bucket}/") - reads
+            observed[query] = {"origin_reads": first_reads, "ms": times}
+        return observed
+
+    nessie_env = {"QUARKUS_HTTP_PORT": nessie_port, "QUARKUS_MANAGEMENT_PORT": free_port(),
+                  "NESSIE_VERSION_STORE_TYPE": "JDBC2", "NESSIE_VERSION_STORE_PERSIST_JDBC_DATASOURCE": "postgresql",
+                  "QUARKUS_DATASOURCE_POSTGRESQL_JDBC_URL": f"jdbc:postgresql://{pg.hostname}:{pg.port}/nessie",
+                  "QUARKUS_DATASOURCE_POSTGRESQL_USERNAME": pg.username,
+                  "QUARKUS_DATASOURCE_POSTGRESQL_PASSWORD": pg.password}
+    with OriginProxy(latency, keep_alive=True) as proxy, ExitStack() as stack:
+        configure_origin(proxy, bucket, "trino-origin", strip=True, range_chunk=range_chunk,
+                         extra=("--fill-concurrency", fill) if fill else ())
+        for name, endpoint, cache in [("direct", proxy.endpoint, None), ("via_b", B, None), ("via_a", A, None),
+                                      ("alluxio", proxy.endpoint, "alluxio"), ("direct_cached", proxy.endpoint, "trino"),
+                                      ("via_a_cached", A, "trino")]:
+            catalog(name, endpoint, cache)
+        stack.enter_context(container(f"{prefix}-nessie", NESSIE_IMAGE,
+                                      *(arg for key, value in nessie_env.items() for arg in ("-e", f"{key}={value}"))))
+        eventually("nessie readiness", lambda: request(f"http://127.0.0.1:{nessie_port}", "/api/v2/config", timeout=2), 120)
+        stack.enter_context(container(f"{prefix}-trino", TRINO_IMAGE, "-v", f"{etc}:/etc/trino:ro",
+                                      "--tmpfs", "/cache:rw,mode=1777,size=4g"))
+        eventually("trino readiness",
+                   lambda: not json.load(urlopen(server + "/v1/info", timeout=2))["starting"] and trino_query(server, "SELECT 1"), 180)
+
+        trino_query(server, "CREATE SCHEMA direct.bench")
+        trino_query(server, f"CREATE TABLE {table('direct')} WITH (partitioning = ARRAY['month(shipdate)']) "
+                            "AS SELECT * FROM tpch.sf1.lineitem WITH NO DATA")
+        started = time.monotonic()
+        for month in build:
+            insert("direct", month)
+        build_s = round(time.monotonic() - started, 1)
+        started = time.monotonic()
+        trino_query(server, f"CREATE TABLE {table('direct', 'big')} AS SELECT * FROM tpch.{scale}.lineitem")
+        big_s = round(time.monotonic() - started, 1)
+        layout = {kind: trino_query(server, f'SELECT count(*), sum(file_size_in_bytes), max(file_size_in_bytes) '
+                                            f'FROM direct.bench."{kind}$files"')[0][0] for kind in ("lineitem", "big")}
+        oracles = {}
+
+        def expect(months):
+            out = {}
+            for query, kind, template in TRINO_QUERIES:
+                if kind == "big" and query in oracles:
+                    out[query] = oracles[query]
+                    continue
+                out[query] = trino_query(server, template.format(t=oracle(months, kind)))[0]
+                if kind == "big":
+                    oracles[query] = out[query]
+            return out
+
+        expected = expect(build)
+        run("warm-up", "direct", expected, runs=1)
+        records = [{"role": "direct", "queries": run("direct", "direct", expected)}]
+        cold = run("origin-cache cold", "via_b", expected)
+        warm = run("origin-cache warm", "via_a", expected)
+        assert all(q["origin_reads"] == 0 for q in warm.values()), ("gateway A re-read the origin", warm)
+        records += [{"role": "origin-cache cold", "queries": cold}, {"role": "origin-cache warm", "queries": warm},
+                    {"role": "alluxio", "queries": run("alluxio", "alluxio", expected)},
+                    {"role": "direct, trino metadata cache", "queries": run("direct cached", "direct_cached", expected)},
+                    {"role": "origin-cache warm, trino metadata cache",
+                     "queries": run("warm cached", "via_a_cached", expected)}]
+
+        through_ms = [insert("via_a", month) for month in through]
+        written = run("write-through", "via_b", expect(build + through), runs=1)
+        assert all(q["origin_reads"] == 0 for q in written.values()), ("write-through commit was pulled from the origin", written)
+        records.append({"role": "write-through", "insert_ms": through_ms, "queries": written})
+        eventually("trino write-back drain", lambda: pending("trino-origin") == 0, 120)
+        direct_ms = [insert("direct", month) for month in appended]
+        records.append({"role": "direct insert", "insert_ms": direct_ms})
+        final = expect(TRINO_MONTHS)
+        run("final direct", "direct", final, runs=1)
+        run("final cache", "via_b", final, runs=1)
+        nessie_rows = int(sql("SELECT count(*) FROM objs2", DATABASE.replace("/pgvs3?", "/nessie?")))
+    (RUN / "trino.json").write_text(json.dumps({"complete": True, "months": len(TRINO_MONTHS), "big_scale": scale,
+                                                 "files": {kind: {"count": n, "bytes": total, "max_bytes": largest}
+                                                           for kind, (n, total, largest) in layout.items()},
+                                                 "origin_latency_ms": latency * 1000, "range_chunk": range_chunk,
+                                                 "build_s": build_s, "big_build_s": big_s, "nessie_objects": nessie_rows,
+                                                 "records": records}, indent=2) + "\n")
+    median = lambda values: sorted(values)[len(values) // 2]
+    roles = {record["role"]: record["queries"] for record in records if "queries" in record}
+    summary = "; ".join(f"{query} {median(roles['direct'][query]['ms']):.0f}/{cold[query]['ms'][0]:.0f}/"
+                        f"{median(warm[query]['ms']):.0f}/{median(roles['alluxio'][query]['ms']):.0f} ms"
+                        for query, _, _ in TRINO_QUERIES)
+    files = ", ".join(f"{kind} {n} files / {total / (1 << 20):.0f} MiB" for kind, (n, total, _) in layout.items())
+    print(f"trino: {len(TRINO_MONTHS)} Nessie commits; {files}; "
+          f"{latency * 1000:.0f} ms origin latency; direct/cold/warm/alluxio {summary}; insert direct "
+          f"{median(direct_ms):.0f} ms vs through pgvs3 {median(through_ms):.0f} ms; all roles match TPC-H", flush=True)
+
+
 if __name__ == "__main__":
     scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet, "ortho": ortho,
-                 "iceberg": iceberg}
+                 "iceberg": iceberg, "trino": trino}
     for name in sys.argv[1:]:
         scenarios[name]()

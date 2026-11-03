@@ -1377,6 +1377,51 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 	}
 }
 
+type rangeCountingOrigin struct {
+	originHandle
+	ranges atomic.Int64
+}
+
+func (o *rangeCountingOrigin) GetRange(ctx context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
+	o.ranges.Add(1)
+	return o.originHandle.GetRange(ctx, key, offset, length, ifMatch)
+}
+
+func TestRangeRunsFetchOncePerGap(t *testing.T) {
+	const chunk = 64 << 10
+	f := newFixture(t, TierOptions{TTL: time.Hour, RangeChunk: chunk})
+	data := bytes.Repeat([]byte("parquet column "), (10<<20)/15)
+	random := make([]byte, 3<<20)
+	rand.New(rand.NewSource(1)).Read(random)
+	copy(data[chunk:], random)
+	ck := f.tier.key("bkt", "runs")
+	if _, err := f.tier.origin.Upload(testCtx, ck, bytes.NewReader(data), int64(len(data)), originUpload{}); err != nil {
+		t.Fatal(err)
+	}
+	counted := &rangeCountingOrigin{originHandle: f.tier.origin}
+	f.tier.origin = counted
+	for _, tc := range []struct {
+		start, end int64
+		fetches    int64
+		hit        bool
+	}{
+		{chunk + 100, 6*chunk - 1, 1, false},
+		{10, 9*chunk + 5, 2, false},
+		{0, 10*chunk - 1, 0, true},
+		{int64(len(data)) - 3*chunk - 7, int64(len(data)) - 1, 1, false},
+	} {
+		before := counted.ranges.Load()
+		obj, err := f.tier.Open(testCtx, "bkt", "runs", store.Range(tc.start, tc.end, -1))
+		testutil.Must(t, err)
+		if got := readObject(t, obj); got != string(data[tc.start:tc.end+1]) {
+			t.Fatalf("range %d-%d returned wrong bytes", tc.start, tc.end)
+		}
+		if fetched := counted.ranges.Load() - before; fetched != tc.fetches || obj.Hit != tc.hit {
+			t.Fatalf("range %d-%d: %d origin GETs hit=%t, want %d hit=%t", tc.start, tc.end, fetched, obj.Hit, tc.fetches, tc.hit)
+		}
+	}
+}
+
 func TestParentHeadPublicationFencedByTombstone(t *testing.T) {
 	f := newFixture(t)
 	ck := f.tier.key("bkt", "fenced-head")

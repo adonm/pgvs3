@@ -132,8 +132,7 @@ func TestReadGuardSnapshotOutlivesIdleTimeout(t *testing.T) {
 	defer guard.close()
 	schema, err := ref.Schema()
 	testutil.Must(t, err)
-	first, doneFirst, err := guard.join(ctx)
-	testutil.Must(t, err)
+	first, doneFirst := guard.lead()
 	defer doneFirst()
 	time.Sleep(time.Second)
 	second, doneSecond, err := guard.join(ctx)
@@ -149,6 +148,98 @@ func TestReadGuardSnapshotOutlivesIdleTimeout(t *testing.T) {
 		testutil.Must(t, err)
 		if len(got) == 0 {
 			t.Fatalf("worker %d read nothing", i)
+		}
+	}
+}
+
+// A multi-piece read that gets only its guard connection must still finish:
+// the guard session does the read's work instead of waiting on the pool for
+// a worker connection that other reads hold.
+func TestMultiPieceReadProgressesOnGuardConnection(t *testing.T) {
+	for _, mode := range []string{"pinned", "snapshot"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(testCtx, 30*time.Second)
+			defer cancel()
+			st := openReadStore(t, func(o *OpenOptions) { o.MaxConns = 6 })
+			st.forceSnapshotReads = mode == "snapshot"
+			bucket := unique("read-guard-pool")
+			testutil.Must(t, st.CreateBucket(ctx, bucket))
+			dropOnCleanup(t, ns.Bucket, bucket)
+			ref := ObjectRef{NS: ns.BucketRef(bucket), Key: "big"}
+			data := randomBytes(16<<20, 7)
+			putChunked(t, st, ref, data)
+			for range 5 {
+				held, err := st.chunkPool.Acquire(ctx)
+				testutil.Must(t, err)
+				defer held.Release()
+			}
+			got, err := st.Get(ctx, ref, WholeObjectRange())
+			testutil.Must(t, err)
+			if !bytes.Equal(got.Bytes, data) {
+				t.Fatalf("read %d bytes, mismatch against %d", len(got.Bytes), len(data))
+			}
+		})
+	}
+}
+
+// A chunked write that holds the only main-pool connection must still be able
+// to allocate a file ID block.
+func TestChunkedWriteOnSingleConnectionPool(t *testing.T) {
+	ctx, cancel := context.WithTimeout(testCtx, 30*time.Second)
+	defer cancel()
+	st := openReadStore(t, func(o *OpenOptions) { o.MaxConns = 1 })
+	bucket := unique("write-one-conn")
+	testutil.Must(t, st.CreateBucket(ctx, bucket))
+	dropOnCleanup(t, ns.Bucket, bucket)
+	ref := ObjectRef{NS: ns.BucketRef(bucket), Key: "obj"}
+	data := randomBytes(1<<20, 8)
+	w, err := st.StartObject(ctx, ref, WriteOptions{ContentType: "application/octet-stream"})
+	testutil.Must(t, err)
+	if _, err := w.Write(data); err != nil {
+		w.Abort()
+		t.Fatal(err)
+	}
+	_, err = w.Finish(nil)
+	testutil.Must(t, err)
+	got, err := st.Get(ctx, ref, WholeObjectRange())
+	testutil.Must(t, err)
+	if !bytes.Equal(got.Bytes, data) {
+		t.Fatal("read back different bytes")
+	}
+}
+
+func TestCacheReadManyAssemblesUnorderedRows(t *testing.T) {
+	ctx := testCtx
+	name := unique("read-many")
+	ref := ns.CacheRef(name)
+	dropOnCleanup(t, ns.Cache, name)
+	want := map[string][]byte{
+		"inline": []byte("small"),
+		"empty":  {},
+		"one":    randomBytes(3*RowBytes+17, 9),
+		"two":    randomBytes(40*RowBytes, 10),
+	}
+	for key, data := range want {
+		obj := ObjectRef{NS: ref, Key: key}
+		if key == "inline" {
+			_, err := testStore.PutInline(ctx, obj, data, WriteOptions{})
+			testutil.Must(t, err)
+			continue
+		}
+		putChunked(t, testStore, obj, data)
+	}
+	keys := []string{"two", "missing", "inline", "one", "empty", "two"}
+	got, err := testStore.Cache(name).ReadMany(ctx, keys)
+	testutil.Must(t, err)
+	for i, key := range keys {
+		if key == "missing" {
+			if got[i] != nil {
+				t.Fatalf("missing key returned %d bytes", len(got[i]))
+			}
+			continue
+		}
+		if got[i] == nil || !bytes.Equal(got[i], want[key]) {
+			t.Fatalf("%s (position %d): got %d bytes, want %d", key, i, len(got[i]), len(want[key]))
 		}
 	}
 }
