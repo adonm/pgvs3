@@ -88,21 +88,26 @@ jobs:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
-      contents: write
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
       - run: mise install
       - run: mise exec -- just docs
-      - name: Publish Quarto site to gh-pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          touch docs/_site/.nojekyll
-          git -C docs/_site init -b gh-pages
-          git -C docs/_site config user.name "github-actions[bot]"
-          git -C docs/_site config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C docs/_site add -A
-          git -C docs/_site commit --no-verify -m "docs: publish Quarto site (${GITHUB_SHA::7})"
-          git -C docs/_site push --no-verify --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/_site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
