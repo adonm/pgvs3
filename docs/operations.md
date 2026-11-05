@@ -231,7 +231,9 @@ Multi-piece reads count as `pgvs3_read_pinned_total` on writable gateways and
 `pgvs3_read_snapshot_total` on standbys or when pins fall back. With
 `--read-cache-bytes` set, `pgvs3_read_cache_bytes` and the `hits`, `hit_bytes`,
 `fills` and `evictions` counters show whether hot reads stay in gateway memory;
-a hit ratio near zero means the budget is better spent elsewhere.
+a hit ratio near zero means the budget is better spent elsewhere. The byte
+gauge is retained cache residency, not process RSS, scratch spool or in-flight
+request/response bodies.
 
 TTL expiry counts include expired metadata-only origin parent records in layout
 v25. Range metadata is used only when range caching is enabled, never substitutes
@@ -873,12 +875,15 @@ pending-upload workers. Cold scans by parallel engines such as DuckDB queue on
 it; for lakehouse origins, raise it on both `serve` and `origin set` (32 cut a
 cold Iceberg scan by about 40% in
 [benchmarks](benchmarks.md#iceberg-through-the-cache-tier-just-iceberg)).
-Lakehouse gateways also want `--read-cache-bytes`: warm range-cache reads of
-files already in gateway memory skip PostgreSQL chunk reads, which brought
-warm Trino scans level with Trino's own local cache in
+Lakehouse gateways can opt into `--read-cache-bytes`: with the 3 GiB
+gateway-local cache used for the historical Trino run, warm range-cache reads of
+files already in gateway memory skip PostgreSQL chunk reads and were level with
+Trino's own local cache in
 [benchmarks](benchmarks.md#trino-and-nessie-through-the-cache-tier-just-trino).
-Compacting many-commit tables and sorting large ones by their filter columns
-helped those queries as much as the cache did.
+That run is local-memory-assisted, not a shared-PostgreSQL-only result;
+`just trino` now defaults the cache off so its file reads share PostgreSQL.
+Layout changes also moved those queries, and that run does not isolate how much
+each factor contributed.
 
 S3 keeps the immediate acquisition fast path. A brief burst above the active
 limit waits in a bounded per-gateway queue: at most **twice `--s3-concurrency`**

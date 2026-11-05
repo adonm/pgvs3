@@ -38,7 +38,7 @@ spec:
       {{- end }}
       containers:
         - name: pgvs3
-          image: {{ .Values.image }}
+          image: {{ .Values.image | default (printf "ghcr.io/adonm/pgvs3:%s" .Chart.AppVersion) | quote }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           {{- with .Values.containerSecurityContext }}
           securityContext:

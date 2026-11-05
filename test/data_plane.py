@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import date, timedelta
 import hashlib
@@ -8,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import signal
 import socket
@@ -210,6 +212,12 @@ class OriginProxy:
     def reads_under(self, prefix):
         with self.lock:
             return sum(n for (method, path), n in self.counts.items() if method in ("GET", "HEAD") and path.startswith(prefix))
+
+    def methods_under(self, prefix):
+        with self.lock:
+            return {method: sum(n for (m, path), n in self.counts.items()
+                                if m == method and path.startswith(prefix))
+                    for method in ("GET", "HEAD")}
 
 
 def configure_origin(proxy, bucket, namespace, endpoints=(A, B), database=DATABASE, upstream="upstream", strip=False,
@@ -848,7 +856,8 @@ def guides():
                      "pgvs3_pending_uploads_bytes", "pgvs3_pending_uploads_oldest_seconds", "pgvs3_spool_peak_bytes"):
             assert re.search(r"^" + name + r" [0-9.eE+-]+$", metrics, re.M), name
         help_result = subprocess.run([BIN, "serve", "--help"], capture_output=True, text=True, timeout=30)
-        assert help_result.returncode == 2 and "s3-queue-wait" in help_result.stderr and "default 1s" in help_result.stderr
+        assert help_result.returncode == 0 and "s3-queue-wait" in help_result.stderr and "default 1s" in help_result.stderr, (
+            help_result.returncode, help_result.stderr)
         record("PostgreSQL 18 diagnostics, optional pg_stat_statements and actual metric/flag names", metrics_checked=7)
         script("demo-cleanup-namespaces")
         pg("demo-cleanup-catalog", catalog_url())
@@ -1168,6 +1177,8 @@ TRINO_QUERIES = [
     ("big q1", "big", TRINO_Q1),
 ]
 
+TRINO_PAIRED_CATALOGS = {"pg": "via_a", "alluxio": "alluxio"}
+
 
 def free_port():
     with socket.socket() as sock:
@@ -1204,6 +1215,113 @@ def trino_query(server, statement):
         response = json.load(urlopen(Request(response["nextUri"], headers=headers), timeout=600))
 
 
+def trino_observation(times, method_runs):
+    """One query's timings and origin GET/HEAD counts. The first run is
+    separate from its repeats, and the total covers every repetition because a
+    later run can still miss after a first-run hit."""
+    first = method_runs[0]
+    total = {method: sum(run.get(method, 0) for run in method_runs) for method in ("GET", "HEAD")}
+    return {"origin_reads": sum(first.values()), "origin_reads_total": sum(total.values()),
+            "origin_methods": {"first": first, "total": total, "runs": method_runs},
+            "first_ms": times[0], "repeat_ms": times[1:], "ms": times}
+
+
+def trino_config(latency, repeat, scale, range_chunk, fill):
+    """The effective values the gateways and origin setter received. Read-cache
+    bytes bound local cache residency, not process RSS or in-flight bodies."""
+    gateway_fill = int(os.environ.get("PGVS3_FILL_CONCURRENCY", "8"))
+    return {
+        "gateway_read_cache_bytes": int(os.environ.get("PGVS3_READ_CACHE_BYTES", "0")),
+        "gateway_pool_max": int(os.environ.get("PGVS3_POOL_MAX", "8")),
+        "gateway_fill_concurrency": gateway_fill,
+        "origin_set_fill_concurrency": int(fill) if fill else gateway_fill,
+        "repeat": repeat,
+        "range_chunk": range_chunk,
+        "origin_latency_ms": latency * 1000,
+        "big_scale": scale,
+    }
+
+
+def trino_identity():
+    """The source revision, gateway binary, host and pinned engine images; no
+    credentials or connection strings."""
+    try:
+        commit = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True,
+                                         stderr=subprocess.DEVNULL).strip()
+        dirty = bool(subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"], text=True,
+                                             stderr=subprocess.DEVNULL).strip())
+    except (OSError, subprocess.CalledProcessError):
+        commit, dirty = None, None
+    return {"git_commit": commit, "git_dirty": dirty,
+            "binary_sha256": hashlib.sha256(Path(BIN).read_bytes()).hexdigest(),
+            "host": {"platform": platform.platform(), "machine": platform.machine(), "cpu_count": os.cpu_count()},
+            "images": {"trino": TRINO_IMAGE, "nessie": NESSIE_IMAGE}}
+
+
+def trino_paired(execute, proxy, expected, cycles, prefix, checkpoint, queries=TRINO_QUERIES):
+    """ABBA paired warm runs against the same fixture. The caller computes
+    paired ratios/CIs offline; this only preserves the block sequence."""
+    providers = {
+        "pg": {"catalog": TRINO_PAIRED_CATALOGS["pg"],
+               "description": "pgvs3 gateway-local read cache (gateway A); Trino filesystem cache disabled"},
+        "alluxio": {"catalog": TRINO_PAIRED_CATALOGS["alluxio"],
+                    "description": "Alluxio unified metadata+data cache"},
+    }
+    paired = {"enabled": True, "cycles": cycles, "providers": providers,
+              "alluxio_head_expected_per_sample": 2, "complete": False, "queries": {}}
+    checkpoint(paired)
+    for query, kind, template in queries:
+        blocks, samples = [], []
+        for cycle in range(cycles):
+            order = ("pg", "alluxio", "alluxio", "pg") if cycle % 2 == 0 else ("alluxio", "pg", "pg", "alluxio")
+            block = {"cycle": cycle + 1, "order": list(order), "samples": []}
+            for position, provider in enumerate(order, 1):
+                before = proxy.methods_under(prefix)
+                rows, elapsed = execute(provider, query, kind, template)
+                after = proxy.methods_under(prefix)
+                methods = {method: after[method] - before[method] for method in ("GET", "HEAD")}
+                assert rows == expected[query], (query, provider, rows, expected[query])
+                if provider == "pg":
+                    assert methods == {"GET": 0, "HEAD": 0}, ("pg paired origin read", query, methods)
+                else:
+                    assert methods["GET"] == 0, ("alluxio paired GET", query, methods)
+                sample = {"cycle": cycle + 1, "position": position, "provider": provider,
+                          "ms": elapsed, "origin_methods": methods}
+                block["samples"].append(sample)
+                samples.append(sample)
+            blocks.append(block)
+        paired["queries"][query] = {"blocks": blocks, "samples": samples}
+        checkpoint(paired)
+    paired["complete"] = True
+    checkpoint(paired)
+    return paired
+
+
+def trino_profile(pprof, run, expected, runs=20, seconds=20):
+    """Capture CPU/allocs while an extra warm query loop runs. This is a
+    diagnostic beside the timed roles, never part of their medians."""
+    base = pprof if pprof.startswith(("http://", "https://")) else "http://" + pprof
+    paths = {kind: RUN / f"trino-{kind}.pprof" for kind in ("cpu", "allocs")}
+    endpoints = {"cpu": "profile", "allocs": "allocs"}
+
+    def capture(kind):
+        paths[kind].write_bytes(urlopen(f"{base}/debug/pprof/{endpoints[kind]}?seconds={seconds}",
+                                        timeout=seconds + 60).read())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(capture, kind) for kind in paths]
+        queries = run("profile warm", "via_a", expected, runs=runs)
+        for future in futures:
+            future.result()
+    metrics_path = RUN / "gateway-a-metrics.txt"
+    metrics_path.write_bytes(request(A, "/metrics")[1])
+    assert all(q["origin_reads_total"] == 0 for q in queries.values()), ("profile warm read the origin", queries)
+    return {"enabled": True, "diagnostic": True, "role": "origin-cache warm", "catalog": "via_a",
+            "runs": runs, "cpu_seconds": seconds, "allocs_seconds": seconds,
+            "cpu_profile": str(paths["cpu"]), "allocs_profile": str(paths["allocs"]),
+            "metrics": str(metrics_path), "queries": queries}
+
+
 def trino():
     """Trino 484 with a Nessie catalog whose version store is the same
     PostgreSQL: a TPC-H lineitem table committed month by month (many
@@ -1215,8 +1333,23 @@ def trino():
     scale = os.environ.get("PGVS3_TRINO_BIG_SCALE", "sf10")
     range_chunk = int(os.environ.get("PGVS3_TRINO_RANGE_CHUNK", str(1 << 20)))
     fill = os.environ.get("PGVS3_TRINO_FILL_CONCURRENCY")
+    paired_cycles = int(os.environ.get("PGVS3_TRINO_PAIRED_CYCLES", "0"))
+    profile_enabled = bool(os.environ.get("PGVS3_TEST_PPROF_A")) and os.environ.get("PGVS3_TRINO_PROFILE") == "1"
     bucket, prefix = "trino", f"pgvs3-{RUN.name}"
     build, through, appended = TRINO_MONTHS[:78], TRINO_MONTHS[78:81], TRINO_MONTHS[81:]
+    report = {"complete": False, "months": len(TRINO_MONTHS), "big_scale": scale,
+              "config": trino_config(latency, repeat, scale, range_chunk, fill),
+              "paired": {"enabled": False}, "profile": {"enabled": False},
+              "identity": trino_identity(), "records": []}
+
+    def save():
+        (RUN / "trino.json").write_text(json.dumps(report, indent=2) + "\n")
+
+    def checkpoint(record):
+        report["records"].append(record)
+        save()
+
+    save()
     pg = urlsplit(DATABASE)
     nessie_port, trino_port = free_port(), free_port()
     server = f"http://127.0.0.1:{trino_port}"
@@ -1237,9 +1370,10 @@ def trino():
     (etc / "catalog" / "tpch.properties").write_text("connector.name=tpch\n")
 
     def catalog(name, endpoint, cache=None):
-        """cache: None reads storage on every query (a fresh coordinator),
-        "trino" keeps Trino's default metadata cache, "alluxio" adds its
-        node-local data cache."""
+        """cache: None disables the engine metadata cache, "trino" keeps
+        Trino's coordinator MemoryBlobCache (engine metadata plus small data
+        files on a single coordinator+worker), "alluxio" replaces the engine
+        cache with Alluxio's unified metadata+data cache."""
         lines = ["connector.name=iceberg", "iceberg.catalog.type=nessie",
                  f"iceberg.nessie-catalog.uri=http://127.0.0.1:{nessie_port}/api/v2", "iceberg.nessie-catalog.ref=main",
                  f"iceberg.nessie-catalog.default-warehouse-dir=s3://{bucket}/warehouse", "fs.native-s3.enabled=true",
@@ -1267,17 +1401,20 @@ def trino():
 
     def run(role, name, expected, runs=repeat, schema="bench"):
         """Per query: coordinator milliseconds of each run (the first is the
-        cold one for a fresh cache) and origin reads during the first."""
+        cold one for a fresh cache), first-run milliseconds and repeats, and
+        origin GET/HEAD counts during the first run, each run and across all
+        runs."""
         observed = {}
         for query, kind, template in TRINO_QUERIES:
-            times, reads = [], proxy.reads_under(f"/{bucket}/")
+            times, method_runs = [], []
             for _ in range(runs):
+                before = proxy.methods_under(f"/{bucket}/")
                 rows, elapsed = trino_query(server, template.format(t=table(name, kind, schema)))
+                after = proxy.methods_under(f"/{bucket}/")
                 assert rows == expected[query], (role, query, rows, expected[query])
                 times.append(elapsed)
-                if len(times) == 1:
-                    first_reads = proxy.reads_under(f"/{bucket}/") - reads
-            observed[query] = {"origin_reads": first_reads, "ms": times}
+                method_runs.append({method: after[method] - before[method] for method in ("GET", "HEAD")})
+            observed[query] = trino_observation(times, method_runs)
         return observed
 
     nessie_env = {"QUARKUS_HTTP_PORT": nessie_port, "QUARKUS_MANAGEMENT_PORT": free_port(),
@@ -1327,30 +1464,44 @@ def trino():
 
         expected = expect(build)
         run("warm-up", "direct", expected, runs=1)
-        records = [{"role": "direct", "queries": run("direct", "direct", expected)}]
+        checkpoint({"role": "direct", "queries": run("direct", "direct", expected)})
         cold = run("origin-cache cold", "via_b", expected)
+        checkpoint({"role": "origin-cache cold", "queries": cold})
         warm = run("origin-cache warm", "via_a", expected)
-        assert all(q["origin_reads"] == 0 for q in warm.values()), ("gateway A re-read the origin", warm)
-        records += [{"role": "origin-cache cold", "queries": cold}, {"role": "origin-cache warm", "queries": warm},
-                    {"role": "alluxio", "queries": run("alluxio", "alluxio", expected)},
-                    {"role": "direct, trino metadata cache", "queries": run("direct cached", "direct_cached", expected)},
-                    {"role": "origin-cache warm, trino metadata cache",
-                     "queries": run("warm cached", "via_a_cached", expected)}]
+        checkpoint({"role": "origin-cache warm", "queries": warm})
+        assert all(q["origin_reads_total"] == 0 for q in warm.values()), ("gateway A re-read the origin", warm)
+        checkpoint({"role": "alluxio", "queries": run("alluxio", "alluxio", expected)})
+        checkpoint({"role": "direct, trino metadata cache", "includes_small_data_files": True,
+                    "queries": run("direct cached", "direct_cached", expected)})
+        checkpoint({"role": "origin-cache warm, trino metadata cache", "includes_small_data_files": True,
+                    "queries": run("warm cached", "via_a_cached", expected)})
 
-        through_ms = [insert("via_a", month) for month in through]
-        written = run("write-through", "via_b", expect(build + through), runs=1)
-        assert all(q["origin_reads"] == 0 for q in written.values()), ("write-through commit was pulled from the origin", written)
-        records.append({"role": "write-through", "insert_ms": through_ms, "queries": written})
-        eventually("trino write-back drain", lambda: pending("trino-origin") == 0, 120)
-        direct_ms = [insert("direct", month) for month in appended]
-        records.append({"role": "direct insert", "insert_ms": direct_ms})
-        final = expect(TRINO_MONTHS)
-        run("final direct", "direct", final, runs=1)
-        run("final cache", "via_b", final, runs=1)
+        if paired_cycles:
+            def paired_query(provider, query, kind, template):
+                catalog_name = TRINO_PAIRED_CATALOGS[provider]
+                return trino_query(server, template.format(t=table(catalog_name, kind)))
 
-        # Layout: the commit log compacted into one snapshot and manifest, and
-        # the large table sorted by the month filter's column so row-group
-        # statistics prune it. Gateway B has not read these files yet.
+            def checkpoint_paired(paired):
+                report["paired"] = paired
+                save()
+
+            report["paired"] = trino_paired(paired_query, proxy, expected, paired_cycles, f"/{bucket}/", checkpoint_paired)
+            paired_metrics = RUN / "gateway-a-metrics-paired.txt"
+            paired_metrics.write_bytes(request(A, "/metrics")[1])
+            report["paired"]["metrics"] = str(paired_metrics)
+            save()
+
+        if profile_enabled:
+            report["profile"] = trino_profile(os.environ["PGVS3_TEST_PPROF_A"], run, expected)
+            save()
+
+        # Layout: rebuild the 78-month build cohort into one current snapshot
+        # and manifest, and sort the large table by the month filter's column
+        # so row-group statistics prune it. Historical Nessie commits remain,
+        # but planning reads the current snapshot's manifests. Gateway B has
+        # not read these files yet. Comparing this with `expected` keeps the
+        # layout comparison on the same rows; the write-through and appended
+        # inserts run afterwards.
         trino_query(server, "CREATE SCHEMA direct.tuned")
         started = time.monotonic()
         trino_query(server, f"CREATE TABLE {table('direct', schema='tuned')} WITH (partitioning = ARRAY['month(shipdate)']) "
@@ -1358,19 +1509,26 @@ def trino():
         trino_query(server, f"CREATE TABLE {table('direct', 'big', 'tuned')} WITH (sorted_by = ARRAY['shipdate']) "
                             f"AS SELECT * FROM tpch.{scale}.lineitem")
         tuned_s = round(time.monotonic() - started, 1)
-        tuned = {"direct": run("tuned direct", "direct", final, schema="tuned"),
-                 "cold": run("tuned cold", "via_b", final, schema="tuned"),
-                 "warm": run("tuned warm", "via_a", final, schema="tuned")}
-        assert all(q["origin_reads"] == 0 for q in tuned["warm"].values()), ("tuned warm read the origin", tuned["warm"])
-        records += [{"role": f"tuned {role}", "queries": queries} for role, queries in tuned.items()]
+        tuned = {}
+        for role, catalog_name in (("direct", "direct"), ("cold", "via_b"), ("warm", "via_a")):
+            queries = run(f"tuned {role}", catalog_name, expected, schema="tuned")
+            tuned[role] = queries
+            checkpoint({"role": f"tuned {role}", "queries": queries})
+        assert all(q["origin_reads_total"] == 0 for q in tuned["warm"].values()), ("tuned warm read the origin", tuned["warm"])
+
+        through_ms = [insert("via_a", month) for month in through]
+        written = run("write-through", "via_b", expect(build + through), runs=1)
+        checkpoint({"role": "write-through", "insert_ms": through_ms, "queries": written})
+        assert all(q["origin_reads_total"] == 0 for q in written.values()), ("write-through commit was pulled from the origin", written)
+        eventually("trino write-back drain", lambda: pending("trino-origin") == 0, 120)
+        direct_ms = [insert("direct", month) for month in appended]
+        checkpoint({"role": "direct insert", "insert_ms": direct_ms})
+        final = expect(TRINO_MONTHS)
+        run("final direct", "direct", final, runs=1)
+        run("final cache", "via_b", final, runs=1)
+
         nessie_rows = int(sql("SELECT count(*) FROM objs2", DATABASE.replace("/pgvs3?", "/nessie?")))
-    (RUN / "trino.json").write_text(json.dumps({"complete": True, "months": len(TRINO_MONTHS), "big_scale": scale,
-                                                 "files": {kind: {"count": n, "bytes": total, "max_bytes": largest}
-                                                           for kind, (n, total, largest) in layout.items()},
-                                                 "origin_latency_ms": latency * 1000, "range_chunk": range_chunk,
-                                                 "build_s": build_s, "big_build_s": big_s, "tuned_build_s": tuned_s,
-                                                 "nessie_objects": nessie_rows,
-                                                 "records": records}, indent=2) + "\n")
+    records = report["records"]
     median = lambda values: sorted(values)[len(values) // 2]
     roles = {record["role"]: record["queries"] for record in records if "queries" in record}
     summary = "; ".join(f"{query} {median(roles['direct'][query]['ms']):.0f}/{cold[query]['ms'][0]:.0f}/"
@@ -1379,9 +1537,16 @@ def trino():
     tuned_summary = "; ".join(f"{query} {median(tuned['direct'][query]['ms']):.0f}/{tuned['cold'][query]['ms'][0]:.0f}/"
                               f"{median(tuned['warm'][query]['ms']):.0f} ms" for query, _, _ in TRINO_QUERIES)
     files = ", ".join(f"{kind} {n} files / {total / (1 << 20):.0f} MiB" for kind, (n, total, _) in layout.items())
+    report.update({"complete": True,
+                   "files": {kind: {"count": n, "bytes": total, "max_bytes": largest}
+                             for kind, (n, total, largest) in layout.items()},
+                   "origin_latency_ms": latency * 1000, "range_chunk": range_chunk,
+                   "build_s": build_s, "big_build_s": big_s, "tuned_build_s": tuned_s,
+                   "tuned_months": len(build), "nessie_objects": nessie_rows})
+    save()
     print(f"trino: {len(TRINO_MONTHS)} Nessie commits; {files}; "
           f"{latency * 1000:.0f} ms origin latency; direct/cold/warm/alluxio {summary}; insert direct "
-          f"{median(direct_ms):.0f} ms vs through pgvs3 {median(through_ms):.0f} ms; compacted and sorted "
+          f"{median(direct_ms):.0f} ms vs through pgvs3 {median(through_ms):.0f} ms; rebuilt and sorted "
           f"direct/cold/warm {tuned_summary}; all roles match TPC-H", flush=True)
 
 

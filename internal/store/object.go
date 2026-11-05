@@ -618,6 +618,13 @@ type Body struct {
 	conn   *pgxpool.Conn
 }
 
+// NewPartsBody returns a streaming body over caller-owned parts. The body
+// borrows the bytes without copying; callers must not modify them while the
+// body is in use. Parts are never returned to the chunk buffer pool.
+func NewPartsBody(parts [][]byte) *Body {
+	return &Body{parts: parts}
+}
+
 func (b *Body) Read(p []byte) (int, error) {
 	if b.static {
 		if len(b.cur) == 0 {
@@ -647,6 +654,9 @@ func (b *Body) WriteTo(w io.Writer) (int64, error) {
 		}
 		m, err := w.Write(p)
 		n += int64(m)
+		if err == nil && m != len(p) {
+			err = io.ErrShortWrite
+		}
 		return err
 	}
 	if err := write(b.cur); err != nil {

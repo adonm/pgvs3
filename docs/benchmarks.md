@@ -416,18 +416,19 @@ cold time and should be re-measured.
 
 ## Iceberg through the cache tier (`just iceberg`)
 
-Iceberg on S3 is latency-bound: planning reads `metadata.json`, the manifest
-list and every manifest in turn, and each is a separate object-store round
-trip. `just iceberg` writes a table with pyiceberg 0.12 (SQLite catalog,
-identity-partitioned by day, one 20,000-row append and one snapshot per day,
-`PGVS3_ICEBERG_COMMITS=100`) straight to the origin. DuckDB 2.0's `iceberg`
-extension then reads it in three ways: directly from the origin through a proxy
-that adds `PGVS3_ICEBERG_ORIGIN_MS` to every request, through gateway B on a
-cold cache, and through gateway A warm. The cache bucket maps 1:1 onto the
-origin bucket (`strip_bucket`), so the table's absolute `s3://` paths resolve
-unchanged; clients only switch endpoints. Three more appends then go through
-gateway A and are read back through B. Every role must match the generated
-data, and the warm and write-through reads must cause zero origin reads.
+Iceberg on S3 is latency-bound: planning reads `metadata.json` and the manifest
+list, then each manifest referenced by the current table state, and each is a
+separate object-store round trip. `just iceberg` writes a table with pyiceberg
+0.12 (SQLite catalog, identity-partitioned by day, one 20,000-row append and one
+snapshot per day, `PGVS3_ICEBERG_COMMITS=100`) straight to the origin. DuckDB
+2.0's `iceberg` extension then reads it in three ways: directly from the origin
+through a proxy that adds `PGVS3_ICEBERG_ORIGIN_MS` to every request, through
+gateway B on a cold cache, and through gateway A warm. The cache bucket maps
+1:1 onto the origin bucket (`strip_bucket`), so the table's absolute `s3://`
+paths resolve unchanged; clients only switch endpoints. Three more appends then
+go through gateway A and are read back through B. Every role must match the
+generated data, and the warm and write-through reads must cause zero origin
+reads.
 
 Measured 2026-11-03 on the 16-thread Intel Core Ultra laptop (median of 5
 runs; cold is the first run on gateway B; default `--fill-concurrency 8`):
@@ -460,19 +461,127 @@ store lives in the same PostgreSQL, configured as in the
 [Nessie Trino guide](https://projectnessie.org/iceberg/trino/) with Trino's
 native S3 file system pointed at each endpoint. `lineitem` is TPC-H SF1
 committed month by month (78 Nessie commits, 78 files / 136 MiB, partitioned
-by month); `big` is one CTAS of SF10 (10 files / 1,448 MiB, up to 180 MiB
+by month); `big` is one CTAS of SF10 (10 files / 1,448 MiB, about 180 MiB
 each). Each catalog reads the same tables directly from a 20 ms origin, cold
 through gateway B, warm through gateway A, and through Trino's own Alluxio
 file cache; every result must match Trino's `tpch` connector, and warm and
-write-through reads must cause zero origin reads. Cache gateways run with
-`--pool-max 8`, a 1 MiB `--range-cache-chunk` and a 3 GiB `--read-cache-bytes`
-(the origin gateway has no read cache).
+write-through reads must cause zero origin reads across all repetitions. By
+default, `just trino` leaves `PGVS3_READ_CACHE_BYTES=0`, so cache gateways serve
+the shared PostgreSQL chunk rows; set it to `3221225472` to opt into the bounded
+3 GiB gateway-local read cache. That budget bounds retained cache residency, not
+process RSS, request/response buffers or other in-flight bodies.
 
-Measured 2026-11-03 on the 16-thread Intel Core Ultra laptop (coordinator
-milliseconds, median of 3; cold is the first run on gateway B; the last two
-columns keep Trino's metadata cache):
+### 2026-11-05 standalone paired run: pgvs3 vs Alluxio
 
-| Query | Direct | Cold | Warm | Alluxio | Direct, metadata cache | Warm, metadata cache |
+This is the strict standalone comparison, not a layered or hybrid path. pgvs3
+used `via_a` with its own 3 GiB gateway-local read cache and both Trino
+file-system caches disabled (`iceberg.metadata-cache.enabled=false`, no Alluxio
+volume). Alluxio used its full 4 GB tmpfs cache as a separate catalog. Both read
+the same SF10 tables with a 20 ms origin, pool 8, fill 8 and a 1 MiB range
+chunk. The run took 15 ABBA blocks per query, flipping the starting provider each
+block (`PG, Alluxio, Alluxio, PG`, then the reverse), for 30 samples/provider/
+query. Profile collection was off. The report and analysis are archived under
+`.tmp/verify/standalone-paired.20261105T151816Z/`; `trino.json` SHA-256 is
+`2e28bf1f53935f55b7d7222d388858be0218034b1ffbe96a0ef8a99e12cc3cc0`.
+
+Raw coordinator medians are not the paired block ratios. The ratio and interval
+below use the geometric mean of the 15 PG/Alluxio block-mean ratios, with 50,000
+whole-block bootstrap resamples, seed `20261105 + query index`, and a
+Bonferroni-adjusted 99.2857% interval across seven queries:
+
+| Query | PG median ms | Alluxio median ms | Paired ratio | Adjusted 99.2857% CI | PG block wins |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `count(*)` | 53 | 97 | 0.5521 | [0.5395, 0.5695] | 15/15 |
+| One month | 36 | 78 | 0.4577 | [0.4429, 0.4733] | 15/15 |
+| One `orderkey` | 78 | 115 | 0.6745 | [0.6583, 0.6923] | 15/15 |
+| TPC-H Q1 | 100.5 | 137 | 0.7449 | [0.7242, 0.7650] | 15/15 |
+| `big` one `orderkey` | 96 | 133 | 0.7318 | [0.7137, 0.7532] | 15/15 |
+| `big` one month | 174 | 193.5 | 0.8904 | [0.8662, 0.9169] | 15/15 |
+| `big` Q1 | 520 | 529 | 0.9689 | [0.9455, 0.9919] | 12/15 |
+
+All seven intervals are below 1 within this session, but `big` Q1 has only a
+~3% paired margin and just 12/15 block wins. An earlier unpaired run also
+produced lower Alluxio times, so this does not attribute all movement to the
+new write path; ABBA only controls within-session drift. This is one host and
+one session, not production or fleet proof. pgvs3's 210 paired samples had 0 GET and 0 HEAD
+origin requests; Alluxio's 210 had 0 GET and 2 HEAD each. The repeated HEAD is a
+real metadata-length probe, so the comparison includes pgvs3's metadata/cache
+advantage, not only byte-cache throughput. Alluxio is not a layer in front of
+pgvs3.
+
+Configured memory was 3 GiB per pgvs3 cache gateway (6 GiB across two) versus
+Alluxio's 4 GB per Trino worker on tmpfs; gateway A reported about 608 MiB
+active at the snapshot. Both caches fit the dataset; this is not a fleet
+memory, cost or equivalence claim. A separate allocation check reduced
+per-1 MiB-part allocations from 32,872 to 184 B/op and per-8 MiB-part from
+33,448 to 352 B/op; that microbenchmark is not proof of the query change.
+Earlier profiling of this path was mostly kernel/socket time (78%) and the
+allocation delta sample was empty, so CPU/alloc attribution remains limited.
+
+The 2026-11-05 shared-PostgreSQL-only table below remains the cache-disabled
+baseline. The 2026-11-03 table is historical and local-memory-assisted.
+
+### 2026-11-05 shared-PostgreSQL-only run
+
+`just trino` now defaults the gateway read cache off. The complete report at
+`.tmp/verify/analytics.actpBG/trino.json` (SHA-256
+`031354c74575ea2dfca09231d4d75f9a0ab23e6ac98602fdf5abb1e9dcff95b2`) used
+cache 0, pool 8, gateway/origin fill 8, repeat 3, 20 ms origin latency, a
+1 MiB range chunk and SF10; `tuned_months` is 78. It was built from `85d58e9`
+plus a dirty working tree, not released v0.6; binary SHA-256
+`4991ccda932319e76ccad1b6b836dd82ac4eaef31c8b2a5c6329784cb765fbc4`.
+Coordinator milliseconds are medians of three executions; cold is the first
+execution in the sequenced run, not a fresh cache per query:
+
+| Query | Direct | Cold, first | Warm, median | Alluxio, median | Direct, MemoryBlobCache | Warm, MemoryBlobCache |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `count(*)` | 223 | 457 | 71 | 112 | 57 | 59 |
+| One month | 169 | 118 | 54 | 85 | 40 | 40 |
+| One `orderkey` | 318 | 644 | 131 | 148 | 86 | 74 |
+| TPC-H Q1 | 348 | 144 | 174 | 161 | 100 | 100 |
+| `big` one `orderkey` | 253 | 400 | 164 | 154 | 182 | 146 |
+| `big` one month | 460 | 1,013 | 341 | 197 | 403 | 321 |
+| `big` Q1 | 835 | 900 | 720 | 560 | 777 | 708 |
+
+All origin-cache warm roles, including the coordinator-MemoryBlobCache variant,
+plus tuned-warm and write-through observations had `origin_reads_total` 0.
+Large scans remain slower than Alluxio (`big` one month 341 vs 197 ms; `big`
+Q1 720 vs 560 ms). The two MemoryBlobCache columns use the legacy
+`... trino metadata cache` role keys: Trino's coordinator MemoryBlobCache stores
+engine metadata and, when coordinator and worker are co-located, small data
+files that pass its 8 MiB filter. They are secondary observations, not the
+strict standalone comparison. This engine cache narrows some of the warm
+advantage: with it, `count(*)` is 57 ms direct against 59 ms warm. This is one
+host's role comparison, not a universal near-Alluxio parity claim, an engine
+ranking or a multi-cluster capacity result.
+
+The matched 78-month tuned comparison keeps rows fixed while changing layout:
+warm `count(*)` 71 → 38 ms, `big` one month 341 → 149 ms, but `big` one `orderkey`
+164 → 257 ms. The rebuild helps these scans and hurts that lookup; it is not a
+general layout winner. The 2026-11-03 layout table below remains historical and
+changed its row cohort.
+
+### 2026-11-03 local-memory-assisted run (historical)
+
+The 2026-11-03 table below used that 3 GiB local cache on both cache gateways,
+so its cold and warm columns are local-memory-assisted, not
+shared-PostgreSQL-only latency. Its cold column also predates the synchronous
+range-fill publication fix, so those first reads include the old fill behavior.
+Cache gateways otherwise ran `--pool-max 8` and a 1 MiB `--range-cache-chunk`
+(the origin gateway has no read cache). New runs record the effective gateway
+cache, pool and fill settings, source/binary/host identity and engine image tags
+in `trino.json`.
+
+Measured 2026-11-03 on the 16-thread Intel Core Ultra laptop, with the 3 GiB
+gateway-local cache enabled (coordinator milliseconds, median of 3; cold is the
+first run on gateway B; the last two columns keep Trino's coordinator
+MemoryBlobCache, the legacy metadata-cache role keys, which can include small
+data files when coordinator and worker are co-located). Cold here means the
+first execution in a sequenced run, not a cache reset before every query; later
+queries can reuse fills published by earlier ones. This table is historical and
+local-memory-assisted; it is not a current shared-PostgreSQL result.
+
+| Query | Direct | Cold | Warm | Alluxio | Direct, MemoryBlobCache | Warm, MemoryBlobCache |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `count(*)` | 232 | 457 | 74 | 122 | 61 | 68 |
 | One month | 173 | 125 | 62 | 95 | 44 | 43 |
@@ -482,23 +591,33 @@ columns keep Trino's metadata cache):
 | `big` one month | 531 | 1,034 | 250 | 239 | 436 | 236 |
 | `big` Q1 | 916 | 784 | 652 | 638 | 879 | 652 |
 
-Warm reads are 1.4–3.1x faster than direct and level with Alluxio's local
-tmpfs cache on every query. A first cold read costs up to 2x direct for
-selective lookups and the large one-month scan, which wait on fills, but is
-faster than direct for the one-month filter and both Q1 scans. Month-by-month
-`INSERT`s through the write-through tier take about as long as direct ones
-(1.15 s against 1.18 s) because each commit's files reach the origin before the
-PUT returns.
+In that local run, warm reads were 1.4–3.1x faster than direct and roughly
+level with Alluxio's local tmpfs cache; the Alluxio comparison is within this
+host's run-to-run noise, not a general engine ranking. A first cold read costs
+up to 2x direct for selective lookups and the large one-month scan, which wait
+on fills, but is faster than direct for the one-month filter and both Q1 scans.
+Month-by-month `INSERT`s in that run took 1.15 s through the tier against
+1.18 s direct. These use different monthly batches, so they do not isolate
+write-path overhead. The harness does not run a matched DuckLake workload;
+these Trino-internal role comparisons do not rank Trino against DuckLake.
 
 Run-to-run noise on the laptop is 20–30% even for roles that never touch the
-cache gateways, so only ratios within one run are meaningful. Raising
-`--pool-max` from 8 to 32 changed no ratio; once the deadlocks below were
-fixed, the pool was not the limit. A 4 MiB range chunk moved time from warm to
-cold reads without a net gain.
+cache gateways, so only ratios within one run are meaningful. One laptop trial
+raising `--pool-max` from 8 to 32 changed no ratio; that single observation does
+not prove the pool had spare capacity or replace a pool-wait/saturation
+measurement. A 4 MiB range chunk moved time from warm to cold reads without a
+net gain.
 
-Table layout matters as much as the cache. The benchmark then copies
-`lineitem` into one snapshot (one CTAS instead of 84 commits) and rewrites
-`big` with `sorted_by = ARRAY['shipdate']`:
+Table layout matters too. The current benchmark rebuilds the 78-month build
+cohort with one CTAS, creating a new current table snapshot whose current
+metadata points at one manifest; historical Nessie commits remain, but planning
+does not replay them. It compares direct/cold/warm on those same 78 months
+(recorded as `tuned_months` in `trino.json`), holding rows constant, and gives
+`big` the same `sorted_by = ARRAY['shipdate']` rewrite as before.
+
+Historical 2026-11-03 layout run (not an isolated comparison: it rebuilt after
+the six write-through/appended months, so layout and row cohort changed
+together):
 
 | Query | Direct | Cold | Warm | Warm, original layout |
 | --- | ---: | ---: | ---: | ---: |
@@ -509,19 +628,25 @@ Table layout matters as much as the cache. The benchmark then copies
 | `big` one month | 333 | 518 | 105 | 250 |
 | `big` Q1 | 737 | 818 | 453 | 652 |
 
-Compaction speeds every `lineitem` query on every endpoint (`count(*)` falls
-from 81 origin reads to 4). Sorting by `shipdate` lets row-group statistics
-prune the one-month scan, 2.4x faster warm, but loses the `orderkey`
-clustering the original CTAS had, so the key lookup gets slower. Sort by the
-columns that queries filter on.
+In that historical run, the one-snapshot rebuild improved most `lineitem`
+queries, but not every query on every endpoint: cold one-`orderkey` rose from
+665 to 736 ms. It cuts `count(*)` origin reads from 81 to 4. Sorting by
+`shipdate` lets row-group statistics prune the one-month scan, 2.4x faster warm,
+but loses the `orderkey` clustering the original CTAS had, so the key lookup
+gets slower. Sort by the columns that queries filter on. Current runs keep the
+78-month cohort fixed, so use their `tuned` records for layout conclusions.
 
-Warm gains came from three changes. `ReadMany` serves files whose bytes are in
-the gateway read cache from memory (metadata still comes from PostgreSQL) and
-splits the rest across chunk connections. Range responses stream the cached
-chunk slices instead of copying them into one buffer; a CPU profile had
-`memmove` and `memclr` at 45% of the warm gateway's time. Cold fills return
-the origin bytes at once and store the chunks behind the response, serving
-them from memory until stored.
+Three implementation details shape the warm path. `ReadMany` serves files
+whose bytes are in the gateway read cache from memory (metadata still comes
+from PostgreSQL) and splits the rest across chunk connections. Range responses
+stream the cached chunk slices instead of copying them into one buffer; a CPU
+profile had `memmove` and `memclr` at 45% of the warm gateway's time. Range
+fills now read each missing run from the origin once, publish each aligned
+chunk to PostgreSQL synchronously with bounded store concurrency, and only then
+assemble the response. Synchronous publication is a correctness change, not a
+measured warm gain. A successfully published fill is immediately visible to
+other gateways sharing PostgreSQL; store errors are best-effort, logged, and
+the response still uses the fetched bytes.
 
 The first runs of this benchmark found two connection-pool deadlocks that
 only a burst of concurrent large reads exposes. Cold `big` one-month took

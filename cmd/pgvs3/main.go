@@ -54,6 +54,20 @@ var describeFlags func(command string, fs *flag.FlagSet)
 
 var errDescribed = errors.New("flags described")
 
+// reportedFlagError marks a flag.Parse error whose output the flag package
+// already wrote, so callers do not print it twice.
+type reportedFlagError struct{ err error }
+
+func (e *reportedFlagError) Error() string { return e.err.Error() }
+func (e *reportedFlagError) Unwrap() error { return e.err }
+
+func flagExitCode(err error) int {
+	if errors.Is(err, flag.ErrHelp) {
+		return 0
+	}
+	return 2
+}
+
 var commandByName = indexCommands(commandTable)
 
 func indexCommands(table []command) map[string]command {
@@ -202,7 +216,10 @@ func parseServeConfig(args []string) (serveConfig, error) {
 		return serveConfig{}, err
 	}
 	if err := fs.Parse(args); err != nil {
-		return serveConfig{}, err
+		return serveConfig{}, &reportedFlagError{err: err}
+	}
+	if fs.NArg() > 0 {
+		return serveConfig{}, fmt.Errorf("unexpected serve argument %q", fs.Arg(0))
 	}
 	if cfg.spoolMaxBytes <= 0 || cfg.poolMax <= 0 || cfg.maxConns <= 0 || cfg.fillConcurrency <= 0 ||
 		cfg.s3Concurrency <= 0 || cfg.queueConcurrency <= 0 || cfg.respConcurrency <= 0 {
@@ -222,6 +239,13 @@ func parseServeConfig(args []string) (serveConfig, error) {
 func serve(args []string) int {
 	cfg, err := parseServeConfig(args)
 	if err != nil {
+		if errors.Is(err, errDescribed) {
+			return 0
+		}
+		if _, ok := errors.AsType[*reportedFlagError](err); ok {
+			return flagExitCode(err)
+		}
+		fmt.Fprintf(os.Stderr, "pgvs3 serve: %v\n", err)
 		return 2
 	}
 	log := newLogger(cfg.logLevel)
@@ -426,7 +450,7 @@ func withStore(name string, args []string, timeout time.Duration, checkLayout bo
 		return 0
 	}
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return flagExitCode(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -703,7 +727,7 @@ func health(args []string) int {
 		return 0
 	}
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return flagExitCode(err)
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(*u)

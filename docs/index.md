@@ -40,7 +40,7 @@ exact arithmetic, not a model; rerun them on your own hardware.
 | Question | Tool | Example output on the dev host |
 | --- | --- | --- |
 | How many PostgreSQL connections does the fleet need? | `pgvs3 doctor --gateways N --pool-max P` | 2 gateways at the default pool-max need (2 + 1 surge) × (64 main + 64 chunk) = 384. On a 256-connection server: `FAIL connections … raise max_connections to at least 387, or run --pool-max 42`. |
-| How fast is one stream? | `just sol` | 256 MiB PUT 318 MiB/s, 95% of a raw PostgreSQL `COPY`; 256 MiB GET 1,213 MiB/s, 48% of its floor ([full table](performance.md#speed-of-light)). |
+| How fast is one stream? | `just sol` | The latest dev-host 256 MiB PUT/GET rates and their percentages of the raw PostgreSQL `COPY` and loopback HTTP floors are in the [speed-of-light table](performance.md#speed-of-light). |
 | How much writer RAM does a wide DuckLake table need? | 122,880 rows × row bytes | See below. |
 
 DuckDB writes Parquet row groups of `parquet_row_group_size` = 122,880 rows by

@@ -102,10 +102,13 @@ The DuckLake catalog and the pgvs3 objects share a cluster but commit in
 - **Shared coordination.** Fills, the write-back outbox and maintenance coordinate
   through leases, fences and advisory locks in PostgreSQL. Gateway memory and
   scratch files are never the copy of record.
-- **Measured against the hardware.** Writes run at the raw PostgreSQL `COPY`
-  floor. Whole-object GETs reach 83–89% of the loopback HTTP floor and 8 MiB
-  ranges 53–58%; an opt-in gateway cache of immutable blocks serves hot reads
-  several times faster. See [speed of light](docs/performance.md#speed-of-light).
+- **Measured against the hardware.** On this host, writes reach 57–83% of the
+  raw PostgreSQL `COPY` rate; whole-object GETs reach 83–89% of the loopback
+  HTTP floor and 8 MiB ranges 53–58%. These local ratios show the observed gap
+  on one host; profile gateway, WAL and disk before attributing it, and do not
+  treat them as proof of gateway headroom or a ceiling elsewhere. An opt-in
+  gateway cache of immutable blocks serves hot reads several times faster. See
+  [speed of light](docs/performance.md#speed-of-light).
 
 ## Operate it
 

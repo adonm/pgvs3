@@ -49,29 +49,32 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish container image (amd64 + arm64) and Helm chart to GHCR
+      - name: Publish container image (amd64 + arm64); tag builds also publish Helm chart
         run: |
           set -euo pipefail
-          mkdir -p .tmp/pgvs3
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             ver="${GITHUB_REF_NAME}"
             semver="${ver#v}"
             tags="${ver},${semver},latest"
           else
             ver="${GITHUB_SHA::7}"
-            semver="0.3.0"
             tags="latest,${ver}"
+          fi
+          mise exec helm -- helm lint deploy/charts/pgvs3
+          # Main builds publish only container tags. Validate and package a
+          # release chart before building an image; push it only after success.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            mkdir -p .tmp/pgvs3
+            mise exec helm -- helm package deploy/charts/pgvs3 \
+              -d .tmp/pgvs3 --version "${semver}" --app-version "${ver}"
           fi
           mise exec go ko -- ko build --bare \
             --platform=linux/amd64,linux/arm64 \
             --tags "${tags}" \
             --ldflags "-s -w -X main.version=${ver}" \
             ./cmd/pgvs3
-          mise exec helm -- helm lint deploy/charts/pgvs3
-          mise exec helm -- helm package deploy/charts/pgvs3 \
-            -d .tmp/pgvs3 --version "${semver}" --app-version "${ver}"
-          mise exec helm -- helm push ".tmp/pgvs3/pgvs3-${semver}.tgz" "${CHART_REPO}"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            mise exec helm -- helm push ".tmp/pgvs3/pgvs3-${semver}.tgz" "${CHART_REPO}"
             if gh release view "${ver}" >/dev/null 2>&1; then
               gh release upload "${ver}" ".tmp/pgvs3/pgvs3-${semver}.tgz" --clobber
             else

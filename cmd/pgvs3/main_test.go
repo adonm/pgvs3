@@ -1,7 +1,10 @@
 package main
 
 import (
+	"io"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +33,8 @@ func TestSelectCommand(t *testing.T) {
 		{in: []string{"version"}, wantCmd: "version", wantOK: true},
 		{in: []string{"--addr=127.0.0.1:8014", "serve"}, wantCmd: "serve", wantOK: true},
 		{in: []string{"--url", "postgres://localhost/pgvs3", "stat"}, wantCmd: "stat", wantOK: true},
+		{in: []string{"--read-only", "serve", "--addr", "127.0.0.1:8014"}, wantCmd: "serve", wantOK: true},
+		{in: []string{"serve", "--url", "postgres://localhost/pgvs3"}, wantCmd: "serve", wantOK: true},
 		{in: []string{"unknown", "serve"}, wantOK: false},
 		{in: []string{"--", "serve"}, wantOK: false},
 	}
@@ -56,6 +61,27 @@ func clearServeEnv(t *testing.T) {
 	} {
 		t.Setenv(key, "")
 	}
+}
+
+func runCaptured(t *testing.T, args ...string) (int, string) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stderr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	old := os.Stderr
+	os.Stderr = f
+	defer func() { os.Stderr = old }()
+	code := run(args)
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code, string(out)
 }
 
 func TestParseServeConfigDefaults(t *testing.T) {
@@ -234,11 +260,86 @@ func TestParseServeConfigRejectsInvalidLimits(t *testing.T) {
 	}
 }
 
-func TestParseServeConfigRejectsMalformedEnv(t *testing.T) {
-	clearServeEnv(t)
-	t.Setenv("PGVS3_POOL_MAX", "not-a-number")
-	if _, err := parseServeConfig(nil); err == nil {
-		t.Fatal("parseServeConfig accepted malformed PGVS3_POOL_MAX")
+func TestServePrintsConfigErrors(t *testing.T) {
+	cases := []struct {
+		name     string
+		envKey   string
+		envValue string
+		args     []string
+		want     string
+	}{
+		{
+			name: "malformed environment", envKey: "PGVS3_POOL_MAX", envValue: "not-a-number",
+			args: []string{"serve"}, want: "PGVS3_POOL_MAX",
+		},
+		{
+			name: "invalid validation", args: []string{"serve", "--pool-max", "0"},
+			want: "limits must be positive",
+		},
+		{
+			name: "unknown flag is not repeated", args: []string{"serve", "--not-a-flag"},
+			want: "flag provided but not defined",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearServeEnv(t)
+			if tc.envKey != "" {
+				t.Setenv(tc.envKey, tc.envValue)
+			}
+			code, stderr := runCaptured(t, tc.args...)
+			if code != 2 {
+				t.Fatalf("exit = %d, want 2; stderr=%q", code, stderr)
+			}
+			if strings.Count(stderr, tc.want) != 1 {
+				t.Fatalf("stderr = %q, want exactly one %q", stderr, tc.want)
+			}
+		})
+	}
+}
+
+func TestHelpSucceeds(t *testing.T) {
+	for _, args := range [][]string{
+		{"--help"},
+		{"serve", "--help"},
+		{"stat", "--help"},
+		{"health", "--help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			clearServeEnv(t)
+			code, stderr := runCaptured(t, args...)
+			if code != 0 {
+				t.Fatalf("run(%v) = %d, want 0; stderr=%q", args, code, stderr)
+			}
+			if !strings.Contains(stderr, "Usage of ") {
+				t.Fatalf("run(%v) did not print usage; stderr=%q", args, stderr)
+			}
+		})
+	}
+}
+
+func TestRunRejectsUnexpectedServeArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"typo before flags", []string{"nonsense", "--url", "postgres://localhost/pgvs3"}, `unexpected serve argument "nonsense"`},
+		{"typo after flags", []string{"--url", "postgres://localhost/pgvs3", "nonsense"}, `unexpected serve argument "nonsense"`},
+		{"extra serve arg", []string{"serve", "extra"}, `unexpected serve argument "extra"`},
+		{"arg after terminator", []string{"--", "serve"}, `unexpected serve argument "serve"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearServeEnv(t)
+			code, stderr := runCaptured(t, tc.args...)
+			if code != 2 {
+				t.Fatalf("run(%v) = %d, want 2; stderr=%q", tc.args, code, stderr)
+			}
+			if !strings.Contains(stderr, tc.want) {
+				t.Fatalf("stderr = %q, want it to contain %q", stderr, tc.want)
+			}
+		})
 	}
 }
 

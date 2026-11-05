@@ -129,14 +129,19 @@ iceberg:
 
 # Trino 484 + Nessie 0.109 (JDBC version store in the same PostgreSQL) on TPC-H
 # lineitem committed month by month plus one large-file CTAS: direct origin,
-# cache tier, Trino's Alluxio cache, then a compacted and sorted layout.
+# cache tier, Trino's Alluxio cache, then a one-snapshot rebuild and sorted
+# layout. Cache gateways read shared PostgreSQL chunks by default
+# (PGVS3_READ_CACHE_BYTES=0); set 3221225472 for the optional 3 GiB
+# gateway-local cache used by the 2026-11-03 historical and 2026-11-05 paired tables.
 # PGVS3_TRINO_ORIGIN_MS=20, PGVS3_TRINO_REPEAT=3, PGVS3_TRINO_BIG_SCALE=sf10,
 # PGVS3_TRINO_RANGE_CHUNK=1048576, PGVS3_TRINO_FILL_CONCURRENCY (per tier),
-# PGVS3_READ_CACHE_BYTES=3221225472 and PGVS3_POOL_MAX=8 (cache gateways).
+# PGVS3_POOL_MAX=8 (cache gateways). PGVS3_TRINO_PAIRED_CYCLES=15 enables the
+# ABBA paired warm runs; PGVS3_TEST_PPROF_A plus PGVS3_TRINO_PROFILE=1 opts into
+# the separate profile diagnostic.
 # Pulls two container images.
 [group('dev')]
 trino:
-    PGVS3_READ_CACHE_BYTES=${PGVS3_READ_CACHE_BYTES:-3221225472} PGVS3_ANALYTICS=trino bash deploy/bench/stack.sh analytics
+    PGVS3_READ_CACHE_BYTES=${PGVS3_READ_CACHE_BYTES:-0} PGVS3_ANALYTICS=trino bash deploy/bench/stack.sh analytics
 
 # Bound SQL/API workload recipes and failure windows in the existing disposable fixture.
 [group('test')]

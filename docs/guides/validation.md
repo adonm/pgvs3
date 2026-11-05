@@ -131,9 +131,10 @@ vendor binaries or vendor performance tests.
 
 - `.tmp/verify/guides.OFzcOK`: diagnostic query failed on ambiguous `relname`.
   Fixed the **shown** query to `t.relname`; the failed report/log remain.
-- `.tmp/verify/guides.7mk8au`: harness assumed `serve --help` exited zero. The
-  existing CLI exits two; the harness now checks its real status/output instead
-  of changing runtime behavior. Failed evidence remains.
+- `.tmp/verify/guides.7mk8au`: the original CLI exited two from `serve --help`;
+  the harness then expected zero. On 2026-11-05 the CLI help path was corrected
+  to exit zero, and the guide test now expects zero while still checking the
+  real flag/default output. Historical failed evidence remains.
 - `.tmp/verify/guides.GPIO9D`: expected count for `events_hash32` after deleting
   `id < 4096` was written as `72` instead of `71` (`4096 = 8 × 500 + 96`, removing
   9 of the 80 rows for `customer_id = 42`). Fixed the documented expected value

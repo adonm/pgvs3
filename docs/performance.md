@@ -52,12 +52,14 @@ compare against that understated floor.
 
 What it says:
 
-- **Writes are at the floor.** PUT is 57–83% of a raw PostgreSQL `COPY` here
-  (77–96% in the earlier desktop run). Faster single-stream writes need a
-  faster PostgreSQL write path (WAL, disk), not gateway work.
-- **Reads are bound by HTTP, not PostgreSQL.** Eight connections deliver
-  2.5–5.8 GiB/s and one ~0.8–1.2 GiB/s, so the loopback HTTP floor binds every
-  read. Whole-object GET reaches 2.1–3.3 GiB/s (83–89% of floor).
+- **Writes have a remaining gap to the PostgreSQL floor.** PUT is 57–83% of a
+  raw PostgreSQL `COPY` here (77–96% in the earlier desktop run). The gap alone
+  does not show whether gateway, WAL or disk accounts for it; profile those
+  before attributing it. It does not prove the gateway has no headroom.
+- **Reads sit below the loopback HTTP floor in this run.** Eight connections
+  deliver 2.5–5.8 GiB/s and one ~0.8–1.2 GiB/s; whole-object GET reaches
+  2.1–3.3 GiB/s (83–89% of that floor). The floor is a measured local
+  reference, not a proven universal bottleneck.
 - **Ranges pay fixed setup.** An 8 MiB range reaches 1.0–2.0 GiB/s (53–58%).
   Metadata, the read guard and each worker's first rows cost about 1–1.5 ms
   before the first byte on this host, a quarter to a third of the request.
@@ -165,14 +167,23 @@ come from, not who owns them:
   the namespace `objects` table OID plus `file_id` and block number. File IDs are
   never reused within a table and the OID changes on drop/restore, so a key
   never names different content and nothing needs invalidating.
-- **Fills while streaming.** Reads aligned to whole blocks store blocks as they
-  pass through. A fully cached span needs no chunk connection, pin or snapshot;
-  partly cached spans serve cached pieces in order and query the rest.
+- **Memory hits and shared fills.** A fully cached span needs no chunk
+  connection, pin or snapshot; partly cached spans serve cached pieces in
+  order. Local misses read PostgreSQL rows, and batched `ReadMany` may cache
+  whole aligned range-chunk files as well as 32-row blocks. Only missing
+  shared origin range chunks fetch the origin once, publish each chunk to
+  PostgreSQL synchronously with bounded store concurrency, then assemble the
+  response. Store failures are logged and the response still uses the fetched
+  bytes.
 - **Scan resistant.** Each shard runs S3-FIFO: new blocks enter a small queue
   and only blocks read again move to the main queue, so one large scan cannot
   flush hot footers and row groups.
 - **Per gateway.** Replicas do not share it; PostgreSQL remains the shared cache
   across gateways and standbys. Count the budget inside `GOMEMLIMIT`.
+
+The budget bounds retained cache residency, not process RSS, scratch spool,
+request/response buffers or other in-flight work. A request can span many
+chunks, so keep headroom for concurrent fills and response assembly.
 
 Measured above: warm whole-object reads 2.3–2.6× faster for one client and about
 3.5× higher aggregate for eight, with gateway CPU per byte falling from ~0.9 to

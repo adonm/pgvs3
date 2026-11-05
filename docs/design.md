@@ -98,9 +98,11 @@ API.
 ## Shape of the system
 
 - **One binary, one port.** S3, OJS and plain HTTP share the HTTP listener;
-  RESP2 is detected from the first byte. There is no sidecar, no local object
-  authority, and no per-pod cache of object bytes or metadata. Scratch spools and
-  local/test origin providers are not production copies of record.
+  RESP2 is detected from the first byte. There is no sidecar and no local object
+  or metadata authority. An optional bounded gateway read cache may retain
+  immutable chunk bytes, but every request checks PostgreSQL metadata first;
+  scratch spools and local/test origin providers are not production copies of
+  record.
 - **One PostgreSQL schema per namespace.** `s3b_<name>` is a durable bucket,
   `s3c_<name>` the WAL-logged shared cache namespace (origin fills and
   RESP/cache users), `s3w_<name>` a WAL-logged write-back namespace, and

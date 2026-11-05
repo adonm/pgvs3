@@ -1352,7 +1352,6 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 		t.Fatalf("metadata became a body: %v", err)
 	}
 
-	f.tier.stores.Wait()
 	ro, err := New(nil, []byte(`{"type":"ephemeral"}`), testStore, f.tier.runtime, TierOptions{
 		Namespace: f.tier.namespace, TTL: time.Hour, Retention: time.Hour, MaxFills: 1, ReadOnly: true, RangeChunk: 64 << 10,
 	})
@@ -1386,6 +1385,126 @@ type rangeCountingOrigin struct {
 func (o *rangeCountingOrigin) GetRange(ctx context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
 	o.ranges.Add(1)
 	return o.originHandle.GetRange(ctx, key, offset, length, ifMatch)
+}
+
+type fetchedRangeOrigin struct {
+	originHandle
+	fetched chan struct{}
+	once    sync.Once
+}
+
+func (o *fetchedRangeOrigin) GetRange(ctx context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
+	rc, err := o.originHandle.GetRange(ctx, key, offset, length, ifMatch)
+	if err == nil {
+		o.once.Do(func() { close(o.fetched) })
+	}
+	return rc, err
+}
+
+func TestRangeFillPublishesBeforeReturn(t *testing.T) {
+	const chunk = 64 << 10
+	ctx, cancel := context.WithTimeout(testCtx, 20*time.Second)
+	defer cancel()
+	f := newFixture(t, TierOptions{TTL: time.Hour, RangeChunk: chunk})
+	data := bytes.Repeat([]byte("p"), (9<<20)+17)
+	ck := f.tier.key("bkt", "slow-publish")
+	attrs, err := f.tier.origin.Upload(ctx, ck, bytes.NewReader(data), int64(len(data)), originUpload{ContentType: "application/octet-stream"})
+	testutil.Must(t, err)
+	schema, err := ns.Cache.Schema(f.tier.namespace)
+	testutil.Must(t, err)
+	chunkKey := rangeChunkKey(ck, 0, attrs.ETag)
+
+	// Block the shared chunk publication at the same advisory lock publish_value
+	// takes. A completed fill must wait for that publication before returning.
+	tx, err := testStore.Pool().Begin(ctx)
+	testutil.Must(t, err)
+	t.Cleanup(func() { _ = tx.Rollback(context.WithoutCancel(ctx)) })
+	_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1 || E'\x1f' || $2, 0))`, schema, chunkKey)
+	testutil.Must(t, err)
+
+	counted := &fetchedRangeOrigin{originHandle: f.tier.origin, fetched: make(chan struct{})}
+	f.tier.origin = counted
+	type result struct {
+		body []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	rng := store.Range(100, 199, -1)
+	go func() {
+		obj, err := f.tier.Open(ctx, "bkt", "slow-publish", rng)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		body, err := io.ReadAll(obj.Body)
+		_ = obj.Body.Close()
+		done <- result{body: body, err: err}
+	}()
+
+	var pending *result
+	select {
+	case <-counted.fetched:
+	case <-ctx.Done():
+		t.Fatalf("range fill did not reach the origin: %v", ctx.Err())
+	case res := <-done:
+		select {
+		case <-counted.fetched:
+			pending = &res
+		default:
+			if res.err != nil {
+				t.Fatalf("range fill failed before fetching the origin: %v", res.err)
+			}
+			t.Fatal("range fill completed without fetching the origin")
+		}
+	}
+	testutil.Eventually(t, 5*time.Second, "range publication did not block on the advisory lock", func() bool {
+		var waiting bool
+		testutil.Must(t, testStore.Pool().QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_locks
+			WHERE locktype = 'advisory' AND NOT granted
+			  AND objid = ((hashtextextended($1, 0) & 4294967295)::bigint)::oid
+		)`, schema+"\x1f"+chunkKey).Scan(&waiting))
+		return waiting
+	})
+	if pending != nil {
+		t.Fatalf("range fill returned before its cache publication completed: %+v", *pending)
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("range fill returned before its cache publication completed: %+v", res)
+	default:
+	}
+
+	testutil.Must(t, tx.Rollback(context.WithoutCancel(ctx)))
+	var filled result
+	select {
+	case filled = <-done:
+	case <-ctx.Done():
+		t.Fatalf("range fill did not finish after publication was released: %v", ctx.Err())
+	}
+	testutil.Must(t, filled.err)
+	if !bytes.Equal(filled.body, data[100:200]) {
+		t.Fatalf("range fill returned wrong bytes: %q", filled.body)
+	}
+
+	ro, err := New(nil, []byte(`{"type":"ephemeral"}`), testStore, f.tier.runtime, TierOptions{
+		Namespace: f.tier.namespace, TTL: time.Hour, Retention: time.Hour, MaxFills: 1, ReadOnly: true, RangeChunk: chunk,
+	})
+	testutil.Must(t, err)
+	defer ro.Close()
+	other := &rangeCountingOrigin{originHandle: ro.origin}
+	ro.origin = other
+	obj, err := ro.Open(ctx, "bkt", "slow-publish", rng)
+	testutil.Must(t, err)
+	if !obj.Hit {
+		t.Fatal("second tier range read missed the shared cache")
+	}
+	if got := readObject(t, obj); got != string(data[100:200]) {
+		t.Fatalf("second tier read = %q", got)
+	}
+	if got := other.ranges.Load(); got != 0 {
+		t.Fatalf("second tier issued %d origin range GETs", got)
+	}
 }
 
 func TestRangeRunsFetchOncePerGap(t *testing.T) {

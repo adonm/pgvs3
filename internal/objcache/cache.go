@@ -49,11 +49,6 @@ type Tier struct {
 	closeOnce      sync.Once
 	closeErr       error
 	fillTTL        time.Duration
-	// storing holds range chunks, by key, whose write-behind store is running.
-	storing      sync.Map
-	stores       sync.WaitGroup
-	storesMu     sync.Mutex
-	storesClosed bool
 }
 
 const (
@@ -205,10 +200,6 @@ func (t *Tier) Close() error {
 		if t.cancel != nil {
 			t.cancel()
 		}
-		t.storesMu.Lock()
-		t.storesClosed = true
-		t.storesMu.Unlock()
-		t.stores.Wait()
 		if t.workerStarted {
 			<-t.done
 		}
@@ -624,24 +615,9 @@ func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Obje
 	for i, off := range offsets {
 		keys[i] = rangeChunkKey(ck, off, v.ETag)
 	}
-	// Check write-behind chunks first: one leaves storing only after its row
-	// commits, so a key missing here is visible to the ReadMany that follows.
-	chunks := make([][]byte, len(keys))
-	var lookup []string
-	var at []int
-	for i, k := range keys {
-		if b, ok := t.storing.Load(k); ok {
-			chunks[i] = b.([]byte)
-		} else {
-			lookup, at = append(lookup, k), append(at, i)
-		}
-	}
-	stored, err := t.store.Cache(t.namespace).ReadMany(ctx, lookup)
+	chunks, err := t.store.Cache(t.namespace).ReadMany(ctx, keys)
 	if err != nil {
 		return nil, err
-	}
-	for j, i := range at {
-		chunks[i] = stored[j]
 	}
 	present := func(i int) bool { return chunks[i] != nil && int64(len(chunks[i])) == t.rangeChunkLen(v, offsets[i]) }
 	hit := true
@@ -665,96 +641,74 @@ func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Obje
 		hit = false
 		i = j + 1
 	}
-	parts := make([]io.Reader, len(offsets))
+	parts := make([][]byte, len(offsets))
 	var assembled int64
 	for i, off := range offsets {
 		part := chunks[i][max(start-off, 0):min(end-off+1, int64(len(chunks[i])))]
-		parts[i] = bytes.NewReader(part)
+		parts[i] = part
 		assembled += int64(len(part))
 	}
 	if assembled != end-start+1 {
 		return nil, fmt.Errorf("range cache assembled %d bytes, wanted %d", assembled, end-start+1)
 	}
 	v.hit = hit
-	return newObject(v, io.NopCloser(io.MultiReader(parts...))), nil
+	return newObject(v, store.NewPartsBody(parts)), nil
 }
 
 // fillRangeRun fetches the aligned chunks first..last (offsets) with one
-// origin GET and returns them at once; each is stored as its own cache object
-// behind the response, still holding the fill slots so writes stay bounded,
-// and is served from memory until stored. Chunk keys carry the origin
-// version, so a concurrent fill elsewhere writes identical bytes and needs no
-// fill lease.
+// origin GET and stores each as its own cache object before returning. Store
+// failures remain best effort, but a successfully published fill is
+// immediately visible to other tiers sharing PostgreSQL. Chunk keys carry the
+// origin version, so a concurrent fill elsewhere writes identical bytes and
+// needs no fill lease.
 func (t *Tier) fillRangeRun(ctx context.Context, ck, key string, v readView, first, last int64) ([][]byte, error) {
 	version := v.ETag
 	length := last + t.rangeChunkLen(v, last) - first
 	ch := t.group.DoChan(fmt.Sprintf("range:%s:%x:%x:%s", ck, first, length, version), func() (any, error) {
 		fillCtx, cancel := context.WithTimeout(t.baseContext(), 2*time.Minute)
-		release := cancel
-		fail := func(err error) (any, error) {
-			release()
-			return nil, err
-		}
+		defer cancel()
 		if !acquireProcess(t.runtime.fills, fillCtx) {
-			return fail(fillCtx.Err())
+			return nil, fillCtx.Err()
 		}
-		release = func() { <-t.runtime.fills; cancel() }
+		defer func() { <-t.runtime.fills }()
 		if !acquireProcess(t.fills, fillCtx) {
-			return fail(fillCtx.Err())
+			return nil, fillCtx.Err()
 		}
-		release = func() { <-t.fills; <-t.runtime.fills; cancel() }
+		defer func() { <-t.fills }()
 		rc, err := t.origin.GetRange(fillCtx, ck, first, length, version)
 		if err != nil {
 			if errors.Is(err, errOriginPrecondition) {
 				_ = t.store.Cache(t.namespace).ForgetOriginMetadata(fillCtx, ck, version)
-				return fail(store.ErrStaleCache)
+				return nil, store.ErrStaleCache
 			}
 			if t.origin.IsObjNotFoundErr(err) {
-				return fail(store.ErrNotFound)
+				return nil, store.ErrNotFound
 			}
-			return fail(err)
+			return nil, err
 		}
 		buf := make([]byte, length)
 		_, err = io.ReadFull(rc, buf)
 		_ = rc.Close()
 		if err != nil {
-			return fail(fmt.Errorf("origin range %s at %d: %w", key, first, err))
+			return nil, fmt.Errorf("origin range %s at %d: %w", key, first, err)
 		}
 		var chunks [][]byte
-		var chunkKeys []string
+		g, gctx := errgroup.WithContext(fillCtx)
+		g.SetLimit(4)
 		for off := first; off <= last; off += t.rangeSize {
-			chunks = append(chunks, buf[off-first:off-first+t.rangeChunkLen(v, off)])
-			chunkKeys = append(chunkKeys, rangeChunkKey(ck, off, version))
+			chunk := buf[off-first : off-first+t.rangeChunkLen(v, off)]
+			chunks = append(chunks, chunk)
+			chunkKey := rangeChunkKey(ck, off, version)
+			g.Go(func() error {
+				_, err := t.storeSpooled(gctx, t.cacheRef(chunkKey), spooled{r: bytes.NewReader(chunk), data: chunk, size: int64(len(chunk))},
+					store.WriteOptions{ContentType: v.ContentType, OriginModified: v.CreatedAt,
+						Publication: store.FillPublication(version, version, nil)}, nil)
+				return err
+			})
 		}
-		t.storesMu.Lock()
-		if t.storesClosed {
-			t.storesMu.Unlock()
-			release()
-			return chunks, nil
+		if err := g.Wait(); err != nil {
+			t.log.Debug("range chunk store failed", "key", key, "offset", first, "err", err)
 		}
-		t.stores.Add(1)
-		t.storesMu.Unlock()
-		for i, chunk := range chunks {
-			t.storing.Store(chunkKeys[i], chunk)
-		}
-		go func() {
-			defer t.stores.Done()
-			defer release()
-			g, gctx := errgroup.WithContext(fillCtx)
-			g.SetLimit(4)
-			for i, chunk := range chunks {
-				g.Go(func() error {
-					defer t.storing.Delete(chunkKeys[i])
-					_, err := t.storeSpooled(gctx, t.cacheRef(chunkKeys[i]), spooled{r: bytes.NewReader(chunk), data: chunk, size: int64(len(chunk))},
-						store.WriteOptions{ContentType: v.ContentType, OriginModified: v.CreatedAt,
-							Publication: store.FillPublication(version, version, nil)}, nil)
-					return err
-				})
-			}
-			if err := g.Wait(); err != nil {
-				t.log.Debug("range chunk store failed", "key", key, "offset", first, "err", err)
-			}
-		}()
 		return chunks, nil
 	})
 	select {

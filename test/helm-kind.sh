@@ -22,6 +22,23 @@ kind() { mise exec kind -- kind "$@"; }
 kubectl() { mise exec kubectl -- kubectl --context "kind-$cluster" "$@"; }
 helm() { mise exec helm -- helm --kube-context "kind-$cluster" "$@"; }
 
+check_chart_renders() {
+  local chart=$1 app
+  app=$(mise exec helm -- helm show chart "$chart" |
+    awk '$1 == "appVersion:" {gsub(/"/, "", $2); print $2}')
+  test -n "$app"
+  mise exec helm -- helm template "$release" "$chart" |
+    grep -F "image: \"ghcr.io/adonm/pgvs3:${app}\"" >/dev/null
+  mise exec helm -- helm template "$release" "$chart" \
+    --set-string image=registry.example/pgvs3:custom |
+    grep -F 'image: "registry.example/pgvs3:custom"' >/dev/null
+  # Release tagging overrides both chart versions without editing Chart.yaml.
+  mise exec helm -- helm package "$chart" -d "$PGVS3_TEST_RUN_DIR" \
+    --version 9.9.9 --app-version v9.9.9 >/dev/null
+  mise exec helm -- helm template "$release" "$PGVS3_TEST_RUN_DIR/pgvs3-9.9.9.tgz" |
+    grep -F 'image: "ghcr.io/adonm/pgvs3:v9.9.9"' >/dev/null
+}
+
 cleanup() {
   status=$?
   if [ "$created" = true ]; then
@@ -43,6 +60,7 @@ cleanup() {
 trap cleanup EXIT
 
 main() {
+check_chart_renders "$ROOT/deploy/charts/pgvs3"
 if kind get clusters 2>/dev/null | grep -qx "$cluster"; then
   echo "refusing to replace existing kind cluster $cluster" >&2
   return 1

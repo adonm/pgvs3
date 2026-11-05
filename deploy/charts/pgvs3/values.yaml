@@ -1,5 +1,7 @@
 replicas: 3
-image: ghcr.io/adonm/pgvs3:latest
+# Full image reference override. Empty means ghcr.io/adonm/pgvs3 at the chart
+# appVersion, so a chart release pins the matching container image.
+image: ""
 imagePullPolicy: IfNotPresent
 # Secret with a `url` key (standard libpq/pgx URL; sslmode controls DB TLS).
 urlSecretName: pgvs3-db
