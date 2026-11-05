@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 430" role="img" aria-labelledby="fig6-title fig6-desc">
+  <title id="fig6-title">FIG 06 — Transactional SQL Outbox, OJS Lazy Claims and 3-Segment TRUNCATE Streams</title>
+  <desc id="fig6-desc">Two non-crossing horizontal pipelines showing OJS job outbox/claim/receipt transaction boundaries and PgQue-shaped 3-segment TRUNCATE stream rotation.</desc>
+  <defs>
+    <marker id="f6-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
+    </marker>
+    <marker id="f6-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--purple)"/>
+    </marker>
+    <marker id="f6-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
+    </marker>
+  </defs>
+  <style>
+    svg {
+      color-scheme: light dark;
+      --bg: light-dark(#ffffff, #09090b);
+      --hdr: light-dark(#fafafa, #141418);
+      --lane: light-dark(#fafafa, #18181b);
+      --box: light-dark(#ffffff, #1e1e22);
+      --border: light-dark(#e4e4e7, #303036);
+      --fg: light-dark(#262626, #e5e5e5);
+      --muted: light-dark(#71717a, #a1a1aa);
+      --blue: light-dark(#0284c7, #38bdf8);
+      --success: light-dark(#008032, #6cc070);
+      --warning: light-dark(#a65b00, #f0a030);
+      --danger: light-dark(#d32f2f, #f4807b);
+      --purple: light-dark(#7c3aed, #c084fc);
+      --hit: light-dark(#e6f4ea, #064e3b);
+    }
+    .bg { fill: var(--bg); }
+    .hdr { fill: var(--hdr); stroke: var(--border); stroke-width: 1; }
+    .lane { fill: var(--lane); stroke: var(--border); stroke-width: 1.4; rx: 8; }
+    .b-sql { fill: var(--box); stroke: var(--blue); stroke-width: 1.6; rx: 6; }
+    .b-ojs { fill: var(--box); stroke: var(--purple); stroke-width: 1.6; rx: 6; }
+    .b-ack { fill: var(--hit); stroke: var(--success); stroke-width: 1.6; rx: 6; }
+    .fig { fill: var(--blue); font: 700 10.5px ui-monospace, Consolas, monospace; letter-spacing: 0.06em; }
+    .title { fill: var(--fg); font: 600 14.5px system-ui, -apple-system, sans-serif; }
+    .h3 { fill: var(--fg); font: 600 12.5px system-ui, -apple-system, sans-serif; }
+    .h4 { fill: var(--fg); font: 600 11.5px system-ui, -apple-system, sans-serif; }
+    .sub { fill: var(--muted); font: 400 10.5px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .cb { fill: var(--blue); }
+    .cg { fill: var(--success); }
+    .ca { fill: var(--warning); }
+    .cr { fill: var(--danger); }
+    .cp { fill: var(--purple); }
+    .fc { stroke: var(--blue); stroke-width: 2.3; fill: none; }
+    .fp { stroke: var(--purple); stroke-width: 2.3; fill: none; }
+    .fg { stroke: var(--success); stroke-width: 2.3; fill: none; }
+  </style>
+
+  <rect width="1040" height="430" class="bg" rx="8"/>
+  <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
+  <text x="24" y="27" class="fig">FIG 06</text>
+  <text x="80" y="27" class="title">Queue &amp; Stream Model (s3q_&lt;name&gt;): Outbox Boundaries &amp; 3-Segment TRUNCATE</text>
+
+  <!-- Pipeline 1: OJS Jobs -->
+  <rect x="20" y="56" width="1000" height="168" class="lane"/>
+  <text x="36" y="78" class="h3 cb">1. OJS Competing Jobs — 4 DB Commits, Then an HTTP ACK</text>
+
+  <rect x="36" y="92" width="216" height="114" class="b-sql"/>
+  <text x="48" y="114" class="h4 cb">Tx 1: Producer SQL</text>
+  <text x="48" y="133" class="mono">UPDATE orders +</text>
+  <text x="48" y="149" class="mono">INSERT INTO outbox</text>
+  <text x="48" y="168" class="sub">Rollback leaves 0 jobs</text>
+  <text x="48" y="186" class="mono ca">args: JSON array [...]</text>
+
+  <rect x="284" y="92" width="216" height="114" class="b-ojs"/>
+  <text x="296" y="114" class="h4 cp">Tx 2: Relay Enqueue</text>
+  <text x="296" y="133" class="mono">POST /ojs/v1/jobs</text>
+  <text x="296" y="151" class="sub">Lost reply? Retry POST:</text>
+  <text x="296" y="167" class="sub">409 → GET &amp; verify body</text>
+  <text x="296" y="186" class="mono cr">Mismatch halts &amp; alerts</text>
+
+  <rect x="532" y="92" width="216" height="114" class="b-ojs"/>
+  <text x="544" y="114" class="h4 cp">Tx 3: Lazy Claim</text>
+  <text x="544" y="133" class="mono">FOR UPDATE SKIP LOCKED</text>
+  <text x="544" y="151" class="sub">1 index: (priority DESC,</text>
+  <text x="544" y="167" class="sub">next_visible_at, seq)</text>
+  <text x="544" y="186" class="mono cg">Issues UUIDv7 lease_token</text>
+
+  <rect x="780" y="92" width="224" height="114" class="b-ack"/>
+  <text x="792" y="114" class="h4 cg">Tx 4: Receipt, then ACK</text>
+  <text x="792" y="133" class="mono">INSERT INTO receipts</text>
+  <text x="792" y="151" class="sub">Commits with SQL effect</text>
+  <text x="792" y="167" class="sub">before POST /workers/ack</text>
+  <text x="792" y="186" class="mono ca">Stale token → 409 conflict</text>
+
+  <path d="M 252 149 L 278 149" class="fc" marker-end="url(#f6-b)"/>
+  <path d="M 500 149 L 526 149" class="fp" marker-end="url(#f6-p)"/>
+  <path d="M 748 149 L 774 149" class="fg" marker-end="url(#f6-g)"/>
+
+  <!-- Pipeline 2: PgQue-Shaped Streams -->
+  <rect x="20" y="240" width="1000" height="168" class="lane"/>
+  <text x="36" y="262" class="h3 cg">2. PgQue-Shaped Fan-Out Streams — Snapshot Ticks &amp; Zero-Bloat 3-Segment TRUNCATE</text>
+
+  <rect x="36" y="276" width="248" height="114" class="b-sql"/>
+  <text x="48" y="298" class="h4 cb">Snapshot-Delimited Ticks</text>
+  <text x="48" y="317" class="mono">pg_visible_in_snapshot()</text>
+  <text x="48" y="335" class="sub">Prevents late-commit sequence</text>
+  <text x="48" y="351" class="sub">gaps; `max` ceiling returns 413</text>
+  <text x="48" y="370" class="mono ca">Repeat receive = same batch</text>
+
+  <rect x="316" y="276" width="208" height="114" class="b-sql"/>
+  <text x="328" y="298" class="h4 cb">Segment 0 (Active)</text>
+  <text x="328" y="317" class="mono">stream_events_0</text>
+  <text x="328" y="335" class="sub">Receives appends &amp; retries</text>
+  <text x="328" y="351" class="sub">Rotates at retention / 2</text>
+  <text x="328" y="370" class="mono">(default: 3.5 days)</text>
+
+  <rect x="556" y="276" width="208" height="114" class="b-ojs"/>
+  <text x="568" y="298" class="h4 cp">Segment 1 (Sealed)</text>
+  <text x="568" y="317" class="mono">stream_events_1</text>
+  <text x="568" y="335" class="sub">Records `sealed_xid`</text>
+  <text x="568" y="351" class="sub">Consumers drain batches</text>
+  <text x="568" y="370" class="mono ca">Slow cursor pins segment</text>
+
+  <rect x="796" y="276" width="208" height="114" class="b-ack"/>
+  <text x="808" y="298" class="h4 cg">Segment 2 (Truncate)</text>
+  <text x="808" y="317" class="mono">TRUNCATE TABLE</text>
+  <text x="808" y="335" class="sub">When all cursors pass</text>
+  <text x="808" y="351" class="sub">`sealed_xid` → instant</text>
+  <text x="808" y="370" class="mono cg">OS reclaim · 0 dead tuples</text>
+
+  <path d="M 284 333 L 310 333" class="fc" marker-end="url(#f6-b)"/>
+  <path d="M 524 333 L 550 333" class="fp" marker-end="url(#f6-p)"/>
+  <path d="M 764 333 L 790 333" class="fg" marker-end="url(#f6-g)"/>
+</svg>

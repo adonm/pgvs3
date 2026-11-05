@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 420" role="img" aria-labelledby="fig3-title fig3-desc">
+  <title id="fig3-title">FIG 03 — 8,192-Byte PostgreSQL Page, 8,120-Byte Chunks and Cut-Through I/O</title>
+  <desc id="fig3-desc">Visual byte-scale cross-section of a single 8,192-byte PostgreSQL page holding one 8,120-byte chunk without TOAST, flanked by 4 MiB binary COPY framing and parallel bitmap-scan snapshot readers.</desc>
+  <defs>
+    <marker id="f3-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
+    </marker>
+    <marker id="f3-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
+    </marker>
+  </defs>
+  <style>
+    svg {
+      color-scheme: light dark;
+      --bg: light-dark(#ffffff, #09090b);
+      --hdr: light-dark(#fafafa, #141418);
+      --panel: light-dark(#fafafa, #18181b);
+      --card: light-dark(#ffffff, #1e1e22);
+      --pill: light-dark(#f4f4f5, #27272a);
+      --border: light-dark(#e4e4e7, #303036);
+      --fg: light-dark(#262626, #e5e5e5);
+      --muted: light-dark(#71717a, #a1a1aa);
+      --blue: light-dark(#0284c7, #38bdf8);
+      --success: light-dark(#008032, #6cc070);
+      --warning: light-dark(#a65b00, #f0a030);
+      --purple: light-dark(#7c3aed, #c084fc);
+      --pay: light-dark(#e6f4ea, #064e3b);
+    }
+    .bg { fill: var(--bg); }
+    .hdr { fill: var(--hdr); stroke: var(--border); stroke-width: 1; }
+    .stage { fill: var(--panel); stroke: var(--border); stroke-width: 1.2; rx: 8; }
+    .box { fill: var(--card); stroke: var(--border); stroke-width: 1.4; rx: 6; }
+    .page-frame { fill: var(--card); stroke: var(--blue); stroke-width: 1.8; rx: 8; }
+    .bar-hdr { fill: var(--pill); stroke: var(--border); stroke-width: 1; rx: 4; }
+    .bar-pay { fill: var(--pay); stroke: var(--success); stroke-width: 1.6; rx: 6; }
+    .chip-b { fill: var(--pill); stroke: var(--blue); stroke-width: 1.2; rx: 4; }
+    .chip-g { fill: var(--pill); stroke: var(--success); stroke-width: 1.2; rx: 4; }
+    .fig { fill: var(--blue); font: 700 10.5px ui-monospace, Consolas, monospace; letter-spacing: 0.06em; }
+    .title { fill: var(--fg); font: 600 14.5px system-ui, -apple-system, sans-serif; }
+    .h3 { fill: var(--fg); font: 600 13px system-ui, -apple-system, sans-serif; }
+    .sub { fill: var(--muted); font: 400 10.5px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .cb { fill: var(--blue); }
+    .cg { fill: var(--success); }
+    .ca { fill: var(--warning); }
+    .cp { fill: var(--purple); }
+    .ln-b { stroke: var(--blue); stroke-width: 2.3; fill: none; }
+    .ln-g { stroke: var(--success); stroke-width: 2.3; fill: none; }
+  </style>
+
+  <rect width="1040" height="420" class="bg" rx="8"/>
+  <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
+  <text x="24" y="27" class="fig">FIG 03</text>
+  <text x="80" y="27" class="title">8,192-Byte Page &amp; 8,120-Byte Chunk Pipeline</text>
+  <text x="720" y="26" class="mono cg">offset = no × 8,120 · 0 TOAST tables</text>
+
+  <!-- Stage 1: Write Slicer -->
+  <rect x="20" y="60" width="268" height="340" class="stage"/>
+  <text x="36" y="84" class="h3 cb">1. Write Slicer &amp; Binary COPY</text>
+
+  <rect x="36" y="98" width="236" height="58" class="box"/>
+  <text x="48" y="118" class="mono ca">≤ 64 KiB: Inline Fast Path</text>
+  <text x="48" y="138" class="sub">objects.inline_data (1 PK Upsert)</text>
+
+  <rect x="36" y="170" width="236" height="134" class="box"/>
+  <text x="48" y="192" class="mono cb">&gt; 64 KiB: 8,120 B Block Slicer</text>
+  <rect x="48" y="204" width="50" height="28" class="chip-b"/><text x="56" y="222" class="mono cb">no=0</text>
+  <rect x="104" y="204" width="50" height="28" class="chip-b"/><text x="112" y="222" class="mono cb">no=1</text>
+  <rect x="160" y="204" width="50" height="28" class="chip-b"/><text x="168" y="222" class="mono cb">no=2</text>
+  <rect x="216" y="204" width="42" height="28" class="chip-b"/><text x="230" y="222" class="mono cb">…</text>
+  <rect x="48" y="242" width="210" height="48" class="bar-hdr"/>
+  <text x="58" y="262" class="mono">4 MiB Binary COPY Framer</text>
+  <text x="58" y="279" class="sub">Zstd per block only if it shrinks</text>
+
+  <rect x="36" y="318" width="236" height="64" class="box"/>
+  <text x="48" y="340" class="mono cp">Atomic Publish Swap</text>
+  <text x="48" y="358" class="sub">RETURNING old.file_id → garbage</text>
+
+  <!-- Stage 2: 8,192 B Page Cross-Section -->
+  <rect x="332" y="60" width="376" height="340" class="stage"/>
+  <text x="352" y="84" class="h3 ca">2. Inside One 8,192-Byte PostgreSQL Page</text>
+
+  <rect x="352" y="98" width="336" height="208" class="page-frame"/>
+  <text x="368" y="118" class="sub">Byte 0</text>
+  <text x="618" y="118" class="sub">Byte 8,192</text>
+
+  <rect x="368" y="126" width="304" height="28" class="bar-hdr"/>
+  <text x="380" y="144" class="mono">0..28 B: PageHeaderData + ItemId Pointer</text>
+
+  <rect x="368" y="160" width="304" height="32" class="bar-hdr"/>
+  <text x="380" y="180" class="mono">28..68 B: Tuple Hdr + file_id (8B) + no (4B)</text>
+
+  <rect x="368" y="198" width="304" height="94" class="bar-pay"/>
+  <text x="382" y="224" class="h3 cg">68..8,188 B: 8,120-Byte Chunk Payload</text>
+  <text x="382" y="246" class="mono">toast_tuple_target = 8160 · STORAGE EXTERNAL</text>
+  <text x="382" y="266" class="sub">1 tuple = 1 page · Zero out-of-line TOAST hops</text>
+  <text x="382" y="282" class="sub">Incompressible Parquet stored raw without expansion</text>
+
+  <rect x="352" y="318" width="336" height="64" class="box"/>
+  <text x="368" y="340" class="mono cg">O(1) HTTP Range Mapping:</text>
+  <text x="368" y="360" class="mono">WHERE file_id = $1 · no BETWEEN A/8120 AND B/8120</text>
+
+  <!-- Stage 3: Cut-Through Reader -->
+  <rect x="752" y="60" width="268" height="340" class="stage"/>
+  <text x="768" y="84" class="h3 cg">3. Parallel Cut-Through Reader</text>
+
+  <rect x="768" y="98" width="236" height="94" class="box"/>
+  <text x="780" y="118" class="mono cg">chunkPool (Bitmap Heap Scan)</text>
+  <rect x="780" y="128" width="102" height="24" class="chip-g"/><text x="788" y="144" class="mono">Piece 0 (8MB)</text>
+  <rect x="890" y="128" width="102" height="24" class="chip-g"/><text x="898" y="144" class="mono">Piece 1 (8MB)</text>
+  <rect x="780" y="158" width="102" height="24" class="chip-g"/><text x="788" y="174" class="mono">Piece 2 (8MB)</text>
+  <rect x="890" y="158" width="102" height="24" class="chip-g"/><text x="898" y="174" class="mono">Piece 3 (8MB)</text>
+
+  <rect x="768" y="206" width="236" height="98" class="box"/>
+  <text x="780" y="228" class="mono ca">TID Reorder + 32-Slot Ring</text>
+  <text x="780" y="248" class="sub">Reorders bitmap TIDs to strict `no`</text>
+  <rect x="780" y="258" width="212" height="32" class="bar-hdr"/>
+  <text x="790" y="278" class="mono cg">32 × 256 KiB ring</text>
+
+  <rect x="768" y="318" width="236" height="64" class="box"/>
+  <text x="780" y="340" class="mono cp">Exported Snapshot Isolation</text>
+  <text x="780" y="358" class="sub">pg_export_snapshot() across pieces</text>
+
+  <!-- Horizontal Connectors -->
+  <path id="p3-in" d="M 288 242 L 346 242" class="ln-b" marker-end="url(#f3-b)"/>
+  <path id="p3-out" d="M 708 242 L 762 242" class="ln-g" marker-end="url(#f3-g)"/>
+</svg>
