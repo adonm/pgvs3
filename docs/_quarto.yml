@@ -80,7 +80,7 @@ website:
             href: roadmap.md
       - section: "Benchmarks & Qualification"
         contents:
-          - text: "Paired Runner & Capacity Method"
+          - text: "DuckDB, Trino & Gateway Benchmarks"
             href: benchmarks.md
           - text: "Replica Proof & Capacity Ledger"
             href: data-plane-results.md

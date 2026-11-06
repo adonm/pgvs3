@@ -15,6 +15,21 @@ For workload selection, freshness, OLTP budgets and executable SQL/API recipes,
 use the [workload guides](guides/index.md). `just guides` validates those recipes
 in the existing fixture; it is not a third benchmark or performance acceptance.
 
+## Current workload summary
+
+Headline results first; detailed methods and caveats follow. All rows are
+single-host samples on the 16-core laptop unless noted, not a fleet capacity
+claim.
+
+| Workload | Transport | Headline results |
+| --- | --- | --- |
+| Speed of light (`just sol`) | S3 HTTP | 256 MiB GET **3,311 MiB/s** (83% of floor); 1 GiB GET **2,077 MiB/s** (84%); 256 MiB PUT **384 MiB/s** (83%). |
+| 20M-row DuckLake row-group tuning (`just bench tuning`) | DuckDB `httpfs` | DuckDB 2.0.0, ~823 MiB stored: 122,880 rows/group loads in **8.79 s**, projected full scan **159 ms** (**130.6 MiB** read), 1% range **66 ms** (**3.4 MiB** in 7 GETs), point lookup **64 ms** (**1.2 MiB** in 3 GETs). |
+| 1.14 GB LINZ Wellington orthophoto (`just bench ortho`) | DuckDB `httpfs` | 16 tiles/row-group: point lookup **25 q/s** (1w, **39 ms** p50, **4.1 MB** in 10 GETs) and **111 q/s** (16w); 9% central region **0.92 s** (**117 MiB**). |
+| Official-base `pgvs3-duckdb:2.0.0` server (`just duckdb-integration-bench`) | DuckDB Quack | 1M-row DuckLake (42.7 MiB): projection **13.0 ms**, 1% range **11.9 ms**, point lookup **16.9 ms**. 1.14 GB LINZ orthophoto: z21 point **38.2 ms**, z16 overview **31.7 ms**, 9% region (704 tiles) **291.2 ms**. 5k-row spatial RTree **2.96 ms** vs **10.17 ms** lake scan; 5k×32 vector HNSW **3.19 ms** (10/10 recall) vs **13.26 ms** lake scan (earlier sample; see the dated section below). |
+| 100-snapshot Iceberg (`just iceberg`) | DuckDB `httpfs` | 20–60 ms origin: warm `count(*)` **6 ms** vs **115–316 ms** direct; 100-snapshot group-by **67 ms** vs **434–1,079 ms** direct. |
+| Trino 484 + Nessie (`just trino`) | Trino S3 | 20 ms origin: standalone paired 3 GiB cache beats Alluxio across all 7 queries (**36–520 ms** vs **78–529 ms**, paired ratios **0.46–0.97**). |
+
 Two benchmark harnesses are included in the repository:
 
 - **`just load`** runs `test/loadgen` directly against the HTTP gateway to
@@ -234,9 +249,11 @@ Key takeaways:
   the OJS v1 rewrite. Run `test/loadgen` with `-op ojs-enqueue` / `-op ojs-fetch`
   against a live PostgreSQL to measure the new path; no numbers are claimed
   here yet.
-- **Sub-millisecond S3 small reads & 20.9k/s durable S3 writes:** S3 4 KiB
-  `GET` reaches **35.8k req/s** (`0.17 ms` p50 at 1 worker) and durable 4 KiB
-  `PUT` reaches **20.9k req/s**.
+- **Sub-millisecond S3 small reads & 20.4k/s durable S3 writes:** S3 4 KiB
+  `GET` reaches **35.5k req/s at 256 workers** (`25.3k` at 64 workers, `0.17 ms`
+  p50 at 1 worker) and durable 4 KiB `PUT` reaches **20.4k req/s at 256 workers**
+  (`17.8k` at 64 workers, `0.82 ms` p50 at 1 worker). The headline rates use
+  256 workers; the latency samples use 1 worker.
 - **Cache tier:** a warm 4 KiB `GET` through the cache proxy costs one
   PostgreSQL read and reaches **12.2k req/s**; 64 MiB reads reach **4.0 GiB/s**
   and write-through PUTs **488 MiB/s** (origin is a local filesystem).
@@ -339,6 +356,36 @@ Measured on the 6-vCPU VM with 2,000 4 KiB objects and 128 8 MiB objects
 DuckDB's `httpfs` adds its own request scheduling and connection pool; the
 direct numbers above show the gateway ceiling underneath it.
 
+## DuckLake 20M-row row-group tuning (`just bench tuning`)
+
+`just bench tuning` builds a 20,000,000-row DuckLake table in two files
+(~822–826 MiB stored) at four `parquet_row_group_size` values. It then measures a
+projected full scan, a low-selectivity string filter, a 1% key range and a point
+lookup through DuckDB 2.0.0 `httpfs`. Measured 2026-11-06 on the 16-core laptop
+(`.tmp/bench-tuning-20261106/bench-tuning-2.0.0.json`, SHA-256
+`4be783eb2032646c2c96bf18df33a62415257622ff0400b7bec15decf5f1a9cc`, run
+`r3a5eadd925c3`; medians of the recorded repeats):
+
+| row_group_rows | load_s | stored_mib | full_scan | string_filter | range_1pct | point_lookup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 30,720 | 9.295 | 826.1 | 0.256 s / 654 GETs / 132.8 MiB | 0.509 s / 654 GETs / 616.0 MiB | 0.093 s / 17 GETs / 2.4 MiB | 0.069 s / 3 GETs / 0.5 MiB |
+| 122,880 | 8.785 | 823.0 | 0.159 s / 165 GETs / 130.6 MiB | 0.433 s / 328 GETs / 615.8 MiB | 0.066 s / 7 GETs / 3.4 MiB | 0.064 s / 3 GETs / 1.2 MiB |
+| 491,520 | 8.267 | 822.1 | 0.129 s / 84 GETs / 130.1 MiB | 0.430 s / 328 GETs / 615.7 MiB | 0.074 s / 4 GETs / 4.5 MiB | 0.066 s / 4 GETs / 4.5 MiB |
+| 1,966,080 | 8.252 | 821.6 | 0.153 s / 74 GETs / 129.9 MiB | 0.489 s / 318 GETs / 615.3 MiB | 0.121 s / 11 GETs / 17.9 MiB | 0.103 s / 11 GETs / 17.9 MiB |
+
+Query cells are `median_s / GETs / MiB read` from the client.
+
+The trade-off is pruning versus request count, not a single "best" group size.
+`30,720` rows/group gives the sharpest point and range pruning (0.5 MiB and
+2.4 MiB) but pays the most GETs (654) and the slowest full scan (256 ms).
+`122,880` is the default and a balanced point: 3 GETs for a 1.2 MiB point lookup
+and 7 GETs for a 3.4 MiB range, with a 159 ms full scan. `491,520` has the
+fastest projected scan here (129 ms, 84 GETs) but reads 4.5 MiB for a point.
+`1,966,080` minimizes GETs (74 for the full scan) yet pulls 17.9 MiB in 103 ms
+for a single point and 121 ms for a 1% range. Sort order and filter selectivity
+still matter more than group size alone: the string filter reads roughly the
+whole table at every setting.
+
 ## RaQuet raster lookups (`just bench raquet`)
 
 [RaQuet](https://www.raquet.io/) stores rasters in Parquet: one row per
@@ -413,6 +460,44 @@ S3 admission slots long enough that the default 1 s `--s3-queue-wait` returns
 chunk. These cold figures predate a fix to the test origin proxy, whose 5-entry
 listen backlog stalled bursts of new connections for about 1 s; they overstate
 cold time and should be re-measured.
+
+## Official-base DuckDB 2.0 + Quack container (`just duckdb-integration-bench`)
+
+`just duckdb-integration-bench` runs the prebuilt `pgvs3-duckdb:2.0.0` image
+(official DuckDB 2.0.0 distroless base, `sha256:40e76ebda4abf91529e0c1978bca50c6887714b69348b5febfe940c858c8dfd1`)
+against the same PostgreSQL database and `PGVS3_ENDPOINT` gateway, with clients
+using native Quack over `:9494`. Measured 2026-11-06 on the 16-core laptop
+(`.tmp/duckdb-large-bench-20261106/compute.json`, SHA-256
+`b5d355cb3f14fdab4509940d2d5fa094d59320ca2833a2d36cba864b0f988388`); these are
+single-host Quack round-trip samples, not storage-throughput claims.
+
+The 5,000-row sample compares a lake scan with a native table plus a local index:
+
+| Sample | Lake scan | Native materialization | Native query |
+| --- | ---: | --- | ---: |
+| Spatial, 5,000 points | 17.3 ms warm (44.7 ms first) | copy 9.9 ms + RTree 4.1 ms | 4.07 ms warm (3.8 ms first), 1,521 rows |
+| Vector, 5,000 × 32 dimensions | 18.3 ms warm (53.7 ms first) | copy 27.0 ms + HNSW 42.3 ms | 4.79 ms, 10/10 recall at 10 |
+| FTS, 20 documents | unsupported on DuckLake | native build 44.8 ms | 12.9 ms |
+
+An earlier official-base sample (`.tmp/duckdb-official-perf-20261106T020735Z/compute.json`,
+SHA-256 `ebfc41428689a21d321ba083c15767c9597885a426ee119c1b69f257bcaf3471`)
+measured lower 5k-row medians (RTree 2.96 ms vs 10.17 ms lake scan; HNSW
+3.19 ms vs 13.26 ms lake scan). Absolute times vary between runs; compare ratios
+within one session. Incremental INSERT and DELETE were visible immediately,
+while UPDATE left the FTS index stale in DuckDB 2.0.0.
+
+The larger pass adds a 1,000,000-row DuckLake table and the 1.14 GB LINZ
+Wellington orthophoto:
+
+| Dataset | Stored / upload | Timings |
+| --- | ---: | --- |
+| 1M-row DuckLake `large_events` | 42.7 MiB, load 677 ms | projection 13.0 ms; 1% range 11.9 ms; point lookup 16.9 ms |
+| 1.14 GB LINZ orthophoto, 7,140 tiles | upload 3.94 s at 275 MiB/s | metadata 5.6 ms; z21 point 38.2 ms; z16 overview 31.7 ms; 9% region (704 tiles) 291.2 ms; region stats 983.8 ms |
+
+**DuckLake 1.1 does not support indexes directly.** The native RTree, HNSW and
+FTS measurements operate on materialized native DuckDB tables, which are
+snapshots: they must be rebuilt when lake freshness matters. The lake table
+remains the durable copy.
 
 ## Iceberg through the cache tier (`just iceberg`)
 
@@ -750,9 +835,9 @@ S3 Express One Zone figures below are AWS's published service specifications and
 
 | Dimension | pgvs3 (16-core local / 6-vCPU VM) | S3 Express One Zone (published) |
 | --- | --- | --- |
-| 4 KiB GET / PUT p50 (1w) | 0.17 ms GET, 0.78 ms PUT (0.47 / 1.37 ms on 6 vCPU) | Consistent single-digit ms |
-| 4 KiB GET throughput | 32.5k/s (9.8k/s on 6 vCPU) | 200k/s default, 2M/s max per bucket |
-| 4 KiB PUT throughput | 17.5k/s durable at 64w (3.7k/s on 6 vCPU) | 100k/s default, 200k/s max per bucket |
+| 4 KiB GET / PUT p50 (1w) | 0.17 ms GET, 0.82 ms PUT (0.47 / 1.37 ms on 6 vCPU) | Consistent single-digit ms |
+| 4 KiB GET throughput | 35.5k/s at 256w (25.3k/s at 64w); 9.8k/s at 256w on 6 vCPU | 200k/s default, 2M/s max per bucket |
+| 4 KiB PUT throughput | 20.4k/s durable at 256w (17.8k/s at 64w); 3.7k/s at 64w on 6 vCPU | 100k/s default, 200k/s max per bucket |
 | 8–64 MiB GET | 1.1–3.45 GiB/s (0.3–1.1 GiB/s on 6 vCPU) | Network/concurrency-bound; elastic |
 | 64 MiB PUT | 188–458 MiB/s (86–171 MiB/s on 6 vCPU) | Elastic, distributed |
 | Capacity | 32 TiB per bucket; ~17.4 TB per object (at most 100 namespaces per database) | Unlimited storage; 50 TB per object |
@@ -762,11 +847,13 @@ S3 Express One Zone figures below are AWS's published service specifications and
 ### Top 6 takeaways
 
 1. **Latency:** pgvs3 serves a 4 KiB `GET` in `0.17 ms` and a durable `PUT` in
-   `0.78 ms` p50, ~10× faster than S3 Express's single-digit milliseconds.
-2. **Small-object reads:** pgvs3 peaks at `32.5k GET/s` on one 16-core node,
-   ~6× below S3 Express's `200k/s` default bucket quota (`2M/s` max).
-3. **Small-object writes:** pgvs3 reaches `17.5k` durable 4 KiB `PUT/s`, ~6×
-   below S3 Express's `100k/s` default quota (`200k/s` max).
+   `0.82 ms` p50, ~10× faster than S3 Express's single-digit milliseconds.
+2. **Small-object reads:** pgvs3 peaks at `35.5k GET/s` at 256 workers
+   (`25.3k` at 64 workers) on one 16-core node, ~6× below S3 Express's `200k/s`
+   default bucket quota (`2M/s` max).
+3. **Small-object writes:** pgvs3 reaches `20.4k` durable 4 KiB `PUT/s` at 256
+   workers (`17.8k` at 64 workers), ~5× below S3 Express's `100k/s` default
+   quota (`200k/s` max).
 4. **Large-object bandwidth:** pgvs3 streams 64 MiB reads at `3.45 GiB/s` and
    writes at `458 MiB/s` in cache/NVMe (`125–1,000 MiB/s` on cold EBS gp3),
    while S3 Express scales elastically with client network.
@@ -782,7 +869,8 @@ S3 Express One Zone figures below are AWS's published service specifications and
 ```sh
 just contract   # run the correctness suite first
 just load       # exploratory matrix (isolated .tmp/verify/ artifacts)
-just bench s3   # DuckDB 2.0 httpfs matrix (.tmp/pgvs3/bench.json)
+just bench s3      # DuckDB 2.0 httpfs matrix (.tmp/pgvs3/bench.json)
+just bench tuning  # 20M-row DuckLake row-group tuning
 just bench raquet  # RaQuet raster point lookups; PGVS3_READ_CACHE_BYTES=... for the cache
 just bench ortho   # the same on a real LINZ orthophoto; PGVS3_ORTHO_SHEETS=4|8|...
 just bench      # full DuckDB + DuckLake compatibility and row-group tuning

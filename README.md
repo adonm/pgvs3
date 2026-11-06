@@ -5,10 +5,12 @@ store 10 MiB–1 GiB Parquet objects for DuckDB and [DuckLake](https://ducklake.
 in PostgreSQL tables, and use its transactions, MVCC snapshots, WAL, replication
 and locks instead of separate durability, cache-coherence and coordination services.
 
-> **Trusted networks only — permanently.** pgvs3 does not authenticate clients,
-> terminate TLS or validate S3 signatures, and never will. Run it on loopback, a
-> private network or behind a mesh that enforces access control, and treat `:8014`
-> like a database port. See [docs/design.md](docs/design.md#trust-model-permanent).
+> **Trusted networks only — permanently.** pgvs3 does not authenticate or
+> authorize clients, terminate TLS, or validate S3 signatures or credentials,
+> and never will. Presigned URLs are rejected (`400 InvalidRequest`). Run it on
+> loopback, a private network or behind a mesh that enforces access control, and
+> treat `:8014` like a database port. See
+> [docs/design.md](docs/design.md#trust-model-permanent).
 
 **Status: pre-alpha.** PostgreSQL 18+ (Aurora 18.3+). Storage layout **v25** has no
 in-place upgrade: a layout change needs a fresh database and a re-import.
@@ -131,6 +133,9 @@ just ci         # every local/CI gate
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full gate list and invariants.
+The local native DuckDB 2.0 analytics image (official DuckDB base, no in-image
+Python/shell) has its own [build and integration guide](deploy/duckdb/README.md)
+(`just duckdb-test`, `just duckdb-image`, `just duckdb-integration`).
 
 ## Documentation
 
@@ -139,6 +144,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full gate list and invariants.
 - [Design](docs/design.md): trust model, envelope, limits and safety invariants.
 - [Interfaces and scope](docs/interfaces.md): S3, origin cache, RESP2, OJS, experiments.
 - [Performance](docs/performance.md) and [benchmarks](docs/benchmarks.md): layout, I/O paths, measured results.
+- [DuckDB 2.0 + Quack container](deploy/duckdb/README.md): prebuilt official-base analytics image, catalog/endpoint wiring and measured samples.
 - [Roadmap](docs/roadmap.md): ranked work and acceptance criteria.
 
 ## License

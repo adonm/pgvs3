@@ -1,0 +1,155 @@
+{
+  "schema": 1,
+  "duckdb": {
+    "version": "v2.0.0",
+    "source_id": "d54cbbe3df",
+    "released": "2026-10-21"
+  },
+  "platform": "linux_amd64",
+  "base": {
+    "image": "duckdb/duckdb:2.0.0",
+    "digest": "sha256:453caf4f1c445ee8363acaa6cd383751396d2eae0d02f362ada64d87267a4221",
+    "manifest_amd64": "sha256:59dbf78b352fd4477d74544c31db2e99889e6bd0db52ef7ec3dc0d1e53b32997",
+    "binary_path": "/duckdb",
+    "user": "65532:65532"
+  },
+  "libexpat": {
+    "package": "libexpat1",
+    "version": "2.5.0-1+deb12u5",
+    "path": "usr/lib/x86_64-linux-gnu/libexpat.so.1.8.10",
+    "sha256": "b342d94f6a71df596f19b1b0d4d3af9b883f0333027de6c3fc0dbc9ff8c45057",
+    "bytes": 186472,
+    "build_image": "debian:bookworm-slim",
+    "build_digest": "sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc"
+  },
+  "cli": {
+    "url": "https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz",
+    "sha256_tar": "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc",
+    "bytes_tar": 24424037,
+    "tar_member": "duckdb",
+    "sha256": "c41f957db5645d545a9caef430994cf262d24fad9297fef70c691395aadb43fb",
+    "bytes": 77526584
+  },
+  "extensions": [
+    {
+      "name": "spatial",
+      "origin": "core",
+      "version": "a3dbcd1781",
+      "url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/spatial.duckdb_extension.gz",
+      "sha256_gz": "8d4bf1ab198806f123821d52ff5131745baaa19d5e91bd6b9772db922d31a228",
+      "bytes_gz": 36283733,
+      "sha256": "8ec99d875355200316c743ede176e2cb50d2b712d2fa192ccbf19cc245a8d0bc",
+      "bytes": 108189118,
+      "sha256_info": "bffa03592a75b4298764f6a236c710a7a791613ecda11a339562103bd63468ce",
+      "bytes_info": 247,
+      "info_b64": "ZAABZQBLaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvc3BhdGlhbC5kdWNrZGJfZXh0ZW5zaW9uLmd6ZgAcaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZ2cACmEzZGJjZDE3ODFoACQiZjVkOWRlN2Q3MTljM2YyMjY5Y2RiZDhjMzBjZTU4YTQtNSJqAARjb3JlawBHc2hhMjU2OmQ3ZTNiYjljMjUxZDFlZDM5OWI5OTU4N2I2ZGZlMjAzYTM5OWE4NzMzYjcxOTRkNjA3MDc0N2VhMTA1NTBmZDP//w=="
+    },
+    {
+      "name": "ducklake",
+      "origin": "core",
+      "version": "417a9117f5",
+      "url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/ducklake.duckdb_extension.gz",
+      "sha256_gz": "ff1c730a5d5a7cb14ed9547ba15c259c24805eb4cf12c17727c2a4faffe1ada7",
+      "bytes_gz": 17217388,
+      "sha256": "4b497cf95d768004d34a97e7098d33f687e994dc523945948c321af25061b39b",
+      "bytes": 54873022,
+      "sha256_info": "aecd30b3682414c18062015f111990e73d75b7c14b9ea5b01a8f505d7902dfd2",
+      "bytes_info": 246,
+      "info_b64": "ZAABZQBMaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvZHVja2xha2UuZHVja2RiX2V4dGVuc2lvbi5nemYAHGh0dHA6Ly9leHRlbnNpb25zLmR1Y2tkYi5vcmdnAAo0MTdhOTExN2Y1aAAiIjc0ZWYyMmFhODQxNmI3MDRmMmIzMzUzNmY1Zjk2MGU2ImoABGNvcmVrAEdzaGEyNTY6YTMxOWRlMWYxM2JjODVhMGFmMGM1MWQ1Y2E0N2UzYWZmOTY4MGQ4MzMzZTg5NWEzYTM1ZTVmZjk3YTY5ZGMxMv//"
+    },
+    {
+      "name": "postgres_scanner",
+      "origin": "core",
+      "version": "c0f5a3c0c4",
+      "url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/postgres_scanner.duckdb_extension.gz",
+      "sha256_gz": "54b3d751cafc9ffa439886b1607d0ee758dab4dc070f0171e779b95f2f3e554f",
+      "bytes_gz": 18910802,
+      "sha256": "39e661c5cfb678c9472f5acd88235f84f3ef4126e7444c7c8a01214d9b291601",
+      "bytes": 59211910,
+      "sha256_info": "6b26d9c085a0ba0922063bd19c487d4d50269ec4548e3eab8320a7abaf8a223d",
+      "bytes_info": 254,
+      "info_b64": "ZAABZQBUaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvcG9zdGdyZXNfc2Nhbm5lci5kdWNrZGJfZXh0ZW5zaW9uLmd6ZgAcaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZ2cACmMwZjVhM2MwYzRoACIiMjA1NjcxYzMxZmJiNmNmZmE2NzYxMjMxYzAwZGJiYWMiagAEY29yZWsAR3NoYTI1NjphMzE5ZGUxZjEzYmM4NWEwYWYwYzUxZDVjYTQ3ZTNhZmY5NjgwZDgzMzNlODk1YTNhMzVlNWZmOTdhNjlkYzEy//8="
+    },
+    {
+      "name": "fts",
+      "origin": "core",
+      "version": "223b8cb9e6",
+      "url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/fts.duckdb_extension.gz",
+      "sha256_gz": "9172520652ce609d163cf30645f382b197f2c7294448a816c77d62b0f029d96e",
+      "bytes_gz": 4637695,
+      "sha256": "d0236578d3758b689c871957ce8654b629b11c8008f7789054a526446c6bf8a3",
+      "bytes": 16229078,
+      "sha256_info": "00bb765a4f625d3f242fd5cc85aaa1df5077104ab349434cc74d401f723db507",
+      "bytes_info": 241,
+      "info_b64": "ZAABZQBHaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvZnRzLmR1Y2tkYl9leHRlbnNpb24uZ3pmABxodHRwOi8vZXh0ZW5zaW9ucy5kdWNrZGIub3JnZwAKMjIzYjhjYjllNmgAIiJlMTdiMTg5NWE0NWUzN2YzNTkwYjNhYWI4NDJiZjI5YiJqAARjb3JlawBHc2hhMjU2OmEzMTlkZTFmMTNiYzg1YTBhZjBjNTFkNWNhNDdlM2FmZjk2ODBkODMzM2U4OTVhM2EzNWU1ZmY5N2E2OWRjMTL//w=="
+    },
+    {
+      "name": "vss",
+      "origin": "core",
+      "version": "3685131eac",
+      "url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/vss.duckdb_extension.gz",
+      "sha256_gz": "02d1ae4508e00cf0dae89f713683f4bf0622774eaa4154398945b77134fdfc3a",
+      "bytes_gz": 15826922,
+      "sha256": "5afcd13e9e10061969701fbd9d80bd0512c1071fe6a8ab1c993030fbefe165d1",
+      "bytes": 50624494,
+      "sha256_info": "ec64a53432635474bd9ea442e7ac834bbc4a26da11090cdb6e366b1d38ad516a",
+      "bytes_info": 241,
+      "info_b64": "ZAABZQBHaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvdnNzLmR1Y2tkYl9leHRlbnNpb24uZ3pmABxodHRwOi8vZXh0ZW5zaW9ucy5kdWNrZGIub3JnZwAKMzY4NTEzMWVhY2gAIiJiZGNlYWU4Mjg5Yzg5MGViN2M4ZWMwYzBmNDM3OTk4YyJqAARjb3JlawBHc2hhMjU2OmEzMTlkZTFmMTNiYzg1YTBhZjBjNTFkNWNhNDdlM2FmZjk2ODBkODMzM2U4OTVhM2EzNWU1ZmY5N2E2OWRjMTL//w=="
+    },
+    {
+      "name": "quack",
+      "origin": "core",
+      "version": "f96420ed46",
+      "url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/quack.duckdb_extension.gz",
+      "sha256_gz": "f9a5c0d2e0eef0f7546aba4579ab80d75d167cdf48830459faf67378ab2000fe",
+      "bytes_gz": 18983283,
+      "sha256": "9c893bd543ec2c5253d0c47d5614f90a1bfa1791c735dc6bbcea4e8bd3811a97",
+      "bytes": 59756486,
+      "sha256_info": "38bbc29ae2bba0e69a0c9f72fde65a23f0cf6f3b987aa8c2e09d3f4185825fe9",
+      "bytes_info": 243,
+      "info_b64": "ZAABZQBJaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvcXVhY2suZHVja2RiX2V4dGVuc2lvbi5nemYAHGh0dHA6Ly9leHRlbnNpb25zLmR1Y2tkYi5vcmdnAApmOTY0MjBlZDQ2aAAiIjliNWE1ZjA3YWI0Y2FiNzY0OTkzZTdkZGY2YzYyY2VhImoABGNvcmVrAEdzaGEyNTY6YTMxOWRlMWYxM2JjODVhMGFmMGM1MWQ1Y2E0N2UzYWZmOTY4MGQ4MzMzZTg5NWEzYTM1ZTVmZjk3YTY5ZGMxMv//"
+    },
+    {
+      "name": "httpfs",
+      "origin": "core",
+      "version": "77392a7207",
+      "url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/httpfs.duckdb_extension.gz",
+      "sha256_gz": "ee6c7d7e60a5da1b6f6bf6156b4298b55ddce0496a5bfe628bd6ab6d47eb8e3e",
+      "bytes_gz": 8657469,
+      "sha256": "77e6c429aa04f25da7962572f12b19113e0ce46080fa1365ad66017aadcdb68d",
+      "bytes": 26929718,
+      "sha256_info": "a0ff2ed8d637934648d7c3a75ac4fbd87a1e402b4916b5ba370c42c22a99bbcb",
+      "bytes_info": 244,
+      "info_b64": "ZAABZQBKaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvaHR0cGZzLmR1Y2tkYl9leHRlbnNpb24uZ3pmABxodHRwOi8vZXh0ZW5zaW9ucy5kdWNrZGIub3JnZwAKNzczOTJhNzIwN2gAIiI2MTJhNTllZjViNDkxYTVmNDEzYzFkYWJlNTQxYzhmYyJqAARjb3JlawBHc2hhMjU2OmEzMTlkZTFmMTNiYzg1YTBhZjBjNTFkNWNhNDdlM2FmZjk2ODBkODMzM2U4OTVhM2EzNWU1ZmY5N2E2OWRjMTL//w=="
+    },
+    {
+      "name": "raquet",
+      "origin": "community",
+      "version": "1d900cbb7e",
+      "url": "https://community-extensions.duckdb.org/v2.0.0/linux_amd64/raquet.duckdb_extension.gz",
+      "sha256_gz": "06937535c7c715c804a28d2b0a4be6c0141896dfbd05921081efb65ab359c716",
+      "bytes_gz": 33621621,
+      "sha256": "adc10c82ab1c5551ced9ad46af03098e9ebd40ca80023ba1dbbfac483b777595",
+      "bytes": 95935054,
+      "sha256_info": "be275d2ffbea67ccf9c90c56fc759ca270ab128f89be2d7efec3f1100d089ce6",
+      "bytes_info": 272,
+      "info_b64": "ZAABZQBUaHR0cDovL2NvbW11bml0eS1leHRlbnNpb25zLmR1Y2tkYi5vcmcvdjIuMC4wL2xpbnV4X2FtZDY0L3JhcXVldC5kdWNrZGJfZXh0ZW5zaW9uLmd6ZgAmaHR0cDovL2NvbW11bml0eS1leHRlbnNpb25zLmR1Y2tkYi5vcmdnAAoxZDkwMGNiYjdlaAAiImE5YzJhZmM3NGE3ODY3OWY5YjlmNmNiNjcwN2M1ZDIzImkAAWoACWNvbW11bml0eWsAR3NoYTI1NjpiOWFhYzcwYTliMWRlODk2MDc5MDQxZDc2NjkxMjg0YWNlZWM0NGM0ZWVmNzVhNTBjOTBhYjJlOTlmOWQ1NGQx//8=",
+      "source_commit": "1d900cbb7e4c021e441c44ed49384a6955191633",
+      "descriptor_version": "0.3.0"
+    },
+    {
+      "name": "differential",
+      "origin": "community",
+      "version": "v1.1.0",
+      "url": "https://community-extensions.duckdb.org/v2.0.0/linux_amd64/differential.duckdb_extension.gz",
+      "sha256_gz": "6c338deb3d72afde93876c0ec908ad4ec2c25048da240a4cc0d39f0d32a3c1b8",
+      "bytes_gz": 24146238,
+      "sha256": "91f15992c01ac18fd839952f3cc33e82b96f3af7def8feeef708823b3eaf408f",
+      "bytes": 70530414,
+      "sha256_info": "b61a0a5f4a93dffc399e2788bbfb6d22a7bf6c985eefbf1e248b110d482bf5e1",
+      "bytes_info": 274,
+      "info_b64": "ZAABZQBaaHR0cDovL2NvbW11bml0eS1leHRlbnNpb25zLmR1Y2tkYi5vcmcvdjIuMC4wL2xpbnV4X2FtZDY0L2RpZmZlcmVudGlhbC5kdWNrZGJfZXh0ZW5zaW9uLmd6ZgAmaHR0cDovL2NvbW11bml0eS1leHRlbnNpb25zLmR1Y2tkYi5vcmdnAAZ2MS4xLjBoACIiMmU0NTI4MWQyNjZlZmQ1ZDMyMmExMTEzZmYwNGRhNjQiaQABagAJY29tbXVuaXR5awBHc2hhMjU2OmI5YWFjNzBhOWIxZGU4OTYwNzkwNDFkNzY2OTEyODRhY2VlYzQ0YzRlZWY3NWE1MGM5MGFiMmU5OWY5ZDU0ZDH//w==",
+      "source_commit": "43203569f46b3a7f0c3a88fa8b4c34a50052ceb0"
+    }
+  ]
+}

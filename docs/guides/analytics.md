@@ -160,13 +160,21 @@ CREATE TABLE lake.orders AS
 FROM lake.options();
 ```
 
-Compare projected full scans **and** selective filters at 10/100/1,024 MiB with
-`just bench tuning`. Row groups are rows, file targets are bytes; neither is a
-hard exact physical file size. Larger groups improve scan/compression efficiency;
-smaller ones can improve pruning but cost metadata/requests. Sorting by useful
-filters matters more than blindly choosing 8,192-row groups. DuckDB 2.0 Parquet
-uses async I/O: inspect `async_threads`, read-ahead and HTTP pool capacity as well
-as execution `threads`; keep aggregate client pressure within gateway admission.
+The included `just bench tuning` workload is **20,000,000 rows, ~823 MiB stored**
+across four Parquet row-group sizes (`30,720` to `1,966,080` rows per group) on
+DuckDB 2.0.0. At `122,880` rows/group a point lookup reads `1.2 MiB` in 3 GETs
+in `64 ms`, a 1% range reads `3.4 MiB` in 7 GETs in `66 ms`, and a projected full
+scan reads `130.6 MiB` in `159 ms`; at `1,966,080` rows/group the same point
+lookup reads `17.9 MiB` in `103 ms` and the projected scan reads `129.9 MiB` in
+`153 ms`. Smaller groups prune more selectively but issue more requests; larger
+groups reduce request count and scan overhead at the cost of reading unrelated
+rows. The result depends on sort order and filter selectivity, not group size
+alone. Row groups are rows, file targets are bytes; neither is a hard exact
+physical file size. See [the full 20M-row table and trade-off](../benchmarks.md#ducklake-20m-row-row-group-tuning-just-bench-tuning).
+Sorting by useful filters matters more than blindly choosing 8,192-row groups.
+DuckDB 2.0 Parquet uses async I/O: inspect `async_threads`, read-ahead and HTTP
+pool capacity as well as execution `threads`; keep aggregate client pressure
+within gateway admission.
 
 Inlining is another choice, not an invisible benchmark advantage:
 
@@ -187,7 +195,11 @@ an unrelated session option.
 
 ## Schema, wide-column, spatiotemporal and write-for-read modeling
 
-When scaling DuckLake and Parquet on pgvs3 to **billion-row collections**, **wide
+The executable SQL below validates mechanics on a **40,000-row** disposable
+fixture; measured **20M-row** row-group tuning and multi-GB raster/Quack results
+live in [benchmarks.md](../benchmarks.md).
+
+When scaling DuckLake and Parquet on pgvs3 to **large-table collections**, **wide
 columns**, **spatiotemporal relations**, or **batch-write / fast-read** workloads,
 physical layout determines whether queries scan kilobytes or terabytes.
 
@@ -211,7 +223,7 @@ physical layout determines whether queries scan kilobytes or terabytes.
   consume non-evictable buffer memory, and are not used by joins or aggregations.
   Enforce uniqueness in the OLTP source or batch deduplication step instead.
 
-### 2. Billion-row collections with wide columns
+### 2. Large-table collections with wide columns
 
 | Bottleneck on wide tables | Mechanism | Concrete fix |
 | --- | --- | --- |

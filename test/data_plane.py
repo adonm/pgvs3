@@ -7,19 +7,21 @@ import hashlib
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import re
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import threading
 import time
 from types import SimpleNamespace
 from urllib.error import HTTPError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
@@ -50,6 +52,75 @@ def eventually(description, fn, seconds=60):
 
 def sql(statement, database=DATABASE):
     return subprocess.check_output([PSQL, database, "-XAt", "-v", "ON_ERROR_STOP=1", "-c", statement], text=True, stderr=subprocess.PIPE, timeout=30).strip()
+
+
+DUCKDB_IMAGE = os.environ.get("PGVS3_DUCKDB_IMAGE", "pgvs3-duckdb:2.0.0")
+DUCKDB_EXTENSION_VERSION = "v2.0.0"
+DUCKDB_EXTENSION_PLATFORM = "linux_amd64"
+
+
+def sql_str(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def compute_names(run_name):
+    """Stable, unique names for the disposable compute scenario. The bucket,
+    prefix and PostgreSQL metadata schema survive only for this run and are
+    used again by the restarted container."""
+    slug = re.sub(r"[^a-z0-9]+", "", Path(run_name).name.lower())[:24] or "run"
+    return {
+        "slug": slug,
+        "bucket": f"compute-{slug}"[:63],
+        "prefix": f"compute/{slug}/lake",
+        "schema": f"compute_{slug}"[:63],
+    }
+
+
+def parse_s3_keys(body):
+    root = ET.fromstring(body)
+    return [node.text for node in root.findall("{*}Contents/{*}Key") if node.text]
+
+
+def parse_s3_objects(body):
+    """(key, size) pairs from a ListObjectsV2 response."""
+    root = ET.fromstring(body)
+    objects = []
+    for node in root.findall("{*}Contents"):
+        key = node.findtext("{*}Key")
+        if key:
+            objects.append((key, int(node.findtext("{*}Size") or 0)))
+    return objects
+
+
+def duckdb_client_config(extension_directory):
+    """Offline, signed host-client configuration. The caller copies quack and
+    httpfs plus their .info sidecars out of the image into this directory."""
+    return {
+        "extension_directory": str(extension_directory),
+        "autoinstall_known_extensions": "false",
+        "autoload_known_extensions": "false",
+        "allow_unsigned_extensions": "false",
+    }
+
+
+def timing_summary(samples):
+    values = [round(float(value), 3) for value in samples]
+    if not values:
+        return {"ms": [], "first_ms": None, "repeat_ms": [], "median_ms": None,
+                "min_ms": None, "max_ms": None}
+    return {
+        "ms": values,
+        "first_ms": values[0],
+        "repeat_ms": values[1:],
+        "median_ms": round(statistics.median(values), 3),
+        "min_ms": min(values),
+        "max_ms": max(values),
+    }
+
+
+def docker_inspect(target, template):
+    return subprocess.check_output(["docker", "inspect", "--format", template, target],
+                                   text=True, stderr=subprocess.PIPE, timeout=30).strip()
 
 
 def command(*args):
@@ -1200,6 +1271,779 @@ def container(name, image, *args):
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
 
+def copy_client_extensions(image, extension_directory):
+    """Copy only the signed quack/httpfs artifacts and .info sidecars out of
+    the image for the host Python 2.0 client. No runtime INSTALL is used."""
+    import_target = Path(extension_directory) / DUCKDB_EXTENSION_VERSION / DUCKDB_EXTENSION_PLATFORM
+    import_target.mkdir(parents=True, exist_ok=True)
+    helper = f"pgvs3-{RUN.name}-extcopy"
+    subprocess.run(["docker", "rm", "-f", helper], capture_output=True)
+    subprocess.check_output(["docker", "create", "--name", helper, image], text=True,
+                            stderr=subprocess.STDOUT)
+    try:
+        for extension in ("httpfs", "quack", "spatial", "raquet"):
+            for suffix in ("", ".info"):
+                source = (f"{helper}:/opt/duckdb/.duckdb/extensions/"
+                          f"{DUCKDB_EXTENSION_VERSION}/{DUCKDB_EXTENSION_PLATFORM}/"
+                          f"{extension}.duckdb_extension{suffix}")
+                subprocess.check_output(["docker", "cp", source, str(import_target) + "/"],
+                                        text=True, stderr=subprocess.STDOUT)
+    finally:
+        subprocess.run(["docker", "rm", "-f", helper], capture_output=True)
+    return Path(extension_directory)
+
+
+def host_client(extension_directory, port=None, token=None):
+    """The host analytics uv client, using signed image artifacts offline and
+    an existing connection for every functional/benchmark query."""
+    import duckdb
+    connection = duckdb.connect(config=duckdb_client_config(extension_directory))
+    connection.execute("LOAD httpfs; LOAD quack;")
+    connection.execute("SET enable_external_file_cache=false; SET parquet_metadata_cache=false;")
+    if port is not None:
+        connection.execute(
+            f"ATTACH 'quack:127.0.0.1:{port}' AS q (TYPE quack, TOKEN {sql_str(token)})"
+        )
+    return connection
+
+
+def q_sql(client, statement):
+    """Execute SQL on the native Quack server, not a new CLI process."""
+    return client.execute("FROM q.query(" + sql_str(statement) + ")").fetchall()
+
+
+def q_exec(client, statement):
+    started = time.perf_counter()
+    rows = q_sql(client, statement)
+    return round((time.perf_counter() - started) * 1000, 3), rows
+
+
+def q_timed(client, statement, repeat=3):
+    samples, rows = [], None
+    for _ in range(repeat):
+        started = time.perf_counter()
+        rows = q_sql(client, statement)
+        samples.append((time.perf_counter() - started) * 1000)
+    return timing_summary(samples), rows
+
+
+def wait_compute(extension_directory, port, token):
+    def ready():
+        try:
+            connection = host_client(extension_directory, port, token)
+            try:
+                return connection.execute("SELECT 1").fetchone() == (1,)
+            finally:
+                connection.close()
+        except Exception:
+            return False
+    eventually("compute Quack readiness", ready, 120)
+
+
+def compute_environment(names, endpoint, port, token):
+    return {
+        "PGVS3_URL": DATABASE,
+        "PGVS3_BUCKET": names["bucket"],
+        "PGVS3_PREFIX": names["prefix"],
+        "PGVS3_ENDPOINT": endpoint,
+        "PGVS3_S3_ACCESS_KEY": os.environ["PGVS3_ACCESS_KEY"],
+        "PGVS3_S3_SECRET_KEY": os.environ["PGVS3_SECRET_KEY"],
+        "PGVS3_S3_USE_SSL": "false",
+        "PGVS3_METADATA_SCHEMA": names["schema"],
+        "QUACK_TOKEN": token,
+        "QUACK_BIND": f"127.0.0.1:{port}",
+        "QUACK_ALLOW_OTHER_HOSTNAME": "false",
+        "DUCKDB_MEMORY_LIMIT": "1GB",
+        "DUCKDB_THREADS": "4",
+        "DUCKDB_TEMP_DIRECTORY": "/tmp/duckdb",
+    }
+
+
+def compute_container_args(environment):
+    # Native DuckDB is PID 1 by default: without -i it sees stdin EOF and exits,
+    # and without an init it ignores SIGTERM. One host Docker init plus open
+    # stdin keeps Quack alive and turns docker stop into a normal 143 exit.
+    args = ["-i", "--init", "--read-only", "--tmpfs", "/tmp:rw,size=2g"]
+    for key, value in environment.items():
+        args.extend(["-e", f"{key}={value}"])
+    return args
+
+
+def stop_compute(name):
+    started = time.perf_counter()
+    subprocess.run(["docker", "stop", "--time", "20", name], check=True,
+                   capture_output=True, text=True, timeout=40)
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    state = json.loads(docker_inspect(name, "{{json .State}}"))
+    logs = subprocess.run(["docker", "logs", name], text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          timeout=30).stdout
+    assert state["ExitCode"] == 143, ("compute SIGTERM exit", state)
+    assert "PGVS3_READY" in logs, logs[-2000:]
+    assert "warning Quack sessions start in the memory catalog" in logs, logs[-2000:]
+    return {"sigterm": True, "exit_code": state["ExitCode"], "stop_ms": elapsed,
+            "ready_log": True, "memory_catalog_warning": True}
+
+
+def client_s3_secret(client, endpoint):
+    host = endpoint.split("://", 1)[-1]
+    client.execute(
+        "CREATE SECRET pgvs3_native (TYPE s3, "
+        f"KEY_ID {sql_str(os.environ['PGVS3_ACCESS_KEY'])}, "
+        f"SECRET {sql_str(os.environ['PGVS3_SECRET_KEY'])}, "
+        "REGION 'us-east-1', "
+        f"ENDPOINT {sql_str(host)}, URL_STYLE 'path', USE_SSL false)"
+    )
+
+
+def lake_parquet_objects(bucket, prefix):
+    _, listing = request(B, f"/{bucket}?list-type=2&prefix={quote(prefix.rstrip('/') + '/')}",
+                         timeout=60)
+    return [(key, size) for key, size in parse_s3_objects(listing) if key.endswith(".parquet")]
+
+
+def lake_object_keys(bucket, prefix):
+    return [key for key, _ in lake_parquet_objects(bucket, prefix)]
+
+
+@contextmanager
+def raquet_local(extension_directory):
+    """Signed spatial/raquet artifacts copied from the image, loaded offline as
+    a local oracle for the Quack measurements."""
+    import duckdb
+    connection = duckdb.connect(config=duckdb_client_config(extension_directory))
+    try:
+        connection.execute("LOAD spatial; LOAD raquet;")
+        yield connection
+    finally:
+        connection.close()
+
+
+def parquet_digest(client, bucket, keys):
+    paths = "[" + ",".join(sql_str(f"s3://{bucket}/{key}") for key in keys) + "]"
+    return client.execute(
+        f"SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) FROM read_parquet({paths})"
+    ).fetchone()
+
+
+def differential_local(name):
+    statement = """
+SET autoinstall_known_extensions=false;
+SET autoload_known_extensions=false;
+LOAD differential;
+SET differential_repository='/tmp/compute-differential/repo';
+ATTACH 'differential:compute' AS d;
+USE d;
+CREATE TABLE t (id INTEGER);
+INSERT INTO t VALUES (1),(2),(3);
+CHECKPOINT;
+CALL differential_create_snapshot('d', name='v1');
+SELECT count(*) FROM differential_snapshots('d')
+  WHERE snapshot_name='v1' AND publication_state='local_published' AND NOT retired;
+USE memory;
+DETACH d;
+ATTACH 'differential:compute' AS d2;
+SELECT count(*) FROM d2.main.t;
+DETACH d2;
+"""
+    result = subprocess.run(
+        ["docker", "exec", "-i", name, "/duckdb", "-no-agent",
+         "-batch", "-noheader", "-csv", "-bail"],
+        input=statement, text=True, capture_output=True, timeout=90,
+    )
+    assert result.returncode == 0, (result.stdout[-1000:], result.stderr[-1000:])
+    assert "1" in result.stdout.splitlines() and "3" in result.stdout.splitlines(), result.stdout
+    return {"baked": True, "local_snapshot": True, "reopened_rows": 3,
+            "remote_ack": False,
+            "note": "local native snapshot only; differential is not the stateless lake backend"}
+
+
+def unsupported_index(client, statement):
+    try:
+        q_sql(client, statement)
+        return {"supported": True}
+    except Exception as error:
+        return {"supported": False, "error": str(error).splitlines()[0][:300]}
+
+
+def compute_large(client, names, extension_directory):
+    """The opt-in large datasets: a 1M-row DuckLake table and the real LINZ
+    Wellington orthophoto. Loads and timings go through the live Quack server;
+    local signed spatial/raquet artifacts are only the value oracle."""
+    import hashlib
+    import raquet_ortho
+
+    create_ms, _ = q_exec(
+        client,
+        "CREATE TABLE lake.main.large_events AS "
+        "SELECT i::BIGINT AS id, (i % 1000)::INT AS group_id, i::DOUBLE AS val, "
+        "'payload-' || md5(i::VARCHAR) || md5((i + 1)::VARCHAR) AS payload "
+        "FROM range(1000000) t(i)",
+    )
+    flush_ms, _ = q_exec(
+        client,
+        "CALL ducklake_flush_inlined_data('lake', table_name => 'large_events')",
+    )
+    load_ms = round(create_ms + flush_ms, 3)
+    lake_files, lake_bytes = q_sql(
+        client,
+        "SELECT count(*), coalesce(sum(data_file_size_bytes), 0) "
+        "FROM ducklake_list_files('lake', 'large_events')",
+    )[0]
+    table_prefix = f"{names['prefix']}/main/large_events"
+    objects = lake_parquet_objects(names["bucket"], table_prefix)
+    object_bytes = sum(size for _, size in objects)
+    assert lake_files == len(objects), (lake_files, objects)
+    assert object_bytes == lake_bytes, (object_bytes, lake_bytes)
+    assert 35 << 20 <= object_bytes <= 55 << 20, object_bytes
+
+    projection_timing, projection_rows = q_timed(
+        client, "SELECT sum(val), count(*) FROM lake.main.large_events")
+    assert projection_rows == [(499999500000.0, 1000000)], projection_rows
+    range_timing, range_rows = q_timed(
+        client,
+        "SELECT sum(val) FROM lake.main.large_events "
+        "WHERE id BETWEEN 500000 AND 509999",
+    )
+    assert range_rows == [(5049995000.0,)], range_rows
+    point_timing, point_rows = q_timed(
+        client,
+        "SELECT payload FROM lake.main.large_events WHERE id = 777777",
+    )
+    payload = ("payload-" + hashlib.md5(b"777777").hexdigest()
+               + hashlib.md5(b"777778").hexdigest())
+    assert point_rows == [(payload,)], (point_rows, payload)
+
+    path = raquet_ortho.build(4)
+    size = path.stat().st_size
+    metadata = raquet_ortho.metadata(path)
+    digest = raquet_ortho.sha256(path)
+    key = "ortho-4x4.parquet"
+    started = time.perf_counter()
+    raquet_ortho.upload(A, f"/{names['bucket']}/{key}", path)
+    upload_ms = round((time.perf_counter() - started) * 1000, 1)
+    headers, _ = request(B, f"/{names['bucket']}/{key}", "HEAD", timeout=600)
+    assert int(headers["Content-Length"]) == size, headers
+    url = f"s3://{names['bucket']}/{key}"
+
+    west, south, east, north = metadata["bounds"]
+    lon, lat = (west + east) / 2, (south + north) / 2
+    x0, x1 = west + (east - west) * 0.35, west + (east - west) * 0.65
+    y0, y1 = south + (north - south) * 0.35, south + (north - south) * 0.65
+    region = (f"'POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, "
+              f"{x0} {y1}, {x0} {y0}))'::GEOMETRY")
+    lookup = lambda zoom="": (
+        f"SELECT {raquet_ortho.rgb(lon, lat)} FROM "
+        f"read_raquet_at('{url}', {lon!r}, {lat!r}{zoom})")
+    with raquet_local(extension_directory) as oracle:
+        local_metadata = json.loads(oracle.execute(
+            "SELECT metadata FROM read_raquet_metadata(?)", [str(path)]).fetchone()[0])
+        assert local_metadata == metadata, "cached ortho metadata changed"
+        local_native = oracle.execute(
+            f"SELECT {raquet_ortho.rgb(lon, lat)} FROM "
+            f"read_raquet_at('{path}', {lon!r}, {lat!r})").fetchall()
+        local_overview = oracle.execute(
+            f"SELECT {raquet_ortho.rgb(lon, lat)} FROM "
+            f"read_raquet_at('{path}', {lon!r}, {lat!r}, 16)").fetchall()
+        local_matched = oracle.execute(
+            f"SELECT count(*) FROM read_raquet('{path}', {region})").fetchone()[0]
+        local_region = oracle.execute(
+            f"SELECT unnest(ST_RegionStats(band_1, block, {region}, metadata)) "
+            f"FROM read_raquet('{path}', {region})").fetchall()
+
+    metadata_timing, metadata_rows = q_timed(
+        client, f"SELECT metadata FROM read_raquet_metadata('{url}')")
+    assert json.loads(metadata_rows[0][0]) == metadata, "Quack metadata differs"
+    native_timing, native_rows = q_timed(client, lookup())
+    assert native_rows == local_native, (native_rows, local_native)
+    overview_timing, overview_rows = q_timed(client, lookup(", 16"))
+    assert overview_rows == local_overview, (overview_rows, local_overview)
+    region_ms, region_rows = q_exec(
+        client, f"SELECT count(*) FROM read_raquet('{url}', {region})")
+    assert region_rows == [(local_matched,)], (region_rows, local_matched)
+    region_stats_ms, server_region = q_exec(
+        client,
+        f"SELECT unnest(ST_RegionStats(band_1, block, {region}, metadata)) "
+        f"FROM read_raquet('{url}', {region})",
+    )
+    assert raquet_ortho.same(server_region, local_region), (server_region, local_region)
+
+    mib = 1 << 20
+    return {
+        "ducklake": {
+            "table": "q.lake.main.large_events",
+            "server_table": "lake.main.large_events",
+            "rows": 1000000,
+            "load_ms": load_ms,
+            "create_ms": create_ms,
+            "flush_ms": flush_ms,
+            "ducklake_stored_bytes": int(lake_bytes),
+            "s3_listing": {
+                "endpoint": "gateway B",
+                "prefix": table_prefix,
+                "objects": len(objects),
+                "bytes": object_bytes,
+                "mib": round(object_bytes / mib, 1),
+            },
+            "queries": {
+                "columnar_projection": {
+                    "sql": "SELECT sum(val), count(*) FROM lake.main.large_events",
+                    "result": {"sum_val": projection_rows[0][0],
+                               "count": projection_rows[0][1]},
+                    "timing": projection_timing,
+                },
+                "range_1pct": {
+                    "sql": "SELECT sum(val) FROM lake.main.large_events "
+                           "WHERE id BETWEEN 500000 AND 509999",
+                    "result": {"sum_val": range_rows[0][0]},
+                    "timing": range_timing,
+                },
+                "point_lookup": {
+                    "sql": "SELECT payload FROM lake.main.large_events "
+                           "WHERE id = 777777",
+                    "result": {"payload": point_rows[0][0]},
+                    "timing": point_timing,
+                },
+            },
+        },
+        "ortho": {
+            "file": str(path),
+            "bytes": size,
+            "gib": round(size / (1 << 30), 3),
+            "sha256": digest,
+            "upload": {
+                "endpoint": "gateway A",
+                "target": f"{names['bucket']}/{key}",
+                "ms": upload_ms,
+                "mib_s": round(size / mib / (upload_ms / 1000), 1),
+            },
+            "tiling": metadata["tiling"],
+            "metadata": {"timing": metadata_timing, "matches": True},
+            "native_z21": {
+                "lon": lon,
+                "lat": lat,
+                "rgb": list(native_rows[0]),
+                "timing": native_timing,
+            },
+            "overview_z16": {
+                "rgb": list(overview_rows[0]),
+                "timing": overview_timing,
+            },
+            "region_9pct": {
+                "predicate": "read_raquet(url, region) uses ST_Intersects",
+                "ms": region_ms,
+                "stats_ms": region_stats_ms,
+                "matched_tiles": region_rows[0][0],
+                "expected_matched_tiles": local_matched,
+                "stats": server_region,
+                "matches": True,
+            },
+        },
+    }
+
+
+def compute_bench(client, names, extension_directory):
+    q_exec(client, "SET enable_external_file_cache=false; SET parquet_metadata_cache=false")
+    points_build_ms, _ = q_exec(
+        client,
+        "CREATE TABLE lake.main.bench_points AS "
+        "SELECT i AS id, ST_Point((i % 100)::DOUBLE, (i // 100)::DOUBLE) AS geom "
+        "FROM range(5000) t(i)",
+    )
+    spatial_lake, lake_spatial = q_timed(
+        client,
+        "SELECT count(*) FROM lake.main.bench_points "
+        "WHERE ST_Within(geom, ST_MakeEnvelope(10,10,50,50))",
+    )
+    points_copy_ms, _ = q_exec(
+        client, "CREATE TABLE native_points AS SELECT * FROM lake.main.bench_points"
+    )
+    points_index_ms, _ = q_exec(
+        client, "CREATE INDEX native_points_rtree ON native_points USING RTREE (geom)"
+    )
+    spatial_statement = (
+        "SELECT count(*) FROM native_points "
+        "WHERE ST_Within(geom, ST_MakeEnvelope(10,10,50,50))"
+    )
+    spatial_native, native_spatial = q_timed(client, spatial_statement)
+    assert lake_spatial == native_spatial, (lake_spatial, native_spatial)
+    unsupported_spatial = unsupported_index(
+        client, "CREATE INDEX lake_points_rtree ON lake.main.bench_points USING RTREE (geom)"
+    )
+    q_exec(client, "INSERT INTO lake.main.bench_points VALUES (5000, ST_Point(500,500))")
+    lakes_after = q_sql(client, "SELECT count(*) FROM lake.main.bench_points")[0][0]
+    native_after = q_sql(client, "SELECT count(*) FROM native_points")[0][0]
+    assert lakes_after == 5001 and native_after == 5000, (lakes_after, native_after)
+
+    vec_build_ms, _ = q_exec(
+        client,
+        "CREATE TABLE lake.main.bench_vecs AS "
+        "SELECT i AS id, list_transform(range(32), lambda j: sin(i*0.01+j*0.1)::FLOAT) AS vec "
+        "FROM range(5000) t(i)",
+    )
+    query = [math.sin(42 * 0.01 + j * 0.1) for j in range(32)]
+    literal = "[" + ",".join(f"{value:.9g}" for value in query) + "]::FLOAT[32]"
+    vector_lake, lake_ids = q_timed(
+        client,
+        "SELECT id FROM lake.main.bench_vecs "
+        f"ORDER BY array_cosine_distance(vec::FLOAT[32], {literal}) LIMIT 10",
+    )
+    columns = ", ".join(f"vec[{j}]::FLOAT" for j in range(1, 33))
+    vector_copy_ms, _ = q_exec(
+        client,
+        f"CREATE TABLE native_vecs AS SELECT id, array_value({columns}) AS vec "
+        "FROM lake.main.bench_vecs",
+    )
+    vector_index_ms, _ = q_exec(
+        client,
+        "CREATE INDEX native_vec_hnsw ON native_vecs USING HNSW (vec) WITH (metric='cosine')",
+    )
+    vector_statement = (
+        "SELECT id FROM native_vecs "
+        f"ORDER BY array_cosine_distance(vec, {literal}) LIMIT 10"
+    )
+    vector_native, native_ids = q_timed(client, vector_statement)
+    recall_hits = len({row[0] for row in lake_ids} & {row[0] for row in native_ids})
+    assert recall_hits == 10, (recall_hits, lake_ids, native_ids)
+    recall = recall_hits / 10
+    unsupported_vector = unsupported_index(
+        client, "CREATE INDEX lake_vec_hnsw ON lake.main.bench_vecs USING HNSW (vec)"
+    )
+
+    docs_build_ms, _ = q_exec(
+        client, "CREATE TABLE native_docs (id INTEGER NOT NULL, body VARCHAR)"
+    )
+    q_exec(client, "INSERT INTO native_docs SELECT i, 'doc ' || i FROM range(20) t(i)")
+    fts_build_ms, _ = q_exec(
+        client,
+        "PRAGMA create_fts_index('native_docs','id','body', incremental=true, overwrite=1)",
+    )
+    fts_statement = (
+        "SELECT count(*) FROM (SELECT *, "
+        "fts_main_native_docs.match_bm25(id,'zebra') AS score FROM native_docs) "
+        "WHERE score IS NOT NULL"
+    )
+    fts_before, _ = q_timed(client, fts_statement)
+    q_exec(client, "INSERT INTO native_docs VALUES (100, 'zebra')")
+    fts_insert = q_sql(client, fts_statement)[0][0]
+    q_exec(client, "DELETE FROM native_docs WHERE id=100")
+    fts_delete = q_sql(client, fts_statement)[0][0]
+    q_exec(client, "INSERT INTO native_docs VALUES (101, 'zebra')")
+    q_exec(client, "UPDATE native_docs SET body='wombat' WHERE id=101")
+    fts_after_update = q_sql(client, fts_statement)[0][0]
+    wombat = q_sql(client, fts_statement.replace("'zebra'", "'wombat'"))[0][0]
+    assert fts_insert == 1 and fts_delete == 0, (fts_insert, fts_delete)
+
+    return {
+        "enabled": True,
+        "datasets": {"points": 5000, "vectors": 5000, "dimensions": 32, "documents": 20},
+        "spatial": {
+            "lake_scan": spatial_lake,
+            "native_rtree": {"copy_ms": points_copy_ms, "index_ms": points_index_ms,
+                             "query": spatial_native},
+            "lake_build_ms": points_build_ms,
+            "rows": lake_spatial[0][0],
+            "lake_after_insert": lakes_after,
+            "native_copy_after_insert": native_after,
+            "native_copy_stale_rows": lakes_after - native_after,
+            "unsupported_lake_index": unsupported_spatial,
+        },
+        "vector": {
+            "lake_scan": vector_lake,
+            "native_hnsw": {"copy_ms": vector_copy_ms, "index_ms": vector_index_ms,
+                            "query": vector_native},
+            "lake_build_ms": vec_build_ms,
+            "recall_at_10": recall_hits,
+            "recall": recall,
+            "unsupported_lake_index": unsupported_vector,
+        },
+        "fts": {
+            "native_build_ms": round(docs_build_ms + fts_build_ms, 3),
+            "query": fts_before,
+            "insert_visible": fts_insert,
+            "delete_removed": fts_delete,
+            "zebra_after_update": fts_after_update,
+            "wombat_after_update": wombat,
+            "update_maintained": fts_after_update == 0 and wombat == 1,
+            "note": "incremental INSERT/DELETE maintained; UPDATE remains stale in DuckDB 2.0.0",
+        },
+        "large": compute_large(client, names, extension_directory),
+        "caveat": "native copies are ephemeral memory objects, not lake indexes; timings are "
+                  "native Quack round-trip samples, not storage or throughput claims",
+    }
+
+
+def compute():
+    """The actual deployment shape: one existing pgvs3 PostgreSQL database,
+    native S3 buckets through gateways A/B, the non-root/read-only DuckDB image
+    with native Quack, and a restart with no persistent local database."""
+    names = compute_names(RUN.name)
+    image = DUCKDB_IMAGE
+    extension_directory = RUN / "duckdb-client-extensions"
+    copy_client_extensions(image, extension_directory)
+    import duckdb
+    image_id = docker_inspect(image, "{{.Id}}")
+    parts = urlsplit(DATABASE)
+    report = {
+        "preamble": False,
+        "success": False,
+        "complete": False,
+        "image": {"tag": image, "id": image_id},
+        "providers": {
+            "compute": "pgvs3-duckdb 2.0.0 image, native Quack",
+            "object_store": "pgvs3 native bucket through gateways A/B",
+            "catalog": "PostgreSQL 18 pgvs3 database",
+            "client": "host Python duckdb 2.0.0 with signed image quack/httpfs",
+        },
+        "config": {
+            "pg_host": parts.hostname,
+            "pg_port": parts.port,
+            "pg_database": parts.path.lstrip("/"),
+            "bucket": names["bucket"],
+            "prefix": names["prefix"],
+            "metadata_schema": names["schema"],
+            "endpoint_a": A,
+            "endpoint_b": B,
+            "readonly_rootfs": True,
+            "nonroot_user": "65532:65532",
+            "duckdb_memory_limit": "1GB",
+            "duckdb_threads": 4,
+        },
+        "versions": {},
+        "functional": {},
+        "restart": {},
+        "negative": {},
+        "bench": {"enabled": False},
+        "raw_samples": {},
+    }
+
+    def save():
+        (RUN / "compute.json").write_text(json.dumps(report, indent=2) + "\n")
+
+    save()
+    request(A, f"/{names['bucket']}", "PUT", b"")
+    token = os.urandom(16).hex()
+    port = free_port()
+    env = compute_environment(names, A, port, token)
+    name = f"pgvs3-{RUN.name}-compute-a"
+    with container(name, image, *compute_container_args(env)):
+        wait_compute(extension_directory, port, token)
+        client = host_client(extension_directory, port, token)
+        try:
+            client_s3_secret(client, B)
+            server_version = q_sql(client, "SELECT version()")[0][0]
+            server_modules = q_sql(
+                client,
+                "SELECT extension_name, extension_version, installed_from, loaded "
+                "FROM duckdb_extensions() WHERE extension_name IN "
+                "('spatial','ducklake','postgres_scanner','fts','vss','quack','httpfs',"
+                "'raquet','differential') ORDER BY 1",
+            )
+            client_version = duckdb.__version__
+            client_modules = client.execute(
+                "SELECT extension_name, extension_version, installed_from, loaded "
+                "FROM duckdb_extensions() WHERE extension_name IN ('quack','httpfs') ORDER BY 1"
+            ).fetchall()
+            report["versions"] = {
+                "server_duckdb": server_version,
+                "client_duckdb": client_version,
+                "server_modules": [dict(zip(("name", "version", "origin", "loaded"), row))
+                                   for row in server_modules],
+                "client_modules": [dict(zip(("name", "version", "origin", "loaded"), row))
+                                   for row in client_modules],
+            }
+            assert server_version.startswith("v2.0.0"), server_version
+            assert all(row[1] for row in server_modules), server_modules
+            assert all(row[1] for row in client_modules), client_modules
+            assert all(row[3] for row in server_modules), server_modules
+
+            schema_tables = int(sql(
+                "SELECT count(*) FROM information_schema.tables WHERE table_schema = "
+                f"{sql_str(names['schema'])}"
+            ))
+            namespace_rows = int(sql(
+                f"SELECT count(*) FROM s3p.namespaces WHERE name = {sql_str(names['bucket'])}"
+            ))
+            assert schema_tables > 0, schema_tables
+            assert namespace_rows == 1, namespace_rows
+
+            native_key = "native/compute-object.txt"
+            request(A, f"/{names['bucket']}/{native_key}", "PUT", b"native-object")
+            _, native_body = request(B, f"/{names['bucket']}/{native_key}")
+            assert native_body == b"native-object", native_body
+
+            client.execute("CREATE TABLE q.lake.main.events (id INTEGER, payload VARCHAR)")
+            client.execute(
+                "INSERT INTO q.lake.main.events SELECT i, 'value-' || i FROM range(100) t(i)"
+            )
+            q_exec(client, "CALL ducklake_flush_inlined_data('lake', table_name => 'events')")
+            lake_rows = client.execute(
+                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) "
+                "FROM q.lake.main.events"
+            ).fetchone()
+            assert lake_rows[0] == 100 and lake_rows[1] == 4950, lake_rows
+            keys = lake_object_keys(names["bucket"], names["prefix"])
+            assert keys, "DuckLake stored no Parquet keys"
+            parquet_rows = parquet_digest(client, names["bucket"], keys)
+            assert parquet_rows == lake_rows, (parquet_rows, lake_rows)
+
+            report["functional"] = {
+                "explicit_bucket_created": True,
+                "metadata_schema_tables": schema_tables,
+                "same_database_native_namespace": namespace_rows,
+                "native_put_get_after_ducklake": True,
+                "qualified_read": "q.lake.main.events",
+                "qualified_create_insert": True,
+                "rows": lake_rows[0],
+                "id_sum": lake_rows[1],
+                "hash": str(lake_rows[2]),
+                "parquet_keys": keys,
+                "parquet_rows": parquet_rows[0],
+                "parquet_hash": str(parquet_rows[2]),
+                "raquet_functions": q_sql(
+                    client,
+                    "SELECT count(DISTINCT function_name) FROM duckdb_functions() "
+                    "WHERE function_name IN ('read_raquet_metadata','read_raquet_at')",
+                )[0][0],
+                "differential": differential_local(name),
+                "qualified_note": "q.lake.main.* writes are durable; unqualified "
+                                  "q.<table> writes land in the ephemeral memory catalog",
+            }
+            assert report["functional"]["raquet_functions"] == 2
+            report["raw_samples"]["functional"] = {
+                "lake_rows": lake_rows,
+                "parquet_rows": parquet_rows,
+                "keys": keys,
+            }
+            save()
+
+            stopping = stop_compute(name)
+        finally:
+            client.close()
+    report["restart"]["shutdown"] = stopping
+
+    port2 = free_port()
+    env2 = compute_environment(names, B, port2, token)
+    name2 = f"pgvs3-{RUN.name}-compute-b"
+    with container(name2, image, *compute_container_args(env2)):
+        wait_compute(extension_directory, port2, token)
+        client2 = host_client(extension_directory, port2, token)
+        try:
+            client_s3_secret(client2, B)
+            rows_after = client2.execute(
+                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) "
+                "FROM q.lake.main.events"
+            ).fetchone()
+            assert rows_after == lake_rows, (rows_after, lake_rows)
+            client2.execute(
+                "INSERT INTO q.lake.main.events VALUES (100, 'after-restart')"
+            )
+            q_exec(client2, "CALL ducklake_flush_inlined_data('lake', table_name => 'events')")
+            rows_after_write = client2.execute(
+                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) "
+                "FROM q.lake.main.events"
+            ).fetchone()
+            assert rows_after_write[0] == 101, rows_after_write
+            keys_after = lake_object_keys(names["bucket"], names["prefix"])
+            parquet_after = parquet_digest(client2, names["bucket"], keys_after)
+            assert parquet_after == rows_after_write, (parquet_after, rows_after_write)
+            report["restart"].update({
+                "endpoint": "gateway B",
+                "fresh_container": True,
+                "persistent_local_database": False,
+                "rows_before_write": rows_after,
+                "rows_after_write": rows_after_write,
+                "parquet_keys_after": keys_after,
+                "parquet_rows_after": parquet_after,
+            })
+            report["raw_samples"]["restart"] = {
+                "rows_before_write": rows_after,
+                "rows_after_write": rows_after_write,
+                "keys_after": keys_after,
+            }
+            if os.environ.get("PGVS3_DUCKDB_BENCH") == "1":
+                report["bench"] = compute_bench(client2, names, extension_directory)
+                report["raw_samples"]["bench"] = report["bench"]
+            else:
+                report["bench"] = {"enabled": False,
+                                   "reason": "set PGVS3_DUCKDB_BENCH=1 for the opt-in sample"}
+            report["image"].update({
+                "architecture": docker_inspect(image, "{{.Architecture}}"),
+                "user": docker_inspect(name2, "{{.Config.User}}"),
+                "readonly_rootfs": docker_inspect(
+                    name2, "{{.HostConfig.ReadonlyRootfs}}"
+                ).lower() == "true",
+                "mounts": int(docker_inspect(name2, "{{len .Mounts}}")),
+            })
+            save()
+            report["restart"]["shutdown_b"] = stop_compute(name2)
+        finally:
+            client2.close()
+
+    missing_bucket = f"compute-absent-{names['slug']}"[:63]
+    request(B, f"/{missing_bucket}", "GET", want=404)
+    missing_bucket_error = None
+    probe_client = host_client(extension_directory)
+    try:
+        client_s3_secret(probe_client, B)
+        try:
+            probe_client.execute(
+                f"SELECT * FROM read_parquet({sql_str(f's3://{missing_bucket}/absent.parquet')})"
+            )
+        except Exception as error:
+            missing_bucket_error = str(error).splitlines()[0][:300]
+    finally:
+        probe_client.close()
+    assert missing_bucket_error is not None, "missing bucket unexpectedly readable"
+    request(B, f"/{missing_bucket}", "GET", want=404)
+
+    missing_database = f"compute_missing_{names['slug']}"[:63]
+    missing_url = urlunsplit((parts.scheme, parts.netloc, "/" + missing_database,
+                              parts.query, parts.fragment))
+    missing_env = dict(env)
+    missing_env["PGVS3_URL"] = missing_url
+    missing_env["PGVS3_METADATA_SCHEMA"] = f"{names['schema']}_missing"[:63]
+    missing_args = ["docker", "run", "--rm", "--read-only", "--tmpfs", "/tmp:rw,size=1g"]
+    for key, value in missing_env.items():
+        missing_args.extend(["-e", f"{key}={value}"])
+    # Native lake-only check: no Quack token/server, just secret + attach.
+    missing_args.extend([
+        image, "-no-agent", "-batch", "-bail",
+        "-init", "/opt/pgvs3-duckdb/lake-only.sql",
+    ])
+    missing = subprocess.run(missing_args, text=True, capture_output=True, timeout=120)
+    missing_text = missing.stdout + missing.stderr
+    assert missing.returncode != 0, missing_text
+    assert "PGVS3_LAKE_OK" not in missing_text, missing_text
+    assert DATABASE not in missing_text, missing_text
+    assert "postgres:postgres" not in missing_text, missing_text
+    missing_database_count = int(sql(
+        f"SELECT count(*) FROM pg_database WHERE datname = {sql_str(missing_database)}"
+    ))
+    assert missing_database_count == 0, missing_database_count
+
+    report["negative"] = {
+        "missing_bucket": missing_bucket,
+        "missing_bucket_404": True,
+        "missing_bucket_error": missing_bucket_error,
+        "no_implicit_bucket_recreation": True,
+        "missing_database": missing_database,
+        "missing_database_exit": missing.returncode,
+        "missing_database_created": missing_database_count,
+        "credentials_redacted": True,
+    }
+
+    report["success"] = True
+    report["complete"] = True
+    save()
+    print(
+        f"compute: image {image_id[:19]} DuckDB {server_version} client {client_version}; "
+        f"schema {names['schema']} rows {lake_rows[0]} -> {rows_after_write[0]}; "
+        f"keys {len(keys)} -> {len(keys_after)}; native ops, restart, absence checks passed",
+        flush=True,
+    )
+
+
 def trino_query(server, statement):
     """Runs one statement over Trino's client protocol; returns the rows and
     the coordinator's elapsed milliseconds."""
@@ -1552,6 +2396,6 @@ def trino():
 
 if __name__ == "__main__":
     scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet, "ortho": ortho,
-                 "iceberg": iceberg, "trino": trino}
+                 "iceberg": iceberg, "trino": trino, "compute": compute}
     for name in sys.argv[1:]:
         scenarios[name]()

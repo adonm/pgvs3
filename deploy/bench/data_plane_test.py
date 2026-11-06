@@ -19,6 +19,58 @@ sys.path.insert(0, str(ROOT / "test"))
 import data_plane
 
 
+class ComputeHelperTests(unittest.TestCase):
+    def test_compute_names_are_stable_unique_and_safe(self):
+        first = data_plane.compute_names("compute.AbC123")
+        self.assertEqual(first, data_plane.compute_names("compute.AbC123"))
+        self.assertEqual(first["schema"], "compute_computeabc123")
+        self.assertEqual(first["bucket"], "compute-computeabc123")
+        self.assertEqual(first["prefix"], "compute/computeabc123/lake")
+        for key in ("schema", "bucket"):
+            self.assertLessEqual(len(first[key]), 63)
+        self.assertRegex(first["schema"], r"^[a-z_][a-z0-9_]*$")
+        self.assertRegex(first["bucket"], r"^[a-z0-9][a-z0-9-]*$")
+
+    def test_parse_s3_keys_handles_namespace_and_suffix(self):
+        body = b"""<?xml version="1.0"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Contents><Key>prefix/main/a.parquet</Key></Contents>
+  <Contents><Key>prefix/main/b.txt</Key></Contents>
+</ListBucketResult>"""
+        keys = data_plane.parse_s3_keys(body)
+        self.assertEqual(keys, ["prefix/main/a.parquet", "prefix/main/b.txt"])
+        self.assertEqual([key for key in keys if key.endswith(".parquet")],
+                         ["prefix/main/a.parquet"])
+        sized = body.replace(
+            b"<Key>prefix/main/a.parquet</Key>",
+            b"<Key>prefix/main/a.parquet</Key><Size>1234</Size>")
+        self.assertEqual(data_plane.parse_s3_objects(sized),
+                         [("prefix/main/a.parquet", 1234), ("prefix/main/b.txt", 0)])
+
+    def test_host_client_config_is_offline_signed_and_pinned(self):
+        config = data_plane.duckdb_client_config(Path("/tmp/run/extensions"))
+        self.assertEqual(config["extension_directory"], "/tmp/run/extensions")
+        self.assertEqual(config["autoinstall_known_extensions"], "false")
+        self.assertEqual(config["autoload_known_extensions"], "false")
+        self.assertEqual(config["allow_unsigned_extensions"], "false")
+
+    def test_sql_str_and_timing_summary_preserve_raw_samples(self):
+        self.assertEqual(data_plane.sql_str("a'b"), "'a''b'")
+        timings = data_plane.timing_summary([9, 4, 6, 5])
+        self.assertEqual(timings["ms"], [9.0, 4.0, 6.0, 5.0])
+        self.assertEqual(timings["first_ms"], 9.0)
+        self.assertEqual(timings["repeat_ms"], [4.0, 6.0, 5.0])
+        self.assertEqual(timings["median_ms"], 5.5)
+        self.assertEqual(timings["min_ms"], 4.0)
+        self.assertEqual(timings["max_ms"], 9.0)
+
+    def test_empty_timing_summary_is_explicit(self):
+        self.assertEqual(data_plane.timing_summary([]), {
+            "ms": [], "first_ms": None, "repeat_ms": [],
+            "median_ms": None, "min_ms": None, "max_ms": None,
+        })
+
+
 class TrinoReportTests(unittest.TestCase):
     def test_first_run_and_total_origin_methods_are_recorded(self):
         runs = [{"GET": 4, "HEAD": 1}, {"GET": 0, "HEAD": 2}, {"GET": 0, "HEAD": 2}]

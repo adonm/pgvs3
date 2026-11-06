@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.artifacts/downloads/
+.artifacts/bin/
+.artifacts/**/*.tmp-*
+*_test.py
+fetch_artifacts.py
+image_tools.py
+smoke.py
+README.md

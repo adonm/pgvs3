@@ -241,6 +241,63 @@ image push="false":
       KO_DOCKER_REPO=ko.local mise exec go ko -- ko build "${kwargs[@]}" --local ./cmd/pgvs3
     fi
 
+# Pinned DuckDB 2.0.0 + nine signed extensions + native Quack.
+DUCKDB_IMAGE := env("DUCKDB_IMAGE", "pgvs3-duckdb:2.0.0")
+DUCKDB_IMAGE_REPO := env("DUCKDB_IMAGE_REPO", "ghcr.io/adonm/pgvs3-duckdb")
+
+# Fetch/verify the pinned artifacts, build and check the amd64 image, and
+# optionally push it to GHCR.
+[group('image')]
+duckdb-image push="false":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    python3 deploy/duckdb/fetch_artifacts.py
+    docker build --platform linux/amd64 -t "{{ DUCKDB_IMAGE }}" deploy/duckdb
+    python3 deploy/duckdb/image_tools.py check "{{ DUCKDB_IMAGE }}"
+    if [ "{{ push }}" = "true" ]; then
+      docker tag "{{ DUCKDB_IMAGE }}" "{{ DUCKDB_IMAGE_REPO }}:2.0.0"
+      docker tag "{{ DUCKDB_IMAGE }}" "{{ DUCKDB_IMAGE_REPO }}:latest"
+      docker push "{{ DUCKDB_IMAGE_REPO }}:2.0.0"
+      docker push "{{ DUCKDB_IMAGE_REPO }}:latest"
+    fi
+
+# Offline extension/entrypoint check in the non-root, read-only-root image.
+[group('test')]
+duckdb-check:
+    python3 deploy/duckdb/image_tools.py check "{{ DUCKDB_IMAGE }}"
+
+# Host-driven local no-PG/no-S3 functional smoke and illustrative timings.
+[group('test')]
+duckdb-smoke:
+    python3 deploy/duckdb/smoke.py "{{ DUCKDB_IMAGE }}"
+
+# One-shot PG/S3 DuckLake attach without starting Quack (next-phase integration).
+[group('test')]
+duckdb-no-daemon:
+    docker run --rm --read-only --tmpfs /tmp:rw,size=1g \
+      -e PGVS3_URL -e PGVS3_BUCKET -e PGVS3_PREFIX -e PGVS3_ENDPOINT \
+      -e PGVS3_S3_USE_SSL -e PGVS3_S3_ACCESS_KEY -e PGVS3_S3_SECRET_KEY \
+      --entrypoint /duckdb "{{ DUCKDB_IMAGE }}" \
+      -no-agent -batch -bail -init /opt/pgvs3-duckdb/lake-only.sql
+
+# Functional compute image on the disposable pgvs3 stack: same PG database,
+# native S3 bucket through gateways A/B, native Quack and a fresh-container restart.
+[group('test')]
+duckdb-integration:
+    PGVS3_ANALYTICS=compute bash deploy/bench/stack.sh analytics
+
+# Opt-in small spatial/vector/FTS measurements in the same compute fixture.
+[group('test')]
+duckdb-integration-bench:
+    PGVS3_DUCKDB_BENCH=1 PGVS3_ANALYTICS=compute bash deploy/bench/stack.sh analytics
+
+# Focused host-side stdlib tests for the native SQL/artifact lock and the
+# compute helper contracts; no Docker/PG/S3 runtime work.
+[group('test')]
+duckdb-test:
+    python3 -m unittest discover -s deploy/duckdb -p '*_test.py'
+    mise exec python -- python -m unittest discover -s deploy/bench -p 'data_plane_test.py'
+
 # Lint, package and optionally push the OCI Helm chart to GHCR.
 [group('image')]
 chart push="false":
@@ -267,6 +324,7 @@ ci:
     mise exec go -- go vet -tags=integration ./...
     mise exec go -- go test -race ./...
     mise exec python -- python -m unittest discover -s deploy/bench -p '*_test.py'
+    mise exec python -- python -m unittest discover -s deploy/duckdb -p '*_test.py'
     GOFLAGS=-race just integration
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=5s ./internal/s3
     mise exec go -- go test -fuzz=FuzzChunkedBody -fuzztime=5s ./internal/s3

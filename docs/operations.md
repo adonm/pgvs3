@@ -118,6 +118,24 @@ Long streaming reads use the chunk pool without a statement timeout; upload
 transactions explicitly disable it while `COPY` runs. Tune the database limits
 with `--db-*` flags only after measuring the actual workload.
 
+## Prebuilt DuckDB 2.0 + Quack container
+
+The optional `pgvs3-duckdb:2.0.0` image is an official DuckDB 2.0.0 distroless
+base with nine signed extensions, including DuckLake, `httpfs`,
+`postgres_scanner`, `spatial`, `vss`, `fts` and `quack`. It attaches to the same
+`PGVS3_URL` database as the gateways (`METADATA_SCHEMA 'ducklake_pgvs3'`) and
+reads and writes the same bucket through `PGVS3_ENDPOINT` over native Quack on
+`:9494`. Quack sessions start in the memory catalog, so persistent tables must
+be qualified as `lake.main.<table>`.
+
+Run it with `docker run -d -i --init`: `-i` keeps the CLI process alive and
+`--init` provides a normal `SIGTERM`/`143` shutdown. See
+[the image guide](../deploy/duckdb/README.md) for build, variables, catalog/bucket
+semantics and limits, and [benchmarks.md](benchmarks.md) for the measured Quack
+samples. CI publishes `ghcr.io/adonm/pgvs3-duckdb:2.0.0` (plus `:latest`, and
+`:vX.Y.Z` on release tags) for `linux/amd64`; `just duckdb-image` builds
+`pgvs3-duckdb:2.0.0` locally. The image is not wired into the Helm chart.
+
 ## Choosing and sizing a storage role
 
 | Decision | Native PostgreSQL objects | Origin-backed cache/staging |

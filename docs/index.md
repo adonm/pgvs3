@@ -9,6 +9,10 @@ cache-coherence and coordination services.
 
 ![FIG 01 — System Topology & Parallel Authority Lanes](assets/architecture-flow.svg)
 
+> **Status: pre-alpha.** PostgreSQL 18+ (Aurora 18.3+). Storage layout **v25**
+> has no in-place upgrade: a layout change needs a fresh database and a
+> re-import.
+>
 > **Trusted networks only — permanently.** pgvs3 does not authenticate or
 > authorize clients, terminate inbound TLS, or validate S3 signatures or
 > credentials. Run it on loopback, a private VPC/VLAN, or behind a service mesh
@@ -25,7 +29,7 @@ cache-coherence and coordination services.
 | --- | --- | --- |
 | **Choose the right schema, partition & storage model** | [Workload Decision Tree & Resource Trade-offs](guides/index.md) | Map OLTP, DuckLake, cache and queue requirements across RAM, Disk/WAL, Network and CPU. |
 | **Protect OLTP tail latency & partition without cron DDL** | [1. Protect OLTP & Fixed Partitioning](guides/postgres.md) | Connection pool math, covering B-tree plans, TOAST splitting, and 32–64 fixed hash/quantile partitions. |
-| **Model billion-row DuckLake, wide columns & Hilbert curves** | [2. Analytical Snapshots, Wide Columns & Hilbert](guides/analytics.md) | 24-bit hierarchical Hilbert sorting for skewed hotspots, byte-bounded row groups, `skip_stats_columns`, late materialization & batch compaction. |
+| **Model large-table DuckLake, wide columns & Hilbert curves** | [2. Analytical Snapshots, Wide Columns & Hilbert](guides/analytics.md) | 24-bit hierarchical Hilbert sorting for skewed hotspots, byte-bounded row groups, `skip_stats_columns`, late materialization & batch compaction. |
 | **Share S3/HTTP bytes & stage large writes across gateways** | [3. Shared Cache & Write-Back Staging](guides/cache.md) | Coalesced cold fills (`s3c_`), aligned Parquet range caching, and non-expiring ack-first write-back (`s3w_`). |
 | **Bridge committed SQL changes to background workers** | [4. Jobs, Outboxes & Streams](guides/jobs.md) | Transactional SQL outbox, HTTP `409` envelope reconciliation, lazy `SKIP LOCKED` claims, receipts & 3-segment `TRUNCATE` streams. |
 | **Diagnose bottlenecks & execute safe recovery** | [5. Observe, Diagnose & Recover](guides/observe-recover.md) | PostgreSQL 18 `pg_stat_io` / `pg_stat_checkpointer` triage, LSN replay barriers, and pending-body restore checklists. |
@@ -82,7 +86,7 @@ See [Shared Cache & Write-Back Staging](guides/cache.md) and [Operations: Cache 
 
 ---
 
-### FIG 05 — Billion-Row DuckLake: Fixed Buckets, Density-Adaptive Hilbert & Late Materialization
+### FIG 05 — Large-Table DuckLake: Fixed Buckets, Density-Adaptive Hilbert & Late Materialization
 
 Instead of high-maintenance rolling time partitions or equal-area spatial grids that skew under urban hotspots, combine **fixed 32–64 hash buckets** (`bucket(32, customer_id)`) with **high-resolution 1D Hilbert sorting** (`SORTED BY (hilbert_id, ts)`). Because Parquet row groups (`parquet_row_group_size_bytes`) and DuckLake files (`target_file_size`) slice the sorted stream by **row/byte count (empirical quantiles)** rather than geographic area, sparse regions pack into one row group while dense hotspots automatically subdivide into tight neighborhood bounding boxes.
 
