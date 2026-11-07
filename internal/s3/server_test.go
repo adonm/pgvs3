@@ -703,14 +703,12 @@ func (f *fakeConditionalBackend) Open(_ context.Context, _, _ string, rng store.
 func TestConditionalReadBackendSkipsOpen(t *testing.T) {
 	body := "hello"
 	f := &fakeConditionalBackend{
-		fakeReadBackend: fakeReadBackend{
-			head: readHead{Info: store.ObjectInfo{Size: int64(len(body)), ETag: "etag"}},
-			res: &store.ReadResult{
-				Size: int64(len(body)), ETag: "etag",
-				Body:  io.NopCloser(strings.NewReader(body)),
-				Start: 0,
-				End:   int64(len(body) - 1),
-			},
+		head: readHead{Info: store.ObjectInfo{Size: int64(len(body)), ETag: "etag"}},
+		res: &store.ReadResult{
+			Size: int64(len(body)), ETag: "etag",
+			Body:  io.NopCloser(strings.NewReader(body)),
+			Start: 0,
+			End:   int64(len(body) - 1),
 		},
 		err: store.ErrNotModified,
 	}

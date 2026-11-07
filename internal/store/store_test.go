@@ -676,7 +676,7 @@ func TestChunkRowReaderColdFillReturnsSharedBlock(t *testing.T) {
 	p := testPiece(blockBytes, 0, blockRows-1)
 	raw := make([][][]byte, 0, blockRows)
 	want := make([]byte, 0, blockBytes)
-	for no := int32(0); no < blockRows; no++ {
+	for no := range int32(blockRows) {
 		data := rowFill(byte('a'+no%26), RowBytes)
 		raw = append(raw, chunkRow(no, data))
 		want = append(want, data...)
