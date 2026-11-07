@@ -20,8 +20,12 @@ durable write stage, not an automatic query-result cache or refresh engine.
 | Application result caching via RESP | Application-owned versioned key + TTL/invalidation | pgvs3 knows which SQL rows make a result stale. |
 
 Prefer immutable dataset keys. For a hot set that fits only partly in PostgreSQL,
-measure selective ranges before filling entire GiB objects. Fills consume logged
-PostgreSQL bytes, indexes, WAL and replay capacity; they are not free reads.
+measure selective ranges before filling entire GiB objects. Unlike Alluxio's
+stateful consistent-hash worker ring with worker-local NVMe page stores, pgvs3
+gateways are stateless and persist shared range chunks (`s3c_`) and write-back
+bodies (`s3w_`) inside PostgreSQL alongside the catalog: fills consume logged
+PostgreSQL bytes, indexes, WAL and replay capacity rather than a separate cache
+cluster's local disks ([research comparison](sources.md#caches-are-not-interchangeable)).
 
 ## Reproduce a cross-gateway hit and a stale read
 

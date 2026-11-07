@@ -71,6 +71,35 @@ class ComputeHelperTests(unittest.TestCase):
         })
 
 
+class QuackPoolHelperTests(unittest.TestCase):
+    def test_application_name_preserves_existing_query(self):
+        self.assertEqual(
+            data_plane.with_application_name(
+                "postgres://u:p@h/db?sslmode=disable", "pgvs3_pool"),
+            "postgres://u:p@h/db?sslmode=disable&application_name=pgvs3_pool")
+        self.assertEqual(
+            data_plane.with_application_name("postgres://u:p@h/db", "ducklake_pool"),
+            "postgres://u:p@h/db?application_name=ducklake_pool")
+
+    def test_pool_percentile_is_linear_and_bounded(self):
+        values = [10, 20, 30, 40]
+        self.assertEqual(data_plane.pool_percentile(values, 0), 10)
+        self.assertEqual(data_plane.pool_percentile(values, 0.5), 25)
+        self.assertEqual(data_plane.pool_percentile(values, 0.99), 39.7)
+        self.assertEqual(data_plane.pool_percentile(values, 1), 40)
+
+    def test_pool_digest_and_metric_delta_keep_only_counters(self):
+        rows = [(1, 2, 3.5), (4, 5, 6.5)]
+        self.assertEqual(data_plane.pool_digest(rows, (1, 2)), [2, 7.0, 10.0])
+        before = {"pgvs3_read_cache_hits_total": 1,
+                  "pgvs3_read_cache_bytes": 999}
+        after = {"pgvs3_read_cache_hits_total": 4,
+                 "pgvs3_read_cache_bytes": 10}
+        delta = data_plane.pool_metric_delta(before, after)
+        self.assertEqual(delta["pgvs3_read_cache_hits_total"], 3)
+        self.assertNotIn("pgvs3_read_cache_bytes", delta)
+
+
 class TrinoReportTests(unittest.TestCase):
     def test_first_run_and_total_origin_methods_are_recorded(self):
         runs = [{"GET": 4, "HEAD": 1}, {"GET": 0, "HEAD": 2}, {"GET": 0, "HEAD": 2}]

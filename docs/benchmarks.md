@@ -486,6 +486,119 @@ measured lower 5k-row medians (RTree 2.96 ms vs 10.17 ms lake scan; HNSW
 within one session. Incremental INSERT and DELETE were visible immediately,
 while UPDATE left the FTS index stale in DuckDB 2.0.0.
 
+### C clients x W worker pool benchmark
+
+`just duckdb-pool-bench` measures 45 cells: `W = 1, 2, 4` native Quack workers
+× `C = 1, 4, 8, 16, 32` independent host clients. Each client holds one
+persistent `ATTACH 'quack:...'` and routes to worker `i mod W`; every worker is
+`pgvs3-duckdb:2.0.0` with `DUCKDB_THREADS=4` and `DUCKDB_MEMORY_LIMIT=1GB`.
+One dedicated gateway runs at `--pool-max 32`; it is restarted with
+`--read-cache-bytes 0` and then `268435456` (256 MiB). The fixture is a
+1,000,000-row DuckLake `lake.main.events` (42.7 MiB, one Parquet object) plus a
+5,000-point native RTree rebuilt in each worker. Each client disables its own
+external-file and Parquet metadata caches, runs one warm-up query, then 20 timed
+`FROM q.query(...)` round trips. `q/s` is total timed statements divided by wall
+time; `C=1` p99 is the maximum of its 20 samples. PostgreSQL activity is sampled
+from `pg_stat_activity` by `application_name` (`pgvs3_pool` versus
+`ducklake_pool`); active counts miss sub-sample queries, so total connections are
+the capacity figure.
+
+The two single-client samples above are separate 1-query-at-a-time runs, not two
+capacity points or a range: the dated 2026-11-06 pass measured RTree 4.07 ms and
+lake 13.0/11.9/16.9 ms, while the earlier pass measured RTree 2.96 ms and HNSW
+3.19 ms. The pool table below is a different experiment (aggregate `C × W`
+throughput, repeated 20-query cells) and neither supersedes nor averages those
+single-client medians. Its `W=1, C=1` lake p50 (14.94 ms cache off) is close to
+the 13.0 ms single-client projection only because the same host and 1M-row shape
+were used; do not compare percentiles across the two protocols.
+
+**Lake range/aggregation, `--read-cache-bytes 0`** (`SELECT group_id, count(*),
+sum(val) ... WHERE group_id BETWEEN 100 AND 199 GROUP BY group_id`):
+
+| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 66.9 | 14.94 | 16.18 | 16.40 | 0/18 | 8 | 0/1 |
+| 1 | 4 | 153.4 | 24.14 | 30.55 | 50.33 | 1/34 | 18 | 0/4 |
+| 1 | 8 | 204.4 | 37.45 | 52.15 | 55.99 | 1/39 | 18 | 1/8 |
+| 1 | 16 | 236.0 | 65.04 | 85.56 | 97.09 | 3/48 | 24 | 1/16 |
+| 1 | 32 | 180.7 | 172.16 | 247.15 | 270.28 | 3/56 | 31 | 4/27 |
+| 2 | 1 | 57.2 | 17.41 | 19.10 | 19.56 | 0/18 | 8 | 0/25 |
+| 2 | 4 | 172.9 | 21.95 | 27.19 | 29.90 | 0/34 | 18 | 0/26 |
+| 2 | 8 | 212.1 | 35.17 | 51.62 | 67.76 | 0/47 | 24 | 1/28 |
+| 2 | 16 | 242.2 | 64.27 | 85.91 | 91.89 | 1/56 | 32 | 2/32 |
+| 2 | 32 | 247.0 | 125.98 | 175.40 | 197.16 | 1/61 | 32 | 1/40 |
+| 4 | 1 | 69.2 | 14.35 | 15.43 | 15.72 | 0/18 | 8 | 0/42 |
+| 4 | 4 | 164.8 | 23.02 | 31.14 | 33.34 | 0/39 | 19 | 0/42 |
+| 4 | 8 | 206.2 | 36.98 | 44.89 | 49.05 | 1/52 | 27 | 1/44 |
+| 4 | 16 | 208.6 | 74.81 | 97.58 | 104.49 | 0/59 | 31 | 3/48 |
+| 4 | 32 | 231.3 | 131.02 | 188.94 | 215.63 | 3/62 | 32 | 1/56 |
+
+**Lake range/aggregation, `--read-cache-bytes 256 MiB`.** Warm-up fills the
+block cache; every timed cell recorded zero `chunkPool` acquires and zero fills:
+
+| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 77.8 | 12.79 | 14.32 | 14.72 | 0/18 | 7 | 0/24 |
+| 1 | 4 | 224.8 | 17.14 | 20.76 | 26.03 | 0/30 | 7 | 1/24 |
+| 1 | 8 | 271.4 | 27.23 | 40.05 | 47.57 | 0/30 | 7 | 2/24 |
+| 1 | 16 | 190.5 | 81.31 | 120.83 | 135.65 | 1/41 | 7 | 2/24 |
+| 1 | 32 | 222.4 | 138.23 | 193.97 | 226.16 | 1/41 | 7 | 3/26 |
+| 2 | 1 | 78.8 | 12.62 | 14.16 | 14.20 | 0/18 | 7 | 0/40 |
+| 2 | 4 | 213.2 | 17.97 | 22.41 | 23.39 | 0/32 | 7 | 0/40 |
+| 2 | 8 | 175.6 | 39.94 | 68.53 | 73.25 | 1/35 | 7 | 3/40 |
+| 2 | 16 | 285.9 | 54.12 | 72.32 | 79.42 | 1/41 | 7 | 2/40 |
+| 2 | 32 | 275.5 | 109.82 | 165.79 | 189.32 | 1/41 | 7 | 1/40 |
+| 4 | 1 | 75.3 | 13.15 | 14.31 | 14.54 | 0/18 | 8 | 0/56 |
+| 4 | 4 | 187.3 | 18.53 | 28.83 | 30.34 | 0/32 | 8 | 1/56 |
+| 4 | 8 | 133.0 | 57.89 | 81.04 | 85.47 | 0/35 | 8 | 0/56 |
+| 4 | 16 | 283.7 | 54.50 | 68.77 | 76.41 | 1/41 | 8 | 1/56 |
+| 4 | 32 | 253.7 | 119.13 | 171.42 | 195.10 | 0/41 | 8 | 2/56 |
+
+**Native 5,000-point RTree in each worker** (pure Quack RPC + worker CPU, no
+gateway request in the timed path):
+
+| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 258.7 | 3.77 | 4.33 | 4.84 | 0/56 | 31 | 0/24 |
+| 1 | 4 | 944.5 | 4.03 | 4.89 | 5.01 | 0/56 | 31 | 0/24 |
+| 1 | 8 | 1,181.6 | 5.27 | 11.39 | 13.34 | 0/56 | 31 | 0/24 |
+| 1 | 16 | 1,356.7 | 9.98 | 20.44 | 24.48 | 0/56 | 31 | 0/24 |
+| 1 | 32 | 1,271.0 | 21.71 | 47.23 | 54.25 | 0/56 | 31 | 0/24 |
+| 2 | 1 | 259.3 | 3.69 | 5.47 | 5.49 | 0/61 | 32 | 0/40 |
+| 2 | 4 | 1,049.2 | 3.68 | 4.29 | 4.52 | 0/61 | 32 | 0/40 |
+| 2 | 8 | 1,580.8 | 4.55 | 6.88 | 8.00 | 0/61 | 32 | 0/40 |
+| 2 | 16 | 2,139.9 | 6.19 | 11.36 | 13.51 | 0/61 | 32 | 0/40 |
+| 2 | 32 | 2,353.4 | 11.35 | 24.04 | 35.29 | 0/61 | 32 | 0/40 |
+| 4 | 1 | 207.5 | 4.79 | 5.25 | 5.37 | 0/62 | 32 | 0/56 |
+| 4 | 4 | 1,001.1 | 3.90 | 4.54 | 4.73 | 0/62 | 32 | 0/56 |
+| 4 | 8 | 863.9 | 8.56 | 12.35 | 14.76 | 0/62 | 32 | 0/56 |
+| 4 | 16 | 1,454.1 | 8.72 | 16.41 | 21.01 | 0/62 | 32 | 0/56 |
+| 4 | 32 | 2,037.5 | 13.09 | 26.30 | 32.15 | 0/62 | 32 | 0/56 |
+
+What the run says:
+
+- **Native RPC scales to two workers, then hits host CPU.** At `C=32`, W=1
+  delivered 1,271 q/s, W=2 2,353 q/s (1.85×), and W=4 2,038 q/s. Four workers ×
+  four threads fill all 16 cores; adding workers beyond that raised p99 instead
+  of throughput.
+- **A lake scan through one gateway plateaus near 230–285 q/s.** W=1/2/4 at
+  `C=32` delivered 181/247/231 q/s cache off and 222/276/254 q/s with the 256 MiB
+  cache. Worker count does not create PostgreSQL chunk throughput.
+- **The 256 MiB cache removed timed PostgreSQL chunk traffic.** Cache-off cells
+  acquired the chunk pool 10 times per lake query (one per GET) and kept 31–32
+  chunk connections; cache-on cells recorded 0 acquires and 7–8 connections.
+  Median q/s at `C >= 8` rose from 212 to 254 (+20%), with no help for one-pass
+  scans or the single-gateway ceiling.
+- **Every worker count needs catalog headroom.** DuckLake connections grew from 24
+  (W=1) to 56 (W=4), independent of pgvs3 pools; the gateway's own total reached
+  62. Size `max_connections` from the sum in
+  [operations](operations.md#sizing-a-quack-worker-pool), not from `P` alone.
+
+Report: `.tmp/verify/pool.mH6Prx/quack_pool.json`, SHA-256
+`3add9c71c3250a48bab62747535c588ce6a1f43ae7719a32213f100705bb7429`.
+Single host, one session; non-monotonic cells (for example W=4, C=8) are run
+noise, not a scaling claim.
+
 The larger pass adds a 1,000,000-row DuckLake table and the 1.14 GB LINZ
 Wellington orthophoto:
 

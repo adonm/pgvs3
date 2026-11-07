@@ -291,6 +291,12 @@ duckdb-integration:
 duckdb-integration-bench:
     PGVS3_DUCKDB_BENCH=1 PGVS3_ANALYTICS=compute bash deploy/bench/stack.sh analytics
 
+# C clients x W native Quack workers against DuckLake, a native RTree and one
+# cache-controlled gateway; writes quack_pool.json into the kept run directory.
+[group('bench')]
+duckdb-pool-bench:
+    bash deploy/bench/stack.sh pool
+
 # Focused host-side stdlib tests for the native SQL/artifact lock and the
 # compute helper contracts; no Docker/PG/S3 runtime work.
 [group('test')]

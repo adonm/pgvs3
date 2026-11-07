@@ -62,9 +62,9 @@ measured here, so no number is quoted.
 
 ---
 
-## Visual Atlas of Data Layouts & Movements (FIG 03–06)
+## Visual Atlas of Data Layouts & Movements (FIG 03–07)
 
-Figures use stable site-wide numbers, so the same diagram can be reused on a guide page without renumbering. FIG 01 (topology) and FIG 02 (decision tree) appear above; the four data-layout figures follow.
+Figures use stable site-wide numbers, so the same diagram can be reused on a guide page without renumbering. FIG 01 (topology) and FIG 02 (decision tree) appear above; the data-layout and capacity figures follow.
 
 ### FIG 03 — 8,192-Byte Page Layout & Cut-Through Streaming I/O
 
@@ -103,6 +103,16 @@ Each `s3q_<name>` schema provides two delivery views: **OJS competing jobs** (br
 ![FIG 06 — OJS Outbox Claim/ACK Boundaries & 3-Segment TRUNCATE Streams](assets/outbox-jobs-streams.svg)
 
 See [Jobs, Outboxes & Streams](guides/jobs.md) and [Queue & Stream Model](queue-stream.md).
+
+---
+
+### FIG 07 — Quack Client-to-Worker Pool, Gateway Admission & PostgreSQL Capacity
+
+`C` Quack clients hold one active statement per persistent connection and route across `W` `pgvs3-duckdb:2.0.0` workers, each one `DatabaseInstance` with shared `T = 4` threads, an `A = min(4 × CPU, 256)` async HTTP pool, a `256 MiB ≤ M/4` stream buffer, and per-worker native RTree/HNSW memory. `G` gateways admit `32` active + `64` queued S3 requests each (`G ≥ ⌈R/32⌉` zero queue, `G ≥ ⌈R/96⌉` burst), reserve `1 + w` chunk connections per multi-piece read, and can bypass the chunk pool with a bounded `--read-cache-bytes` block cache. PostgreSQL `max_connections` must cover `(G + surge) × (P + min(P, 64)) + Σ a_w` because DuckLake catalog connections bypass pgvs3.
+
+![FIG 07 — Quack Client-to-Worker Pool, Gateway Admission and PostgreSQL Capacity Model](assets/quack-worker-pool.svg)
+
+See [Quack client-to-worker pool capacity model](performance.md#quack-client-to-worker-pool-capacity-model), [worker-pool sizing](operations.md#sizing-a-quack-worker-pool), and the [measured `C × W` pool](benchmarks.md#c-clients-x-w-worker-pool-benchmark).
 
 ---
 

@@ -1340,9 +1340,9 @@ def wait_compute(extension_directory, port, token):
     eventually("compute Quack readiness", ready, 120)
 
 
-def compute_environment(names, endpoint, port, token):
+def compute_environment(names, endpoint, port, token, database=None):
     return {
-        "PGVS3_URL": DATABASE,
+        "PGVS3_URL": database or DATABASE,
         "PGVS3_BUCKET": names["bucket"],
         "PGVS3_PREFIX": names["prefix"],
         "PGVS3_ENDPOINT": endpoint,
@@ -2044,6 +2044,437 @@ def compute():
     )
 
 
+POOL_WORKERS = (1, 2, 4)
+POOL_CLIENTS = (1, 4, 8, 16, 32)
+POOL_LAKE_REPEAT = int(os.environ.get("PGVS3_POOL_LAKE_REPEAT", "20"))
+POOL_NATIVE_REPEAT = int(os.environ.get("PGVS3_POOL_NATIVE_REPEAT", "20"))
+POOL_READ_CACHE = (0, 256 << 20)
+POOL_LAKE_QUERY = (
+    "SELECT group_id, count(*), sum(val) FROM lake.main.events "
+    "WHERE group_id BETWEEN 100 AND 199 GROUP BY group_id ORDER BY group_id"
+)
+POOL_LAKE_CREATE = (
+    "CREATE TABLE lake.main.events AS "
+    "SELECT i::BIGINT AS id, (i % 1000)::INT AS group_id, i::DOUBLE AS val, "
+    "'payload-' || md5(i::VARCHAR) || md5((i + 1)::VARCHAR) AS payload "
+    "FROM range(1000000) t(i)"
+)
+POOL_NATIVE_CREATE = (
+    "CREATE OR REPLACE TABLE native_points AS "
+    "SELECT i AS id, ST_Point((i % 100)::DOUBLE, (i // 100)::DOUBLE) AS geom "
+    "FROM range(5000) t(i)"
+)
+POOL_NATIVE_INDEX = "CREATE OR REPLACE INDEX native_points_rtree ON native_points USING RTREE (geom)"
+POOL_NATIVE_QUERY = (
+    "SELECT count(*) FROM native_points "
+    "WHERE ST_Within(geom, ST_MakeEnvelope(10,10,50,50))"
+)
+POOL_METRICS = (
+    "pgvs3_read_cache_hits_total",
+    "pgvs3_read_cache_hit_bytes_total",
+    "pgvs3_read_cache_fills_total",
+    "pgvs3_read_cache_bytes",
+    "pgvs3_pg_pool_acquire_count_total",
+    "pgvs3_chunk_pool_acquire_count_total",
+)
+POOL_COUNTERS = tuple(name for name in POOL_METRICS if not name.endswith("_bytes"))
+
+
+def with_application_name(url, name):
+    parts = urlsplit(url)
+    query = parts.query + ("&" if parts.query else "") + "application_name=" + name
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+
+class PoolGateway:
+    """One gateway process that can be restarted with a different read cache."""
+
+    def __init__(self, port, database):
+        self.port = port
+        self.database = database
+        self.process = None
+        self.log = None
+        self.log_path = None
+
+    @property
+    def endpoint(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    def start(self, cache_bytes, label):
+        assert self.process is None, "gateway already running"
+        self.log_path = RUN / f"pool-gateway-{label}.log"
+        self.log = self.log_path.open("ab")
+        self.process = subprocess.Popen(
+            [BIN, "--url", self.database, "serve", "--addr", f"127.0.0.1:{self.port}",
+             "--pool-max", "32", "--read-cache-bytes", str(cache_bytes), "--log-level", "warn"],
+            stdout=self.log, stderr=subprocess.STDOUT,
+        )
+
+        def ready():
+            try:
+                request(self.endpoint, "/readyz", timeout=2)
+                return True
+            except Exception:
+                return False
+
+        try:
+            eventually(f"pool gateway {label} readiness", ready, 120)
+        except Exception as error:
+            self.stop()
+            raise AssertionError(f"pool gateway {label} did not start: {error}\n"
+                                 + self.log_path.read_text()[-2000:])
+
+    def stop(self):
+        if self.process is None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(30)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(10)
+        self.process = None
+        self.log.close()
+        self.log = None
+
+
+def pool_metrics(endpoint):
+    _, body = request(endpoint, "/metrics", timeout=10)
+    values = {}
+    for line in body.decode().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition(" ")
+        if name in POOL_METRICS:
+            values[name] = float(value)
+    return values
+
+
+def pool_metric_delta(before, after):
+    return {name: round(after.get(name, 0) - before.get(name, 0), 3) for name in POOL_COUNTERS}
+
+
+def pool_activity_sample():
+    output = sql(
+        "SELECT coalesce(application_name,''), state, count(*), "
+        "count(*) FILTER (WHERE query LIKE '%chunks%') "
+        "FROM pg_stat_activity WHERE datname = current_database() "
+        "AND backend_type = 'client backend' GROUP BY 1,2"
+    )
+    counts = {"gateway_active": 0, "gateway_total": 0, "gateway_chunk": 0,
+              "ducklake_active": 0, "ducklake_total": 0}
+    for line in output.splitlines():
+        application, state, total, chunk = line.split("|")
+        if application == "pgvs3_pool":
+            counts["gateway_total"] += int(total)
+            counts["gateway_chunk"] += int(chunk)
+            if state == "active":
+                counts["gateway_active"] += int(total)
+        elif application == "ducklake_pool":
+            counts["ducklake_total"] += int(total)
+            if state == "active":
+                counts["ducklake_active"] += int(total)
+    return counts
+
+
+def pool_percentile(values, fraction):
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return round(ordered[low] + (ordered[high] - ordered[low]) * (position - low), 3)
+
+
+def pool_digest(rows, columns):
+    return [len(rows)] + [round(sum(float(row[index]) for row in rows), 3) for index in columns]
+
+
+def pool_cell(extension_directory, ports, token, gateway_port, statement, workload, clients_count,
+              cache_bytes, repeat, columns, expected=None):
+    """Runs C independent host Quack connections over W attached workers and
+    records aggregate rate, per-query latency and sampled PostgreSQL activity."""
+    import duckdb
+
+    clients = [host_client(extension_directory, ports[index % len(ports)], token)
+               for index in range(clients_count)]
+    before = pool_metrics(f"http://127.0.0.1:{gateway_port}")
+    try:
+        for client in clients:
+            q_exec(client, "SET enable_external_file_cache=false; SET parquet_metadata_cache=false")
+        warmup = []
+        for client in clients:
+            started = time.perf_counter()
+            rows = q_sql(client, statement)
+            warmup.append(round((time.perf_counter() - started) * 1000, 3))
+            if expected is None:
+                expected = pool_digest(rows, columns)
+            assert pool_digest(rows, columns) == expected, (workload, expected, rows[:3])
+        after_warmup = pool_metrics(f"http://127.0.0.1:{gateway_port}")
+        barrier = threading.Barrier(clients_count + 1)
+        times = []
+        errors = []
+
+        def run(client):
+            barrier.wait()
+            for _ in range(repeat):
+                started = time.perf_counter()
+                rows = q_sql(client, statement)
+                elapsed = (time.perf_counter() - started) * 1000
+                if pool_digest(rows, columns) != expected:
+                    errors.append((expected, rows[:3]))
+                    return
+                times.append(elapsed)
+
+        stop = threading.Event()
+        started_at = [None]
+        activity = []
+
+        def sample():
+            while not stop.is_set():
+                if started_at[0] is not None:
+                    try:
+                        counts = pool_activity_sample()
+                    except Exception:
+                        counts = None
+                    if counts is not None:
+                        record = {"t_ms": round((time.perf_counter() - started_at[0]) * 1000, 1)}
+                        record.update(counts)
+                        activity.append(record)
+                stop.wait(0.02)
+
+        sampler = threading.Thread(target=sample, name="pool-activity", daemon=True)
+        sampler.start()
+        with ThreadPoolExecutor(max_workers=clients_count) as pool:
+            futures = [pool.submit(run, client) for client in clients]
+            barrier.wait()
+            started = time.perf_counter()
+            started_at[0] = started
+            for future in futures:
+                future.result()
+            wall = time.perf_counter() - started
+        stop.set()
+        sampler.join(timeout=5)
+        assert not errors, errors
+        after = pool_metrics(f"http://127.0.0.1:{gateway_port}")
+        assert len(times) == clients_count * repeat, (len(times), clients_count * repeat)
+        summary = {}
+        for field in ("gateway_active", "gateway_total", "gateway_chunk",
+                      "ducklake_active", "ducklake_total"):
+            values = [record[field] for record in activity]
+            summary[field + "_max"] = max(values, default=0)
+            summary[field + "_mean"] = round(statistics.mean(values), 1) if values else 0
+        cell = {
+            "workload": workload,
+            "workers": len(ports),
+            "clients": clients_count,
+            "read_cache_bytes": cache_bytes,
+            "repeat": repeat,
+            "requests": clients_count * repeat,
+            "wall_ms": round(wall * 1000, 1),
+            "qps": round(clients_count * repeat / wall, 1),
+            "p50_ms": pool_percentile(times, 0.50),
+            "p95_ms": pool_percentile(times, 0.95),
+            "p99_ms": pool_percentile(times, 0.99),
+            "min_ms": round(min(times), 3),
+            "max_ms": round(max(times), 3),
+            "warmup_ms": warmup,
+            "result_digest": expected,
+            "pg": {"samples": activity, **summary},
+            "gateway": {
+                "before": before,
+                "after_warmup": after_warmup,
+                "after": after,
+                "warmup_delta": pool_metric_delta(before, after_warmup),
+                "timed_delta": pool_metric_delta(after_warmup, after),
+            },
+        }
+        return cell, expected
+    finally:
+        for client in clients:
+            client.close()
+
+
+def pool_start_worker(stack, image, extension_directory, names, database, endpoint, token, index):
+    port = free_port()
+    env = compute_environment(names, endpoint, port, token, database)
+    name = f"pgvs3-{RUN.name}-pool-w{index}"
+    stack.enter_context(container(name, image, *compute_container_args(env)))
+    wait_compute(extension_directory, port, token)
+    return port
+
+
+def pool_native_fixture(extension_directory, port, token):
+    client = host_client(extension_directory, port, token)
+    try:
+        q_exec(client, "SET enable_external_file_cache=false; SET parquet_metadata_cache=false")
+        q_exec(client, POOL_NATIVE_CREATE)
+        q_exec(client, POOL_NATIVE_INDEX)
+        timing, rows = q_timed(client, POOL_NATIVE_QUERY, repeat=3)
+        assert rows == [(1521,)], rows
+        return timing
+    finally:
+        client.close()
+
+
+def compute_pool():
+    """Measure C host Quack clients across W native Quack worker containers
+    attached to one DuckLake catalog and one pgvs3 gateway. Every client holds
+    its own persistent connection; ports round-robin across workers. The
+    gateway is restarted between read-cache states, and the disposable stack is
+    removed on exit."""
+    import duckdb
+
+    names = compute_names(RUN.name)
+    names = {
+        **names,
+        "bucket": f"quackpool-{names['slug']}"[:63],
+        "prefix": f"quackpool/{names['slug']}/lake",
+        "schema": f"quack_pool_{names['slug']}"[:63],
+    }
+    image = DUCKDB_IMAGE
+    extension_directory = RUN / "duckdb-pool-client-extensions"
+    copy_client_extensions(image, extension_directory)
+    image_id = docker_inspect(image, "{{.Id}}")
+    gateway = PoolGateway(free_port(), with_application_name(DATABASE, "pgvs3_pool"))
+    worker_database = with_application_name(DATABASE, "ducklake_pool")
+    token = os.urandom(16).hex()
+    stack = ExitStack()
+    report = {
+        "complete": False,
+        "success": False,
+        "image": {"tag": image, "id": image_id},
+        "host": {"platform": platform.platform(), "machine": platform.machine(),
+                 "cpu_count": os.cpu_count()},
+        "binary_sha256": hashlib.sha256(Path(BIN).read_bytes()).hexdigest(),
+        "config": {
+            "gateway_pool_max": 32,
+            "gateway_read_cache_bytes": list(POOL_READ_CACHE),
+            "worker_duckdb_threads": 4,
+            "worker_duckdb_memory_limit": "1GB",
+            "workers": list(POOL_WORKERS),
+            "clients": list(POOL_CLIENTS),
+            "lake_repeat": POOL_LAKE_REPEAT,
+            "native_repeat": POOL_NATIVE_REPEAT,
+            "routing": "client i -> worker i mod W; one persistent connection per client",
+            "client_caches": "enable_external_file_cache=false; parquet_metadata_cache=false",
+        },
+        "fixture": {},
+        "cells": [],
+        "notes": [
+            "single host, loopback; not a fleet capacity claim",
+            "one warm-up query per client before each timed cell",
+            "q/s counts one q.query(...) round trip; p99 at C=1 is the maximum of the repeat count",
+            "pgvs3_pool and ducklake_pool connections are separated by application_name",
+        ],
+    }
+
+    def save():
+        (RUN / "quack_pool.json").write_text(json.dumps(report, indent=2) + "\n")
+
+    ports = []
+    try:
+        gateway.start(0, "cache0-initial")
+        base = gateway.endpoint
+        request(base, f"/{names['bucket']}", "PUT", b"")
+        ports.append(pool_start_worker(stack, image, extension_directory, names,
+                                       worker_database, base, token, 0))
+        client = host_client(extension_directory, ports[0], token)
+        try:
+            create_ms, _ = q_exec(client, POOL_LAKE_CREATE)
+            flush_ms, _ = q_exec(
+                client, "CALL ducklake_flush_inlined_data('lake', table_name => 'events')")
+            lake_rows = q_sql(
+                client, "SELECT count(*), sum(id), sum(group_id) FROM lake.main.events")[0]
+            assert lake_rows == (1000000, 499999500000, 499500000), lake_rows
+            lake_files, lake_bytes = q_sql(
+                client,
+                "SELECT count(*), coalesce(sum(data_file_size_bytes), 0) "
+                "FROM ducklake_list_files('lake', 'events')",
+            )[0]
+            _, listing = request(
+                base,
+                f"/{names['bucket']}?list-type=2&prefix="
+                + quote(names["prefix"] + "/main/events/"),
+                timeout=120,
+            )
+            objects = [(key, size) for key, size in parse_s3_objects(listing)
+                       if key.endswith(".parquet")]
+            assert int(lake_files) == len(objects), (lake_files, objects)
+            assert int(lake_bytes) == sum(size for _, size in objects), (lake_bytes, objects)
+            assert 35 << 20 <= int(lake_bytes) <= 55 << 20, lake_bytes
+            report["fixture"]["lake"] = {
+                "table": "lake.main.events",
+                "rows": lake_rows[0],
+                "id_sum": lake_rows[1],
+                "group_id_sum": lake_rows[2],
+                "create_ms": create_ms,
+                "flush_ms": flush_ms,
+                "stored_bytes": int(lake_bytes),
+                "stored_mib": round(int(lake_bytes) / (1 << 20), 1),
+                "parquet_objects": len(objects),
+                "query": POOL_LAKE_QUERY,
+            }
+            save()
+        finally:
+            client.close()
+        report["fixture"].setdefault("native_index", {})["w0"] = \
+            pool_native_fixture(extension_directory, ports[0], token)
+        save()
+
+        for workers in POOL_WORKERS:
+            while len(ports) < workers:
+                index = len(ports)
+                ports.append(pool_start_worker(stack, image, extension_directory, names,
+                                               worker_database, base, token, index))
+                report["fixture"].setdefault("native_index", {})[f"w{index}"] = \
+                    pool_native_fixture(extension_directory, ports[index], token)
+                save()
+
+            gateway.stop()
+            gateway.start(0, f"cache0-w{workers}")
+
+            for clients_count in POOL_CLIENTS:
+                cell, expected = pool_cell(
+                    extension_directory, ports[:workers], token, gateway.port, POOL_LAKE_QUERY,
+                    "lake-read-cache-0", clients_count, 0, POOL_LAKE_REPEAT, (1, 2))
+                report["cells"].append(cell)
+                report["fixture"].setdefault("lake_result_digest", expected)
+                save()
+                print(f"pool lake cache0 W={workers} C={clients_count}: "
+                      f"{cell['qps']} q/s p50 {cell['p50_ms']} ms", flush=True)
+            for clients_count in POOL_CLIENTS:
+                cell, expected = pool_cell(
+                    extension_directory, ports[:workers], token, gateway.port, POOL_NATIVE_QUERY,
+                    "native-rtree", clients_count, 0, POOL_NATIVE_REPEAT, (0,))
+                report["cells"].append(cell)
+                report["fixture"].setdefault("native_result_digest", expected)
+                save()
+                print(f"pool native W={workers} C={clients_count}: "
+                      f"{cell['qps']} q/s p50 {cell['p50_ms']} ms", flush=True)
+
+            gateway.stop()
+            gateway.start(POOL_READ_CACHE[1], f"cache256-w{workers}")
+            for clients_count in POOL_CLIENTS:
+                cell, expected = pool_cell(
+                    extension_directory, ports[:workers], token, gateway.port, POOL_LAKE_QUERY,
+                    "lake-read-cache-256mib", clients_count, POOL_READ_CACHE[1],
+                    POOL_LAKE_REPEAT, (1, 2))
+                report["cells"].append(cell)
+                report["fixture"].setdefault("lake_result_digest", expected)
+                save()
+                print(f"pool lake cache256 W={workers} C={clients_count}: "
+                      f"{cell['qps']} q/s p50 {cell['p50_ms']} ms", flush=True)
+
+        report["complete"] = True
+        report["success"] = True
+        save()
+        print(f"compute pool: image {image_id[:19]} DuckDB {duckdb.__version__}; "
+              f"{len(report['cells'])} cells; {RUN / 'quack_pool.json'}", flush=True)
+    finally:
+        stack.close()
+        gateway.stop()
+
+
 def trino_query(server, statement):
     """Runs one statement over Trino's client protocol; returns the rows and
     the coordinator's elapsed milliseconds."""
@@ -2396,6 +2827,6 @@ def trino():
 
 if __name__ == "__main__":
     scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet, "ortho": ortho,
-                 "iceberg": iceberg, "trino": trino, "compute": compute}
+                 "iceberg": iceberg, "trino": trino, "compute": compute, "compute_pool": compute_pool}
     for name in sys.argv[1:]:
         scenarios[name]()

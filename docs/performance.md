@@ -286,6 +286,118 @@ for provider limits, TTLs, tombstones, retries and spool sizing.
   The chunk pool deliberately disables the statement timeout for long streaming
   reads; upload transactions disable it around `COPY`.
 
+## Quack client-to-worker pool capacity model
+
+![FIG 07 — Quack Client-to-Worker Pool, Gateway Admission and PostgreSQL Capacity Model](assets/quack-worker-pool.svg)
+
+A Quack pool has four independent limits. Size each tier from `W`, `C`, the
+gateway count `G` and the PostgreSQL connection envelope; a fast worker does not
+create gateway or database capacity.
+
+**Tier 1 — `C` clients to `W` workers.** Each client connection carries one
+active statement. A worker accepts up to `Q = 1,024` Quack sessions, so the
+session bound is
+
+```
+C <= W × Q
+```
+
+Route stateless `lake.main.*` reads round-robin (`client i -> worker i mod W`) or
+by load. Keep a client sticky when it uses temp tables, unqualified memory-catalog
+tables, or native RTree/HNSW/FTS indexes: those objects belong to one worker's
+`DatabaseInstance` and are not visible on another worker. The measured run used
+`C <= 32` and `W <= 4`, well below the session bound.
+
+**Tier 2 — `W` workers to `G` gateways.** Each `pgvs3-duckdb:2.0.0` container is
+one `DatabaseInstance`: all sessions share `T = 4` execution threads, the async
+`httpfs` pool admits `A = min(4 × CPU, 256)` requests, and the stream buffer is
+`S = 256 MiB <= M / 4` with `M = 1 GiB`. Concurrent HTTP reads are bounded by
+
+```
+R <= W × min(A, H)
+```
+
+where `H` is the worker's HTTP-pool ceiling. Native RTree/HNSW indexes are
+per-worker in RAM, are not covered by `memory_limit`, and are snapshots that must
+be rebuilt when lake freshness matters. Here a 5,000-point native RTree sustained
+**2,353 q/s at `W=2, C=32`**; `W=4` ran 16 DuckDB threads on a 16-core host and
+did not add throughput (**2,038 q/s**) while raising p99. The lake scan stayed
+near 230–285 q/s because one gateway and one PostgreSQL origin bound it, not the
+worker count.
+
+**Tier 3 — `G` gateways to PostgreSQL `chunkPool`.** Each gateway's S3 guard
+admits **32 active + 64 queued = 96** requests, so
+
+```
+G >= ceil(R / 32)      zero queue
+G >= ceil(R / 96)      burst tolerance
+```
+
+A multi-piece read reserves one guard connection and shares the rest of the
+chunk pool across `w` workers per read:
+
+```
+w = clamp(floor((B / 2 - R) / R), 1, 8)
+B = min(P, 64)
+```
+
+`B = 64` scales one read from nine chunk connections at `R=1` to two at `R=32`:
+
+| Concurrent reads `R` | Available `B/2 - R` | Workers `w` | `1 + w` connections |
+| ---: | ---: | ---: | ---: |
+| 1 | 31 | 8 | 9 |
+| 2 | 30 | 8 | 9 |
+| 4 | 28 | 7 | 8 |
+| 8 | 24 | 3 | 4 |
+| 16 | 16 | 1 | 2 |
+| 32 | 0 | 1 | 2 |
+
+`--read-cache-bytes` adds a bounded, per-gateway zero-copy block cache. A hit is
+served from gateway memory and bypasses the chunk pool and PostgreSQL entirely;
+metadata still comes from PostgreSQL on every request. In the measured run the
+256 MiB cache held the projected lake columns: timed cells recorded **0**
+`chunkPool` acquires and **7–8** chunk-pool connections versus **10 acquires per
+lake query** and **31–32** connections with the cache off. Median lake throughput
+at `C >= 8` rose from **212** to **254 q/s**; the cache did not raise the
+single-gateway ceiling beyond about 286 q/s.
+
+**Tier 4 — PostgreSQL 18 and the S3 origin.** DuckLake catalog connections go
+directly from each worker to PostgreSQL and bypass pgvs3. Add them to the gateway
+envelope:
+
+```
+max_connections > (G + surge) × (P + min(P, 64)) + Σ a_w + other + reserved
+```
+
+`a_w` is worker `w`'s active DuckLake catalog pool; `P` is `--pool-max`;
+`G + surge` includes a rolling-update gateway. A starting point is
+`pg_pool_max_connections = clamp(1.5 × CPU, 4, 32)` per gateway; the measured run
+deliberately used `P = 32`. This run observed `Σ a_w` of **24 / 40 / 56** for
+`W = 1 / 2 / 4` and at most **62** pgvs3 connections. For `G=1`, `surge=1`,
+`P=32` the gateway term is `2 × (32 + 32) = 128`; 128 + 56 = 184 leaves 72 of the
+256-connection server for other clients and reserved slots. Pass the Quack
+catalog budget through
+`pgvs3 doctor --other-connections $((Σ a_w + other))` rather than assuming that
+`max_connections` covers only gateway pools. On the S3 side, `s3b_`/`s3c_`/`s3w_`
+store 8,120-byte chunks and origin fills obey `--fill-concurrency F`.
+
+Measured `C × W` aggregate rate on the 16-core host (`q/s`; 20 repeats per
+client after one warm-up, one gateway at `P=32`):
+
+| `C` | Lake, cache 0: `W=1` | `W=2` | `W=4` | Lake, 256 MiB cache: `W=1` | `W=2` | `W=4` | Native RTree: `W=1` | `W=2` | `W=4` |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 66.9 | 57.2 | 69.2 | 77.8 | 78.8 | 75.3 | 258.7 | 259.3 | 207.5 |
+| 4 | 153.4 | 172.9 | 164.8 | 224.8 | 213.2 | 187.3 | 944.5 | 1,049.2 | 1,001.1 |
+| 8 | 204.4 | 212.1 | 206.2 | 271.4 | 175.6 | 133.0 | 1,181.6 | 1,580.8 | 863.9 |
+| 16 | 236.0 | 242.2 | 208.6 | 190.5 | 285.9 | 283.7 | 1,356.7 | 2,139.9 | 1,454.1 |
+| 32 | 180.7 | 247.0 | 231.3 | 222.4 | 275.5 | 253.7 | 1,271.0 | 2,353.4 | 2,037.5 |
+
+Full p50/p95/p99 and PostgreSQL connection tables are in
+[benchmarks](benchmarks.md#c-clients-x-w-worker-pool-benchmark). Report:
+`.tmp/verify/pool.mH6Prx/quack_pool.json`, SHA-256
+`3add9c71c3250a48bab62747535c588ce6a1f43ae7719a32213f100705bb7429`.
+This is one host and one session; cells are not a monotonic scaling claim.
+
 ## Reaping and vacuum
 
 - **Read grace window:** Deleted or overwritten files remain in their namespace's

@@ -3,9 +3,9 @@ set -euo pipefail
 # shellcheck source=test/harness.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../test/harness.sh"
 mode=${1:-contract}
-case "$mode" in contract | analytics | guides | fault | interop | s3t | bench | sol) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
+case "$mode" in contract | analytics | guides | fault | interop | s3t | bench | sol | pool) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
 test_run "$mode"
-if [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = sol ]; then test_keep_artifacts=true; fi
+if [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = sol ] || [ "$mode" = pool ]; then test_keep_artifacts=true; fi
 parts=${2:-s3,compat,tuning}
 raquet_deps=(--with quadbin==0.2.2 --with pyarrow==26.0.0 --with numpy==2.5.4)
 iceberg_deps=(--with 'pyiceberg[pyarrow,sql-sqlite]==0.12.0')
@@ -29,11 +29,12 @@ export PGVS3_TEST_DB_URL="postgres://postgres:postgres@$pg/pgvs3?sslmode=disable
 export PGVS3_ACCESS_KEY="pgvs3-$mode"
 PGVS3_SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
 export PGVS3_SECRET_KEY
-if [ "$mode" != bench ] && [ "$mode" != sol ]; then export PGVS3_POOL_MAX=${PGVS3_POOL_MAX:-8}; fi
+if [ "$mode" != bench ] && [ "$mode" != sol ] && [ "$mode" != pool ]; then export PGVS3_POOL_MAX=${PGVS3_POOL_MAX:-8}; fi
 
 test_build_gateway
 
-read -r port_a port_b < <(python3 -c '
+if [ "$mode" != pool ]; then
+  read -r port_a port_b < <(python3 -c '
 import socket
 sockets=[socket.socket() for _ in range(2)]
 for s in sockets:
@@ -42,20 +43,25 @@ print(*(s.getsockname()[1] for s in sockets))
 for s in sockets:
     s.close()
 ')
-for entry in "a:$port_a" "b:$port_b"; do
-  label=${entry%%:*}; port=${entry#*:}
-  args=()
-  if [ "$mode" = contract ] || [ "$mode" = fault ] || [ "$mode" = interop ]; then
-    args+=(--reap-grace 1s)
-  fi
-  pprof_var="PGVS3_TEST_PPROF_${label^^}"
-  if [ -n "${!pprof_var:-}" ]; then args+=(--pprof-addr "${!pprof_var}"); fi
-  test_start_gateway "$label" "$PGVS3_TEST_DB_URL" "$port" "${args[@]}"
-done
-export PGVS3_TEST_ENDPOINT_A="http://127.0.0.1:$port_a"
-export PGVS3_TEST_ENDPOINT_B="http://127.0.0.1:$port_b"
-export PGVS3_TEST_PID_A="${test_pids[0]}"
-export PGVS3_TEST_PID_B="${test_pids[1]}"
+  for entry in "a:$port_a" "b:$port_b"; do
+    label=${entry%%:*}; port=${entry#*:}
+    args=()
+    if [ "$mode" = contract ] || [ "$mode" = fault ] || [ "$mode" = interop ]; then
+      args+=(--reap-grace 1s)
+    fi
+    pprof_var="PGVS3_TEST_PPROF_${label^^}"
+    if [ -n "${!pprof_var:-}" ]; then args+=(--pprof-addr "${!pprof_var}"); fi
+    test_start_gateway "$label" "$PGVS3_TEST_DB_URL" "$port" "${args[@]}"
+  done
+  export PGVS3_TEST_ENDPOINT_A="http://127.0.0.1:$port_a"
+  export PGVS3_TEST_ENDPOINT_B="http://127.0.0.1:$port_b"
+  export PGVS3_TEST_PID_A="${test_pids[0]}"
+  export PGVS3_TEST_PID_B="${test_pids[1]}"
+else
+  # compute_pool starts its own cache-controlled gateway and workers.
+  export PGVS3_TEST_ENDPOINT_A="http://127.0.0.1:1" PGVS3_TEST_ENDPOINT_B="http://127.0.0.1:1"
+  export PGVS3_TEST_ORIGIN_ENDPOINT="http://127.0.0.1:1"
+fi
 
 if [ "$mode" = bench ] && [[ ",$parts," = *,object-storage,* ]]; then
   ro_port=$(test_port)
@@ -84,6 +90,9 @@ analytics)
   ;;
 guides)
   mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py guides
+  ;;
+pool)
+  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py compute_pool
   ;;
 fault)
   bash test/fault.sh
@@ -127,4 +136,4 @@ bench)
     python deploy/bench/duck_bench.py --parts "$parts" --out "$out" "$@"
   ;;
 esac > "$PGVS3_TEST_RUN_DIR/suite.log" 2>&1
-if [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = sol ] || [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi
+if [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = sol ] || [ "$mode" = pool ] || [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then cat "$PGVS3_TEST_RUN_DIR/suite.log"; fi

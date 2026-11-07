@@ -137,6 +137,65 @@ samples. CI publishes `ghcr.io/adonm/pgvs3-duckdb:2.0.0` (plus `:latest`, and
 `:vX.Y.Z` on release tags) for `linux/amd64`; `just duckdb-image` builds
 `pgvs3-duckdb:2.0.0` locally. The image is not wired into the Helm chart.
 
+### Sizing a Quack worker pool
+
+`W` worker containers are independent `DatabaseInstance`s, and each opens its
+own DuckLake catalog connections straight to PostgreSQL. Size the whole fleet,
+not just the gateways:
+
+```
+max_connections > (G + surge) × (P + min(P, 64)) + Σ a_w + other + reserved
+```
+
+`G + surge` includes one rolling-update gateway, `P` is `--pool-max`,
+`min(P, 64)` is the chunk pool, and `Σ a_w` is the aggregate DuckLake catalog
+pool across workers. A worker can hold more than one catalog connection per
+active query; the 2026-11-07 measurement reached 24 / 40 / 56 connections for
+`W = 1 / 2 / 4`. Do not fold `a_w` into a single per-worker constant.
+
+Pass the Quack catalog budget to the capacity check:
+
+```sh
+pgvs3 doctor --url "$PGVS3_URL" --gateways "$G" --pool-max 32 \
+  --surge 1 --other-connections "$((quack_catalog + other_clients))"
+```
+
+A starting point is `pg_pool_max_connections = clamp(1.5 × CPU, 4, 32)` per
+gateway; the measured pool used the upper value, `P = 32`, on a 16-core host.
+`doctor` prints the exact `max_connections` target and a safe `--pool-max`
+alternative when the server is too small.
+
+Routing follows object ownership:
+
+- **`lake.main.*` is stateless across workers.** Reads and qualified writes
+  resolve through the shared DuckLake catalog, so clients may round-robin
+  (`client i -> worker i mod W`) or use least-loaded routing.
+- **Temp tables, unqualified memory-catalog tables, and native RTree/HNSW/FTS
+  indexes are per-worker.** Keep a client sticky to the worker that built them,
+  or rebuild the native snapshot on every worker. A Quack session starts in the
+  memory catalog; qualify durable writes as `lake.main.<table>`.
+- **Balance `C` across `W`.** One client never splits a statement across
+  workers, and a hot shard can leave other workers idle.
+
+Tune the compute side against the gateway, not in isolation:
+
+- `DUCKDB_THREADS` is shared by every session on one worker. Four workers × four
+  threads filled this 16-core host; the native RTree gain over two workers was
+  negative and p99 rose. Start at 4 and raise it only when worker CPU, not
+  gateway capacity, is the limit.
+- DuckDB 2.0 async I/O uses `async_threads` in addition to execution threads;
+  budget it with the worker HTTP pool `A = min(4 × CPU, 256)` and keep aggregate
+  `httpfs` concurrency below `W × min(A, H)`.
+- Match worker pressure to `--s3-concurrency` (32 active) and `--pool-max`
+  (32 main + up to `min(P, 64)` chunk connections per gateway). More workers do
+  not raise the per-gateway S3 admission limit.
+- Use `--read-cache-bytes` on lakehouse gateways for repeated hot ranges. A hit
+  bypasses the chunk pool and PostgreSQL; it does not help one-pass scans and is
+  per gateway, so count it inside `GOMEMLIMIT`.
+- Re-run `just duckdb-pool-bench` after changing `W`, `C`, `DUCKDB_THREADS`,
+  gateway pools or the read cache. The committed table is one host and one
+  session, not a fleet SLO.
+
 ## Choosing and sizing a storage role
 
 | Decision | Native PostgreSQL objects | Origin-backed cache/staging |
