@@ -203,7 +203,7 @@ func TestWriteValidationReleasesLocalLock(t *testing.T) {
 
 func TestPlanCacheRead(t *testing.T) {
 	const rangeSize = 1 << 20
-	large := int64(32 << 20)
+	large := int64(128 << 20)
 
 	tests := []struct {
 		name     string
@@ -223,6 +223,7 @@ func TestPlanCacheRead(t *testing.T) {
 		{name: "large range", res: cacheResolution{state: store.CacheLive}, start: 0, end: rangeSize - 1, size: large, ranged: true, want: cacheActionRange},
 		{name: "large full", res: cacheResolution{state: store.CacheLive}, size: large, end: large - 1, want: cacheActionCached},
 		{name: "large range too wide", res: cacheResolution{state: store.CacheLive}, start: 0, end: maxRangeCacheSpan, size: large, ranged: true, want: cacheActionPassThrough},
+		{name: "sub-8MiB ranged uses range cache", res: cacheResolution{state: store.CacheLive}, start: (2 << 20) - 4096, end: (2 << 20) - 1, size: 2 << 20, ranged: true, want: cacheActionRange},
 		{name: "no range cache", res: cacheResolution{state: store.CacheLive}, start: 0, end: rangeSize - 1, size: large, ranged: true, want: cacheActionPassThrough},
 	}
 	for _, tc := range tests {
@@ -2429,7 +2430,7 @@ func TestSaveSpecRejectsInvalidOriginConfig(t *testing.T) {
 		{name: "range", spec: Spec{RangeChunk: -1}},
 		{name: "namespace", spec: Spec{Namespace: "bad!"}},
 		{name: "bucket", bucket: "bad!"},
-		{name: "scope", spec: Spec{Scope: "bucket"}},
+		{name: "scope", spec: Spec{ScopeKind: "bucket"}},
 		{name: "prefix", spec: Spec{Config: `{"type":"ephemeral","prefix":"../escape"}`}},
 		{name: "unknown option", spec: Spec{Config: `{"type":"ephemeral","config":{"typo":true}}`}},
 		{name: "http header", spec: Spec{Config: `{"type":"http","config":{"base_url":"http://localhost","headers":{"bad name":"value"}}}`}},
@@ -2456,7 +2457,7 @@ func TestOriginSpecValidationDoesNotOpenProviders(t *testing.T) {
 	}
 	spec, opts, err := normalizeSpec("edge", Spec{TTL: "60s", Retention: "0s", RangeChunk: 1, Config: `{"type":"ephemeral"}`})
 	testutil.Must(t, err)
-	if spec.Scope != "bucket" || spec.Bucket != "edge" || spec.Namespace != "origin-edge" || spec.TTL != "1m0s" ||
+	if spec.ScopeKind != "bucket" || spec.Bucket != "edge" || spec.Namespace != "origin-edge" || spec.TTL != "1m0s" ||
 		opts.TTL != time.Minute || opts.Retention != 24*time.Hour || opts.MaxFills != 8 || opts.RangeChunk != 64<<10 {
 		t.Fatalf("spec=%+v options=%+v", spec, opts)
 	}

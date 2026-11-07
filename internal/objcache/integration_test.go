@@ -11,6 +11,10 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,6 +269,11 @@ func newS3Fixture(t *testing.T, prefix string) *s3Fixture {
 	t.Helper()
 	cfg, err := testutil.S3()
 	testutil.Must(t, err)
+	return newS3FixtureAt(t, prefix, cfg)
+}
+
+func newS3FixtureAt(t *testing.T, prefix string, cfg testutil.S3Config) *s3Fixture {
+	t.Helper()
 	bucket := fmt.Sprintf("pgvs3-test-%d", time.Now().UnixNano())
 	client, err := s3client.New(s3client.Config{
 		Endpoint: cfg.Endpoint, Bucket: bucket, AccessKey: cfg.AccessKey,
@@ -401,6 +410,93 @@ func TestTierS3PrefixMetadataAndConditions(t *testing.T) {
 	testutil.Must(t, err)
 	if len(rows) != 2 || rows[0].Key != "dir/a" || rows[1].Key != "dir/b" {
 		t.Fatalf("prefixed list = %+v", rows)
+	}
+}
+
+func TestSaveSpecBudgetsAndClear(t *testing.T) {
+	ctx := testCtx
+	bucket := fmt.Sprintf("spec-%d", time.Now().UnixNano())
+	cacheNS := "origin-" + bucket
+	dropOnCleanup(t, ns.Bucket, bucket)
+	dropOnCleanup(t, ns.Cache, cacheNS)
+	dropOnCleanup(t, ns.WriteBack, cacheNS)
+	spec := Spec{Namespace: cacheNS, MaxBytes: 1234, Config: `{"type":"ephemeral"}`}
+	testutil.Must(t, SaveSpec(ctx, testStore, bucket, spec))
+	attrsFor := func(kind ns.Kind) map[string]any {
+		attrs, ok, err := testStore.NamespaceAttrs(ctx, kind, cacheNS)
+		testutil.Must(t, err)
+		if !ok {
+			t.Fatalf("%s namespace %q was not created", kind, cacheNS)
+		}
+		return attrs
+	}
+	if got, _ := attrsFor(ns.Cache)["max_bytes"].(float64); got != 1234 {
+		t.Fatalf("cache max_bytes = %v, want 1234", got)
+	}
+	if got, _ := attrsFor(ns.WriteBack)["max_bytes"].(float64); got != 1234 {
+		t.Fatalf("write-back max_bytes = %v, want 1234", got)
+	}
+	spec.MaxBytes = 0
+	testutil.Must(t, SaveSpec(ctx, testStore, bucket, spec))
+	if got, _ := attrsFor(ns.Cache)["max_bytes"].(float64); got != 0 {
+		t.Fatalf("cache max_bytes after reset = %v, want 0", got)
+	}
+	testutil.Must(t, ClearSpec(ctx, testStore, bucket, ""))
+	for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
+		if _, ok := attrsFor(kind)["max_bytes"]; ok {
+			t.Fatalf("%s max_bytes survived ClearSpec", kind)
+		}
+	}
+	attrs, ok, err := testStore.NamespaceAttrs(ctx, ns.Bucket, bucket)
+	testutil.Must(t, err)
+	if !ok {
+		t.Fatal("bucket namespace disappeared")
+	}
+	if _, exists := attrs["origin"]; exists {
+		t.Fatal("bucket origin spec survived ClearSpec")
+	}
+}
+
+func TestTierS3DeleteManyUsesBatchEndpoint(t *testing.T) {
+	cfg, err := testutil.S3()
+	testutil.Must(t, err)
+	target := cfg.Endpoint
+	if !strings.Contains(target, "://") {
+		target = "http://" + target
+	}
+	upstream, err := url.Parse(target)
+	testutil.Must(t, err)
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	var batchPosts atomic.Int64
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("delete") {
+			batchPosts.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer front.Close()
+	cfg.Endpoint = front.URL
+	f := newS3FixtureAt(t, "batch-delete", cfg)
+	ctx := testCtx
+	keys := []string{"a.txt", "b.txt", "c.txt"}
+	for _, key := range keys {
+		if _, err := f.tier.Upload(ctx, "bkt", key, strings.NewReader(key), nil, "text/plain"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	results := f.tier.DeleteMany(ctx, "bkt", keys)
+	for _, result := range results {
+		if result.Err != nil {
+			t.Fatalf("delete %s: %v", result.Key, result.Err)
+		}
+	}
+	if got := batchPosts.Load(); got != 1 {
+		t.Fatalf("POST /?delete requests = %d, want 1", got)
+	}
+	for _, key := range keys {
+		if _, err := f.client.Stat(ctx, "bkt/"+key); !s3client.NotFound(err) {
+			t.Fatalf("%s survived batch delete: %v", key, err)
+		}
 	}
 }
 
@@ -1325,6 +1421,170 @@ func TestSpooledPublicationMetadata(t *testing.T) {
 	}
 }
 
+func TestSub8MiBRangeCaching(t *testing.T) {
+	f := newFixture(t, TierOptions{TTL: time.Hour, RangeChunk: 1 << 20})
+	data := bytes.Repeat([]byte("parquet"), 1<<20)
+	ck := f.tier.key("bkt", "small.parquet")
+	if _, err := f.tier.origin.Upload(testCtx, ck, bytes.NewReader(data), int64(len(data)), originUpload{ContentType: "application/parquet"}); err != nil {
+		t.Fatal(err)
+	}
+	counted := &rangeCountingOrigin{originHandle: f.tier.origin}
+	f.tier.origin = counted
+	rng := store.Range(int64(len(data))-4096, -1, -1)
+	for pass := range 2 {
+		obj, err := f.tier.Open(testCtx, "bkt", "small.parquet", rng)
+		testutil.Must(t, err)
+		if obj.Hit != (pass > 0) {
+			t.Fatalf("pass %d hit=%t", pass, obj.Hit)
+		}
+		if got := readObject(t, obj); got != string(data[len(data)-4096:]) {
+			t.Fatalf("pass %d returned %d bytes", pass, len(got))
+		}
+	}
+	if got := counted.ranges.Load(); got != 1 {
+		t.Fatalf("origin range GETs = %d, want 1", got)
+	}
+	if got := counted.attributes.Load(); got != 1 {
+		t.Fatalf("origin HEADs = %d, want 1 across two range reads", got)
+	}
+	if _, err := testStore.Meta(testCtx, f.tier.cacheRef(ck)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sub-8MiB ranged read cached a whole-body object: %v", err)
+	}
+}
+
+type blockingHeadOrigin struct {
+	*rangeCountingOrigin
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (o *blockingHeadOrigin) Attributes(ctx context.Context, key string) (originAttrs, error) {
+	o.once.Do(func() { close(o.started) })
+	select {
+	case <-o.release:
+	case <-ctx.Done():
+		return originAttrs{}, ctx.Err()
+	}
+	return o.rangeCountingOrigin.Attributes(ctx, key)
+}
+
+func TestConcurrentColdRangeHeadCoalesced(t *testing.T) {
+	// TTL 0 skips the shared origin_metadata lookup so every reader reaches
+	// the singleflight HEAD at nearly the same time.
+	f := newFixture(t, TierOptions{TTL: 0, RangeChunk: 1 << 20})
+	data := bytes.Repeat([]byte("parquet"), 2<<20)
+	ck := f.tier.key("bkt", "concurrent.parquet")
+	if _, err := f.tier.origin.Upload(testCtx, ck, bytes.NewReader(data), int64(len(data)), originUpload{ContentType: "application/parquet"}); err != nil {
+		t.Fatal(err)
+	}
+	base := &rangeCountingOrigin{originHandle: f.tier.origin}
+	counted := &blockingHeadOrigin{
+		rangeCountingOrigin: base,
+		started:             make(chan struct{}),
+		release:             make(chan struct{}),
+	}
+	f.tier.origin = counted
+
+	const readers = 8
+	var start, done sync.WaitGroup
+	start.Add(1)
+	done.Add(readers)
+	errs := make(chan error, readers)
+	for i := range readers {
+		go func() {
+			defer done.Done()
+			start.Wait()
+			offset := int64(i * 128 << 10)
+			obj, err := f.tier.Open(testCtx, "bkt", "concurrent.parquet", store.Range(offset, offset+4095, -1))
+			if err != nil {
+				errs <- err
+				return
+			}
+			got, err := io.ReadAll(obj.Body)
+			_ = obj.Body.Close()
+			if err != nil {
+				errs <- err
+				return
+			}
+			if len(got) != 4096 {
+				errs <- fmt.Errorf("reader %d got %d bytes", i, len(got))
+			}
+		}()
+	}
+	start.Done()
+	select {
+	case <-counted.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cold range reads never issued a HEAD")
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(counted.release)
+	done.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if got := base.attributes.Load(); got != 1 {
+		t.Fatalf("origin HEADs = %d, want 1 across %d concurrent readers", got, readers)
+	}
+}
+
+func TestRangeChunkTouch(t *testing.T) {
+	f := newFixture(t, TierOptions{TTL: time.Hour, RangeChunk: 1 << 20})
+	f.tier.retention = time.Hour
+	data := bytes.Repeat([]byte("hot"), 3<<20)
+	ck := f.tier.key("bkt", "hot.parquet")
+	if _, err := f.tier.origin.Upload(testCtx, ck, bytes.NewReader(data), int64(len(data)), originUpload{ContentType: "application/parquet"}); err != nil {
+		t.Fatal(err)
+	}
+	rng := store.Range(0, 4095, -1)
+	obj, err := f.tier.Open(testCtx, "bkt", "hot.parquet", rng)
+	testutil.Must(t, err)
+	_ = readObject(t, obj)
+
+	schema := `"s3c_` + f.tier.namespace + `"`
+	tag, err := testStore.Pool().Exec(testCtx, `UPDATE `+schema+`.objects
+		SET expires_at = now() + interval '1 minute'
+		WHERE key LIKE '%__range__%' AND expires_at IS NOT NULL`)
+	testutil.Must(t, err)
+	if tag.RowsAffected() == 0 {
+		t.Fatal("range chunks were not cached")
+	}
+	obj, err = f.tier.Open(testCtx, "bkt", "hot.parquet", rng)
+	testutil.Must(t, err)
+	if !obj.Hit {
+		t.Fatal("second range read was not a cache hit")
+	}
+	_ = readObject(t, obj)
+
+	var soon int
+	testutil.Must(t, testStore.Pool().QueryRow(testCtx, `SELECT count(*) FROM `+schema+`.objects
+		WHERE key LIKE '%__range__%' AND expires_at < now() + interval '30 minutes'`).Scan(&soon))
+	if soon != 0 {
+		t.Fatalf("%d range chunks were not touched", soon)
+	}
+}
+
+func TestRangeFillRunBounded(t *testing.T) {
+	f := newFixture(t, TierOptions{TTL: time.Hour, RangeChunk: 1 << 20})
+	data := bytes.Repeat([]byte("r"), 33<<20)
+	ck := f.tier.key("bkt", "wide.parquet")
+	if _, err := f.tier.origin.Upload(testCtx, ck, bytes.NewReader(data), int64(len(data)), originUpload{}); err != nil {
+		t.Fatal(err)
+	}
+	counted := &rangeCountingOrigin{originHandle: f.tier.origin}
+	f.tier.origin = counted
+	obj, err := f.tier.Open(testCtx, "bkt", "wide.parquet", store.Range(0, 32<<20-1, -1))
+	testutil.Must(t, err)
+	if got := readObject(t, obj); got != string(data[:32<<20]) {
+		t.Fatalf("range returned %d bytes", len(got))
+	}
+	if got := counted.ranges.Load(); got != 4 {
+		t.Fatalf("origin range GETs = %d, want 4 (8 MiB each)", got)
+	}
+}
+
 func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 	f := newFixture(t, TierOptions{TTL: time.Hour, RangeChunk: 64 << 10})
 	data := bytes.Repeat([]byte("parquet"), 2<<20)
@@ -1379,12 +1639,18 @@ func TestRangeParentMetadataSharedAndReadOnly(t *testing.T) {
 
 type rangeCountingOrigin struct {
 	originHandle
-	ranges atomic.Int64
+	ranges     atomic.Int64
+	attributes atomic.Int64
 }
 
 func (o *rangeCountingOrigin) GetRange(ctx context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
 	o.ranges.Add(1)
 	return o.originHandle.GetRange(ctx, key, offset, length, ifMatch)
+}
+
+func (o *rangeCountingOrigin) Attributes(ctx context.Context, key string) (originAttrs, error) {
+	o.attributes.Add(1)
+	return o.originHandle.Attributes(ctx, key)
 }
 
 type fetchedRangeOrigin struct {

@@ -111,6 +111,139 @@ func TestBlockFillSkipsIncompleteBlocks(t *testing.T) {
 	}
 }
 
+func TestBlockFillDisabledWhenBlocksCannotFit(t *testing.T) {
+	c := newBlockCache(blockShards)
+	p := piece{fileID: 1, segLen: blockBytes, lo: 0, hi: segmentLastRow(blockBytes)}
+	if f := c.fill(1, p); f != nil {
+		t.Fatal("cache smaller than one block still enabled fills")
+	}
+}
+
+func TestBlockFillReportsAssembledBlocks(t *testing.T) {
+	segLen := int64(blockBytes)
+	payload := make([]byte, segLen)
+	for i := range payload {
+		payload[i] = byte(i * 3)
+	}
+	c := newBlockCache(64 << 20)
+	p := piece{fileID: 4, segLen: segLen, lo: 0, hi: segmentLastRow(segLen)}
+	f := c.fill(11, p)
+	for no := p.lo; no < p.hi; no++ {
+		lo := int64(no) * RowBytes
+		block, inBlock := f.add(no, payload[lo:lo+RowBytes])
+		if !inBlock || block != nil {
+			t.Fatalf("row %d: block=%v inBlock=%v, want an unfinished filled block", no, block != nil, inBlock)
+		}
+	}
+	last := p.hi
+	block, inBlock := f.add(last, payload[int64(last)*RowBytes:])
+	if !inBlock || !bytes.Equal(block, payload) {
+		t.Fatalf("last row returned block=%d bytes, inBlock=%v; want the assembled block", len(block), inBlock)
+	}
+
+	f = c.fill(11, p)
+	for no := p.lo; no <= p.hi; no++ {
+		if _, inBlock := f.add(no, payload[int64(no)*RowBytes:int64(no+1)*RowBytes]); inBlock {
+			t.Fatalf("row %d refilled an already cached block", no)
+		}
+	}
+}
+
+func TestLookupPiecesCountsCachedBlocksOnce(t *testing.T) {
+	const table = 12
+	c := newBlockCache(blockShards * 8 * blockBytes)
+	s := &Store{blocks: c}
+	segLen := int64(2 * blockBytes)
+	payload := make([]byte, segLen)
+	for i := range payload {
+		payload[i] = byte(i * 5)
+	}
+	p0 := piece{fileID: 1, segLen: segLen, lo: 0, hi: segmentLastRow(segLen)}
+	p1 := piece{fileID: 2, segLen: segLen, lo: 0, hi: segmentLastRow(segLen)}
+	fill := func(p piece, through int32) {
+		f := c.fill(table, p)
+		for no := p.lo; no <= through; no++ {
+			lo := int64(no) * RowBytes
+			f.add(no, payload[lo:lo+RowBytes])
+		}
+	}
+	fill(p0, p0.hi)
+
+	cached, need := s.lookupPieces(table, []piece{p0, p1}, 0, 2*segLen-1)
+	if len(cached) != 2 || cached[0] == nil || cached[1] != nil {
+		t.Fatalf("cached = %v, want piece 0 only", cached)
+	}
+	if len(need) != 1 || need[0] != 1 {
+		t.Fatalf("need = %v, want [1]", need)
+	}
+	if got := bytes.Join(cached[0], nil); !bytes.Equal(got, payload) {
+		t.Fatalf("cached piece bytes mismatch: %d", len(got))
+	}
+	if got := c.hits.Load(); got != 2 {
+		t.Fatalf("hits = %d, want 2 (one per cached block)", got)
+	}
+	if got := c.hitBytes.Load(); got != 2*blockBytes {
+		t.Fatalf("hitBytes = %d, want %d", got, 2*blockBytes)
+	}
+
+	fill(p1, blockRows-1)
+	cached, need = s.lookupPieces(table, []piece{p0, p1}, 0, 2*segLen-1)
+	if cached[1] != nil {
+		t.Fatal("partially cached piece reported as cached")
+	}
+	if len(need) != 1 || need[0] != 1 {
+		t.Fatalf("need = %v, want [1]", need)
+	}
+	if got := c.hits.Load(); got != 4 {
+		t.Fatalf("hits = %d, want 4 (single pass over each lookup)", got)
+	}
+	if got := c.hitBytes.Load(); got != 4*blockBytes {
+		t.Fatalf("hitBytes = %d, want %d", got, 4*blockBytes)
+	}
+}
+
+func TestCacheFileLargerThanShard(t *testing.T) {
+	// Ten blocks per file exceed one shard's eight-block budget.
+	c := newBlockCache(blockShards * 8 * blockBytes)
+	s := &Store{blocks: c}
+	size := int64(9*blockBytes + 321)
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i*7 + 1)
+	}
+	want := bytes.Clone(data)
+	s.cacheFile(3, 77, data)
+	for i := range data {
+		data[i] = 0
+	}
+	if c.contains(blockKey{table: 3, file: 77, block: wholeFile}) {
+		t.Fatal("large file stored as one whole-file entry")
+	}
+	if !c.contains(blockKey{table: 3, file: 77, block: 0}) ||
+		!c.contains(blockKey{table: 3, file: 77, block: int32(size / (blockRows * RowBytes))}) {
+		t.Fatal("large file was not split into block entries")
+	}
+	got, ok := s.cachedFile(3, 77, size)
+	if !ok {
+		t.Fatal("large split file missed")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("large split file returned %d wrong bytes", len(got))
+	}
+
+	small := bytes.Repeat([]byte("s"), 2*blockBytes)
+	s.cacheFile(3, 78, small)
+	if !c.contains(blockKey{table: 3, file: 78, block: wholeFile}) {
+		t.Fatal("small file did not use a whole-file entry")
+	}
+	if got, ok := s.cachedFile(3, 78, int64(len(small))); !ok || !bytes.Equal(got, small) {
+		t.Fatalf("small whole-file round trip failed: ok=%v len=%d", ok, len(got))
+	}
+	if _, ok := s.cachedFile(3, 79, 0); ok {
+		t.Fatal("zero-size file reported cached")
+	}
+}
+
 func TestAlignPiecesSnapsToBlocks(t *testing.T) {
 	m := &Meta{Size: 24 << 20, FileID: 1, Parts: []int64{1, 2, 3}, PartEnds: []int64{8 << 20, 16 << 20, 24 << 20}}
 	pieces, err := planPieces(m, 3<<20+17, 20<<20, 8)

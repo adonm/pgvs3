@@ -57,22 +57,38 @@ func (s *Store) openReadGuard(ctx context.Context, pieces []piece, workers int) 
 	g.pending.Store(int32(workers))
 	keys := pinKeys(pieces)
 	if !s.forceSnapshotReads && !inRecovery(conn) && len(keys) <= maxPinnedFiles {
-		var got []int32
-		err := conn.QueryRow(ctx, `SELECT COALESCE(array_agg(k), '{}') FROM unnest($2::int4[]) AS k
-			WHERE pg_try_advisory_lock_shared($1, k)`, pinClass, keys).Scan(&got)
-		if err != nil {
-			conn.Release()
-			return nil, err
-		}
-		g.keys = got
-		if len(got) == len(keys) {
-			s.pinnedReads.Add(1)
-			return g, nil
-		}
-		g.unpin()
-		if g.conn == nil {
-			if g.conn, err = s.chunkPool.Acquire(ctx); err != nil {
+		if len(keys) <= 1 {
+			locked := true
+			if len(keys) == 1 {
+				err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock_shared($1, $2)", pinClass, keys[0]).Scan(&locked)
+				if err != nil {
+					conn.Release()
+					return nil, err
+				}
+			}
+			if locked {
+				g.keys = keys
+				s.pinnedReads.Add(1)
+				return g, nil
+			}
+		} else {
+			var got []int32
+			err := conn.QueryRow(ctx, `SELECT COALESCE(array_agg(k), '{}') FROM unnest($2::int4[]) AS k
+				WHERE pg_try_advisory_lock_shared($1, k)`, pinClass, keys).Scan(&got)
+			if err != nil {
+				conn.Release()
 				return nil, err
+			}
+			g.keys = got
+			if len(got) == len(keys) {
+				s.pinnedReads.Add(1)
+				return g, nil
+			}
+			g.unpin()
+			if g.conn == nil {
+				if g.conn, err = s.chunkPool.Acquire(ctx); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -90,10 +106,19 @@ func (g *readGuard) exportSnapshot(ctx context.Context) error {
 		return err
 	}
 	g.export = tx
-	if _, err := tx.Exec(ctx, "SET LOCAL idle_in_transaction_session_timeout = 0"); err != nil {
+	var b pgx.Batch
+	b.Queue("SET LOCAL idle_in_transaction_session_timeout = 0")
+	b.Queue("SELECT pg_export_snapshot()")
+	br := tx.SendBatch(ctx, &b)
+	if _, err := br.Exec(); err != nil {
+		_ = br.Close()
 		return err
 	}
-	return tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&g.snap)
+	err = br.QueryRow().Scan(&g.snap)
+	if cerr := br.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // lead gives the first worker the guard's own session, so a read never holds
@@ -132,7 +157,18 @@ func (g *readGuard) join(ctx context.Context) (querier, func(), error) {
 	}
 	// A worker can wait on a slow client between pieces; the snapshot must
 	// survive that, so the idle-in-transaction timeout is lifted locally.
-	if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT '"+g.snap+"'; SET LOCAL idle_in_transaction_session_timeout = 0"); err != nil {
+	var b pgx.Batch
+	b.Queue("SET TRANSACTION SNAPSHOT '" + g.snap + "'")
+	b.Queue("SET LOCAL idle_in_transaction_session_timeout = 0")
+	br := tx.SendBatch(ctx, &b)
+	_, err = br.Exec()
+	if err == nil {
+		_, err = br.Exec()
+	}
+	if cerr := br.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		done()
 		return nil, nil, err
 	}
@@ -164,8 +200,13 @@ func (g *readGuard) unpin() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var released bool
-	err := g.conn.QueryRow(ctx, `SELECT COALESCE(bool_and(pg_advisory_unlock_shared($1, k)), true)
-		FROM unnest($2::int4[]) AS k`, pinClass, g.keys).Scan(&released)
+	var err error
+	if len(g.keys) == 1 {
+		err = g.conn.QueryRow(ctx, "SELECT pg_advisory_unlock_shared($1, $2)", pinClass, g.keys[0]).Scan(&released)
+	} else {
+		err = g.conn.QueryRow(ctx, `SELECT COALESCE(bool_and(pg_advisory_unlock_shared($1, k)), true)
+			FROM unnest($2::int4[]) AS k`, pinClass, g.keys).Scan(&released)
+	}
 	g.keys = nil
 	if err != nil || !released {
 		// Never return a session that might still hold a pin to the pool.

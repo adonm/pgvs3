@@ -18,6 +18,7 @@ package s3client
 import (
 	"context"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -98,6 +99,167 @@ func TestPrefixPutStatAndDelete(t *testing.T) {
 	}
 	if _, err := bucket.Stat(ctx, "dir/a.txt"); !NotFound(err) {
 		t.Fatalf("Stat deleted = %v, want not found", err)
+	}
+}
+
+func TestDeleteObjectsBatch(t *testing.T) {
+	mock, server := newTestServer(t)
+	bucket := newTestBucket(t, server, "lake")
+	ctx := context.Background()
+	for _, key := range []string{"a.txt", "b.txt", "c.txt"} {
+		if _, err := bucket.WriteReader(ctx, key, strings.NewReader(key), int64(len(key)), PutOptions{}); err != nil {
+			t.Fatalf("Put %q: %v", key, err)
+		}
+	}
+	errs, err := bucket.DeleteObjects(ctx, []string{"a.txt", "missing.txt", "b.txt", "c.txt"})
+	if err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
+	}
+	if len(errs) != 4 {
+		t.Fatalf("errors = %d, want 4", len(errs))
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("key %d error = %v", i, err)
+		}
+	}
+	mock.mu.Lock()
+	calls := mock.deleteBatchCalls
+	mock.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("batch calls = %d, want 1", calls)
+	}
+	for _, key := range []string{"a.txt", "b.txt", "c.txt"} {
+		if _, err := bucket.Stat(ctx, key); !NotFound(err) {
+			t.Fatalf("%s survived batch delete: %v", key, err)
+		}
+	}
+}
+
+func TestDeleteObjectsChunksAtOneThousand(t *testing.T) {
+	mock, server := newTestServer(t)
+	bucket := newTestBucket(t, server, "")
+	ctx := context.Background()
+	keys := make([]string, 1001)
+	mock.mu.Lock()
+	for i := range keys {
+		keys[i] = fmt.Sprintf("bulk/%04d", i)
+		mock.objects[keys[i]] = &mockObject{data: []byte("x"), etag: testETag([]byte("x")), modified: time.Now()}
+	}
+	mock.mu.Unlock()
+	errs, err := bucket.DeleteObjects(ctx, keys)
+	if err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("key %d error = %v", i, err)
+		}
+	}
+	mock.mu.Lock()
+	calls, remaining := mock.deleteBatchCalls, len(mock.objects)
+	mock.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("batch calls = %d, want 2", calls)
+	}
+	if remaining != 0 {
+		t.Fatalf("%d objects remain", remaining)
+	}
+}
+
+func TestDeleteObjectsFallsBackWithoutBatchEndpoint(t *testing.T) {
+	mock, server := newTestServer(t)
+	bucket := newTestBucket(t, server, "")
+	ctx := context.Background()
+	keys := []string{"a.txt", "b.txt"}
+	for _, key := range keys {
+		if _, err := bucket.WriteReader(ctx, key, strings.NewReader(key), int64(len(key)), PutOptions{}); err != nil {
+			t.Fatalf("Put %q: %v", key, err)
+		}
+	}
+	mock.mu.Lock()
+	mock.deleteBatchUnsupported = true
+	mock.mu.Unlock()
+	errs, err := bucket.DeleteObjects(ctx, keys)
+	if err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("key %d error = %v", i, err)
+		}
+	}
+	mock.mu.Lock()
+	calls := mock.deleteBatchCalls
+	mock.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("batch calls = %d, want 1", calls)
+	}
+	for _, key := range keys {
+		if _, err := bucket.Stat(ctx, key); !NotFound(err) {
+			t.Fatalf("%s survived fallback delete: %v", key, err)
+		}
+	}
+}
+
+func TestTransientResponsesRetry(t *testing.T) {
+	mock, server := newTestServer(t)
+	bucket := newTestBucket(t, server, "")
+	ctx := context.Background()
+	body := "hello"
+	if _, err := bucket.WriteReader(ctx, "retry.txt", strings.NewReader(body), int64(len(body)), PutOptions{}); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+	object, err := bucket.client.objectKey("retry.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain := func(rc io.ReadCloser, err error) error {
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		_, err = io.Copy(io.Discard, rc)
+		return err
+	}
+	cases := []struct {
+		name   string
+		status int
+		code   string
+		call   func() error
+	}{
+		{name: "get", status: http.StatusServiceUnavailable, code: "SlowDown", call: func() error {
+			return drain(bucket.Get(ctx, "retry.txt", 0, -1, ""))
+		}},
+		{name: "stat", status: http.StatusTooManyRequests, code: "SlowDown", call: func() error {
+			_, err := bucket.Stat(ctx, "retry.txt")
+			return err
+		}},
+		{name: "doBytes", status: http.StatusServiceUnavailable, code: "SlowDown", call: func() error {
+			resp, err := bucket.client.doBytes(ctx, http.MethodGet, object, nil, []byte("ignored"))
+			if err != nil {
+				return err
+			}
+			return drain(resp.Body, nil)
+		}},
+		{name: "write", status: http.StatusTooManyRequests, code: "SlowDown", call: func() error {
+			_, err := bucket.WriteReader(ctx, "written.txt", strings.NewReader("new"), 3, PutOptions{})
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock.failNext(tc.status, tc.code, 1)
+			if err := tc.call(); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			mock.mu.Lock()
+			remaining := mock.transientRemaining
+			mock.mu.Unlock()
+			if remaining != 0 {
+				t.Fatalf("transient response was not consumed: %d", remaining)
+			}
+		})
 	}
 }
 
@@ -357,6 +519,37 @@ func TestWalkListing(t *testing.T) {
 	}
 }
 
+func TestWalkAfter(t *testing.T) {
+	mock, server := newTestServer(t)
+	bucket := newTestBucket(t, server, "lake")
+	ctx := context.Background()
+	for _, key := range []string{"dir/a", "dir/a b", "dir/b", "dir/sub/c"} {
+		if _, err := bucket.WriteReader(ctx, key, strings.NewReader(key), int64(len(key)), PutOptions{}); err != nil {
+			t.Fatalf("Put %q: %v", key, err)
+		}
+	}
+	mock.mu.Lock()
+	mock.maxKeys = 1
+	mock.mu.Unlock()
+	var keys []string
+	for info, err := range bucket.WalkAfter(ctx, "dir/", "dir/a") {
+		if err != nil {
+			t.Fatalf("WalkAfter: %v", err)
+		}
+		keys = append(keys, info.Key)
+	}
+	want := []string{"dir/a b", "dir/b", "dir/sub/c"}
+	if !reflect.DeepEqual(keys, want) {
+		t.Fatalf("WalkAfter keys = %#v, want %#v", keys, want)
+	}
+	mock.mu.Lock()
+	after, calls := mock.startAfter, mock.startAfterCalls
+	mock.mu.Unlock()
+	if after != "lake/dir/a" || calls != 1 {
+		t.Fatalf("start-after = %q in %d requests, want lake/dir/a once", after, calls)
+	}
+}
+
 func TestWalkBadContinuationToken(t *testing.T) {
 	mock, server := newTestServer(t)
 	bucket := newTestBucket(t, server, "")
@@ -567,6 +760,32 @@ func TestMultipartPutStream(t *testing.T) {
 	}
 }
 
+func TestMultipartUploadParallelParts(t *testing.T) {
+	mock, server := newTestServer(t)
+	bucket := newTestBucket(t, server, "")
+	bucket.client.maxSinglePut, bucket.client.minPartSize = 20, 8
+	mock.mu.Lock()
+	mock.uploadDelay = 20 * time.Millisecond
+	mock.mu.Unlock()
+	body := strings.Repeat("0123456789abcdef", 2)
+	put, err := bucket.WriteReader(context.Background(), "parallel", strings.NewReader(body), int64(len(body)), PutOptions{})
+	if err != nil {
+		t.Fatalf("parallel multipart: %v", err)
+	}
+	if put.Size != int64(len(body)) {
+		t.Fatalf("size = %d, want %d", put.Size, len(body))
+	}
+	mock.mu.Lock()
+	stored, active := mock.objects["parallel"], mock.maxActiveParts
+	mock.mu.Unlock()
+	if stored == nil || string(stored.data) != body {
+		t.Fatalf("stored = %+v", stored)
+	}
+	if active < 2 {
+		t.Fatalf("max concurrent part uploads = %d, want at least 2", active)
+	}
+}
+
 func TestCalculatePartSize(t *testing.T) {
 	const mib = int64(1 << 20)
 	cases := []struct {
@@ -615,6 +834,9 @@ type mockS3 struct {
 	headCalls int
 	listCalls int
 
+	startAfter      string
+	startAfterCalls int
+
 	lastCreateSawConditions bool
 	lastCompleteIfMatch     string
 	lastCompleteIfNone      string
@@ -625,6 +847,17 @@ type mockS3 struct {
 	badToken                  bool
 	createdBucket             bool
 	deletedBucket             bool
+
+	uploadDelay    time.Duration
+	activeParts    int
+	maxActiveParts int
+
+	deleteBatchCalls       int
+	deleteBatchUnsupported bool
+
+	transientRemaining int
+	transientStatus    int
+	transientCode      string
 }
 
 func newMockS3() *mockS3 {
@@ -643,6 +876,15 @@ func (m *mockS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing x-amz-date", http.StatusForbidden)
 		return
 	}
+	m.mu.Lock()
+	if m.transientRemaining > 0 {
+		m.transientRemaining--
+		status, code := m.transientStatus, m.transientCode
+		m.mu.Unlock()
+		m.writeError(w, status, code, "try again")
+		return
+	}
+	m.mu.Unlock()
 	decoded, err := url.PathUnescape(r.URL.EscapedPath())
 	if err != nil {
 		http.Error(w, "bad path", http.StatusBadRequest)
@@ -657,6 +899,10 @@ func (m *mockS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if key == "" {
 		if r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2" {
 			m.list(w, r)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Query().Has("delete") {
+			m.deleteObjects(w, r)
 			return
 		}
 		m.mu.Lock()
@@ -822,6 +1068,55 @@ func (m *mockS3) delete(w http.ResponseWriter, key string) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (m *mockS3) deleteObjects(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		m.writeError(w, http.StatusBadRequest, "InvalidRequest", err.Error())
+		return
+	}
+	sum := md5.Sum(body)
+	if want := r.Header.Get("Content-MD5"); want != base64.StdEncoding.EncodeToString(sum[:]) {
+		m.writeError(w, http.StatusBadRequest, "BadDigest", "content-md5 mismatch")
+		return
+	}
+	var request struct {
+		Objects []struct {
+			Key string `xml:"Key"`
+		} `xml:"Object"`
+	}
+	if err := xml.Unmarshal(body, &request); err != nil {
+		m.writeError(w, http.StatusBadRequest, "MalformedXML", err.Error())
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deleteBatchCalls++
+	if m.deleteBatchUnsupported {
+		m.writeError(w, http.StatusNotImplemented, "NotImplemented", "unsupported")
+		return
+	}
+	result := struct {
+		XMLName xml.Name `xml:"DeleteResult"`
+		Deleted []struct {
+			Key string `xml:"Key"`
+		} `xml:"Deleted"`
+	}{}
+	for _, object := range request.Objects {
+		delete(m.objects, object.Key)
+		result.Deleted = append(result.Deleted, struct {
+			Key string `xml:"Key"`
+		}{Key: object.Key})
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	_ = xml.NewEncoder(w).Encode(result)
+}
+
+func (m *mockS3) failNext(status int, code string, count int) {
+	m.mu.Lock()
+	m.transientRemaining, m.transientStatus, m.transientCode = count, status, code
+	m.mu.Unlock()
+}
+
 func (m *mockS3) createUpload(w http.ResponseWriter, r *http.Request, key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -837,13 +1132,25 @@ func (m *mockS3) createUpload(w http.ResponseWriter, r *http.Request, key string
 }
 
 func (m *mockS3) uploadPart(w http.ResponseWriter, r *http.Request, key, id string) {
+	m.mu.Lock()
+	m.activeParts++
+	if m.activeParts > m.maxActiveParts {
+		m.maxActiveParts = m.activeParts
+	}
+	delay := m.uploadDelay
+	m.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	data, err := io.ReadAll(r.Body)
+	m.mu.Lock()
+	m.activeParts--
 	if err != nil {
+		m.mu.Unlock()
 		m.writeError(w, http.StatusBadRequest, "InvalidRequest", err.Error())
 		return
 	}
 	number, _ := strconv.Atoi(r.URL.Query().Get("partNumber"))
-	m.mu.Lock()
 	upload, ok := m.uploads[id]
 	if !ok || upload.key != key {
 		m.mu.Unlock()
@@ -928,13 +1235,18 @@ func (m *mockS3) list(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	prefix := query.Get("prefix")
 	token := query.Get("continuation-token")
+	startAfter := query.Get("start-after")
+	if startAfter != "" {
+		m.startAfter = startAfter
+		m.startAfterCalls++
+	}
 	limit := m.maxKeys
 	if limit <= 0 {
 		limit = 1000
 	}
 	keys := make([]string, 0, len(m.objects))
 	for key := range m.objects {
-		if strings.HasPrefix(key, prefix) && (token == "" || key > token) {
+		if strings.HasPrefix(key, prefix) && (token == "" || key > token) && (token != "" || startAfter == "" || key > startAfter) {
 			keys = append(keys, key)
 		}
 	}

@@ -124,11 +124,14 @@ CPU per byte and no PostgreSQL work.
    reader, run as one `chunks` range query
    (`file_id = $1 AND no BETWEEN $2 AND $3`), consistent within its statement.
 3. **Ordered pull window:** larger spans plan balanced pieces (1 MiB minimum,
-   ~8 MiB for large objects). Up to eight workers pull pieces in order from a
-   shared counter and stream each into its own channel; the consumer drains the
-   channels in piece order, so output stays contiguous and memory is bounded by
-   the workers' buffers. The window reserves half the chunk pool for other work
-   and shrinks as reads overlap.
+   ~8 MiB for large objects). A single `lookupPieces` pass classifies every
+   piece against the block cache; cached pieces are emitted without a query and
+   only misses are scheduled. Up to eight workers pull missing pieces in order
+   from a shared counter and stream each into its own two-buffer channel; the
+   consumer drains them in piece order through a window bounded by
+   `min(max(2*workers, 4), 16)` results, so output stays contiguous and memory
+   is bounded. The window reserves half the chunk pool for other work and
+   shrinks as reads overlap.
 4. **Read pins, with a snapshot fallback:** before workers start, one guard
    connection takes shared advisory locks (`pg_try_advisory_lock_shared`) on
    every file in the span. The reaper takes the exclusive lock before deleting a
@@ -141,9 +144,10 @@ CPU per byte and no PostgreSQL work.
    client cannot get a stream cut off mid-object.
 5. **Synchronous vs cut-through streaming:** Reads up to 8 MiB stream
    synchronously on the HTTP goroutine. Above 8 MiB, a background fetcher feeds
-   a bounded 32-buffer channel while `Body.WriteTo` streams 256 KiB buffers to
-   the socket, overlapping database I/O with network writes and backpressuring
-   slow clients.
+   a `min(max(2*workers, 4), 16)` result window while `Body.WriteTo` streams
+   256 KiB buffers to the socket, overlapping database I/O with network writes
+   and backpressuring slow clients. Rows assembled into newly cached blocks are
+   returned as shared cache bytes, so a cold fill does not copy them again.
 6. **Buffered chunk connections:** chunk-pool connections read the socket
    through a 256 KiB buffer under pgx's 8 KiB frame reader, so one read system
    call carries ~32 rows instead of one. This is what lifted large GETs.
@@ -170,11 +174,12 @@ come from, not who owns them:
 - **Memory hits and shared fills.** A fully cached span needs no chunk
   connection, pin or snapshot; partly cached spans serve cached pieces in
   order. Local misses read PostgreSQL rows, and batched `ReadMany` may cache
-  whole aligned range-chunk files as well as 32-row blocks. Only missing
-  shared origin range chunks fetch the origin once, publish each chunk to
-  PostgreSQL synchronously with bounded store concurrency, then assemble the
-  response. Store failures are logged and the response still uses the fetched
-  bytes.
+  whole aligned range-chunk files as well as 32-row blocks. A cold fill publishes
+  each completed block and hands that cache-owned buffer to the response
+  instead of copying it into a separate output buffer. Only missing shared
+  origin range chunks fetch the origin once, publish each chunk to PostgreSQL
+  synchronously with bounded store concurrency, then assemble the response.
+  Store failures are logged and the response still uses the fetched bytes.
 - **Scan resistant.** Each shard runs S3-FIFO: new blocks enter a small queue
   and only blocks read again move to the main queue, so one large scan cannot
   flush hot footers and row groups.
@@ -192,6 +197,10 @@ row groups, shared lake files) and does nothing for one-pass scans. Watch
 `pgvs3_read_cache_hit_bytes_total` against total read volume before sizing it up.
 
 ## Write path
+
+A streaming writer acquires one slot from a per-gateway gate of
+`max(MaxConns/2, 1)` before opening its `ChunkWriter` transaction, so metadata
+operations and reads always keep part of the main pool free.
 
 1. **Inline writes (≤64 KiB):** `s3b_<bucket>.put_inline` takes a per-key
    transaction advisory lock, checks `If-Match` / `If-None-Match`, queues any
@@ -227,10 +236,11 @@ row groups, shared lake files) and does nothing for one-pass scans. Watch
   fills; publication checks the live owner and expected origin version. Waiters
   can fall back to origin pass-through after their bounded wait.
 - **Warm and ranged reads:** within TTL, a hit needs no origin request. Warm GET
-  reuses its already-read metadata. Cold partial reads of objects larger than
-  8 MiB pass through unless aligned range caching is enabled; logged parent
-  metadata avoids repeated origin HEADs. Read-only gateways can consume replayed
-  metadata/blocks but never fill them.
+  reuses its already-read metadata. With `--range-cache-chunk`, cold partial
+  reads of objects larger than the chunk size cache aligned chunks for requests
+  up to 64 MiB; without it they pass through. Logged parent metadata avoids
+  repeated origin HEADs and coalesces concurrent cold HEADs per key. Read-only
+  gateways can consume replayed metadata/blocks but never fill them.
 - **Synchronous mutations:** small/conditional PUT/COPY and deletes require
   origin work before success. Origin mutation and cache publication remain
   separate commits. Foreground mutations and outbox uploads deliberately retain

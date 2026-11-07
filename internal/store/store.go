@@ -49,12 +49,20 @@ type Store struct {
 	knownNS sync.Map
 	quota   sync.Map
 
+	// cacheMaxBytes maps a cache namespace to the byte budget registered by
+	// objcache tiers that were constructed programmatically rather than via a
+	// persisted origin spec.
+	cacheMaxBytes sync.Map
+
 	fileIDMu    sync.Mutex
 	fileIDBlock []int64
 	fileIDPos   int
 
 	// inflightReads bounds per-GET chunk connections when many reads overlap.
 	inflightReads atomic.Int64
+	// writeGate bounds open ChunkWriter transactions so metadata operations
+	// always keep part of the main pool free.
+	writeGate chan struct{}
 
 	blocks             *blockCache
 	forceSnapshotReads bool
@@ -131,7 +139,27 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 		pool: pool, chunkPool: chunkPool, log: log,
 		jobRetention: DefaultJobRetention,
 		blocks:       newBlockCache(opts.ReadCacheBytes),
+		writeGate:    make(chan struct{}, max(int(cfg.MaxConns)/2, 1)),
 	}, nil
+}
+
+func (s *Store) acquireWriter(ctx context.Context) error {
+	if s.writeGate == nil {
+		return nil
+	}
+	select {
+	case s.writeGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Store) releaseWriter() {
+	if s.writeGate == nil {
+		return
+	}
+	<-s.writeGate
 }
 
 func normalizeOpenOptions(opts OpenOptions) (OpenOptions, error) {
@@ -473,6 +501,17 @@ func (s *Store) ReapedRows() int64 { return s.reapedRows.Load() }
 func (s *Store) ReapedFiles() int64 { return s.reapedFiles.Load() }
 
 func (s *Store) ExpiredObjects() int64 { return s.expiredObjects.Load() }
+
+// SetCacheMaxBytes registers a byte budget for cache namespace name.
+// Maintenance evicts the oldest cached objects once the namespace exceeds it.
+// A non-positive budget disables capacity eviction.
+func (s *Store) SetCacheMaxBytes(name string, maxBytes int64) {
+	if maxBytes <= 0 {
+		s.cacheMaxBytes.Delete(name)
+		return
+	}
+	s.cacheMaxBytes.Store(name, maxBytes)
+}
 
 func (s *Store) MaintenanceRuns() int64 { return s.maintenanceRuns.Load() }
 
@@ -886,6 +925,8 @@ type NamespaceInfo struct {
 	Quota     *int64         `json:"quota_bytes,omitempty"`
 	Attrs     map[string]any `json:"attrs,omitempty"`
 	CreatedAt time.Time      `json:"created_at"`
+
+	maxBytes int64
 }
 
 const namespaceCols = "kind, name, schema_name, quota_bytes, attrs, created_at"
@@ -900,6 +941,9 @@ func scanNamespace(row pgx.CollectableRow) (NamespaceInfo, error) {
 	n.Kind = ns.Kind(kind)
 	if len(attrs) > 0 {
 		_ = json.Unmarshal(attrs, &n.Attrs)
+	}
+	if v, ok := n.Attrs["max_bytes"].(float64); ok && v > 0 {
+		n.maxBytes = int64(v)
 	}
 	return n, nil
 }
@@ -1458,7 +1502,7 @@ func (s *Store) expirePass(ctx context.Context, conn *pgxpool.Conn, infos []Name
 			return err
 		}
 		expiredUploads += uploads
-		if err := s.expireNamespace(ctx, conn, q, rounds); err != nil {
+		if _, err := s.expireNamespace(ctx, conn, q, n, rounds); err != nil {
 			return err
 		}
 	}
@@ -1513,22 +1557,122 @@ func (q Queue) expire(ctx context.Context, rounds int) (int64, error) {
 	return total, nil
 }
 
-func (s *Store) expireNamespace(ctx context.Context, conn *pgxpool.Conn, schema string, rounds int) error {
-
+func (s *Store) expireNamespace(ctx context.Context, conn *pgxpool.Conn, schema string, n NamespaceInfo, rounds int) (int, error) {
+	total := 0
 	for range rounds {
 		var v int
 		if err := conn.QueryRow(ctx, "SELECT "+schema+".expire_objects($1)", ExpireBatch).Scan(&v); err != nil {
 			if missingNamespace(ctx, conn, schema, err) {
-				return nil
+				return total, nil
 			}
-			return err
+			return total, err
 		}
 		s.expiredObjects.Add(int64(v))
+		total += v
 		if v < ExpireBatch {
-			return nil
+			break
 		}
 	}
-	return nil
+	if n.Kind != ns.Cache && n.Kind != ns.WriteBack {
+		return total, nil
+	}
+	maxBytes := n.maxBytes
+	if maxBytes == 0 {
+		if v, ok := s.cacheMaxBytes.Load(n.Name); ok {
+			maxBytes, _ = v.(int64)
+		}
+	}
+	if maxBytes <= 0 {
+		return total, nil
+	}
+	for range rounds {
+		evicted, err := s.evictCacheOverBudget(ctx, conn, schema, maxBytes, ExpireBatch)
+		if err != nil {
+			return total, err
+		}
+		s.expiredObjects.Add(int64(evicted))
+		total += evicted
+		if evicted < ExpireBatch {
+			break
+		}
+	}
+	return total, nil
+}
+
+// evictCacheOverBudget deletes the oldest expiring cache objects until the
+// namespace is within maxBytes. It locks candidates with SKIP LOCKED so
+// concurrent maintenance or readers are not blocked, and queues their files
+// for the reaper in the same transaction.
+func (s *Store) evictCacheOverBudget(ctx context.Context, conn *pgxpool.Conn, schema string, maxBytes int64, limit int) (int, error) {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	var used int64
+	if err := tx.QueryRow(ctx,
+		"SELECT COALESCE(SUM(size),0)::int8 FROM "+schema+".objects WHERE expires_at IS NOT NULL").Scan(&used); err != nil {
+		if missingNamespace(ctx, tx, schema, err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if used <= maxBytes {
+		return 0, nil
+	}
+	excess := used - maxBytes
+	rows, err := tx.Query(ctx, `WITH locked AS (
+			SELECT key, size, file_id, parts, expires_at, created_at
+			FROM `+schema+`.objects
+			WHERE expires_at IS NOT NULL
+			ORDER BY expires_at ASC, created_at ASC, key ASC
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		), ranked AS (
+			SELECT key, file_id, parts,
+			       SUM(size) OVER (ORDER BY expires_at ASC, created_at ASC, key ASC) - size AS prior_bytes
+			FROM locked
+		), doomed AS (
+			DELETE FROM `+schema+`.objects o
+			USING ranked r
+			WHERE o.key = r.key AND r.prior_bytes < $2
+			RETURNING o.file_id, o.parts
+		)
+		SELECT file_id, parts FROM doomed`, limit, excess)
+	if err != nil {
+		if missingNamespace(ctx, tx, schema, err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	evicted := 0
+	var files []int64
+	for rows.Next() {
+		var fileID *int64
+		var parts []int64
+		if err := rows.Scan(&fileID, &parts); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		evicted++
+		if fileID != nil {
+			files = append(files, *fileID)
+		}
+		files = append(files, parts...)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(files) > 0 {
+		if _, err := tx.Exec(ctx, "SELECT "+schema+".queue_garbage($1)", files); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return evicted, nil
 }
 
 func (s *Store) reapPass(ctx context.Context, conn *pgxpool.Conn, infos []NamespaceInfo, grace time.Duration, budget int) error {

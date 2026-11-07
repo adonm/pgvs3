@@ -190,6 +190,16 @@ type originHandle interface {
 	Supports(originCapabilities) bool
 	IsObjNotFoundErr(error) bool
 	checkKey(string) error
+	IterAfter(context.Context, string, string) iter.Seq2[originObject, error]
+	DeleteMany(context.Context, []string) []error
+}
+
+type afterIterDriver interface {
+	IterAfter(context.Context, string, string) iter.Seq2[originObject, error]
+}
+
+type batchDeleteDriver interface {
+	DeleteMany(context.Context, []string) []error
 }
 
 type keyChecker interface {
@@ -255,6 +265,35 @@ func (o *origin) Delete(ctx context.Context, key string) error {
 	return o.driver.Delete(ctx, o.physicalKey(key))
 }
 
+// DeleteMany removes keys in one logical operation. S3 drivers implement the
+// batch endpoint; every other driver falls back to individual deletes.
+func (o *origin) DeleteMany(ctx context.Context, keys []string) []error {
+	out := make([]error, len(keys))
+	if len(keys) == 0 {
+		return out
+	}
+	if !o.Supports(capWrite) {
+		for i := range out {
+			out[i] = o.unsupported("deletes")
+		}
+		return out
+	}
+	driver, ok := o.driver.(batchDeleteDriver)
+	if !ok {
+		for i, key := range keys {
+			out[i] = o.Delete(ctx, key)
+		}
+		return out
+	}
+	physical := make([]string, len(keys))
+	for i, key := range keys {
+		physical[i] = o.physicalKey(key)
+	}
+	errs := driver.DeleteMany(ctx, physical)
+	copy(out, errs)
+	return out
+}
+
 func (o *origin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	rc, _, err := o.GetWithAttrs(ctx, key)
 	return rc, err
@@ -293,6 +332,25 @@ func (o *origin) Attributes(ctx context.Context, key string) (originAttrs, error
 }
 
 func (o *origin) Iter(ctx context.Context, dir string) iter.Seq2[originObject, error] {
+	return o.iter(ctx, dir, func() iter.Seq2[originObject, error] {
+		return o.driver.Iter(ctx, o.physicalKey(dir))
+	})
+}
+
+func (o *origin) IterAfter(ctx context.Context, dir, after string) iter.Seq2[originObject, error] {
+	if after == "" {
+		return o.Iter(ctx, dir)
+	}
+	driver, ok := o.driver.(afterIterDriver)
+	if !ok {
+		return o.Iter(ctx, dir)
+	}
+	return o.iter(ctx, dir, func() iter.Seq2[originObject, error] {
+		return driver.IterAfter(ctx, o.physicalKey(dir), o.physicalKey(after))
+	})
+}
+
+func (o *origin) iter(ctx context.Context, dir string, walk func() iter.Seq2[originObject, error]) iter.Seq2[originObject, error] {
 	if !o.Supports(capList) {
 		return func(func(originObject, error) bool) {}
 	}
@@ -301,7 +359,7 @@ func (o *origin) Iter(ctx context.Context, dir string) iter.Seq2[originObject, e
 		bucket, _ = splitBucket(dir)
 	}
 	return func(yield func(originObject, error) bool) {
-		for obj, err := range o.driver.Iter(ctx, o.physicalKey(dir)) {
+		for obj, err := range walk() {
 			if err != nil {
 				if !yield(originObject{}, err) {
 					return
@@ -418,6 +476,18 @@ func (b *s3Bucket) Delete(ctx context.Context, key string) error {
 	return b.client.Delete(ctx, key)
 }
 
+func (b *s3Bucket) DeleteMany(ctx context.Context, keys []string) []error {
+	errs, err := b.client.DeleteObjects(ctx, keys)
+	if err != nil {
+		out := make([]error, len(keys))
+		for i, key := range keys {
+			out[i] = b.client.Delete(ctx, key)
+		}
+		return out
+	}
+	return errs
+}
+
 func (b *s3Bucket) GetWithAttrs(ctx context.Context, key string) (io.ReadCloser, originAttrs, error) {
 	rc, info, err := b.client.GetWithInfo(ctx, key, 0, -1, "")
 	if err != nil {
@@ -439,9 +509,12 @@ func (b *s3Bucket) Attributes(ctx context.Context, key string) (originAttrs, err
 }
 
 func (b *s3Bucket) Iter(ctx context.Context, dir string) iter.Seq2[originObject, error] {
+	return b.IterAfter(ctx, dir, "")
+}
 
+func (b *s3Bucket) IterAfter(ctx context.Context, dir, after string) iter.Seq2[originObject, error] {
 	return func(yield func(originObject, error) bool) {
-		for obj, err := range b.client.Walk(ctx, dir) {
+		for obj, err := range b.client.WalkAfter(ctx, dir, after) {
 			if err != nil {
 				yield(originObject{}, err)
 				return

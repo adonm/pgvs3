@@ -18,6 +18,8 @@ package s3client
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -29,7 +31,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type ObjectInfo struct {
@@ -76,6 +81,13 @@ func (b *Bucket) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 }
 
 func (b *Bucket) Walk(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error] {
+	return b.WalkAfter(ctx, prefix, "")
+}
+
+// WalkAfter lists objects under prefix, starting strictly after startAfter.
+// S3 serves the first page with start-after so deep pages do not rescan the
+// prefix client-side; later pages use the continuation token.
+func (b *Bucket) WalkAfter(ctx context.Context, prefix, startAfter string) iter.Seq2[ObjectInfo, error] {
 	return func(yield func(ObjectInfo, error) bool) {
 		if b.client == nil {
 			yield(ObjectInfo{}, errors.New("s3: nil bucket"))
@@ -94,9 +106,13 @@ func (b *Bucket) Walk(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, 
 			logical = ""
 		}
 		physical := b.client.listPrefix(logical)
+		physicalAfter := ""
+		if startAfter != "" {
+			physicalAfter = b.client.listPrefix(strings.TrimLeft(startAfter, "/"))
+		}
 		token, previous := "", ""
 		for {
-			page, err := b.client.listPage(ctx, physical, token)
+			page, err := b.client.listPage(ctx, physical, token, physicalAfter)
 			if err != nil {
 				yield(ObjectInfo{}, err)
 				return
@@ -236,6 +252,130 @@ func (b *Bucket) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+const (
+	deleteObjectsMax  = 1000
+	deleteObjectsNS   = "http://s3.amazonaws.com/doc/2006-03-01/"
+	deleteResultLimit = 1 << 20
+)
+
+type deleteObjectsRequest struct {
+	XMLName xml.Name              `xml:"Delete"`
+	Xmlns   string                `xml:"xmlns,attr"`
+	Objects []deleteObjectsObject `xml:"Object"`
+}
+
+type deleteObjectsObject struct {
+	Key string `xml:"Key"`
+}
+
+type deleteObjectsResult struct {
+	Deleted []deleteObjectsDeleted `xml:"Deleted"`
+	Errors  []deleteObjectsError   `xml:"Error"`
+}
+
+type deleteObjectsDeleted struct {
+	Key string `xml:"Key"`
+}
+
+type deleteObjectsError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+// DeleteObjects deletes up to 1000 keys per POST /?delete request and returns
+// one error per input key. NoSuchKey is success, matching Delete. Origins that
+// do not implement the batch endpoint fall back to individual deletes.
+func (b *Bucket) DeleteObjects(ctx context.Context, keys []string) ([]error, error) {
+	errs := make([]error, len(keys))
+	if len(keys) == 0 {
+		return errs, nil
+	}
+	c := b.client
+	if c == nil {
+		return nil, errors.New("s3: nil bucket")
+	}
+	for start := 0; start < len(keys); start += deleteObjectsMax {
+		end := min(start+deleteObjectsMax, len(keys))
+		physical := make([]string, 0, end-start)
+		positions := make([]int, 0, end-start)
+		for i := start; i < end; i++ {
+			object, err := c.objectKey(keys[i])
+			if err != nil {
+				errs[i] = err
+				continue
+			}
+			physical = append(physical, object)
+			positions = append(positions, i)
+		}
+		if len(physical) == 0 {
+			continue
+		}
+		batchErrs, err := b.deleteObjectsBatch(ctx, physical)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return errs, ctxErr
+			}
+			for j := range physical {
+				errs[positions[j]] = b.Delete(ctx, keys[positions[j]])
+			}
+			continue
+		}
+		for j, err := range batchErrs {
+			errs[positions[j]] = err
+		}
+	}
+	return errs, nil
+}
+
+func (b *Bucket) deleteObjectsBatch(ctx context.Context, keys []string) ([]error, error) {
+	request := deleteObjectsRequest{Xmlns: deleteObjectsNS, Objects: make([]deleteObjectsObject, len(keys))}
+	for i, key := range keys {
+		request.Objects[i].Key = key
+	}
+	payload, err := xml.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	sum := md5.Sum(payload)
+	resp, err := b.client.doBytes(ctx, http.MethodPost, "", url.Values{"delete": {""}}, payload,
+		[2]string{"content-type", "application/xml"},
+		[2]string{"content-md5", base64.StdEncoding.EncodeToString(sum[:])})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, statusError("POST delete", "", resp)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, deleteResultLimit))
+	if err != nil {
+		return nil, fmt.Errorf("s3: POST delete: reading response: %w", err)
+	}
+	var result deleteObjectsResult
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("s3: POST delete: decoding response: %w", err)
+	}
+	out := make([]error, len(keys))
+	index := make(map[string][]int, len(keys))
+	for i, key := range keys {
+		index[key] = append(index[key], i)
+	}
+	for _, failure := range result.Errors {
+		if failure.Code == "NoSuchKey" {
+			continue
+		}
+		message := failure.Message
+		if message == "" {
+			message = failure.Code
+		}
+		for _, i := range index[failure.Key] {
+			out[i] = fmt.Errorf("s3: DELETE %s: %s: %s", failure.Key, failure.Code, message)
+		}
+	}
+	return out, nil
+}
+
 func (b *Bucket) CreateBucket(ctx context.Context) error {
 	if b.client == nil {
 		return errors.New("s3: nil bucket")
@@ -331,12 +471,32 @@ func (b *Bucket) putMultipartStream(ctx context.Context, key string, r io.Reader
 			_ = u.Abort(context.WithoutCancel(ctx))
 		}
 	}()
-	for number, remaining := int64(1), size; remaining > 0; number++ {
-		want := min(partSize, remaining)
-		if err := u.uploadPart(ctx, number, io.LimitReader(r, want), want); err != nil {
+	if partSize <= 16<<20 {
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(4)
+		for number, remaining := int64(1), size; remaining > 0; number++ {
+			want := min(partSize, remaining)
+			buf := make([]byte, want)
+			if _, err := io.ReadFull(r, buf); err != nil {
+				_ = g.Wait()
+				return ObjectInfo{}, fmt.Errorf("s3: PUT %s: reading part %d: %w", key, number, err)
+			}
+			g.Go(func() error {
+				return u.uploadPart(gctx, number, bytes.NewReader(buf), want)
+			})
+			remaining -= want
+		}
+		if err := g.Wait(); err != nil {
 			return ObjectInfo{}, err
 		}
-		remaining -= want
+	} else {
+		for number, remaining := int64(1), size; remaining > 0; number++ {
+			want := min(partSize, remaining)
+			if err := u.uploadPart(ctx, number, io.LimitReader(r, want), want); err != nil {
+				return ObjectInfo{}, err
+			}
+			remaining -= want
+		}
 	}
 	if err := u.Close(ctx); err != nil {
 		if len(u.conditions) > 0 && Unsupported(err) {
@@ -654,7 +814,7 @@ type listObject struct {
 	ContentType  string    `xml:"ContentType"`
 }
 
-func (c *client) listPage(ctx context.Context, prefix, token string) (listPage, error) {
+func (c *client) listPage(ctx context.Context, prefix, token, startAfter string) (listPage, error) {
 	query := url.Values{
 		"list-type":     {"2"},
 		"encoding-type": {"url"},
@@ -665,6 +825,8 @@ func (c *client) listPage(ctx context.Context, prefix, token string) (listPage, 
 	}
 	if token != "" {
 		query.Set("continuation-token", token)
+	} else if startAfter != "" {
+		query.Set("start-after", startAfter)
 	}
 	resp, err := c.do(ctx, http.MethodGet, "", query, nil, -1)
 	if err != nil {
@@ -699,6 +861,7 @@ type uploader struct {
 
 	id       string
 	etag     string
+	mu       sync.Mutex
 	parts    []tagpart
 	started  bool
 	finished bool
@@ -803,8 +966,14 @@ func (u *uploader) uploadPart(ctx context.Context, num int64, r io.Reader, size 
 	if etag == "" {
 		return errors.New("s3: upload-part: response missing ETag")
 	}
-	u.parts = append(u.parts, tagpart{Num: num, ETag: etag})
+	u.addPart(num, etag)
 	return nil
+}
+
+func (u *uploader) addPart(num int64, etag string) {
+	u.mu.Lock()
+	u.parts = append(u.parts, tagpart{Num: num, ETag: etag})
+	u.mu.Unlock()
 }
 
 func (u *uploader) Close(ctx context.Context) error {

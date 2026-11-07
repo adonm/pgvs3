@@ -136,11 +136,11 @@ CI, while the real-client/recovery/reclamation experiment is explicit. See
 negative fencing evidence and upstream artifact expiry.
 
 `just object-storage` reuses that analytical cohort workflow for the pinned
-SlateDB client and measures default/lean budgets and live/sealed readers. Its
-small remote-WAL process-death proof is reused by the required contract on
-DuckDB 2.0, replacing the older 1.5.6 same-process toy. See
-[object-storage.md](docs/object-storage.md); SQL read-only clients needing object
-checkpoint writes must not bypass gateway read-only restrictions.
+SlateDB client and measures default/lean budgets and live/sealed readers. It runs
+the experimental ObjFS check, including its remote-WAL process-death proof,
+separately from `test/e2e.sh`. See [object-storage.md](docs/object-storage.md);
+SQL read-only clients needing object checkpoint writes must not bypass gateway
+read-only restrictions.
 
 S3 compatibility is **`s3t` only**. The Python `ceph/s3-tests`/tox/pytest path
 was removed deliberately: it required a separate Python toolchain, duplicated

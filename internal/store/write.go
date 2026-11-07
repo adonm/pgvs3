@@ -339,23 +339,30 @@ func (s *Store) startWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 }
 
 func (s *Store) beginWriter(ctx context.Context, t writerTarget) (*ChunkWriter, error) {
+	if err := s.acquireWriter(ctx); err != nil {
+		return nil, err
+	}
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
+		s.releaseWriter()
 		return nil, err
 	}
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		conn.Release()
+		s.releaseWriter()
 		return nil, err
 	}
 	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
 		_ = tx.Rollback(ctx)
 		conn.Release()
+		s.releaseWriter()
 		return nil, err
 	}
 	fail := func(err error) (*ChunkWriter, error) {
 		_ = tx.Rollback(ctx)
 		conn.Release()
+		s.releaseWriter()
 		return nil, err
 	}
 	if t.kind == writePart {
@@ -396,6 +403,7 @@ func (s *Store) beginWriter(ctx context.Context, t writerTarget) (*ChunkWriter, 
 
 func (w *ChunkWriter) run(ctx context.Context, conn *pgxpool.Conn, tx pgx.Tx, pr *io.PipeReader, t writerTarget) {
 	defer conn.Release()
+	defer w.store.releaseWriter()
 	fail := func(err error) {
 		_ = tx.Rollback(ctx)
 		w.done <- err

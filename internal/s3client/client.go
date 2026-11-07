@@ -264,12 +264,59 @@ func (c *client) newRequest(ctx context.Context, method, object string, query ur
 	return req, nil
 }
 
+func replayableBody(body io.Reader) bool {
+	if body == nil || body == http.NoBody {
+		return true
+	}
+	_, ok := body.(io.ReadSeeker)
+	return ok
+}
+
+func retryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func retryableError(err error) bool {
+	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
 func (c *client) do(ctx context.Context, method, object string, query url.Values, body io.Reader, size int64, extra ...[2]string) (*http.Response, error) {
 	req, err := c.newRequest(ctx, method, object, query, body, size, extra...)
 	if err != nil {
 		return nil, err
 	}
-	return c.send(req)
+	replayable := replayableBody(body)
+	backoff := 15 * time.Millisecond
+	for attempt := 0; ; attempt++ {
+		resp, err := c.send(req)
+		retry := attempt < 2 && replayable &&
+			((err != nil && retryableError(err)) || (err == nil && retryableStatus(resp.StatusCode)))
+		if !retry {
+			return resp, err
+		}
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 3
+		if seeker, ok := body.(io.Seeker); ok {
+			_, _ = seeker.Seek(0, io.SeekStart)
+		}
+		req, err = c.newRequest(ctx, method, object, query, body, size, extra...)
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 func (c *client) send(req *http.Request) (*http.Response, error) {

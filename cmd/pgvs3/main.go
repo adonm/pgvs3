@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -43,7 +44,7 @@ var commandTable = []command{
 	{name: "clone", summary: "Copy a bucket or cache namespace inside PostgreSQL.", run: cloneNS},
 	{name: "drop", summary: "Delete a namespace and its schema.", run: dropNS},
 	{name: "adopt", summary: "Register existing s3b_/s3c_/s3w_/s3q_ schemas in the catalog.", run: adoptNS},
-	{name: "origin", summary: "Set, clear or list the origin a bucket (or every bucket) caches.", run: originCmd},
+	{name: "origin", summary: "Set, clear, list or print SQL for the origin a bucket (or every bucket) caches.", run: originCmd},
 	{name: "pending", summary: "List or retry write-back uploads that have not reached the origin.", run: pendingCmd},
 	{name: "version", summary: "Print the binary version.", run: func([]string) int { fmt.Println(version); return 0 }},
 }
@@ -126,6 +127,8 @@ var booleanFlags = map[string]bool{
 	"json":             true,
 	"h":                true,
 	"help":             true,
+	"s3-path-style":    true,
+	"s3-insecure":      true,
 }
 
 func flagTakesValue(name string) bool {
@@ -159,6 +162,7 @@ type serveConfig struct {
 	cacheNamespace          string
 	fillConcurrency         int
 	rangeCacheChunk         int64
+	cacheMaxBytes           int64
 	readCacheBytes          int64
 	s3Concurrency           int
 	s3QueueWait             time.Duration
@@ -199,6 +203,7 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.StringVar(&cfg.cacheNamespace, "cache-namespace", "origin", "cache namespace for origin objects")
 	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills and pending-upload workers")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
+	fs.Int64Var(&cfg.cacheMaxBytes, "cache-max-bytes", 0, "evict oldest cached objects when cache namespace exceeds this byte budget (0 disables)")
 	fs.Int64Var(&cfg.readCacheBytes, "read-cache-bytes", 0, "gateway-local memory for immutable chunk blocks of hot reads; metadata still comes from PostgreSQL on every request (0 disables)")
 	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown")
 	fs.DurationVar(&cfg.s3QueueWait, "s3-queue-wait", time.Second, "maximum S3 admission wait (0 rejects excess immediately)")
@@ -212,7 +217,7 @@ func parseServeConfig(args []string) (serveConfig, error) {
 		describeFlags("serve", fs)
 		return cfg, errDescribed
 	}
-	if err := applyFlagEnv(fs); err != nil {
+	if err := applyFlagEnv(fs, "PGVS3_"); err != nil {
 		return serveConfig{}, err
 	}
 	if err := fs.Parse(args); err != nil {
@@ -227,6 +232,9 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	}
 	if cfg.readCacheBytes < 0 {
 		return serveConfig{}, fmt.Errorf("--read-cache-bytes must be non-negative")
+	}
+	if cfg.cacheMaxBytes < 0 {
+		return serveConfig{}, fmt.Errorf("--cache-max-bytes must be non-negative")
 	}
 	if cfg.dbStatementTimeout < 0 || cfg.dbLockTimeout < 0 || cfg.dbIdleTxTimeout < 0 ||
 		cfg.dbMaxConnLifetime < 0 || cfg.dbMaxConnLifetimeJitter < 0 ||
@@ -378,7 +386,7 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 	}
 	origin, err := objcache.New(log, raw, st, runtime, objcache.TierOptions{
 		Namespace: cfg.cacheNamespace, TTL: cfg.cacheTTL, Retention: cfg.cacheRetention,
-		MaxFills: cfg.fillConcurrency, RangeChunk: cfg.rangeCacheChunk,
+		MaxFills: cfg.fillConcurrency, RangeChunk: cfg.rangeCacheChunk, MaxBytes: cfg.cacheMaxBytes,
 		ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack,
 	})
 	if err != nil {
@@ -448,6 +456,9 @@ func withStore(name string, args []string, timeout time.Duration, checkLayout bo
 	if describeFlags != nil {
 		describeFlags(name, fs)
 		return 0
+	}
+	if err := applyFlagEnv(fs, "PGVS3_"); err != nil {
+		return fail(err)
 	}
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
@@ -624,6 +635,14 @@ type originConfig struct {
 	retention       time.Duration
 	fillConcurrency int
 	rangeCacheChunk int64
+	cacheMaxBytes   int64
+	s3Endpoint      string
+	s3Bucket        string
+	s3Region        string
+	s3AccessKey     string
+	s3SecretKey     string
+	s3PathStyle     bool
+	s3Insecure      bool
 }
 
 func registerOriginFlags(fs *flag.FlagSet, cfg *originConfig) {
@@ -633,6 +652,14 @@ func registerOriginFlags(fs *flag.FlagSet, cfg *originConfig) {
 	fs.DurationVar(&cfg.retention, "cache-retention", 24*time.Hour, "idle eviction interval")
 	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills and pending-upload workers")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
+	fs.Int64Var(&cfg.cacheMaxBytes, "cache-max-bytes", 0, "evict oldest cached objects when cache namespace exceeds this byte budget (0 disables)")
+	fs.StringVar(&cfg.s3Endpoint, "s3-endpoint", "", "S3 origin endpoint URL or host when not passing an origin.json file")
+	fs.StringVar(&cfg.s3Bucket, "s3-bucket", "", "S3 origin bucket name (defaults to --bucket)")
+	fs.StringVar(&cfg.s3Region, "s3-region", "", "S3 origin region (defaults to AWS_REGION or us-east-1)")
+	fs.StringVar(&cfg.s3AccessKey, "s3-access-key", "", "S3 origin access key ID (defaults to AWS_ACCESS_KEY_ID)")
+	fs.StringVar(&cfg.s3SecretKey, "s3-secret-key", "", "S3 origin secret access key (defaults to AWS_SECRET_ACCESS_KEY)")
+	fs.BoolVar(&cfg.s3PathStyle, "s3-path-style", false, "use path-style S3 origin addressing")
+	fs.BoolVar(&cfg.s3Insecure, "s3-insecure", false, "allow plain HTTP S3 origin endpoint")
 }
 
 func (c originConfig) scope() string {
@@ -649,8 +676,54 @@ func (c originConfig) spec(raw []byte) objcache.Spec {
 		Retention:  c.retention.String(),
 		MaxFills:   c.fillConcurrency,
 		RangeChunk: c.rangeCacheChunk,
+		MaxBytes:   c.cacheMaxBytes,
 		Config:     string(raw),
 	}
+}
+
+func (c originConfig) buildS3JSON() ([]byte, error) {
+	bucket := c.s3Bucket
+	if bucket == "" {
+		bucket = c.bucket
+	}
+	region := c.s3Region
+	if region == "" {
+		region = env("AWS_REGION", env("AWS_DEFAULT_REGION", "us-east-1"))
+	}
+	lookup := "auto"
+	if c.s3PathStyle {
+		lookup = "path"
+	}
+	config := struct {
+		Type   string `json:"type"`
+		Config struct {
+			Bucket           string `json:"bucket"`
+			Endpoint         string `json:"endpoint"`
+			Region           string `json:"region"`
+			AccessKey        string `json:"access_key"`
+			SecretKey        string `json:"secret_key"`
+			Insecure         bool   `json:"insecure"`
+			BucketLookupType string `json:"bucket_lookup_type"`
+			StripBucket      bool   `json:"strip_bucket"`
+		} `json:"config"`
+	}{Type: "s3"}
+	accessKey := c.s3AccessKey
+	if accessKey == "" {
+		accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+	}
+	secretKey := c.s3SecretKey
+	if secretKey == "" {
+		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	}
+	config.Config.Bucket = bucket
+	config.Config.Endpoint = c.s3Endpoint
+	config.Config.Region = region
+	config.Config.AccessKey = accessKey
+	config.Config.SecretKey = secretKey
+	config.Config.Insecure = c.s3Insecure
+	config.Config.BucketLookupType = lookup
+	config.Config.StripBucket = c.bucket != ""
+	return json.Marshal(config)
 }
 
 type originAction func(context.Context, *store.Store, []string, originConfig) int
@@ -659,6 +732,7 @@ var originActions = map[string]originAction{
 	"set":   originSet,
 	"clear": originClear,
 	"list":  originList,
+	"sql":   originSQL,
 }
 
 func originCmd(args []string) int {
@@ -673,7 +747,7 @@ func originCmd(args []string) int {
 		}
 		run, ok := originActions[action]
 		if !ok {
-			fmt.Fprintf(os.Stderr, "unknown origin action %q (set, clear or list)\n", action)
+			fmt.Fprintf(os.Stderr, "unknown origin action %q (set, clear, list or sql)\n", action)
 			return 2
 		}
 		return run(ctx, st, rest, cfg)
@@ -681,13 +755,23 @@ func originCmd(args []string) int {
 }
 
 func originSet(ctx context.Context, st *store.Store, rest []string, cfg originConfig) int {
-	if len(rest) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: pgvs3 origin set [--bucket B] [--cache-namespace NS] [--range-cache-chunk N] <origin.json>")
+	var raw []byte
+	var err error
+	switch {
+	case len(rest) == 0 && cfg.s3Endpoint != "":
+		raw, err = cfg.buildS3JSON()
+		if err != nil {
+			return fail(err)
+		}
+	case len(rest) == 1:
+		raw, err = os.ReadFile(rest[0])
+		if err != nil {
+			return fail(err)
+		}
+	default:
+		fmt.Fprintln(os.Stderr, "usage: pgvs3 origin set [--bucket B] [--cache-namespace NS] [--range-cache-chunk N] [--cache-max-bytes N] <origin.json>")
+		fmt.Fprintln(os.Stderr, "   or: pgvs3 origin set --s3-endpoint HOST [--s3-bucket B] [--bucket B] [...]")
 		return 2
-	}
-	raw, err := os.ReadFile(rest[0])
-	if err != nil {
-		return fail(err)
 	}
 	if err := objcache.SaveSpec(ctx, st, cfg.bucket, cfg.spec(raw)); err != nil {
 		return fail(err)
@@ -704,20 +788,81 @@ func originClear(ctx context.Context, st *store.Store, _ []string, cfg originCon
 	return 0
 }
 
-func originList(ctx context.Context, st *store.Store, _ []string, _ originConfig) int {
+func originList(ctx context.Context, st *store.Store, _ []string, cfg originConfig) int {
 	specs, err := objcache.ListSpecs(ctx, st)
 	if err != nil {
 		return fail(err)
 	}
 	for _, sp := range specs {
-		scope := sp.Bucket
-		if scope == "" {
-			scope = "global"
+		scope := sp.Scope()
+		if cfg.bucket != "" && scope != cfg.bucket {
+			continue
 		}
-		fmt.Printf("origin=%s cache=%s ttl=%s retention=%s range_chunk=%d\n", scope, sp.Namespace, sp.TTL, sp.Retention, sp.RangeChunk)
+		line := fmt.Sprintf("origin=%s cache=%s ttl=%s retention=%s range_chunk=%d",
+			scope, sp.Namespace, sp.TTL, sp.Retention, sp.RangeChunk)
+		if sp.MaxBytes > 0 {
+			line += fmt.Sprintf(" max_bytes=%d", sp.MaxBytes)
+		}
+		fmt.Println(line)
 	}
 	return 0
 }
+
+// originSQL prints a DuckDB/DuckLake attach snippet for the configured bucket.
+func originSQL(_ context.Context, _ *store.Store, _ []string, cfg originConfig) int {
+	bucket := cfg.bucket
+	if bucket == "" {
+		bucket = "lake"
+	}
+	endpoint := env("PGVS3_ENDPOINT", "127.0.0.1:8014")
+	if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+		endpoint = u.Host
+	}
+	endpoint = strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
+	host, port, user, password, database := ducklakePostgres()
+	fmt.Println("INSTALL ducklake; INSTALL postgres; LOAD ducklake; LOAD postgres;")
+	fmt.Printf("CREATE TEMP SECRET pgvs3_s3 (TYPE s3, KEY_ID 'test', SECRET 'test', REGION 'us-east-1',\n"+
+		"    ENDPOINT '%s', URL_STYLE 'path', USE_SSL false);\n", sqlLiteral(endpoint))
+	fmt.Printf("CREATE TEMP SECRET pgvs3_pg (TYPE POSTGRES, HOST '%s', PORT %d,\n"+
+		"    DATABASE '%s', USER '%s', PASSWORD '%s');\n",
+		sqlLiteral(host), port, sqlLiteral(database), sqlLiteral(user), sqlLiteral(password))
+	fmt.Printf("ATTACH 'ducklake:pgvs3_pg' AS lake (DATA_PATH 's3://%s/ducklake/');\n", sqlLiteral(bucket))
+	return 0
+}
+
+func ducklakePostgres() (host string, port int, user, password, database string) {
+	host, port, user, password, database = "127.0.0.1", 5432, "postgres", "postgres", "ducklake_catalog"
+	raw := os.Getenv("PGVS3_URL")
+	if raw == "" {
+		return host, port, user, password, database
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return host, port, user, password, database
+	}
+	if value := u.Hostname(); value != "" {
+		host = value
+	}
+	if value := u.Port(); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			port = parsed
+		}
+	}
+	if u.User != nil {
+		if value := u.User.Username(); value != "" {
+			user = value
+		}
+		if value, ok := u.User.Password(); ok {
+			password = value
+		}
+	}
+	if value := strings.TrimPrefix(u.Path, "/"); value != "" {
+		database = value
+	}
+	return host, port, user, password, database
+}
+
+func sqlLiteral(value string) string { return strings.ReplaceAll(value, "'", "''") }
 
 func health(args []string) int {
 	fs := flag.NewFlagSet("health", flag.ContinueOnError)
@@ -802,13 +947,13 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l}))
 }
 
-func applyFlagEnv(fs *flag.FlagSet) error {
+func applyFlagEnv(fs *flag.FlagSet, prefix string) error {
 	var first error
 	fs.VisitAll(func(f *flag.Flag) {
 		if first != nil {
 			return
 		}
-		key := "PGVS3_" + strings.ToUpper(strings.ReplaceAll(f.Name, "-", "_"))
+		key := prefix + strings.ToUpper(strings.ReplaceAll(f.Name, "-", "_"))
 		value, exists := os.LookupEnv(key)
 		if !exists {
 			return

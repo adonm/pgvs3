@@ -66,6 +66,7 @@ class SqlShapeTest(unittest.TestCase):
         self.assertIn("error('PGVS3_BUCKET is required", self.lake)
         self.assertIn("error('QUACK_TOKEN must be at least 4", self.init)
         self.assertIn("regexp_matches(getenv('PGVS3_URL'), '^postgres(ql)?://')", self.lake)
+        self.assertIn("regexp_matches(getenv('PGVS3_BUCKET'), '^[a-z0-9._-]{1,58}$')", self.lake)
         # No validation error prints an env value.
         self.assertNotIn("error(getenv", self.all_sql)
 

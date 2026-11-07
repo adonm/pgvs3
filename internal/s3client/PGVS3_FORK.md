@@ -44,10 +44,12 @@ type PutOptions struct {
 
 func (*Bucket) Stat(ctx, key) (ObjectInfo, error)
 func (*Bucket) Walk(ctx, prefix) iter.Seq2[ObjectInfo, error]
+func (*Bucket) WalkAfter(ctx, prefix, startAfter string) iter.Seq2[ObjectInfo, error]
 func (*Bucket) Get(ctx, key, offset, length int64, ifMatch string) (io.ReadCloser, error)
 func (*Bucket) GetWithInfo(ctx, key, offset, length int64, ifMatch string) (io.ReadCloser, ObjectInfo, error)
 func (*Bucket) WriteReader(ctx, key string, r io.Reader, size int64, opts PutOptions) (ObjectInfo, error)
 func (*Bucket) Delete(ctx, key string) error
+func (*Bucket) DeleteObjects(ctx, keys []string) ([]error, error)
 func (*Bucket) CreateBucket(ctx) error
 func (*Bucket) DeleteBucket(ctx) error
 func (*Bucket) Close() error
@@ -66,10 +68,18 @@ func NotFound, Precondition, Conflict, Unsupported, InvalidRange(error) bool
   different window.
 - Conditional writes apply conditions to final-object completion for
   multipart uploads.
-- `WriteReader` streams and never retries a part. Large writes use sequential
-  multipart parts.
+- `WriteReader` streams and never retries a part. When the calculated part size
+  is at most 16 MiB, it reads parts into memory and uploads four at a time;
+  larger parts use sequential streaming to keep memory bounded.
 - The HTTP transport disables transparent compression.
-- `Walk` validates continuation-token progress.
+- `Walk` validates continuation-token progress. `WalkAfter` sends `start-after`
+  on the first list page, then uses the continuation token, so deep pages do not
+  rescan the prefix client-side.
+- `DeleteObjects` batches up to 1,000 keys into one `POST /?delete` request and
+  returns a per-key error. `NoSuchKey` counts as success, matching `Delete`.
+- Replayable requests (no body or a seekable body) retry up to three attempts on
+  429/5xx responses and transport errors with short exponential backoff.
+  Non-replayable uploads are left to the caller's retry loop.
 - User metadata is sorted, bare name/value pairs.
 
 The package is used by `internal/objcache` for the production S3 origin and by

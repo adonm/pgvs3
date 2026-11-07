@@ -40,6 +40,7 @@ type Tier struct {
 	workerID       string
 	keyLocks       [64]sync.Mutex
 	rangeSize      int64
+	maxBytes       int64
 	pendingWorkers int
 	pendingWake    chan struct{}
 	ctx            context.Context
@@ -54,7 +55,8 @@ type Tier struct {
 const (
 	memFillMax         = 8 << 20
 	fullCacheMax       = 8 << 20
-	maxRangeCacheSpan  = 8 << 20
+	maxRangeChunk      = 8 << 20
+	maxRangeCacheSpan  = 64 << 20
 	writeBackMin       = 8 << 20
 	originTombstoneTTL = 30 * time.Minute
 	fillLeaseTTL       = 2 * time.Minute
@@ -102,6 +104,7 @@ type TierOptions struct {
 	Retention  time.Duration
 	MaxFills   int
 	RangeChunk int64
+	MaxBytes   int64
 	ReadOnly   bool
 	WriteBack  bool
 }
@@ -150,16 +153,20 @@ func New(log *slog.Logger, config []byte, st *store.Store, runtime *Runtime, opt
 		opts.MaxFills = 8
 	}
 	if opts.RangeChunk > 0 {
-		opts.RangeChunk = min(max(opts.RangeChunk, 64<<10), maxRangeCacheSpan)
+		opts.RangeChunk = min(max(opts.RangeChunk, 64<<10), maxRangeChunk)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Tier{
 		origin: b, store: st, runtime: runtime, namespace: opts.Namespace, ttl: opts.TTL, retention: opts.Retention,
 		fills: make(chan struct{}, opts.MaxFills), completes: make(chan struct{}, opts.MaxFills),
-		log: log, readOnly: opts.ReadOnly, writeBack: opts.WriteBack, rangeSize: max(opts.RangeChunk, 0),
+		log: log, readOnly: opts.ReadOnly, writeBack: opts.WriteBack,
+		rangeSize: max(opts.RangeChunk, 0), maxBytes: max(opts.MaxBytes, 0),
 		workerID: randomID(), pendingWorkers: min(opts.MaxFills, 8),
 		pendingWake: make(chan struct{}, 1),
 		ctx:         ctx, cancel: cancel, done: make(chan struct{}),
+	}
+	if st != nil {
+		st.SetCacheMaxBytes(opts.Namespace, t.maxBytes)
 	}
 	if !opts.ReadOnly {
 
@@ -227,7 +234,7 @@ func (t *Tier) writeRef(ck string) store.ObjectRef {
 	return store.ObjectRef{NS: ns.WriteBackRef(t.namespace), Key: ck}
 }
 
-func (t *Tier) lockKey(ck string) func() {
+func (t *Tier) keyLockIndex(ck string) uint32 {
 	const (
 		offset = 2166136261
 		prime  = 16777619
@@ -236,7 +243,11 @@ func (t *Tier) lockKey(ck string) func() {
 	for i := 0; i < len(ck); i++ {
 		h = (h ^ uint32(ck[i])) * prime
 	}
-	mu := &t.keyLocks[h%uint32(len(t.keyLocks))]
+	return h % uint32(len(t.keyLocks))
+}
+
+func (t *Tier) lockKey(ck string) func() {
+	mu := &t.keyLocks[t.keyLockIndex(ck)]
 	mu.Lock()
 	return mu.Unlock
 }
@@ -266,7 +277,7 @@ func planCacheRead(res cacheResolution, rangeSize int64, readOnly bool, v readVi
 	switch {
 	case readOnly && !res.valid && !res.attrsValid:
 		plan.action = cacheActionPassThrough
-	case rangeSize > 0 && !res.valid && size > fullCacheMax &&
+	case rangeSize > 0 && !res.valid && size > rangeSize &&
 		plan.length < size && plan.length <= maxRangeCacheSpan:
 		plan.action = cacheActionRange
 	case res.valid || plan.length == size || size <= fullCacheMax:
@@ -336,7 +347,26 @@ func (t *Tier) resolveCache(ctx context.Context, ck string, deleteStale, withInl
 		}
 	}
 	validated := time.Now()
-	a, aerr := t.origin.Attributes(ctx, ck)
+	// A cold Parquet range read heads the parent object before any chunk is
+	// fetched. DuckDB opens many column ranges on the same file at once, so
+	// coalesce that HEAD per key instead of issuing one per reader.
+	ch := t.group.DoChan("head:"+ck, func() (any, error) {
+		headCtx, cancel := context.WithTimeout(t.baseContext(), 30*time.Second)
+		defer cancel()
+		return t.origin.Attributes(headCtx, ck)
+	})
+	var a originAttrs
+	var aerr error
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			aerr = res.Err
+		} else {
+			a = res.Val.(originAttrs)
+		}
+	case <-ctx.Done():
+		return res, ctx.Err()
+	}
 	if aerr != nil {
 		if t.origin.IsObjNotFoundErr(aerr) {
 			if m != nil && res.ref.NS.Kind == ns.WriteBack && !t.readOnly {
@@ -347,7 +377,7 @@ func (t *Tier) resolveCache(ctx context.Context, ck string, deleteStale, withInl
 		return res, aerr
 	}
 	res.attrs, res.info = a, a.objectInfo()
-	if m == nil && t.rangeSize > 0 && t.ttl > 0 && a.Size > fullCacheMax && !t.readOnly {
+	if m == nil && t.rangeSize > 0 && t.ttl > 0 && a.Size > t.rangeSize && !t.readOnly {
 		if err := t.store.Cache(t.namespace).RememberOriginMetadata(ctx, ck, res.info, validated, min(t.ttl, t.retention)); err != nil {
 			return res, err
 		}
@@ -615,7 +645,11 @@ func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Obje
 	for i, off := range offsets {
 		keys[i] = rangeChunkKey(ck, off, v.ETag)
 	}
-	chunks, err := t.store.Cache(t.namespace).ReadMany(ctx, keys)
+	retention := t.retention
+	if t.readOnly {
+		retention = 0
+	}
+	chunks, err := t.store.Cache(t.namespace).ReadManyWithTouch(ctx, keys, retention)
 	if err != nil {
 		return nil, err
 	}
@@ -631,7 +665,11 @@ func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Obje
 		}
 		j := i
 		for j+1 < len(offsets) && !present(j+1) {
-			j++
+			next := j + 1
+			if (offsets[next]-offsets[i])+t.rangeChunkLen(v, offsets[next]) > maxRangeChunk {
+				break
+			}
+			j = next
 		}
 		filled, err := t.fillRangeRun(ctx, ck, key, v, offsets[i], offsets[j])
 		if err != nil {
@@ -819,7 +857,11 @@ func (t *Tier) listDirect(ctx context.Context, bucket, prefix, after string, lim
 		dir = pfx[:i+1]
 	}
 	out := make([]store.Listed, 0, limit)
-	for obj, err := range t.origin.Iter(ctx, dir) {
+	afterKey := ""
+	if after != "" {
+		afterKey = bucket + "/" + after
+	}
+	for obj, err := range t.origin.IterAfter(ctx, dir, afterKey) {
 		if err != nil {
 			return nil, err
 		}
@@ -1586,21 +1628,64 @@ func (t *Tier) DeleteMany(ctx context.Context, bucket string, keys []string) []D
 	for i, key := range keys {
 		results[i].Key = key
 	}
-	workers := min(8, len(keys))
-	jobs := make(chan int)
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Go(func() {
-			for i := range jobs {
-				results[i].Err = t.Delete(ctx, bucket, keys[i])
+	if len(keys) == 0 {
+		return results
+	}
+	if err := t.requireWrite("delete"); err != nil {
+		for i := range results {
+			results[i].Err = err
+		}
+		return results
+	}
+	fullKeys := make([]string, 0, len(keys))
+	positions := make([]int, 0, len(keys))
+	for i, key := range keys {
+		ck := t.key(bucket, key)
+		if err := t.origin.checkKey(ck); err != nil {
+			results[i].Err = err
+			continue
+		}
+		fullKeys = append(fullKeys, ck)
+		positions = append(positions, i)
+	}
+	if len(fullKeys) == 0 {
+		return results
+	}
+	// Hold every affected local write shard once, in ascending shard order.
+	locked := make([]bool, len(t.keyLocks))
+	for _, ck := range fullKeys {
+		locked[t.keyLockIndex(ck)] = true
+	}
+	for i := range locked {
+		if locked[i] {
+			t.keyLocks[i].Lock()
+		}
+	}
+	defer func() {
+		for i := len(locked) - 1; i >= 0; i-- {
+			if locked[i] {
+				t.keyLocks[i].Unlock()
 			}
-		})
+		}
+	}()
+	originErrs := t.origin.DeleteMany(ctx, fullKeys)
+	cleanupCtx := context.WithoutCancel(ctx)
+	expires := time.Now().Add(originTombstoneTTL)
+	for i, ck := range fullKeys {
+		if err := originErrs[i]; err != nil && !t.origin.IsObjNotFoundErr(err) {
+			results[positions[i]].Err = err
+			continue
+		}
+		if err := t.store.CacheTombstone(cleanupCtx, ns.WriteBackRef(t.namespace), ck, expires); err != nil {
+			results[positions[i]].Err = err
+			continue
+		}
+		if err := t.fenceReadCache(cleanupCtx, ck); err != nil {
+			results[positions[i]].Err = err
+			continue
+		}
+		_ = t.store.Cache(t.namespace).ClearPendingUploads(cleanupCtx, ck)
 	}
-	for i := range keys {
-		jobs <- i
-	}
-	close(jobs)
-	wg.Wait()
 	return results
 }
 
@@ -1623,18 +1708,11 @@ func (t *Tier) flushOneNoLock(ctx context.Context, p store.PendingUpload, owner 
 	if err != nil {
 		return "", err
 	}
+	defer body.Close()
 	if sm.OriginETag != p.Token {
-		_ = body.Close()
 		_ = t.store.Cache(t.namespace).ClearPendingUploadToken(context.WithoutCancel(ctx), p.Key, p.Token)
 		return "", nil
 	}
-	sp, cleanup, err := t.runtime.spoolStream(ctx, body, sm.Size)
-	_ = body.Close()
-	if err != nil {
-		_ = t.store.Cache(t.namespace).FailPendingUpload(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
-		return "", err
-	}
-	defer cleanup()
 	condition := store.IfMatch
 	switch {
 	case p.BaseMissing:
@@ -1643,7 +1721,7 @@ func (t *Tier) flushOneNoLock(ctx context.Context, p store.PendingUpload, owner 
 
 		condition = store.Unconditional
 	}
-	attrs, err := t.origin.Upload(ctx, p.Key, sp.r, sp.size, originUpload{
+	attrs, err := t.origin.Upload(ctx, p.Key, body, sm.Size, originUpload{
 		UserMetadata: sm.UserMetadata, ContentType: sm.ContentType,
 		ContentEncoding: sm.ContentEncoding,
 		Precondition:    store.Precondition{Mode: condition, ETag: p.BaseETag},

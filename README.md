@@ -91,6 +91,34 @@ The DuckLake catalog and the pgvs3 objects share a cluster but commit in
 **separate transactions**; co-location does not make them atomic together.
 `just analytics` runs both snippets in both storage roles in a disposable stack.
 
+### Attach an existing S3 bucket in one command
+
+Store the origin in PostgreSQL once; every gateway discovers it without a local
+config file:
+
+```sh
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+mise exec go -- go run ./cmd/pgvs3 origin --bucket lake \
+  --s3-endpoint s3.us-east-1.amazonaws.com --s3-bucket my-origin-bucket \
+  --range-cache-chunk 1048576 --cache-max-bytes 107374182400 set
+```
+
+`--bucket` is the pgvs3 bucket clients use; `--s3-bucket` defaults to it.
+`--s3-path-style` selects path-style addressing for MinIO and similar,
+`--s3-insecure` allows a plain-HTTP endpoint, and every origin flag also reads
+`PGVS3_<FLAG>` (`PGVS3_S3_ENDPOINT`, `PGVS3_S3_ACCESS_KEY`, ...).
+`--range-cache-chunk 1048576` caches aligned 1 MiB chunks, so Parquet footer and
+column-chunk reads stay in PostgreSQL instead of downloading whole files.
+`--cache-max-bytes` evicts the oldest cached objects once the cache namespace
+exceeds the budget; `0` disables it.
+
+Query the bucket with the DuckDB secret from the previous section:
+
+```sql
+SELECT count(*) FROM read_parquet('s3://lake/events.parquet');
+-- Or keep a DuckLake catalog and set DATA_PATH 's3://lake/ducklake/'.
+```
+
 ## How it works
 
 ![FIG 01 — System Topology & Parallel Authority Lanes](docs/assets/architecture-flow.svg)

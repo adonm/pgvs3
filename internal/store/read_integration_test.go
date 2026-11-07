@@ -5,6 +5,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	mathrand "math/rand"
@@ -142,8 +143,11 @@ func TestReadGuardSnapshotOutlivesIdleTimeout(t *testing.T) {
 	time.Sleep(time.Second)
 	for i, q := range []querier{first, second} {
 		var got []byte
-		err := streamRows(ctx, q, schema, pieces[i], 0, m.Size-1, nil, func(b []byte) bool {
-			got = append(got, b...)
+		err := streamRows(ctx, q, schema, pieces[i], 0, m.Size-1, nil, func(res result) bool {
+			got = append(got, res.b...)
+			if !res.shared {
+				putChunkBuf(res.b)
+			}
 			return true
 		})
 		testutil.Must(t, err)
@@ -329,4 +333,123 @@ func TestReadCachePartialHitKeepsOrder(t *testing.T) {
 	testutil.Must(t, err)
 	cancel()
 	testutil.Must(t, body.Close())
+}
+
+func TestConditionalReadStopsBeforeBody(t *testing.T) {
+	ctx := testCtx
+	st := openReadStore(t, func(o *OpenOptions) { o.ReadCacheBytes = 0 })
+	bucket := unique("read-conditional")
+	testutil.Must(t, st.CreateBucket(ctx, bucket))
+	dropOnCleanup(t, ns.Bucket, bucket)
+	ref := ObjectRef{NS: ns.BucketRef(bucket), Key: "obj"}
+	data := randomBytes(2<<20+123, 13)
+	putChunked(t, st, ref, data)
+	m, err := st.Meta(ctx, ref)
+	testutil.Must(t, err)
+
+	acquires := st.chunkPool.Stat().AcquireCount()
+	sm, body, err := st.GetBody(ctx, ref, Range(0, 1023, -1), &ReadCondition{IfNoneMatch: m.ETag})
+	if !errors.Is(err, ErrNotModified) {
+		t.Fatalf("If-None-Match error = %v, want ErrNotModified", err)
+	}
+	if body != nil {
+		t.Fatal("conditional miss opened a body")
+	}
+	if sm == nil || sm.ETag != m.ETag {
+		t.Fatalf("slice meta = %+v, want ETag %q", sm, m.ETag)
+	}
+	if got := st.chunkPool.Stat().AcquireCount(); got != acquires {
+		t.Fatalf("conditional miss acquired %d chunk connections", got-acquires)
+	}
+
+	sm, body, err = st.GetBody(ctx, ref, Range(0, 1023, -1), &ReadCondition{IfMatch: "other"})
+	if !errors.Is(err, ErrPrecondition) {
+		t.Fatalf("If-Match error = %v, want ErrPrecondition", err)
+	}
+	if body != nil || sm == nil || sm.ETag != m.ETag {
+		t.Fatalf("precondition result = %+v, body=%v", sm, body)
+	}
+	if got := st.chunkPool.Stat().AcquireCount(); got != acquires {
+		t.Fatalf("precondition acquired %d chunk connections", got-acquires)
+	}
+
+	sm, body, err = st.GetBody(ctx, ref, WholeObjectRange(), &ReadCondition{IfMatch: m.ETag})
+	testutil.Must(t, err)
+	defer body.Close()
+	got, err := io.ReadAll(body)
+	testutil.Must(t, err)
+	if !bytes.Equal(got, data) || sm.ETag != m.ETag {
+		t.Fatalf("conditional read got %d bytes, ETag %q", len(got), sm.ETag)
+	}
+}
+
+func TestReadCacheTooSmallForBlocksStillServesData(t *testing.T) {
+	ctx := testCtx
+	st := openReadStore(t, func(o *OpenOptions) { o.ReadCacheBytes = 1 << 10 })
+	bucket := unique("read-cache-tiny")
+	testutil.Must(t, st.CreateBucket(ctx, bucket))
+	dropOnCleanup(t, ns.Bucket, bucket)
+	ref := ObjectRef{NS: ns.BucketRef(bucket), Key: "obj"}
+	data := randomBytes(2<<20+17, 15)
+	putChunked(t, st, ref, data)
+	for _, rng := range []ByteRange{WholeObjectRange(), Range(0, 100, -1), Range(1<<20, 1<<20+4095, -1)} {
+		got, err := st.Get(ctx, ref, rng)
+		testutil.Must(t, err)
+		start, end := int64(0), int64(len(data)-1)
+		if rng.Requested {
+			start, end = max(rng.First, 0), rng.Last
+		}
+		if want := data[start : end+1]; !bytes.Equal(got.Bytes, want) {
+			t.Fatalf("range %+v returned %d wrong bytes", rng, len(got.Bytes))
+		}
+	}
+	if st.blocks.fills.Load() != 0 {
+		t.Fatalf("tiny cache filled %d blocks it cannot hold", st.blocks.fills.Load())
+	}
+}
+
+func TestReadCacheServesFilesLargerThanAShard(t *testing.T) {
+	ctx := testCtx
+	st := openReadStore(t, func(o *OpenOptions) { o.ReadCacheBytes = 64 << 20 })
+	name := unique("read-many-large")
+	ref := ns.CacheRef(name)
+	dropOnCleanup(t, ns.Cache, name)
+	obj := ObjectRef{NS: ref, Key: "large"}
+	data := randomBytes(6<<20+123, 14)
+	putChunked(t, st, obj, data)
+
+	got, err := st.Cache(name).ReadMany(ctx, []string{"large"})
+	testutil.Must(t, err)
+	if len(got) != 1 || !bytes.Equal(got[0], data) {
+		t.Fatalf("first ReadMany got %d bytes", len(got[0]))
+	}
+	m, err := st.Meta(ctx, obj)
+	testutil.Must(t, err)
+	if st.blocks.contains(blockKey{table: m.table, file: m.FileID, block: wholeFile}) {
+		t.Fatal("large file cached as one whole-file entry")
+	}
+	if !st.blocks.contains(blockKey{table: m.table, file: m.FileID, block: 0}) {
+		t.Fatal("large file was not split into block entries")
+	}
+	blocks := int32((len(data) + blockRows*RowBytes - 1) / (blockRows * RowBytes))
+	for b := int32(0); b < blocks; b++ {
+		if !st.blocks.contains(blockKey{table: m.table, file: m.FileID, block: b}) {
+			t.Fatalf("split block %d of %d missing", b, blocks)
+		}
+	}
+	if cached, ok := st.cachedFile(m.table, m.FileID, int64(len(data))); !ok || !bytes.Equal(cached, data) {
+		t.Fatalf("cachedFile split round trip: ok=%v len=%d", ok, len(cached))
+	}
+
+	acquires := st.chunkPool.Stat().AcquireCount()
+	got, err = st.Cache(name).ReadMany(ctx, []string{"large"})
+	testutil.Must(t, err)
+	if !bytes.Equal(got[0], data) {
+		t.Fatalf("cached ReadMany got %d bytes, mismatch", len(got[0]))
+	}
+	// The cached pass still queries metadata once; any further acquisition
+	// would be a per-file chunk fetch.
+	if n := st.chunkPool.Stat().AcquireCount(); n != acquires+1 {
+		t.Fatalf("cached ReadMany acquired %d chunk connections, want 1 metadata query", n-acquires)
+	}
 }

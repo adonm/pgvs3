@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adonm/pgvs3/internal/ns"
+	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
@@ -62,6 +64,7 @@ func doctor(args []string) int {
 				checks = append(checks, check{statusFail, "schema drift", err.Error(), "run a writable `pgvs3 serve` of this version once"})
 			}
 		}
+		checks = append(checks, checkOriginSpecs(ctx, st))
 		if *asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
@@ -80,6 +83,40 @@ func doctor(args []string) int {
 		}
 		return 0
 	})
+}
+
+func checkOriginSpecs(ctx context.Context, st *store.Store) check {
+	namespaces, err := st.NamespacesWithAttr(ctx, "origin")
+	if err != nil {
+		return check{statusFail, "origin specs", err.Error(), "fix database access, then re-run pgvs3 doctor"}
+	}
+	var invalid []string
+	for _, n := range namespaces {
+		raw, err := json.Marshal(n.Attrs["origin"])
+		if err != nil {
+			invalid = append(invalid, fmt.Sprintf("%s %s: %v", n.Kind, n.Name, err))
+			continue
+		}
+		var spec objcache.Spec
+		if err := json.Unmarshal(raw, &spec); err != nil {
+			invalid = append(invalid, fmt.Sprintf("%s %s: invalid origin JSON: %v", n.Kind, n.Name, err))
+			continue
+		}
+		bucket := ""
+		if n.Kind == ns.Bucket {
+			bucket = n.Name
+			if spec.Bucket == "" {
+				spec.Bucket, spec.ScopeKind = n.Name, "bucket"
+			}
+		}
+		if err := objcache.ValidateSpec(bucket, spec); err != nil {
+			invalid = append(invalid, fmt.Sprintf("%s %s: %v", n.Kind, n.Name, err))
+		}
+	}
+	if len(invalid) > 0 {
+		return check{statusFail, "origin specs", strings.Join(invalid, "; "), "re-run pgvs3 origin set or clear the invalid origin"}
+	}
+	return check{statusPass, "origin specs", fmt.Sprintf("%d persisted, all valid", len(namespaces)), ""}
 }
 
 func printChecks(w io.Writer, checks []check) {

@@ -69,6 +69,12 @@ pgvs3 origin --url "$PGVS3_URL" --bucket guide-edge \
   --range-cache-chunk 1048576 set origin.json
 ```
 
+For a standard S3 origin, skip the JSON file: `pgvs3 origin --bucket guide-edge
+--s3-endpoint 127.0.0.1:18014 --s3-path-style --s3-insecure
+--cache-namespace guide-origin --cache-ttl 1h set`. The S3 shorthand flags also
+read `PGVS3_S3_*` environment variables, and `pgvs3 origin --bucket guide-edge
+sql` prints a DuckDB/DuckLake attach snippet for the configured bucket.
+
 Allow up to the bounded one-second configuration refresh. Read once on A, then
 run the **same command on B** by setting `PGVS3_ENDPOINT` to its address:
 
@@ -109,10 +115,15 @@ authority, not merely freshness.
 
 ## Range size and fill pressure
 
-Large (>8 MiB) cold ranges pass through unless range caching is enabled. A
-1 MiB aligned chunk is a **candidate**: it can help nearby column/footer reads
-but overfetch isolated tiny ranges. Smaller chunks trade overfetch for more
-rows/requests; larger ones can evict useful working set. Measure:
+Cold ranged reads of objects larger than `--range-cache-chunk` cache aligned
+chunks when range caching is enabled; requests up to 64 MiB use this path, and
+wider requests pass through. Without `--range-cache-chunk`, ranges pass through.
+`--cache-max-bytes` bounds the cache namespace, including committed write-back
+copies: maintenance evicts the oldest expiring rows, while un-uploaded pending
+bodies (`expires_at IS NULL`) are never capacity-evicted. A 1 MiB aligned chunk
+is a **candidate**: it can help nearby column/footer reads but overfetch
+isolated tiny ranges. Smaller chunks trade overfetch for more rows/requests;
+larger ones can evict useful working set. Measure:
 
 - origin requests **and bytes**, time to first byte and full query p95/p99;
 - full-object versus selective queries, 10/100/1,024 MiB files and concurrency;

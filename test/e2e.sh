@@ -585,9 +585,6 @@ export E2E_BUCKET=$BUCKET E2E_RUN=$RUN E2E_ENDPOINT=$A E2E_KEY=$PGVS3_ACCESS_KEY
        E2E_SECRET=$PGVS3_SECRET_KEY E2E_PG_PORT=$PGVS3_TEST_PG_PORT
 mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py analytics
 
-# --- Signed ObjFS 0.2.0: no-checkpoint process death and fresh remote recovery ---
-mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python deploy/bench/object_storage.py contract
-
 # Workload guides are executable snippets, using this same disposable fixture.
 mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py guides
 

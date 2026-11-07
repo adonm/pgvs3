@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"flag"
 	"io"
 	"os"
 	"reflect"
@@ -54,6 +57,10 @@ func clearServeEnv(t *testing.T) {
 		"PGVS3_LOG_LEVEL", "PGVS3_PPROF_ADDR", "PGVS3_ORIGIN_CONFIG",
 		"PGVS3_CACHE_TTL", "PGVS3_CACHE_RETENTION", "PGVS3_CACHE_NAMESPACE",
 		"PGVS3_FILL_CONCURRENCY", "PGVS3_RANGE_CACHE_CHUNK",
+		"PGVS3_CACHE_MAX_BYTES",
+		"PGVS3_S3_ENDPOINT", "PGVS3_S3_BUCKET", "PGVS3_S3_REGION",
+		"PGVS3_S3_ACCESS_KEY", "PGVS3_S3_SECRET_KEY",
+		"PGVS3_S3_PATH_STYLE", "PGVS3_S3_INSECURE",
 		"PGVS3_QUEUE_CONCURRENCY", "PGVS3_RESP_CONCURRENCY",
 		"PGVS3_JOB_RETENTION",
 		"PGVS3_SPOOL_MAX_BYTES",
@@ -135,6 +142,7 @@ func TestParseServeConfigFlags(t *testing.T) {
 		"--pprof-addr", "127.0.0.1:6060", "--origin-config", "/tmp/origin.json",
 		"--cache-ttl", "30s", "--cache-retention", "1h", "--cache-namespace", "cache",
 		"--fill-concurrency", "3", "--range-cache-chunk", "4096",
+		"--cache-max-bytes", "1048576",
 		"--s3-concurrency", "7", "--s3-queue-wait", "75ms",
 		"--queue-concurrency", "5", "--resp-concurrency", "6",
 		"--job-retention", "2h",
@@ -169,6 +177,7 @@ func TestParseServeConfigFlags(t *testing.T) {
 		cacheWriteBack:          true,
 		fillConcurrency:         3,
 		rangeCacheChunk:         4096,
+		cacheMaxBytes:           1048576,
 		s3Concurrency:           7,
 		s3QueueWait:             75 * time.Millisecond,
 		queueConcurrency:        5,
@@ -190,6 +199,7 @@ func TestOriginConfig(t *testing.T) {
 		retention:       24 * time.Hour,
 		fillConcurrency: 8,
 		rangeCacheChunk: 4096,
+		cacheMaxBytes:   1 << 30,
 	}
 	if got := cfg.scope(); got != "global" {
 		t.Fatalf("scope = %q", got)
@@ -200,13 +210,152 @@ func TestOriginConfig(t *testing.T) {
 	}
 	sp := cfg.spec([]byte(`{"endpoint":"origin"}`))
 	if sp.Namespace != "cache" || sp.TTL != "1m0s" || sp.Retention != "24h0m0s" ||
-		sp.MaxFills != 8 || sp.RangeChunk != 4096 || sp.Config != `{"endpoint":"origin"}` {
+		sp.MaxFills != 8 || sp.RangeChunk != 4096 || sp.MaxBytes != 1<<30 ||
+		sp.Config != `{"endpoint":"origin"}` {
 		t.Fatalf("spec = %+v", sp)
 	}
-	for _, action := range []string{"set", "clear", "list"} {
+	for _, action := range []string{"set", "clear", "list", "sql"} {
 		if originActions[action] == nil {
 			t.Fatalf("origin action %q is missing", action)
 		}
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	fn()
+	os.Stdout = old
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+func TestOriginSQL(t *testing.T) {
+	t.Setenv("PGVS3_ENDPOINT", "http://gateway.example:9000")
+	t.Setenv("PGVS3_URL", "postgres://alice:s%27cret@db.example:5544/lake_catalog?sslmode=disable")
+	code := -1
+	out := captureStdout(t, func() { code = originSQL(context.Background(), nil, nil, originConfig{bucket: "edge"}) })
+	if code != 0 {
+		t.Fatalf("exit code = %d", code)
+	}
+	for _, want := range []string{
+		"ENDPOINT 'gateway.example:9000'",
+		"HOST 'db.example'",
+		"PORT 5544",
+		"DATABASE 'lake_catalog'",
+		"USER 'alice'",
+		"PASSWORD 's''cret'",
+		"DATA_PATH 's3://edge/ducklake/'",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestOriginSQLDefaults(t *testing.T) {
+	t.Setenv("PGVS3_ENDPOINT", "")
+	t.Setenv("PGVS3_URL", "")
+	host, port, user, password, database := ducklakePostgres()
+	if host != "127.0.0.1" || port != 5432 || user != "postgres" || password != "postgres" || database != "ducklake_catalog" {
+		t.Fatalf("defaults = %s %d %s %s %s", host, port, user, password, database)
+	}
+	code := -1
+	out := captureStdout(t, func() { code = originSQL(context.Background(), nil, nil, originConfig{}) })
+	if code != 0 {
+		t.Fatalf("exit code = %d", code)
+	}
+	for _, want := range []string{"ENDPOINT '127.0.0.1:8014'", "DATA_PATH 's3://lake/ducklake/'"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestOriginS3ShorthandFlags(t *testing.T) {
+	clearServeEnv(t)
+	var cfg originConfig
+	fs := flag.NewFlagSet("origin", flag.ContinueOnError)
+	registerOriginFlags(fs, &cfg)
+	if err := fs.Parse([]string{
+		"--s3-endpoint", "s3.example.com", "--s3-bucket", "warehouse",
+		"--s3-region", "eu-west-1", "--s3-access-key", "key",
+		"--s3-secret-key", "secret", "--s3-path-style", "--s3-insecure",
+		"--cache-max-bytes", "2048",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := cfg.buildS3JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Type   string `json:"type"`
+		Config struct {
+			Bucket           string `json:"bucket"`
+			Endpoint         string `json:"endpoint"`
+			Region           string `json:"region"`
+			AccessKey        string `json:"access_key"`
+			SecretKey        string `json:"secret_key"`
+			Insecure         bool   `json:"insecure"`
+			BucketLookupType string `json:"bucket_lookup_type"`
+			StripBucket      bool   `json:"strip_bucket"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != "s3" || got.Config.Bucket != "warehouse" || got.Config.Endpoint != "s3.example.com" ||
+		got.Config.Region != "eu-west-1" || got.Config.AccessKey != "key" || got.Config.SecretKey != "secret" ||
+		!got.Config.Insecure || got.Config.BucketLookupType != "path" || got.Config.StripBucket {
+		t.Fatalf("s3 config = %+v (%s)", got, raw)
+	}
+	if cfg.spec(raw).MaxBytes != 2048 {
+		t.Fatalf("max bytes = %d", cfg.spec(raw).MaxBytes)
+	}
+
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "ap-south-1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "env-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "env-secret")
+	cfg = originConfig{bucket: "edge", s3Endpoint: "minio:9000"}
+	raw, err = cfg.buildS3JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Config.Bucket != "edge" || !got.Config.StripBucket || got.Config.BucketLookupType != "auto" ||
+		got.Config.Region != "ap-south-1" || got.Config.AccessKey != "env-key" || got.Config.SecretKey != "env-secret" {
+		t.Fatalf("environment fallback = %+v (%s)", got, raw)
+	}
+
+	var envCfg originConfig
+	fs = flag.NewFlagSet("origin", flag.ContinueOnError)
+	registerOriginFlags(fs, &envCfg)
+	t.Setenv("PGVS3_S3_ENDPOINT", "env-host:9000")
+	t.Setenv("PGVS3_S3_BUCKET", "env-bucket")
+	t.Setenv("PGVS3_S3_PATH_STYLE", "yes")
+	if err := applyFlagEnv(fs, "PGVS3_"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if envCfg.s3Endpoint != "env-host:9000" || envCfg.s3Bucket != "env-bucket" || !envCfg.s3PathStyle {
+		t.Fatalf("environment flags = %+v", envCfg)
 	}
 }
 
@@ -253,6 +402,7 @@ func TestParseServeConfigRejectsInvalidLimits(t *testing.T) {
 		{"--s3-concurrency", "0"},
 		{"--s3-queue-wait", "-1s"},
 		{"--http-read-timeout", "-1s"},
+		{"--cache-max-bytes", "-1"},
 	} {
 		if _, err := parseServeConfig(args); err == nil {
 			t.Fatalf("parseServeConfig(%v) succeeded, want error", args)

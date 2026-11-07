@@ -18,14 +18,26 @@ import (
 )
 
 type Spec struct {
-	Scope      string `json:"scope"`
+	ScopeKind  string `json:"scope"`
 	Bucket     string `json:"bucket,omitempty"`
 	Namespace  string `json:"namespace"`
 	TTL        string `json:"ttl,omitempty"`
 	Retention  string `json:"retention,omitempty"`
 	MaxFills   int    `json:"max_fills,omitempty"`
 	RangeChunk int64  `json:"range_chunk,omitempty"`
+	MaxBytes   int64  `json:"max_bytes,omitempty"`
 	Config     string `json:"config,omitempty"`
+}
+
+// Scope returns the bucket a spec applies to, or "global".
+func (s Spec) Scope() string {
+	if s.Bucket != "" {
+		return s.Bucket
+	}
+	if s.ScopeKind != "" {
+		return s.ScopeKind
+	}
+	return "global"
 }
 
 func NewFromSpec(log *slog.Logger, st *store.Store, runtime *Runtime, spec Spec, opts TierOptions) (*Tier, error) {
@@ -46,10 +58,10 @@ func normalizeSpec(bucket string, spec Spec) (Spec, TierOptions, error) {
 		}
 		scope = "bucket"
 	}
-	if (spec.Scope != "" && spec.Scope != scope) || (spec.Bucket != "" && spec.Bucket != bucket) {
+	if (spec.ScopeKind != "" && spec.ScopeKind != scope) || (spec.Bucket != "" && spec.Bucket != bucket) {
 		return spec, opts, fmt.Errorf("origin scope does not match bucket %q", bucket)
 	}
-	spec.Scope, spec.Bucket = scope, bucket
+	spec.ScopeKind, spec.Bucket = scope, bucket
 	if spec.Namespace == "" {
 		spec.Namespace = "origin"
 		if bucket != "" {
@@ -75,7 +87,7 @@ func normalizeSpec(bucket string, spec Spec) (Spec, TierOptions, error) {
 		}
 		ret = d
 	}
-	if ttl < 0 || ret < 0 || spec.MaxFills < 0 || spec.RangeChunk < 0 {
+	if ttl < 0 || ret < 0 || spec.MaxFills < 0 || spec.RangeChunk < 0 || spec.MaxBytes < 0 {
 		return spec, opts, fmt.Errorf("origin durations and limits must not be negative")
 	}
 	if ret == 0 {
@@ -85,7 +97,7 @@ func normalizeSpec(bucket string, spec Spec) (Spec, TierOptions, error) {
 		spec.MaxFills = 8
 	}
 	if spec.RangeChunk > 0 {
-		spec.RangeChunk = min(max(spec.RangeChunk, 64<<10), maxRangeCacheSpan)
+		spec.RangeChunk = min(max(spec.RangeChunk, 64<<10), maxRangeChunk)
 	}
 	if err := ValidateConfig([]byte(spec.Config)); err != nil {
 		return spec, opts, fmt.Errorf("invalid origin config: %w", err)
@@ -96,6 +108,7 @@ func normalizeSpec(bucket string, spec Spec) (Spec, TierOptions, error) {
 	spec.TTL, spec.Retention = ttl.String(), ret.String()
 	opts.Namespace, opts.TTL, opts.Retention = spec.Namespace, ttl, ret
 	opts.MaxFills, opts.RangeChunk = spec.MaxFills, spec.RangeChunk
+	opts.MaxBytes = spec.MaxBytes
 	return spec, opts, nil
 }
 
@@ -147,13 +160,31 @@ func SaveSpec(ctx context.Context, st *store.Store, bucket string, spec Spec) er
 			return err
 		}
 		for _, existing := range specs {
-			if (existing.Scope == "global" || existing.Bucket == "") && existing.Namespace != spec.Namespace {
+			if (existing.ScopeKind == "global" || existing.Bucket == "") && existing.Namespace != spec.Namespace {
 				return fmt.Errorf("a global origin already exists in cache namespace %q", existing.Namespace)
 			}
 		}
 	}
 	if err := st.EnsureNamespace(ctx, ns.Cache, spec.Namespace, nil, nil); err != nil {
 		return err
+	}
+	// Persist the budget even when it is zero, so clearing a previous budget
+	// takes effect. Write-back bodies share the namespace name and budget.
+	if err := st.SetNamespaceAttrs(ctx, ns.Cache, spec.Namespace, map[string]any{"max_bytes": spec.MaxBytes}); err != nil {
+		return err
+	}
+	writeBack, err := st.NamespaceExists(ctx, ns.WriteBack, spec.Namespace)
+	if err != nil {
+		return err
+	}
+	if writeBack {
+		if err := st.SetNamespaceAttrs(ctx, ns.WriteBack, spec.Namespace, map[string]any{"max_bytes": spec.MaxBytes}); err != nil {
+			return err
+		}
+	} else if spec.MaxBytes > 0 {
+		if err := st.EnsureNamespace(ctx, ns.WriteBack, spec.Namespace, nil, map[string]any{"max_bytes": spec.MaxBytes}); err != nil {
+			return err
+		}
 	}
 	targetKind := ns.Cache
 	targetName := spec.Namespace
@@ -174,10 +205,44 @@ func ClearSpec(ctx context.Context, st *store.Store, bucket, cacheNS string) err
 		name = "origin"
 	}
 	if bucket != "" {
+		// The persisted spec knows the cache namespace even when the caller
+		// relies on the default name derived from the bucket.
+		attrs, ok, err := st.NamespaceAttrs(ctx, ns.Bucket, bucket)
+		if err != nil {
+			return err
+		}
+		if ok {
+			if raw, err := json.Marshal(attrs["origin"]); err == nil {
+				var spec Spec
+				if json.Unmarshal(raw, &spec) == nil && spec.Namespace != "" {
+					name = spec.Namespace
+				}
+			}
+		}
+	}
+	for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
+		exists, err := st.NamespaceExists(ctx, kind, name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if err := st.RemoveNamespaceAttr(ctx, kind, name, "max_bytes"); err != nil {
+				return err
+			}
+		}
+	}
+	if bucket != "" {
 		kind = ns.Bucket
 		name = bucket
 	}
 	return st.RemoveNamespaceAttr(ctx, kind, name, "origin")
+}
+
+// ValidateSpec checks a persisted or command-line origin spec without
+// creating namespaces or touching the origin.
+func ValidateSpec(bucket string, spec Spec) error {
+	_, _, err := normalizeSpec(bucket, spec)
+	return err
 }
 
 func ListSpecs(ctx context.Context, st *store.Store) ([]Spec, error) {
@@ -197,7 +262,7 @@ func ListSpecs(ctx context.Context, st *store.Store) ([]Spec, error) {
 		}
 		if n.Kind == ns.Bucket && sp.Bucket == "" {
 			sp.Bucket = n.Name
-			sp.Scope = "bucket"
+			sp.ScopeKind = "bucket"
 		}
 		out = append(out, sp)
 	}
@@ -378,7 +443,7 @@ func (r *Registry) refreshIfStale(ctx context.Context) {
 	defer r.loaded.Store(true)
 	wanted := make(map[string]Spec, len(specs))
 	for _, sp := range specs {
-		if sp.Scope == "bucket" || sp.Bucket != "" {
+		if sp.ScopeKind == "bucket" || sp.Bucket != "" {
 			wanted[sp.Bucket] = sp
 		} else if _, exists := wanted[""]; !exists {
 			wanted[""] = sp

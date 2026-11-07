@@ -515,7 +515,7 @@ func (s *Store) metaForRead(ctx context.Context, ref ObjectRef, cond *ReadCondit
 		return m, nil
 	}
 	if err := cond.Check(true, m.ETag); err != nil {
-		return nil, err
+		return m, err
 	}
 	return m, nil
 }
@@ -689,13 +689,13 @@ func (b *Body) nextStreamChunk() ([]byte, error) {
 	}
 	b.releaseChunk()
 	if b.reader != nil {
-		chunk, err := b.nextChunk()
+		r, err := b.reader.nextChunk()
 		if err != nil {
 			b.err = err
 			return nil, err
 		}
-		b.chunk = chunk
-		return chunk, nil
+		b.chunk, b.shared = r.b, r.shared
+		return r.b, nil
 	}
 	if b.ch == nil {
 		if len(b.parts) == 0 {
@@ -740,6 +740,14 @@ func (b *Body) Close() error {
 		if b.cancel != nil {
 			b.cancel()
 		}
+		if b.ch != nil {
+			for r := range b.ch {
+				if !r.shared {
+					putChunkBuf(r.b)
+				}
+			}
+			b.ch = nil
+		}
 	})
 	return nil
 }
@@ -776,39 +784,14 @@ func decodeRow(dst []byte, segLen int64, no int32, stored []byte) ([]byte, error
 	return decompressBlock(dst, stored, want)
 }
 
-func (b *Body) nextChunk() ([]byte, error) {
-	r := b.reader
-	capHint := int64(chunkSize + RowBytes)
-	if span := r.spanEnd - r.spanStart + 1; span < capHint {
-		capHint = span + RowBytes
-	}
-	var out []byte
-	if capHint >= chunkSize {
-		out = getChunkBuf()
-	} else {
-		out = make([]byte, 0, int(capHint))
-	}
-	for {
-		no, data, err := r.next()
-		if err != nil {
-			if err == io.EOF && len(out) > 0 {
-				return out, nil
-			}
-			putChunkBuf(out)
-			return nil, err
-		}
-		r.appendRow(&out, no, data)
-		if len(out) >= chunkSize {
-			return out, nil
-		}
-	}
-}
-
 func (s *Store) GetBody(ctx context.Context, ref ObjectRef, rng ByteRange, cond *ReadCondition) (*SliceMeta, *Body, error) {
 	var last error
 	for range 2 {
 		m, err := s.metaForRead(ctx, ref, cond)
 		if err != nil {
+			if m != nil {
+				return &SliceMeta{ObjectInfo: m.ObjectInfo}, nil, err
+			}
 			return nil, nil, err
 		}
 		sm, body, err := s.bodyFromMeta(ctx, ref, m, rng)
@@ -879,12 +862,12 @@ func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc
 		reader: newChunkRowReader(rows, p, start, end, s.blocks.fill(table, p)),
 		conn:   conn, cancel: cancel,
 	}
-	chunk, err := body.nextChunk()
+	chunk, err := body.reader.nextChunk()
 	if err != nil {
 		_ = body.Close()
 		return nil, err
 	}
-	body.chunk, body.cur = chunk, chunk
+	body.chunk, body.cur, body.shared = chunk.b, chunk.b, chunk.shared
 	return body, nil
 }
 
@@ -893,7 +876,8 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, ref 
 	if err != nil {
 		return nil, err
 	}
-	pieces, err := planPieces(m, start, end, s.readWorkers())
+	workers := s.readWorkers()
+	pieces, err := planPieces(m, start, end, workers)
 	if err != nil {
 		return nil, err
 	}
@@ -901,19 +885,31 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, ref 
 	if s.blocks != nil {
 		table = m.table
 	}
+	var cached [][][]byte
+	var need []int
 	if table != 0 {
 		pieces = alignPieces(pieces)
-		if parts, ok := s.cachedSpan(table, pieces, start, end); ok {
+		cached, need = s.lookupPieces(table, pieces, start, end)
+		if len(need) == 0 {
+			var parts [][]byte
+			for _, c := range cached {
+				parts = append(parts, c...)
+			}
 			return &Body{parts: parts, cancel: cancel}, nil
+		}
+	} else {
+		need = make([]int, len(pieces))
+		for i := range need {
+			need[i] = i
 		}
 	}
 	if len(pieces) == 1 {
 		return s.startSingleStream(ctx, cancel, schema, table, pieces[0], start, end)
 	}
-	ch := make(chan result, 32)
+	ch := make(chan result, min(max(2*workers, 4), 16))
 	errc := make(chan error, 1)
 	go func() {
-		errc <- s.streamWindow(ctx, ch, schema, table, pieces, start, end)
+		errc <- s.streamWindow(ctx, ch, schema, table, pieces, cached, need, start, end)
 		close(ch)
 	}()
 	first, ok := <-ch
@@ -926,22 +922,19 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, ref 
 	return &Body{ch: ch, errc: errc, cancel: cancel, chunk: first.b, cur: first.b, shared: first.shared}, nil
 }
 
-// cachedSpan serves a whole span from the block cache, or reports a miss.
-func (s *Store) cachedSpan(table uint32, pieces []piece, start, end int64) ([][]byte, bool) {
-	for _, p := range pieces {
-		if !s.blocks.covered(table, p) {
-			return nil, false
+// lookupPieces checks the cache once per piece and reports which pieces still
+// need a query. It is the only place a multi-piece read counts cache hits.
+func (s *Store) lookupPieces(table uint32, pieces []piece, start, end int64) ([][][]byte, []int) {
+	cached := make([][][]byte, len(pieces))
+	var need []int
+	for i, p := range pieces {
+		if parts, ok := s.blocks.pieceParts(table, p, start, end); ok {
+			cached[i] = parts
+		} else {
+			need = append(need, i)
 		}
 	}
-	var out [][]byte
-	for _, p := range pieces {
-		parts, ok := s.blocks.pieceParts(table, p, start, end)
-		if !ok {
-			return nil, false
-		}
-		out = append(out, parts...)
-	}
-	return out, true
+	return cached, need
 }
 
 // readWorkers reserves one guard connection per in-flight read and shares the
@@ -970,22 +963,13 @@ func (s *Store) beginRead() func() {
 // memory is bounded by the workers' channel buffers. Pieces already in the
 // block cache are emitted by the consumer without a query. A readGuard keeps
 // every streamed file from being reaped until the read ends.
-func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema string, table uint32, pieces []piece, start, end int64) error {
+func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema string, table uint32, pieces []piece, cached [][][]byte, need []int, start, end int64) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cached := make([][][]byte, len(pieces))
-	var need []int
-	for i, p := range pieces {
-		if parts, ok := s.blocks.pieceParts(table, p, start, end); ok {
-			cached[i] = parts
-		} else {
-			need = append(need, i)
-		}
-	}
 	chans := make([]chan result, len(pieces))
 	for _, i := range need {
-		chans[i] = make(chan result, 4)
+		chans[i] = make(chan result, 2)
 	}
 	g, gctx := errgroup.WithContext(runCtx)
 	if workers := min(s.readWorkers(), len(need)); workers > 0 {
@@ -1015,9 +999,9 @@ func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema stri
 				}
 				i := need[j]
 				ch := chans[i]
-				send := func(b []byte) bool {
+				send := func(r result) bool {
 					select {
-					case ch <- result{b: b}:
+					case ch <- r:
 						return true
 					case <-gctx.Done():
 						return false
@@ -1051,7 +1035,27 @@ func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema stri
 
 	fail := func(err error) error {
 		cancel()
-		if werr := g.Wait(); werr != nil && !errors.Is(werr, context.Canceled) {
+		werr := g.Wait()
+		for _, ch := range chans {
+			if ch == nil {
+				continue
+			}
+			for {
+				select {
+				case r, ok := <-ch:
+					if !ok {
+						goto drained
+					}
+					if !r.shared {
+						putChunkBuf(r.b)
+					}
+				default:
+					goto drained
+				}
+			}
+		drained:
+		}
+		if werr != nil && !errors.Is(werr, context.Canceled) {
 			return werr
 		}
 		return err
@@ -1065,8 +1069,8 @@ func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema stri
 		}
 	}
 	for i := range pieces {
-		if parts := cached[i]; parts != nil {
-			for _, b := range parts {
+		if i < len(cached) && cached[i] != nil {
+			for _, b := range cached[i] {
 				if err := emit(result{b: b, shared: true}); err != nil {
 					return fail(err)
 				}
@@ -1100,52 +1104,28 @@ func getRangeSQL(schema string) string {
 WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3`
 }
 
-func streamRows(ctx context.Context, q querier, schema string, p piece, start, end int64, fill *blockFill, send func([]byte) bool) error {
+func streamRows(ctx context.Context, q querier, schema string, p piece, start, end int64, fill *blockFill, send func(result) bool) error {
 	rows, err := q.Query(ctx, getRangeSQL(schema), p.fileID, p.lo, p.hi)
 	if err != nil {
 		return err
 	}
 	r := newChunkRowReader(rows, p, start, end, fill)
 	defer r.close()
-	capHint := int64(chunkSize + RowBytes)
-	if span := end - start + 1; span < capHint {
-		capHint = span + RowBytes
-	}
-	var out []byte
-	if capHint >= chunkSize {
-		out = getChunkBuf()
-	} else {
-		out = make([]byte, 0, int(capHint))
-	}
-	defer func() { putChunkBuf(out) }()
 	for {
-		no, data, err := r.next()
+		res, err := r.nextChunk()
 		if err == io.EOF {
-			break
+			return nil
 		}
 		if err != nil {
 			return err
 		}
-		r.appendRow(&out, no, data)
-		if len(out) >= chunkSize {
-			if !send(out) {
-				return ctx.Err()
+		if !send(res) {
+			if !res.shared {
+				putChunkBuf(res.b)
 			}
-			out = nil
-			if capHint >= chunkSize {
-				out = getChunkBuf()
-			} else {
-				out = make([]byte, 0, int(capHint))
-			}
-		}
-	}
-	if len(out) > 0 {
-		if !send(out) {
 			return ctx.Err()
 		}
-		out = nil
 	}
-	return nil
 }
 
 func appendRow(out *[]byte, base int64, no int32, data []byte, start, end int64) {
@@ -1295,7 +1275,8 @@ type chunkRowReader struct {
 	spanStart int64
 	spanEnd   int64
 	nextNo    int32
-	early     map[int32][]byte
+	early     [][]byte
+	pending   []byte
 	decomp    []byte
 	decompPtr *[]byte
 	fill      *blockFill
@@ -1322,15 +1303,15 @@ func (r *chunkRowReader) close() {
 }
 
 func (r *chunkRowReader) next() (int32, []byte, error) {
-	if data, ok := r.early[r.nextNo]; ok {
+	if idx := r.nextNo - r.piece.lo; idx >= 0 && int(idx) < len(r.early) && r.early[idx] != nil {
+		data := r.early[idx]
+		r.early[idx] = nil
 		no := r.nextNo
 		row, err := decodeRow(r.decomp[:0], r.piece.segLen, no, data)
 		if err != nil {
 			return 0, nil, err
 		}
-		delete(r.early, no)
 		r.nextNo++
-		r.fill.add(no, row)
 		return no, row, nil
 	}
 	for r.rows.Next() {
@@ -1339,14 +1320,14 @@ func (r *chunkRowReader) next() (int32, []byte, error) {
 			return 0, nil, fmt.Errorf("file %d rows %d..=%d: unexpected row shape", r.piece.fileID, r.piece.lo, r.piece.hi)
 		}
 		no := int32(uint32(raw[0][0])<<24 | uint32(raw[0][1])<<16 | uint32(raw[0][2])<<8 | uint32(raw[0][3]))
-		if no < r.nextNo {
+		if no < r.nextNo || no > r.piece.hi {
 			continue
 		}
 		if no > r.nextNo {
 			if r.early == nil {
-				r.early = make(map[int32][]byte)
+				r.early = make([][]byte, r.piece.hi-r.piece.lo+1)
 			}
-			r.early[no] = append([]byte(nil), raw[1]...)
+			r.early[no-r.piece.lo] = append([]byte(nil), raw[1]...)
 			continue
 		}
 		row, err := decodeRow(r.decomp[:0], r.piece.segLen, no, raw[1])
@@ -1354,7 +1335,6 @@ func (r *chunkRowReader) next() (int32, []byte, error) {
 			return 0, nil, err
 		}
 		r.nextNo++
-		r.fill.add(no, row)
 		return no, row, nil
 	}
 	if err := r.rows.Err(); err != nil {
@@ -1364,6 +1344,57 @@ func (r *chunkRowReader) next() (int32, []byte, error) {
 		return 0, nil, fmt.Errorf("file %d rows %d..=%d: row %d missing", r.piece.fileID, r.piece.lo, r.piece.hi, r.nextNo)
 	}
 	return 0, nil, io.EOF
+}
+
+// nextChunk yields the next response chunk. Rows assembled into newly cached
+// blocks come back as shared cache bytes; uncached rows are copied into a
+// pooled buffer.
+func (r *chunkRowReader) nextChunk() (result, error) {
+	if r.pending != nil {
+		p := r.pending
+		r.pending = nil
+		return result{b: p, shared: true}, nil
+	}
+	capHint := int64(chunkSize + RowBytes)
+	if span := r.spanEnd - r.spanStart + 1; span < capHint {
+		capHint = span + RowBytes
+	}
+	var out []byte
+	for {
+		no, data, err := r.next()
+		if err != nil {
+			if err == io.EOF && len(out) > 0 {
+				return result{b: out, shared: false}, nil
+			}
+			putChunkBuf(out)
+			return result{}, err
+		}
+		blockBuf, inBlock := r.fill.add(no, data)
+		if inBlock {
+			if blockBuf != nil {
+				clipped := clipBlock(r.piece.base, no/blockRows, blockBuf, r.spanStart, r.spanEnd)
+				if len(clipped) > 0 {
+					if len(out) > 0 {
+						r.pending = clipped
+						return result{b: out, shared: false}, nil
+					}
+					return result{b: clipped, shared: true}, nil
+				}
+			}
+			continue
+		}
+		if out == nil {
+			if capHint >= chunkSize {
+				out = getChunkBuf()
+			} else {
+				out = make([]byte, 0, int(capHint))
+			}
+		}
+		r.appendRow(&out, no, data)
+		if len(out) >= chunkSize {
+			return result{b: out, shared: false}, nil
+		}
+	}
 }
 
 func (r *chunkRowReader) appendRow(out *[]byte, no int32, data []byte) {

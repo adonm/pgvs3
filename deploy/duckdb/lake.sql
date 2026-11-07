@@ -10,7 +10,7 @@ SELECT CASE WHEN NOT regexp_matches(getenv('PGVS3_URL'), '^postgres(ql)?://')
   THEN error('PGVS3_URL must use a postgres or postgresql URL scheme') END;
 SELECT CASE WHEN coalesce(getenv('PGVS3_BUCKET'), '') = ''
   THEN error('PGVS3_BUCKET is required; the bucket must already exist') END;
-SELECT CASE WHEN NOT regexp_matches(getenv('PGVS3_BUCKET'), '^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$')
+SELECT CASE WHEN NOT regexp_matches(getenv('PGVS3_BUCKET'), '^[a-z0-9._-]{1,58}$')
   THEN error('PGVS3_BUCKET is not a safe bucket name') END;
 SELECT CASE WHEN NOT regexp_matches(coalesce(getenv('PGVS3_PREFIX'), ''), '^[A-Za-z0-9._/-]*$')
   THEN error('PGVS3_PREFIX contains an unsafe character') END;

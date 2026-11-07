@@ -87,6 +87,19 @@ type readBackend interface {
 	List(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error)
 }
 
+// conditionalReadBackend lets a backend reject a conditional GET before it
+// opens a body. Backends that do not implement it are checked after Open.
+type conditionalReadBackend interface {
+	OpenConditional(ctx context.Context, bucket, key string, rng store.ByteRange, cond store.ReadCondition) (*store.ReadResult, error)
+}
+
+func openObject(ctx context.Context, backend readBackend, bucket, key string, rng store.ByteRange, cond store.ReadCondition) (*store.ReadResult, error) {
+	if cb, ok := backend.(conditionalReadBackend); ok {
+		return cb.OpenConditional(ctx, bucket, key, rng, cond)
+	}
+	return backend.Open(ctx, bucket, key, rng)
+}
+
 func (s *Server) backendFor(ctx context.Context, bucket string) readBackend {
 	if s.readOverride != nil {
 		return s.readOverride
@@ -111,8 +124,21 @@ func (b localBackend) Head(ctx context.Context, bucket, key string) (readHead, e
 }
 
 func (b localBackend) Open(ctx context.Context, bucket, key string, rng store.ByteRange) (*store.ReadResult, error) {
-	sm, body, err := b.store.GetBody(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, rng, nil)
+	return b.open(ctx, bucket, key, rng, nil)
+}
+
+// OpenConditional checks the read condition before any stream starts, so a
+// 304 or 412 costs only the metadata query.
+func (b localBackend) OpenConditional(ctx context.Context, bucket, key string, rng store.ByteRange, cond store.ReadCondition) (*store.ReadResult, error) {
+	return b.open(ctx, bucket, key, rng, &cond)
+}
+
+func (b localBackend) open(ctx context.Context, bucket, key string, rng store.ByteRange, cond *store.ReadCondition) (*store.ReadResult, error) {
+	sm, body, err := b.store.GetBody(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, rng, cond)
 	if err != nil {
+		if sm != nil {
+			return &store.ReadResult{ObjectInfo: sm.ObjectInfo, Start: sm.Start, End: sm.End, Ranged: rng.Requested}, err
+		}
 		return nil, err
 	}
 	return &store.ReadResult{
@@ -392,12 +418,25 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		rng = store.Range(start, end, -1)
 		partCount = partsCount(m)
 	}
-	res, err := backend.Open(r.Context(), bucket, key, rng)
+	cond := headerReadCondition(r)
+	res, err := openObject(r.Context(), backend, bucket, key, rng, cond)
 	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
 		key += "index.html"
-		res, err = backend.Open(r.Context(), bucket, key, rng)
+		res, err = openObject(r.Context(), backend, bucket, key, rng, cond)
 	}
 	if err != nil {
+		if errors.Is(err, store.ErrNotModified) {
+			etag := ""
+			if res != nil {
+				etag = res.ETag
+			}
+			w.Header().Set("ETag", quoteETag(etag))
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+		if errors.Is(err, store.ErrPrecondition) {
+			return errPreconditionFailed()
+		}
 		if errors.Is(err, store.ErrInvalidRange) {
 			var size int64
 			if head, herr := backend.Head(r.Context(), bucket, key); herr == nil {
@@ -413,13 +452,15 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		w.Header().Set("Content-Range", "bytes */0")
 		return errInvalidRange()
 	}
-	if err := readCondition(r, res.ETag); err != nil {
-		if errors.Is(err, store.ErrNotModified) {
-			w.Header().Set("ETag", quoteETag(res.ETag))
-			w.WriteHeader(http.StatusNotModified)
-			return nil
+	if _, conditional := backend.(conditionalReadBackend); !conditional {
+		if err := readCondition(r, res.ETag); err != nil {
+			if errors.Is(err, store.ErrNotModified) {
+				w.Header().Set("ETag", quoteETag(res.ETag))
+				w.WriteHeader(http.StatusNotModified)
+				return nil
+			}
+			return err
 		}
-		return err
 	}
 	if partCount > 0 {
 		w.Header().Set("x-amz-mp-parts-count", strconv.Itoa(partCount))
@@ -573,6 +614,12 @@ func (s *Server) serveReadResult(w http.ResponseWriter, r *http.Request, key str
 	}
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
+	}
+	if wt, ok := res.Body.(io.WriterTo); ok {
+		if _, err := wt.WriteTo(w); err != nil {
+			s.log.Debug("GET body interrupted", "key", key, "err", err)
+		}
+		return
 	}
 	buf := copyBuf()
 	defer putCopyBuf(buf)
@@ -1573,10 +1620,25 @@ func (s *Server) serveCacheHTTP(w http.ResponseWriter, r *http.Request) error {
 		}
 		if err := cond.Check(true, m.ETag); err != nil {
 			if errors.Is(err, store.ErrNotModified) {
+				w.Header().Set("ETag", quoteETag(m.ETag))
 				w.WriteHeader(http.StatusNotModified)
 				return nil
 			}
 			return errPreconditionFailed()
+		}
+		if r.Method == http.MethodHead {
+			span, err := rng.Resolve(m.Size)
+			if err != nil || (rng.Requested && (m.Size == 0 || span.End < span.Start)) {
+				w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(m.Size, 10))
+				return errInvalidRange()
+			}
+			s.serveReadResult(w, r, key, &store.ReadResult{
+				ObjectInfo: m.ObjectInfo,
+				Start:      span.Start,
+				End:        span.End,
+				Ranged:     rng.Requested,
+			}, false)
+			return nil
 		}
 		sm, body, err := s.store.GetBodyFromMeta(r.Context(), ref, m, rng)
 		if err != nil {

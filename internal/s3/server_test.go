@@ -674,6 +674,84 @@ func TestReadBackendConditionalGet(t *testing.T) {
 	}
 }
 
+type fakeConditionalBackend struct {
+	fakeReadBackend
+	cond      store.ReadCondition
+	condCalls int
+	openCalls int
+	err       error
+}
+
+func (f *fakeConditionalBackend) OpenConditional(_ context.Context, _, _ string, rng store.ByteRange, cond store.ReadCondition) (*store.ReadResult, error) {
+	f.condCalls++
+	f.cond = cond
+	if f.err != nil {
+		return &store.ReadResult{ObjectInfo: f.head.Info}, f.err
+	}
+	res := *f.res
+	res.Ranged = rng.Requested
+	return &res, nil
+}
+
+func (f *fakeConditionalBackend) Open(_ context.Context, _, _ string, rng store.ByteRange) (*store.ReadResult, error) {
+	f.openCalls++
+	res := *f.res
+	res.Ranged = rng.Requested
+	return &res, nil
+}
+
+func TestConditionalReadBackendSkipsOpen(t *testing.T) {
+	body := "hello"
+	f := &fakeConditionalBackend{
+		fakeReadBackend: fakeReadBackend{
+			head: readHead{Info: store.ObjectInfo{Size: int64(len(body)), ETag: "etag"}},
+			res: &store.ReadResult{
+				Size: int64(len(body)), ETag: "etag",
+				Body:  io.NopCloser(strings.NewReader(body)),
+				Start: 0,
+				End:   int64(len(body) - 1),
+			},
+		},
+		err: store.ErrNotModified,
+	}
+	s := testReadServer(f)
+	req := httptest.NewRequest("GET", "/bucket/key", nil)
+	req.Header.Set("If-None-Match", `"etag"`)
+	rec := httptest.NewRecorder()
+	callHandler(t, s, rec, req, func() error { return s.getObject(rec, req, "bucket", "key") })
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304", rec.Code)
+	}
+	if got := rec.Header().Get("ETag"); got != `"etag"` {
+		t.Fatalf("ETag = %q", got)
+	}
+	if f.openCalls != 0 || f.condCalls != 1 {
+		t.Fatalf("open calls = %d, conditional calls = %d", f.openCalls, f.condCalls)
+	}
+	if f.cond.IfNoneMatch != `"etag"` {
+		t.Fatalf("condition = %+v", f.cond)
+	}
+
+	f.err = store.ErrPrecondition
+	req = httptest.NewRequest("GET", "/bucket/key", nil)
+	req.Header.Set("If-Match", `"other"`)
+	rec = httptest.NewRecorder()
+	callHandler(t, s, rec, req, func() error { return s.getObject(rec, req, "bucket", "key") })
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want 412", rec.Code)
+	}
+
+	f.err = nil
+	rec = httptest.NewRecorder()
+	callHandler(t, s, rec, req, func() error { return s.getObject(rec, req, "bucket", "key") })
+	if rec.Code != http.StatusOK || rec.Body.String() != body {
+		t.Fatalf("status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	if f.openCalls != 0 {
+		t.Fatalf("conditional backend used Open %d times", f.openCalls)
+	}
+}
+
 func TestReadBackendRangeOnEmptyObject(t *testing.T) {
 	s := testReadServer(fakeReadBackend{
 		head: readHead{Info: store.ObjectInfo{Size: 0, ETag: "etag"}},

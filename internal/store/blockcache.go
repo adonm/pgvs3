@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -199,18 +200,16 @@ func blockLastRow(block int32, segLen int64) int32 {
 	return min(block*blockRows+blockRows-1, segmentLastRow(segLen))
 }
 
-// covered reports whether every block of p is cached, without touching
-// recency or hit counters.
-func (c *blockCache) covered(table uint32, p piece) bool {
-	if c == nil || table == 0 {
-		return false
+// clipBlock trims one cached block to the [start,end] span.
+func clipBlock(base int64, block int32, data []byte, start, end int64) []byte {
+	off := int64(block) * blockRows * RowBytes
+	lo := max(start-base, off)
+	hi := min(end-base, off+int64(len(data))-1)
+	a, z := max(lo-off, 0), min(hi-off+1, int64(len(data)))
+	if a >= z {
+		return nil
 	}
-	for b := p.lo / blockRows; b <= p.hi/blockRows; b++ {
-		if !c.contains(blockKey{table: table, file: p.fileID, block: b}) {
-			return false
-		}
-	}
-	return true
+	return data[a:z:z]
 }
 
 // pieceParts returns the cached bytes of p trimmed to [start,end], or false if
@@ -228,16 +227,12 @@ func (c *blockCache) pieceParts(table uint32, p piece, start, end int64) ([][]by
 		}
 		blocks = append(blocks, data)
 	}
-	lo := max(start-p.base, int64(p.lo)*RowBytes)
-	hi := min(end-p.base, int64(p.hi)*RowBytes+RowBytes-1, p.segLen-1)
 	parts := make([][]byte, 0, len(blocks))
 	var served int64
 	for i, data := range blocks {
-		off := int64(first+int32(i)) * blockRows * RowBytes
-		a, z := max(lo-off, 0), min(hi-off+1, int64(len(data)))
-		if a < z {
-			parts = append(parts, data[a:z:z])
-			served += z - a
+		if clipped := clipBlock(p.base, first+int32(i), data, start, end); len(clipped) > 0 {
+			parts = append(parts, clipped)
+			served += int64(len(clipped))
 		}
 	}
 	c.hits.Add(int64(len(blocks)))
@@ -245,30 +240,54 @@ func (c *blockCache) pieceParts(table uint32, p piece, start, end int64) ([][]by
 	return parts, true
 }
 
-// wholeFile is the block number of an entry holding a whole file that is only
-// ever read whole (ReadMany), so a hit needs no assembly copy.
+// wholeFile is the block number of a small file stored as one entry for
+// ReadMany, so a hit needs no assembly copy. Files larger than a shard are
+// split into ordinary block entries instead.
 const wholeFile = -1
 
 func (s *Store) cachedFile(table uint32, file, size int64) ([]byte, bool) {
-	if s.blocks == nil || table == 0 {
+	if s.blocks == nil || table == 0 || size <= 0 {
 		return nil, false
 	}
-	data, ok := s.blocks.get(blockKey{table: table, file: file, block: wholeFile})
-	if !ok || int64(len(data)) != size {
+	k := blockKey{table: table, file: file, block: wholeFile}
+	if size <= s.blocks.shard(k).max {
+		data, ok := s.blocks.get(k)
+		if !ok || int64(len(data)) != size {
+			return nil, false
+		}
+		s.blocks.hits.Add(1)
+		s.blocks.hitBytes.Add(size)
+		return data, true
+	}
+	parts, ok := s.blocks.pieceParts(table,
+		piece{fileID: file, segLen: size, lo: 0, hi: segmentLastRow(size)}, 0, size-1)
+	if !ok {
 		return nil, false
 	}
-	s.blocks.hits.Add(1)
-	s.blocks.hitBytes.Add(size)
-	return data, true
+	out := make([]byte, 0, size)
+	for _, part := range parts {
+		out = append(out, part...)
+	}
+	return out, true
 }
 
-// cacheFile stores a whole file; data then belongs to the cache and must not
-// be modified.
+// cacheFile stores a whole file. Small files become one cache-owned entry;
+// larger ones are split into block-sized entries so no shard exceeds its
+// budget.
 func (s *Store) cacheFile(table uint32, file int64, data []byte) {
 	if s.blocks == nil || table == 0 {
 		return
 	}
-	s.blocks.put(blockKey{table: table, file: file, block: wholeFile}, data)
+	k := blockKey{table: table, file: file, block: wholeFile}
+	if int64(len(data)) <= s.blocks.shard(k).max {
+		s.blocks.put(k, data)
+		return
+	}
+	step := blockRows * RowBytes
+	for b, off := int32(0), 0; off < len(data); b, off = b+1, off+step {
+		end := min(off+step, len(data))
+		s.blocks.put(blockKey{table: table, file: file, block: b}, slices.Clone(data[off:end]))
+	}
 }
 
 // blockFill assembles complete blocks from rows streamed in order and stores
@@ -278,39 +297,52 @@ type blockFill struct {
 	table  uint32
 	file   int64
 	segLen int64
+	hi     int32
 	block  int32
 	buf    []byte
 }
 
 func (c *blockCache) fill(table uint32, p piece) *blockFill {
-	if c == nil || table == 0 {
+	if c == nil || table == 0 || c.shards[0].max < blockRows*RowBytes {
+		// A block that cannot fit in a shard would be dropped by put, and
+		// callers skip rows while a block is being assembled.
 		return nil
 	}
-	return &blockFill{cache: c, table: table, file: p.fileID, segLen: p.segLen, block: -1}
+	return &blockFill{cache: c, table: table, file: p.fileID, segLen: p.segLen, hi: p.hi, block: -1}
 }
 
-func (f *blockFill) add(no int32, data []byte) {
+// add returns assembled block bytes when a complete block was newly cached.
+// inBlock reports that the row was consumed into a block this fill is
+// assembling; cached blocks and incomplete tail blocks return false so callers
+// copy their rows into the response.
+func (f *blockFill) add(no int32, data []byte) (block []byte, inBlock bool) {
 	if f == nil {
-		return
+		return nil, false
 	}
 	b := no / blockRows
+	last := blockLastRow(b, f.segLen)
 	if no%blockRows == 0 {
 		f.buf, f.block = nil, -1
-		k := blockKey{table: f.table, file: f.file, block: b}
-		if !f.cache.contains(k) {
-			rows := int64(blockLastRow(b, f.segLen)-no) + 1
-			f.buf = make([]byte, 0, int(min(rows*RowBytes, f.segLen-int64(no)*RowBytes)))
-			f.block = b
+		if last <= f.hi {
+			k := blockKey{table: f.table, file: f.file, block: b}
+			if !f.cache.contains(k) {
+				rows := int64(last-no) + 1
+				f.buf = make([]byte, 0, int(min(rows*RowBytes, f.segLen-int64(no)*RowBytes)))
+				f.block = b
+			}
 		}
 	}
 	if f.block != b || f.buf == nil {
-		return
+		return nil, false
 	}
 	f.buf = append(f.buf, data...)
-	if no == blockLastRow(b, f.segLen) {
-		f.cache.put(blockKey{table: f.table, file: f.file, block: b}, f.buf)
+	if no == last {
+		done := f.buf
+		f.cache.put(blockKey{table: f.table, file: f.file, block: b}, done)
 		f.buf, f.block = nil, -1
+		return done, true
 	}
+	return nil, true
 }
 
 // alignPieces widens each segment's first and last piece to whole blocks and

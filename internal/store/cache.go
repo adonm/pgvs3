@@ -307,6 +307,13 @@ type readManyFile struct {
 // missing. Returned slices may be shared with the read cache and with other
 // positions of the same key, so callers must not modify them.
 func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
+	return c.ReadManyWithTouch(ctx, keys, 0)
+}
+
+// ReadManyWithTouch behaves like ReadMany and, when retention is positive,
+// pushes the expiry of hits that are more than halfway through it. Range
+// chunks read by hot clients therefore stay alive without an UPDATE per read.
+func (c Cache) ReadManyWithTouch(ctx context.Context, keys []string, retention time.Duration) ([][]byte, error) {
 	out := make([][]byte, len(keys))
 	if len(keys) == 0 {
 		return out, nil
@@ -316,7 +323,7 @@ func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
 	}
 	endRead := c.s.beginRead()
 	defer endRead()
-	rows, err := c.s.chunkPool.Query(ctx, `SELECT k.ord, o.size, o.inline_data, o.file_id, o.tableoid
+	rows, err := c.s.chunkPool.Query(ctx, `SELECT k.ord, o.size, o.inline_data, o.file_id, o.tableoid, o.expires_at
 		FROM unnest($1::text[]) WITH ORDINALITY AS k(key, ord)
 		JOIN `+c.sc+`.objects o ON o.key = k.key
 		WHERE (o.expires_at IS NULL OR o.expires_at > now()) AND o.parts IS NULL
@@ -328,6 +335,7 @@ func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	var touch []string
 	var files []*readManyFile
 	byID := map[int64]*readManyFile{}
 	for rows.Next() {
@@ -335,13 +343,17 @@ func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
 		var inline []byte
 		var fileID *int64
 		var table uint32
-		if err := rows.Scan(&ord, &size, &inline, &fileID, &table); err != nil {
+		var expiresAt *time.Time
+		if err := rows.Scan(&ord, &size, &inline, &fileID, &table, &expiresAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		idx := int(ord - 1)
 		if idx < 0 || idx >= len(out) {
 			continue
+		}
+		if retention > 0 && expiresAt != nil && time.Until(*expiresAt) < retention/2 {
+			touch = append(touch, keys[idx])
 		}
 		switch {
 		case inline != nil:
@@ -368,6 +380,11 @@ func (c Cache) ReadMany(ctx context.Context, keys []string) ([][]byte, error) {
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if len(touch) > 0 {
+		_, _ = c.s.pool.Exec(ctx, `UPDATE `+c.sc+`.objects
+			SET expires_at = now() + make_interval(secs => $2)
+			WHERE key = ANY($1) AND expires_at IS NOT NULL`, touch, retention.Seconds())
 	}
 	if err := c.fetchFiles(ctx, files); err != nil {
 		return nil, err

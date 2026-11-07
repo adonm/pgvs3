@@ -3,10 +3,12 @@
 <!-- Generated from the binary's flag sets by `just reference`; `go test ./cmd/pgvs3` fails on drift.
      The metrics block is checked against a live /metrics scrape by `just contract`. -->
 
-Every `serve` flag can also be set with `PGVS3_<FLAG>` (upper case, `-` becomes `_`); an explicit
-flag wins. Maintenance commands default `--url` from `PGVS3_URL`; `reap` also reads
-`PGVS3_REAP_GRACE` and `PGVS3_JOB_RETENTION`, `health` reads `PGVS3_HEALTH_URL` and `doctor`
-reads `PGVS3_POOL_MAX`.
+Every `serve` and `origin` flag can also be set with `PGVS3_<FLAG>` (upper case, `-` becomes `_`); an explicit
+flag wins. Database maintenance commands (`stat`, `clone`, `drop`, `adopt`, `origin`, `pending`, `reap`,
+`doctor`) apply the same mapping to their flags, and the `origin` S3 shorthand flags therefore accept
+`PGVS3_S3_ENDPOINT`, `PGVS3_S3_BUCKET`, `PGVS3_S3_ACCESS_KEY` and friends. Maintenance commands default
+`--url` from `PGVS3_URL`; `reap` also reads `PGVS3_REAP_GRACE` and `PGVS3_JOB_RETENTION`, `health`
+reads `PGVS3_HEALTH_URL` and `doctor` reads `PGVS3_POOL_MAX`.
 
 ## Commands
 
@@ -20,7 +22,7 @@ reads `PGVS3_POOL_MAX`.
 | [`clone`](#pgvs3-clone) | Copy a bucket or cache namespace inside PostgreSQL. |
 | [`drop`](#pgvs3-drop) | Delete a namespace and its schema. |
 | [`adopt`](#pgvs3-adopt) | Register existing s3b_/s3c_/s3w_/s3q_ schemas in the catalog. |
-| [`origin`](#pgvs3-origin) | Set, clear or list the origin a bucket (or every bucket) caches. |
+| [`origin`](#pgvs3-origin) | Set, clear, list or print SQL for the origin a bucket (or every bucket) caches. |
 | [`pending`](#pgvs3-pending) | List or retry write-back uploads that have not reached the origin. |
 | [`version`](#pgvs3-version) | Print the binary version. |
 
@@ -31,6 +33,7 @@ Run the S3/OJS/HTTP/RESP gateway (default when no command is given).
 | Flag | Environment | Default | Description |
 | --- | --- | --- | --- |
 | `--addr` | `PGVS3_ADDR` | `0.0.0.0:8014` | listen address for S3/HTTP/RESP2/OJS, /healthz, /readyz and /metrics |
+| `--cache-max-bytes` | `PGVS3_CACHE_MAX_BYTES` | `0` | evict oldest cached objects when cache namespace exceeds this byte budget (0 disables) |
 | `--cache-namespace` | `PGVS3_CACHE_NAMESPACE` | `origin` | cache namespace for origin objects |
 | `--cache-retention` | `PGVS3_CACHE_RETENTION` | `24h0m0s` | evict cached objects after this idle period |
 | `--cache-ttl` | `PGVS3_CACHE_TTL` | `1m0s` | origin revalidation interval (0 always revalidates) |
@@ -140,16 +143,24 @@ Register existing s3b_/s3c_/s3w_/s3q_ schemas in the catalog.
 
 ## `pgvs3 origin`
 
-Set, clear or list the origin a bucket (or every bucket) caches.
+Set, clear, list or print SQL for the origin a bucket (or every bucket) caches.
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--bucket` | — | restrict origin passthrough to one bucket (default: global) |
+| `--cache-max-bytes` | `0` | evict oldest cached objects when cache namespace exceeds this byte budget (0 disables) |
 | `--cache-namespace` | `origin` | cache namespace in PostgreSQL |
 | `--cache-retention` | `24h0m0s` | idle eviction interval |
 | `--cache-ttl` | `1m0s` | origin revalidation interval (0 always revalidates) |
 | `--fill-concurrency` | `8` | process-wide concurrent origin fills and pending-upload workers |
 | `--range-cache-chunk` | `0` | cache aligned ranges of large objects at this byte size (0 disables) |
+| `--s3-access-key` | — | S3 origin access key ID (defaults to AWS_ACCESS_KEY_ID) |
+| `--s3-bucket` | — | S3 origin bucket name (defaults to --bucket) |
+| `--s3-endpoint` | — | S3 origin endpoint URL or host when not passing an origin.json file |
+| `--s3-insecure` | `false` | allow plain HTTP S3 origin endpoint |
+| `--s3-path-style` | `false` | use path-style S3 origin addressing |
+| `--s3-region` | — | S3 origin region (defaults to AWS_REGION or us-east-1) |
+| `--s3-secret-key` | — | S3 origin secret access key (defaults to AWS_SECRET_ACCESS_KEY) |
 | `--url` | `postgres://localhost/pgvs3` | PostgreSQL URL |
 
 ## `pgvs3 pending`

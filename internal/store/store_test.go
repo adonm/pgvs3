@@ -48,6 +48,34 @@ func TestDefaultOpenOptions(t *testing.T) {
 	}
 }
 
+func TestWriteGateBoundsConcurrentWriters(t *testing.T) {
+	s := &Store{writeGate: make(chan struct{}, 2)}
+	ctx := context.Background()
+	for range 2 {
+		if err := s.acquireWriter(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := s.acquireWriter(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked acquire = %v, want context.Canceled", err)
+	}
+	s.releaseWriter()
+	if err := s.acquireWriter(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		s.releaseWriter()
+	}
+
+	var unguarded Store
+	if err := unguarded.acquireWriter(ctx); err != nil {
+		t.Fatalf("unguarded store acquire = %v", err)
+	}
+	unguarded.releaseWriter()
+}
+
 func TestPublicationIntents(t *testing.T) {
 	s := &Store{}
 	cache := ObjectRef{NS: ns.CacheRef("cache"), Key: "key"}
@@ -573,6 +601,34 @@ func TestChunkRowReaderOutOfOrderAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestChunkRowReaderIgnoresRowsBeyondPiece(t *testing.T) {
+	p := testPiece(8*RowBytes, 5, 7)
+	rows := &fakeRows{rows: chunkRows(
+		chunkRow(7, rowFill('c', RowBytes)),
+		chunkRow(9, rowFill('x', RowBytes)),
+		chunkRow(5, rowFill('a', RowBytes)),
+		chunkRow(8, rowFill('y', RowBytes)),
+		chunkRow(6, rowFill('b', RowBytes)),
+	)}
+	r := newTestReader(t, rows, p, p.base+int64(p.lo)*RowBytes, p.base+int64(p.hi+1)*RowBytes-1)
+
+	got, err := collectRows(t, r)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v, want io.EOF", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d rows, want 3", len(got))
+	}
+	for i, row := range got {
+		if row.no != int32(i+5) {
+			t.Fatalf("row %d number = %d", i, row.no)
+		}
+		if !bytes.Equal(row.data, rowFill("abc"[i], RowBytes)) {
+			t.Fatalf("row %d data mismatch", i)
+		}
+	}
+}
+
 func TestChunkRowReaderGap(t *testing.T) {
 	p := testPiece(3*RowBytes, 0, 2)
 	rows := &fakeRows{rows: chunkRows(
@@ -612,6 +668,36 @@ func TestChunkRowReaderMalformedRow(t *testing.T) {
 				t.Fatalf("err = %v, want unexpected row shape", err)
 			}
 		})
+	}
+}
+
+func TestChunkRowReaderColdFillReturnsSharedBlock(t *testing.T) {
+	c := newBlockCache(64 << 20)
+	p := testPiece(blockBytes, 0, blockRows-1)
+	raw := make([][][]byte, 0, blockRows)
+	want := make([]byte, 0, blockBytes)
+	for no := int32(0); no < blockRows; no++ {
+		data := rowFill(byte('a'+no%26), RowBytes)
+		raw = append(raw, chunkRow(no, data))
+		want = append(want, data...)
+	}
+	r := newChunkRowReader(&fakeRows{rows: raw}, p, p.base, p.base+blockBytes-1, c.fill(5, p))
+	t.Cleanup(r.close)
+	res, err := r.nextChunk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.shared {
+		t.Fatal("cold-fill chunk was not cache shared")
+	}
+	if !bytes.Equal(res.b, want) {
+		t.Fatalf("cold-fill chunk returned %d wrong bytes", len(res.b))
+	}
+	if _, err := r.nextChunk(); !errors.Is(err, io.EOF) {
+		t.Fatalf("second chunk err = %v, want io.EOF", err)
+	}
+	if !c.contains(blockKey{table: 5, file: p.fileID, block: 0}) {
+		t.Fatal("cold fill did not cache the block")
 	}
 }
 

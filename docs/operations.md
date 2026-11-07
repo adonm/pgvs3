@@ -94,9 +94,10 @@ using a small memory-backed `/tmp` can make 64 MiB write-through and cold
 fills fail with `disk quota exceeded`.
 
 `--spool-max-bytes` / `PGVS3_SPOOL_MAX_BYTES` defaults to **8 GiB** of concurrent
-disk-spool payload per gateway, shared across fills, foreground writes and outbox
-workers. Keep it below available scratch space (the chart provides 10 GiB) and
-above the largest object to spool. Admission is nonblocking: exhausted requests
+disk-spool payload per gateway, shared across cache fills and foreground writes.
+Outbox flushes stream committed bodies directly from PostgreSQL and do not
+consume this budget. Keep it below available scratch space (the chart provides
+10 GiB) and above the largest object to spool. Admission is nonblocking: exhausted requests
 return `503 SlowDown`, while pending uploads remain durable and retry. Unknown
 length spools reserve incrementally and abort cleanly rather than deadlocking
 with other partially reserved spools. Small in-memory bodies, Go/copy buffers,
@@ -288,7 +289,7 @@ pgvs3 stat   --url "$PGVS3_URL" [--kind K] [--name N] --json
 pgvs3 reap   --url "$PGVS3_URL" --all                   # reconcile schemas + garbage + TTL sweep
 pgvs3 clone  --url "$PGVS3_URL" [--kind bucket|cache] <src> <dst>
 pgvs3 drop   --url "$PGVS3_URL" [--kind bucket|cache|queue] [--force] <name>
-pgvs3 origin --url "$PGVS3_URL" [--bucket B] set|clear|list [origin.json]
+pgvs3 origin --url "$PGVS3_URL" [--bucket B] set|clear|list|sql [origin.json]
 pgvs3 pending --url "$PGVS3_URL" [--namespace N] list|retry
 ```
 
@@ -685,7 +686,25 @@ pgvs3 origin --url "$PGVS3_URL" list
 pgvs3 origin --url "$PGVS3_URL" --bucket edge clear
 ```
 
-Origin configuration is JSON only.
+An S3 origin needs no JSON file:
+
+```sh
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+pgvs3 origin --url "$PGVS3_URL" --bucket edge \
+  --s3-endpoint s3.us-east-1.amazonaws.com --s3-bucket my-origin \
+  --cache-max-bytes 107374182400 set
+pgvs3 origin --url "$PGVS3_URL" --bucket edge sql
+```
+
+`--s3-bucket` defaults to `--bucket`; `--s3-path-style` selects path-style
+addressing for MinIO and similar, and `--s3-insecure` permits a plain-HTTP
+endpoint. Every `serve` and `origin` flag also reads `PGVS3_<FLAG>`
+(`PGVS3_S3_ENDPOINT`, `PGVS3_S3_ACCESS_KEY`, ...), and database maintenance
+commands accept the same mapping for their flags, so the whole setup can come
+from the environment. The `sql` action prints a ready-to-run DuckDB/DuckLake
+secret and `ATTACH` snippet for the bucket.
+
+Without the shorthand, an origin is a JSON document.
 
 The complete spec is normalized and structurally validated before catalog changes:
 scope, bucket/cache names, durations, limits, provider options and HTTP headers.
@@ -694,6 +713,16 @@ the documented defaults. Negative durations/limits and unknown provider options
 are rejected. Validation does not create origin directories or open providers;
 filesystem availability/permissions and remote reachability are checked when the
 gateway actually opens or uses the origin.
+
+`--cache-max-bytes` on `serve` or `origin set` bounds the cache namespace by
+payload bytes. Once the sum of rows with `expires_at IS NOT NULL` exceeds the
+budget, maintenance evicts the oldest `expires_at` rows first (then `created_at`
+and `key`) from both `s3c_<namespace>` read entries and committed
+`s3w_<namespace>` write-back copies, queuing their files for reaping. Pending
+write-back bodies have `expires_at IS NULL` and are never capacity-evicted, so
+acknowledgement durability is unchanged. Size the budget above the largest
+credible pending backlog; `0` disables capacity eviction. The budget is stored
+with the origin spec in PostgreSQL, so every gateway applies it.
 
 A global origin serves only buckets that exist in the catalog. Create each
 bucket with `PUT /{bucket}` before using it; on an origin-served bucket that
@@ -717,8 +746,25 @@ process-local global fallback and follows the same catalog rule.
 | **TTL revalidation** | After `--cache-ttl`, compare the cached size and origin version/mtime. If they still match, refresh the cache entry; otherwise refill from the origin. Cold whole-object fills are single-request; post-TTL revalidation still uses a metadata probe. |
 | **Write-through / write-back** | Small or conditional writes are synchronous write-through: checksums are verified and conditions are enforced before success, and the origin is mutated before the response. Large unconditional objects (above 8 MiB) use ack-first write-back: the body is committed to the WAL-logged `s3w_<namespace>` and `s3p.pending_uploads` atomically, the object is immediately readable, and the origin upload runs through the bounded outbox worker. `--cache-write-back=false` restores synchronous behavior. |
 | **Multipart** | Completion publishes the assembled write-back object plus an outbox row atomically. With write-back enabled, an unconditional completion returns after that transaction and lets the outbox worker upload the object; conditional completions remain synchronous. A pending body is readable, and the origin upload uses the captured base version when one exists. |
-| **Range cache** | Cold ranges of objects larger than 8 MiB pass through to the origin unless `--range-cache-chunk` is set, in which case aligned chunks are cached in `s3c_<namespace>` and reused. |
-| **Listings** | `ListObjectsV2` merges the origin walk with pending write-back objects from PostgreSQL, one bounded page in memory. There is no listing index, TTL-stale refresh, or per-write listing upsert. |
+| **Range cache** | With `--range-cache-chunk`, cold ranged reads of objects larger than the chunk size cache aligned chunks in `s3c_<namespace>` instead of the whole object. Requests up to 64 MiB are served this way, and contiguous missing chunks are fetched in bounded 8 MiB runs. Warm chunk hits refresh `expires_at` once less than half of `--cache-retention` remains; concurrent cold `HEAD`s for one key are coalesced. Wider requests, or chunk caching disabled, pass through to the origin. |
+| **Listings** | `ListObjectsV2` merges the origin walk with pending write-back objects from PostgreSQL, one bounded page in memory. The first origin page uses `start-after`, so deep pagination does not rescan the prefix client-side. There is no listing index, TTL-stale refresh, or per-write listing upsert. |
+
+### S3 origin data path
+
+- **Outbox flush:** a committed write-back row streams directly from PostgreSQL
+  into the origin request. The flush no longer re-spools the pending body to
+  disk, so `--spool-max-bytes` does not bound drain of already-durable pending
+  objects; origin and database throughput do.
+- **Multipart uploads:** parts up to 16 MiB upload four at a time. Larger parts
+  fall back to sequential streaming to keep memory bounded.
+- **Batch delete:** `DeleteObjects` uses one S3 `POST /?delete` request per
+  1,000 keys, falling back to individual deletes for origins without the batch
+  endpoint.
+- **Listings:** origin walks pass `start-after` through to the S3 client.
+- **Transient retries:** replayable S3 requests (no body or a seekable body)
+  retry twice on 429/5xx responses and transport errors with short exponential
+  backoff. Non-replayable uploads are not retried at this layer; the write-back
+  outbox owns their retry loop.
 
 ### Cross-worker safety
 
@@ -762,11 +808,13 @@ multipart completion, deletes and outbox flushes across gateways.
 
 ### Spooling and large fills
 
-Bodies up to 8 MiB stay in memory. Larger fills and write-through uploads spool
-to `--spool-dir` (the system temp directory by default), and the file is
-removed after the origin/cache operation. Point this at local scratch with
-enough free space; a memory-backed `/tmp` can exhaust quickly with concurrent
-64 MiB fills. The spool is never visible to readers as a cache object.
+Bodies up to 8 MiB stay in memory. Larger fills and foreground write-through
+uploads spool to `--spool-dir` (the system temp directory by default), and the
+file is removed after the origin/cache operation. Outbox flushes do not spool:
+they stream the committed `s3w_` body directly from PostgreSQL to the origin.
+Point the spool at local scratch with enough free space; a memory-backed `/tmp`
+can exhaust quickly with concurrent 64 MiB fills. The spool is never visible to
+readers as a cache object.
 
 ### Limits and failure behavior
 
@@ -796,10 +844,12 @@ enough free space; a memory-backed `/tmp` can exhaust quickly with concurrent
   row `dead` and stop claims; the body remains readable. Inspect
   `pgvs3 pending list`, repair with `pgvs3 pending retry`, and alert on
   `pgvs3_pending_uploads_dead > 0`.
-- **Spooling.** Fills and single-request uploads buffer the body (memory ≤8 MiB,
-  otherwise a temp file) before opening a PostgreSQL body writer. Read-fill
-  downloads do not pin a connection; ordered origin mutations/outbox uploads
-  deliberately retain a session advisory-lock connection across origin I/O.
+- **Spooling.** Fills and foreground single-request uploads buffer the body
+  (memory ≤8 MiB, otherwise a temp file) before opening a PostgreSQL body
+  writer. Outbox flushes stream the logged body directly from PostgreSQL without
+  re-spooling. Read-fill downloads do not pin a connection; ordered origin
+  mutations/outbox uploads deliberately retain a session advisory-lock
+  connection across origin I/O.
 
 Inspect pending work with:
 
@@ -854,10 +904,12 @@ origin (`pgvs3 origin --bucket`):
 }
 ```
 
-Use `pgvs3 origin --range-cache-chunk 1048576 set origin.json` to persist range
-caching for a stored origin, or pass `--range-cache-chunk 1048576` to
-`pgvs3 serve` for a process-local `--origin-config`. The HTTP origin returns an
-explicit error for `ListObjectsV2`; use an S3 origin when listing is required.
+Use `pgvs3 origin --range-cache-chunk 1048576 --cache-max-bytes 107374182400
+set origin.json` to persist range caching and a capacity budget for a stored
+origin, or pass the same flags to `pgvs3 serve` for a process-local
+`--origin-config`. `pgvs3 origin --bucket B sql` prints a matching DuckDB
+snippet. The HTTP origin returns an explicit error for `ListObjectsV2`; use an
+S3 origin when listing is required.
 The integration gate runs the internal S3 client against a second pgvs3
 gateway acting as the S3 origin. Set `PGVS3_TEST_S3_ENDPOINT`,
 `PGVS3_TEST_S3_ACCESS_KEY`, and `PGVS3_TEST_S3_SECRET_KEY` to test an external
