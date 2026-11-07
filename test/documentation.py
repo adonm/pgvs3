@@ -87,8 +87,11 @@ def check_links():
         body = svg.read_text()
         if "light-dark(" not in body or "color-scheme: light dark" not in body:
             raise ValueError(f"SVG {svg.relative_to(ROOT)} must use light-dark() tokens with color-scheme: light dark")
-        if any(token in body for token in ("@keyframes", "animation:", "<animate", "<script")):
-            raise ValueError(f"SVG {svg.relative_to(ROOT)} must be static: no CSS/SMIL animation or script")
+        if "<script" in body:
+            raise ValueError(f"SVG {svg.relative_to(ROOT)} must not contain script")
+        for token in ("@keyframes", "animation:", "@media (prefers-reduced-motion: reduce)"):
+            if token not in body:
+                raise ValueError(f"SVG {svg.relative_to(ROOT)} must contain {token!r} for accessible CSS animation")
         title = root.find("{http://www.w3.org/2000/svg}title")
         label = (title.text or "").strip() if title is not None else ""
         match = re.match(r"^FIG (\d{2}) — ", label)

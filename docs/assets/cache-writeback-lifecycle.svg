@@ -1,14 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 440" role="img" aria-labelledby="fig4-title fig4-desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 480" role="img" aria-labelledby="fig4-title fig4-desc">
   <title id="fig4-title">FIG 04 — Origin Cache (s3c_) and Ack-First Write-Back Outbox (s3w_) Tracks</title>
-  <desc id="fig4-desc">Four-station horizontal tracks showing where Cold Fills, Aligned Parquet Range Reads, and Ack-First Write-Back Uploads commit and acknowledge.</desc>
+  <desc id="fig4-desc">Three horizontal tracks: coalesced cold fills leased in s3p.cache_fill_leases, spooled above 8 MiB and published version-fenced into s3c_; aligned Parquet range caching with coalesced cold HEADs, 1 MiB slices up to 64 MiB and half-retention expiry touches; and ack-first write-back that commits s3w_ plus pending_uploads, drains directly from PostgreSQL with four parallel multipart uploads, then capacity-evicts s3c_ and committed s3w_ rows under --cache-max-bytes.</desc>
   <defs>
-    <marker id="f4-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f4-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
     </marker>
-    <marker id="f4-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f4-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
     </marker>
-    <marker id="f4-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f4-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--warning)"/>
     </marker>
   </defs>
@@ -16,120 +16,176 @@
     svg {
       color-scheme: light dark;
       --bg: light-dark(#ffffff, #09090b);
-      --hdr: light-dark(#fafafa, #141418);
-      --swim: light-dark(#fafafa, #18181b);
-      --card: light-dark(#ffffff, #1e1e22);
+      --hdr: light-dark(#fafafa, #121215);
+      --panel: light-dark(#fafafa, #141417);
+      --card: light-dark(#ffffff, #18181b);
+      --pill: light-dark(#f4f4f5, #27272a);
       --border: light-dark(#e4e4e7, #303036);
       --fg: light-dark(#262626, #e5e5e5);
       --muted: light-dark(#71717a, #a1a1aa);
-      --blue: light-dark(#0284c7, #38bdf8);
+      --blue: light-dark(#0369a1, #38bdf8);
       --success: light-dark(#008032, #6cc070);
       --warning: light-dark(#a65b00, #f0a030);
-      --purple: light-dark(#7c3aed, #c084fc);
-      --hit: light-dark(#e6f4ea, #064e3b);
-      --stage: light-dark(#fef3c7, #1c1917);
+      --purple: light-dark(#6d28d9, #c084fc);
+      --danger: light-dark(#d32f2f, #f4807b);
     }
     .bg { fill: var(--bg); }
-    .hdr { fill: var(--hdr); stroke: var(--border); stroke-width: 1; }
-    .swim { fill: var(--swim); stroke: var(--border); stroke-width: 1.3; rx: 8; }
-    .node { fill: var(--card); stroke: var(--border); stroke-width: 1.3; rx: 6; }
-    .node-hit { fill: var(--hit); stroke: var(--success); stroke-width: 1.6; rx: 6; }
-    .node-st { fill: var(--stage); stroke: var(--warning); stroke-width: 1.6; rx: 6; }
+    .hdr { fill: var(--hdr); }
+    .panel { fill: var(--panel); stroke: var(--border); stroke-width: 1; }
+    .card { fill: var(--card); stroke: var(--border); stroke-width: 1.2; }
     .fig { fill: var(--blue); font: 700 10.5px ui-monospace, Consolas, monospace; letter-spacing: 0.06em; }
     .title { fill: var(--fg); font: 600 14.5px system-ui, -apple-system, sans-serif; }
     .lane-t { fill: var(--fg); font: 600 12px system-ui, -apple-system, sans-serif; }
     .h4 { fill: var(--fg); font: 600 11.5px system-ui, -apple-system, sans-serif; }
-    .sub { fill: var(--muted); font: 400 10.5px system-ui, -apple-system, sans-serif; }
-    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .sub { fill: var(--muted); font: 400 9.8px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 9.8px ui-monospace, Consolas, monospace; }
     .cb { fill: var(--blue); }
     .cg { fill: var(--success); }
     .ca { fill: var(--warning); }
     .cp { fill: var(--purple); }
-    .ln-b { stroke: var(--blue); stroke-width: 2.2; fill: none; }
-    .ln-g { stroke: var(--success); stroke-width: 2.2; fill: none; }
-    .ln-a { stroke: var(--warning); stroke-width: 2.2; fill: none; }
+    .dot-b { fill: var(--blue); }
+    .dot-g { fill: var(--success); }
+    .dot-a { fill: var(--warning); }
+    .ln { stroke: var(--border); stroke-width: 1.2; fill: none; }
+    .flow { stroke-width: 1.6; fill: none; stroke-dasharray: 5 7; stroke-linecap: round; animation: dash 1.8s linear infinite; }
+    .flow-b { stroke: var(--blue); }
+    .flow-g { stroke: var(--success); }
+    .flow-a { stroke: var(--warning); }
+    .s1 { animation-delay: 0s; }
+    .s2 { animation-delay: 0.3s; }
+    .s3 { animation-delay: 0.6s; }
+    .pulse { animation: pulse 2.4s ease-in-out infinite; }
+    @keyframes dash { to { stroke-dashoffset: -24; } }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; }
+    }
   </style>
 
-  <rect width="1040" height="440" class="bg" rx="8"/>
+  <rect width="1040" height="480" class="bg" rx="8"/>
   <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
+  <line x1="0" y1="44" x2="1040" y2="44" class="ln"/>
   <text x="24" y="27" class="fig">FIG 04</text>
   <text x="80" y="27" class="title">Shared Origin Cache (s3c_) &amp; Ack-First Write-Back Outbox (s3w_)</text>
 
-  <!-- Track 1: Cold Fill -->
-  <rect x="20" y="56" width="1000" height="114" class="swim"/>
+  <!-- Track 1: coalesced cold fill -->
+  <rect x="20" y="56" width="1000" height="120" class="panel" rx="8"/>
   <text x="36" y="76" class="lane-t cb">Track 1 — Coalesced Cold Fill → Shared Cross-Gateway &amp; Standby HIT</text>
 
-  <rect x="36" y="88" width="214" height="66" class="node"/>
-  <text x="48" y="110" class="h4">1. Lease Ownership</text>
-  <text x="48" y="128" class="mono cb">s3p.cache_fill_leases</text>
-  <text x="48" y="144" class="sub">1 worker fetches; peers wait</text>
+  <rect x="36" y="92" width="224" height="72" class="card" rx="6"/>
+  <rect x="36" y="98" width="4" height="60" rx="2" fill="var(--blue)"/>
+  <text x="48" y="114" class="h4">1. Lease Ownership</text>
+  <text x="48" y="132" class="mono cb">s3p.cache_fill_leases</text>
+  <text x="48" y="149" class="sub">1 worker fetches · peers wait</text>
+  <circle cx="246" cy="104" r="3" class="dot-b pulse"/>
 
-  <rect x="284" y="88" width="214" height="66" class="node"/>
-  <text x="296" y="110" class="h4">2. Spool Outside DB Tx</text>
-  <text x="296" y="128" class="mono">--spool-dir (&gt;8 MiB)</text>
-  <text x="296" y="144" class="sub">0 DB conns held on download</text>
+  <rect x="286" y="92" width="224" height="72" class="card" rx="6"/>
+  <rect x="286" y="98" width="4" height="60" rx="2" fill="var(--blue)"/>
+  <text x="298" y="114" class="h4">2. Spool &gt;8 MiB</text>
+  <text x="298" y="132" class="mono">--spool-dir / local scratch</text>
+  <text x="298" y="149" class="sub">0 DB conns held on download</text>
+  <circle cx="496" cy="104" r="3" class="dot-b pulse"/>
 
-  <rect x="532" y="88" width="214" height="66" class="node"/>
-  <text x="544" y="110" class="h4">3. Version-Fenced Publish</text>
-  <text x="544" y="128" class="mono">s3c_&lt;ns&gt;.chunks (WAL)</text>
-  <text x="544" y="144" class="sub">Checks live owner + ETag</text>
+  <rect x="536" y="92" width="224" height="72" class="card" rx="6"/>
+  <rect x="536" y="98" width="4" height="60" rx="2" fill="var(--blue)"/>
+  <text x="548" y="114" class="h4">3. Version-Fenced Publish</text>
+  <text x="548" y="132" class="mono">s3c_&lt;ns&gt;.chunks (WAL)</text>
+  <text x="548" y="149" class="sub">Live owner + origin ETag checked</text>
+  <circle cx="746" cy="104" r="3" class="dot-b pulse"/>
 
-  <rect x="780" y="88" width="224" height="66" class="node-hit"/>
-  <text x="792" y="110" class="h4 cg">4. Fleet &amp; Standby HIT</text>
-  <text x="792" y="128" class="mono">X-Cache: HIT (0 Origin GETs)</text>
-  <text x="792" y="144" class="sub">Post-TTL: HEAD revalidates</text>
+  <rect x="786" y="92" width="218" height="72" class="card" rx="6"/>
+  <rect x="786" y="98" width="4" height="60" rx="2" fill="var(--success)"/>
+  <text x="798" y="114" class="h4 cg">4. Fleet &amp; Standby HIT</text>
+  <text x="798" y="132" class="mono cg">X-Cache: HIT · 0 origin GETs</text>
+  <text x="798" y="149" class="sub">Post-TTL HEAD revalidates</text>
+  <circle cx="990" cy="104" r="3" class="dot-g pulse"/>
 
-  <path id="p4-t1" d="M 250 121 L 278 121" class="ln-b" marker-end="url(#f4-b)"/>
-  <path d="M 498 121 L 526 121" class="ln-a" marker-end="url(#f4-a)"/>
-  <path d="M 746 121 L 774 121" class="ln-g" marker-end="url(#f4-g)"/>
+  <path d="M 260 128 H 286" class="ln"/>
+  <path d="M 260 128 H 286" class="flow flow-b s1" marker-end="url(#f4-b)"/>
+  <path d="M 510 128 H 536" class="ln"/>
+  <path d="M 510 128 H 536" class="flow flow-b s2" marker-end="url(#f4-b)"/>
+  <path d="M 760 128 H 786" class="ln"/>
+  <path d="M 760 128 H 786" class="flow flow-g s3" marker-end="url(#f4-g)"/>
 
-  <!-- Track 2: Aligned Range Cache -->
-  <rect x="20" y="184" width="1000" height="114" class="swim"/>
-  <text x="36" y="204" class="lane-t cg">Track 2 — Aligned Parquet Range Cache (--range-cache-chunk 1048576)</text>
+  <!-- Track 2: aligned Parquet range cache -->
+  <rect x="20" y="188" width="1000" height="120" class="panel" rx="8"/>
+  <text x="36" y="208" class="lane-t cg">Track 2 — Aligned Parquet Range Cache (1 MiB slices, up to 64 MiB spans)</text>
 
-  <rect x="36" y="216" width="296" height="66" class="node"/>
-  <text x="48" y="238" class="h4">1. DuckDB Footer &amp; Column Range</text>
-  <text x="48" y="256" class="mono cb">Range: bytes=start-end</text>
-  <text x="48" y="272" class="sub">Skips unprojected wide columns</text>
+  <rect x="36" y="224" width="224" height="72" class="card" rx="6"/>
+  <rect x="36" y="230" width="4" height="60" rx="2" fill="var(--success)"/>
+  <text x="48" y="246" class="h4 cg">1. DuckDB Range Read</text>
+  <text x="48" y="264" class="mono">Range: bytes=start-end</text>
+  <text x="48" y="281" class="sub">Includes sub-8 MiB Parquet footers</text>
+  <circle cx="246" cy="236" r="3" class="dot-g pulse"/>
 
-  <rect x="370" y="216" width="296" height="66" class="node"/>
-  <text x="382" y="238" class="h4">2. Parent Validator + 1 MiB Slices</text>
-  <text x="382" y="256" class="mono">origin_metadata + s3c_ blocks</text>
-  <text x="382" y="272" class="sub">Never confuses metadata w/ full body</text>
+  <rect x="286" y="224" width="224" height="72" class="card" rx="6"/>
+  <rect x="286" y="230" width="4" height="60" rx="2" fill="var(--success)"/>
+  <text x="298" y="246" class="h4 cg">2. Coalesced Cold HEAD</text>
+  <text x="298" y="264" class="mono">origin_metadata + ETag</text>
+  <text x="298" y="281" class="sub">One HEAD per key · peers share it</text>
+  <circle cx="496" cy="236" r="3" class="dot-g pulse"/>
 
-  <rect x="704" y="216" width="300" height="66" class="node-hit"/>
-  <text x="716" y="238" class="h4 cg">3. 206 Partial Content HIT</text>
-  <text x="716" y="256" class="mono">Shared across gateways &amp; standbys</text>
-  <text x="716" y="272" class="sub">Reused by subsequent selective scans</text>
+  <rect x="536" y="224" width="224" height="72" class="card" rx="6"/>
+  <rect x="536" y="230" width="4" height="60" rx="2" fill="var(--success)"/>
+  <text x="548" y="246" class="h4 cg">3. 1 MiB Slices up to 64 MiB</text>
+  <text x="548" y="264" class="mono">aligned s3c_ blocks · 8 MiB runs</text>
+  <text x="548" y="281" class="sub">Slices cover rows, columns, footers</text>
+  <circle cx="746" cy="236" r="3" class="dot-g pulse"/>
 
-  <path d="M 332 249 L 364 249" class="ln-b" marker-end="url(#f4-b)"/>
-  <path d="M 666 249 L 698 249" class="ln-g" marker-end="url(#f4-g)"/>
+  <rect x="786" y="224" width="218" height="72" class="card" rx="6"/>
+  <rect x="786" y="230" width="4" height="60" rx="2" fill="var(--success)"/>
+  <text x="798" y="246" class="h4 cg">4. 206 Partial Content HIT</text>
+  <text x="798" y="264" class="mono cg">Half-Retention Expiry Touch</text>
+  <text x="798" y="281" class="sub">Touch when &lt; retention/2 remains</text>
+  <circle cx="990" cy="236" r="3" class="dot-g pulse"/>
 
-  <!-- Track 3: Ack-First Write-Back -->
-  <rect x="20" y="312" width="1000" height="114" class="swim"/>
-  <text x="36" y="332" class="lane-t ca">Track 3 — Ack-First Durable Write-Back (&gt;8 MiB PUT / Multipart) → Leased Outbox Drain</text>
+  <path d="M 260 260 H 286" class="ln"/>
+  <path d="M 260 260 H 286" class="flow flow-g s1" marker-end="url(#f4-g)"/>
+  <path d="M 510 260 H 536" class="ln"/>
+  <path d="M 510 260 H 536" class="flow flow-g s2" marker-end="url(#f4-g)"/>
+  <path d="M 760 260 H 786" class="ln"/>
+  <path d="M 760 260 H 786" class="flow flow-g s3" marker-end="url(#f4-g)"/>
 
-  <rect x="36" y="344" width="214" height="66" class="node-st"/>
-  <text x="48" y="366" class="h4 ca">1. Atomic PG Commit</text>
-  <text x="48" y="384" class="mono">s3w_ + pending_uploads</text>
-  <text x="48" y="400" class="sub">expires_at IS NULL (Sole Copy!)</text>
+  <!-- Track 3: ack-first write-back and capacity eviction -->
+  <rect x="20" y="320" width="1000" height="140" class="panel" rx="8"/>
+  <text x="36" y="340" class="lane-t ca">Track 3 — Ack-First Write-Back &amp; Capacity Eviction (--cache-max-bytes SKIP LOCKED Eviction on s3c_ &amp; Committed s3w_)</text>
 
-  <rect x="284" y="344" width="214" height="66" class="node-hit"/>
-  <text x="296" y="366" class="h4 cg">2. Fast 200 OK &amp; Read HIT</text>
-  <text x="296" y="384" class="mono">Immediate MVCC visibility</text>
-  <text x="296" y="400" class="sub">Stable public content ETag</text>
+  <rect x="36" y="356" width="224" height="84" class="card" rx="6"/>
+  <rect x="36" y="362" width="4" height="72" rx="2" fill="var(--warning)"/>
+  <text x="48" y="378" class="h4 ca">1. Ack-First Commit</text>
+  <text x="48" y="396" class="mono">Atomic s3w_ + pending_uploads</text>
+  <text x="48" y="412" class="sub">200 OK before origin</text>
+  <text x="48" y="428" class="sub">expires_at IS NULL · sole copy</text>
+  <circle cx="246" cy="368" r="3" class="dot-a pulse"/>
 
-  <rect x="532" y="344" width="214" height="66" class="node"/>
-  <text x="544" y="366" class="h4">3. Advisory-Locked Upload</text>
-  <text x="544" y="384" class="mono cb">5m lease + PG key lock</text>
-  <text x="544" y="400" class="sub">Serializes per-key origin order</text>
+  <rect x="286" y="356" width="224" height="84" class="card" rx="6"/>
+  <rect x="286" y="362" width="4" height="72" rx="2" fill="var(--warning)"/>
+  <text x="298" y="378" class="h4 ca">2. Direct PG-to-S3</text>
+  <text x="298" y="396" class="mono">4× Parallel Multipart Drain</text>
+  <text x="298" y="412" class="sub">5m lease + SKIP LOCKED claim</text>
+  <text x="298" y="428" class="sub">Streams rows directly from PG</text>
+  <circle cx="496" cy="368" r="3" class="dot-a pulse"/>
 
-  <rect x="780" y="344" width="224" height="66" class="node"/>
-  <text x="792" y="366" class="h4 cp">4. Token-Fenced Handoff</text>
-  <text x="792" y="384" class="mono">Origin now Copy of Record</text>
-  <text x="792" y="400" class="sub">Enables normal 24h retention</text>
+  <rect x="536" y="356" width="224" height="84" class="card" rx="6"/>
+  <rect x="536" y="362" width="4" height="72" rx="2" fill="var(--purple)"/>
+  <text x="548" y="378" class="h4 cp">3. Token-Fenced Handoff</text>
+  <text x="548" y="396" class="mono">Origin becomes Copy of Record</text>
+  <text x="548" y="412" class="sub">Retention starts after handoff</text>
+  <text x="548" y="428" class="sub">Committed rows remain expiring</text>
+  <circle cx="746" cy="368" r="3" class="dot-b pulse"/>
 
-  <path d="M 250 377 L 278 377" class="ln-g" marker-end="url(#f4-g)"/>
-  <path d="M 498 377 L 526 377" class="ln-b" marker-end="url(#f4-b)"/>
-  <path d="M 746 377 L 774 377" class="ln-a" marker-end="url(#f4-a)"/>
+  <rect x="786" y="356" width="218" height="84" class="card" rx="6"/>
+  <rect x="786" y="362" width="4" height="72" rx="2" fill="var(--warning)"/>
+  <text x="798" y="378" class="h4 ca">4. Capacity Eviction</text>
+  <text x="798" y="396" class="mono">--cache-max-bytes budget</text>
+  <text x="798" y="412" class="sub">SKIP LOCKED on s3c_ +</text>
+  <text x="798" y="428" class="sub">committed s3w_; pending exempt</text>
+  <circle cx="990" cy="368" r="3" class="dot-a pulse"/>
+
+  <path d="M 260 398 H 286" class="ln"/>
+  <path d="M 260 398 H 286" class="flow flow-a s1" marker-end="url(#f4-a)"/>
+  <path d="M 510 398 H 536" class="ln"/>
+  <path d="M 510 398 H 536" class="flow flow-a s2" marker-end="url(#f4-a)"/>
+  <path d="M 760 398 H 786" class="ln"/>
+  <path d="M 760 398 H 786" class="flow flow-a s3" marker-end="url(#f4-a)"/>
 </svg>

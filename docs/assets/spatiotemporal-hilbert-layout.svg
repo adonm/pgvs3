@@ -1,120 +1,148 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 440" role="img" aria-labelledby="fig5-title fig5-desc">
   <title id="fig5-title">FIG 05 — Density-Adaptive 24-Bit Hilbert Sorting and Late Materialization</title>
-  <desc id="fig5-desc">Visual comparison of skewed spatial data in an equal-area grid versus 1D Hilbert sorting sliced into equal-byte Parquet row groups and two-phase late materialization.</desc>
+  <desc id="fig5-desc">Comparison of an equal-area grid that traps skewed spatial data against 24-bit Hilbert sorting sliced into equal-byte Parquet row groups, followed by two-phase late materialization that prunes row groups with zone maps and fetches only matched 8,120-byte chunks.</desc>
   <defs>
-    <marker id="f5-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f5-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
+    </marker>
+    <marker id="f5-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--warning)"/>
     </marker>
   </defs>
   <style>
     svg {
       color-scheme: light dark;
       --bg: light-dark(#ffffff, #09090b);
-      --hdr: light-dark(#fafafa, #141418);
-      --panel: light-dark(#fafafa, #18181b);
-      --box: light-dark(#ffffff, #1e1e22);
+      --hdr: light-dark(#fafafa, #121215);
+      --panel: light-dark(#fafafa, #141417);
+      --card: light-dark(#ffffff, #18181b);
       --pill: light-dark(#f4f4f5, #27272a);
       --border: light-dark(#e4e4e7, #303036);
       --fg: light-dark(#262626, #e5e5e5);
       --muted: light-dark(#71717a, #a1a1aa);
-      --blue: light-dark(#0284c7, #38bdf8);
+      --blue: light-dark(#0369a1, #38bdf8);
       --success: light-dark(#008032, #6cc070);
       --warning: light-dark(#a65b00, #f0a030);
+      --purple: light-dark(#6d28d9, #c084fc);
       --danger: light-dark(#d32f2f, #f4807b);
-      --hit: light-dark(#e6f4ea, #064e3b);
-      --bad: light-dark(#fef2f2, #1f1215);
     }
     .bg { fill: var(--bg); }
-    .hdr { fill: var(--hdr); stroke: var(--border); stroke-width: 1; }
-    .card-bad { fill: var(--bad); stroke: var(--danger); stroke-width: 1.5; rx: 8; }
-    .card-good { fill: var(--panel); stroke: var(--success); stroke-width: 1.6; rx: 8; }
-    .card-late { fill: var(--panel); stroke: var(--border); stroke-width: 1.4; rx: 8; }
-    .grid-bg { fill: var(--box); stroke: var(--border); stroke-width: 1.2; rx: 4; }
+    .hdr { fill: var(--hdr); }
+    .card { fill: var(--card); stroke: var(--border); stroke-width: 1.2; }
+    .grid-bg { fill: var(--card); stroke: var(--border); stroke-width: 1; }
     .grid-ln { stroke: var(--border); stroke-width: 1; }
-    .rg-sp { fill: var(--pill); stroke: var(--blue); stroke-width: 1.3; rx: 4; }
-    .rg-dn { fill: var(--hit); stroke: var(--success); stroke-width: 1.3; rx: 4; }
-    .box { fill: var(--box); stroke: var(--border); stroke-width: 1.3; rx: 6; }
-    .box-hit { fill: var(--hit); stroke: var(--success); stroke-width: 1.5; rx: 6; }
+    .rg-sp { fill: var(--pill); stroke: var(--border); stroke-width: 1; }
+    .rg-dn { fill: color-mix(in srgb, var(--success) 10%, var(--card)); stroke: var(--border); stroke-width: 1; }
     .fig { fill: var(--blue); font: 700 10.5px ui-monospace, Consolas, monospace; letter-spacing: 0.06em; }
     .title { fill: var(--fg); font: 600 14.5px system-ui, -apple-system, sans-serif; }
     .h3 { fill: var(--fg); font: 600 12.5px system-ui, -apple-system, sans-serif; }
-    .sub { fill: var(--muted); font: 400 10.5px system-ui, -apple-system, sans-serif; }
-    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .sub { fill: var(--muted); font: 400 10px system-ui, -apple-system, sans-serif; }
+    .sub-s { fill: var(--muted); font: 400 9.5px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 10px ui-monospace, Consolas, monospace; }
     .cb { fill: var(--blue); }
     .cg { fill: var(--success); }
     .ca { fill: var(--warning); }
+    .cp { fill: var(--purple); }
     .cr { fill: var(--danger); }
-    .h-curve { stroke: var(--warning); stroke-width: 2.5; fill: none; }
-    .f-arr { stroke: var(--success); stroke-width: 2.3; fill: none; }
+    .dot-b { fill: var(--blue); }
+    .dot-g { fill: var(--success); }
+    .dot-a { fill: var(--warning); }
+    .dot-p { fill: var(--purple); }
+    .h-curve { stroke: var(--warning); stroke-width: 2.2; fill: none; opacity: 0.3; }
+    .h-flow { stroke: var(--warning); stroke-width: 2.2; fill: none; stroke-dasharray: 6 6; stroke-linecap: round; animation: dash 2.2s linear infinite; }
+    .ln { stroke: var(--border); stroke-width: 1.2; fill: none; }
+    .flow { stroke-width: 1.6; fill: none; stroke-dasharray: 5 7; stroke-linecap: round; animation: dash 1.8s linear infinite; }
+    .flow-g { stroke: var(--success); }
+    .s1 { animation-delay: 0s; }
+    .s2 { animation-delay: 0.35s; }
+    .pulse { animation: pulse 2.4s ease-in-out infinite; }
+    @keyframes dash { to { stroke-dashoffset: -24; } }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; }
+    }
   </style>
 
   <rect width="1040" height="440" class="bg" rx="8"/>
   <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
+  <line x1="0" y1="44" x2="1040" y2="44" class="ln"/>
   <text x="24" y="27" class="fig">FIG 05</text>
   <text x="80" y="27" class="title">Density-Adaptive 24-Bit Hilbert Sorting &amp; Two-Phase Late Materialization</text>
 
-  <!-- Left: Equal-Area Trap -->
-  <rect x="20" y="58" width="292" height="232" class="card-bad"/>
+  <!-- Left: equal-area grid trap -->
+  <rect x="20" y="58" width="292" height="232" class="card" rx="8"/>
+  <rect x="20" y="64" width="4" height="220" rx="2" fill="var(--danger)"/>
   <text x="36" y="82" class="h3 cr">Equal-Area Grid Trap (90% Skew)</text>
+  <circle cx="298" cy="72" r="3" class="dot-a pulse"/>
 
-  <rect x="36" y="96" width="112" height="112" class="grid-bg"/>
-  <path d="M 64 96 V 208 M 92 96 V 208 M 120 96 V 208 M 36 124 H 148 M 36 152 H 148 M 36 180 H 148" class="grid-ln"/>
-  <rect x="93" y="125" width="26" height="26" fill="var(--danger)"/>
-  <text x="160" y="116" class="mono cr">1 Cell = 90% Rows</text>
-  <text x="160" y="134" class="sub">1 overloaded partition;</text>
-  <text x="160" y="150" class="sub">63 empty ocean cells</text>
-  <text x="160" y="166" class="sub">write &lt;1 MiB files!</text>
+  <rect x="36" y="96" width="92" height="112" class="grid-bg" rx="4"/>
+  <path d="M 59 96 V 208 M 82 96 V 208 M 105 96 V 208 M 36 124 H 128 M 36 152 H 128 M 36 180 H 128" class="grid-ln"/>
+  <rect x="79" y="125" width="26" height="26" fill="var(--danger)" rx="2"/>
+  <text x="140" y="116" class="mono cr">1 Cell = 90% Rows</text>
+  <text x="140" y="134" class="sub-s">1 overloaded partition;</text>
+  <text x="140" y="150" class="sub-s">Sparse cells write &lt;1 MiB files</text>
+  <text x="140" y="166" class="sub-s">1 MiB minimum file floor</text>
 
   <text x="36" y="232" class="mono cr">SORTED BY (lat, lon) Trap:</text>
-  <text x="36" y="250" class="sub">Orders lat, but lon spans [-180°,+180°]</text>
+  <text x="36" y="250" class="sub">Orders lat, but lon spans [-180°, +180°]</text>
   <text x="36" y="266" class="sub">in every stripe → 0 lon pruning!</text>
 
-  <!-- Right: 24-Bit Hilbert + Equal-Byte Row Groups -->
-  <rect x="332" y="58" width="688" height="232" class="card-good"/>
+  <!-- Right: 24-bit Hilbert plus equal-byte row groups -->
+  <rect x="332" y="58" width="688" height="232" class="card" rx="8"/>
+  <rect x="332" y="64" width="4" height="220" rx="2" fill="var(--success)"/>
   <text x="350" y="82" class="h3 cg">SORTED BY (hilbert_id, ts): Equal-Byte Row Groups Auto-Adapt to Density</text>
+  <circle cx="1004" cy="72" r="3" class="dot-g pulse"/>
 
-  <rect x="350" y="96" width="144" height="144" class="grid-bg"/>
+  <rect x="350" y="96" width="144" height="144" class="grid-bg" rx="4"/>
   <path d="M 386 96 V 240 M 422 96 V 240 M 458 96 V 240 M 350 132 H 494 M 350 168 H 494 M 350 204 H 494" class="grid-ln"/>
-  <rect x="423" y="133" width="34" height="34" fill="var(--success)" fill-opacity="0.25" stroke="var(--success)"/>
+  <rect x="423" y="133" width="34" height="34" fill="var(--success)" fill-opacity="0.25" stroke="var(--success)" rx="2"/>
   <path d="M 368 114 L 404 114 L 404 150 L 368 150 L 368 186 L 368 222 L 404 222 L 404 186 L 440 186 L 440 222 L 476 222 L 476 186 L 476 150 L 440 150 L 440 114 L 476 114" class="h-curve"/>
+  <path d="M 368 114 L 404 114 L 404 150 L 368 150 L 368 186 L 368 222 L 404 222 L 404 186 L 440 186 L 440 222 L 476 222 L 476 186 L 476 150 L 440 150 L 440 114 L 476 114" class="h-flow" marker-end="url(#f5-a)"/>
   <text x="350" y="256" class="mono ca">4096² grid (24-bit)</text>
   <text x="350" y="272" class="sub">4×6-bit · unpartitioned</text>
 
   <text x="516" y="110" class="mono cb">1D Hilbert Stream Sliced by Equal Bytes (32 MB Row Groups):</text>
 
-  <rect x="516" y="120" width="480" height="30" class="rg-sp"/>
-  <text x="528" y="139" class="mono">RG 0 (10% Sparse US/Ocean): 1 Row Group covers [25°..50°, -125°..-74°]</text>
+  <rect x="516" y="120" width="480" height="30" class="rg-sp" rx="4"/>
+  <text x="528" y="139" class="mono">RG 0 sparse US/Ocean: [25°..50°, -125°..-74°]</text>
 
-  <rect x="516" y="158" width="152" height="30" class="rg-dn"/>
+  <rect x="516" y="158" width="152" height="30" class="rg-dn" rx="4"/>
   <text x="526" y="177" class="mono">RG 1: NYC 0.01°</text>
-
-  <rect x="680" y="158" width="152" height="30" class="rg-dn"/>
+  <rect x="680" y="158" width="152" height="30" class="rg-dn" rx="4"/>
   <text x="690" y="177" class="mono">RG 2: NYC 0.01°</text>
-
-  <rect x="844" y="158" width="152" height="30" class="rg-dn"/>
+  <rect x="844" y="158" width="152" height="30" class="rg-dn" rx="4"/>
   <text x="854" y="177" class="mono">RG 3..9: NYC 0.01°</text>
 
   <text x="516" y="212" class="sub">• Zero empty ocean files: sparse cells pack into RG 0.</text>
-  <text x="516" y="230" class="sub">• 90% NYC hotspot auto-subdivides into 9 tight neighborhood row groups!</text>
-  <text x="516" y="250" class="mono cg">• parquet_row_group_size_bytes = '32MB' caps wide-column writer RAM</text>
+  <text x="516" y="230" class="sub">• 90% NYC hotspot auto-subdivides into 9 tight row groups.</text>
+  <text x="516" y="250" class="mono cg">• Zone-map min/max pruning skips non-overlapping row groups</text>
   <text x="516" y="268" class="mono cg">• skip_stats_columns = ['wide_payload'] keeps PG catalog compact</text>
 
-  <!-- Bottom: Two-Phase Late Materialization -->
-  <rect x="20" y="306" width="1000" height="114" class="card-late"/>
+  <!-- Bottom: two-phase late materialization -->
+  <rect x="20" y="306" width="1000" height="114" class="card" rx="8"/>
+  <rect x="20" y="312" width="4" height="102" rx="2" fill="var(--purple)"/>
   <text x="38" y="330" class="h3 cb">Two-Phase Late Materialization for Billion-Row Wide Tables</text>
 
-  <rect x="38" y="344" width="288" height="58" class="box"/>
+  <rect x="38" y="344" width="288" height="58" class="card" rx="6"/>
+  <rect x="38" y="350" width="4" height="46" rx="2" fill="var(--blue)"/>
   <text x="50" y="366" class="mono cb">Phase 1: Narrow Filter CTE</text>
   <text x="50" y="386" class="sub">Scans only (id, hilbert_id, lat, lon, ts)</text>
+  <circle cx="312" cy="354" r="3" class="dot-b pulse"/>
 
-  <rect x="368" y="344" width="288" height="58" class="box"/>
+  <rect x="368" y="344" width="288" height="58" class="card" rx="6"/>
+  <rect x="368" y="350" width="4" height="46" rx="2" fill="var(--warning)"/>
   <text x="380" y="366" class="mono ca">Zone-Map + Merge Pruning</text>
-  <text x="380" y="386" class="sub">Skips 95%+ of row groups &amp; wide chunks</text>
+  <text x="380" y="386" class="sub">Skips non-overlapping row groups before fetch</text>
+  <circle cx="642" cy="354" r="3" class="dot-a pulse"/>
 
-  <rect x="698" y="344" width="302" height="58" class="box-hit"/>
-  <text x="710" y="366" class="mono cg">Phase 2: Fetch Wide Bytes for Top-K</text>
-  <text x="710" y="386" class="sub">JOIN USING (id) reads only matched 8 KiB blocks</text>
+  <rect x="698" y="344" width="302" height="58" class="card" rx="6"/>
+  <rect x="698" y="350" width="4" height="46" rx="2" fill="var(--success)"/>
+  <text x="710" y="366" class="mono cg">Phase 2: Fetch Matched 8,120 B Chunks</text>
+  <text x="710" y="386" class="sub">JOIN USING (id) · only matched chunk pages</text>
+  <circle cx="986" cy="354" r="3" class="dot-g pulse"/>
 
-  <path d="M 326 373 L 362 373" class="f-arr" marker-end="url(#f5-g)"/>
-  <path d="M 656 373 L 692 373" class="f-arr" marker-end="url(#f5-g)"/>
+  <path d="M 326 373 H 362" class="ln"/>
+  <path d="M 326 373 H 362" class="flow flow-g s1" marker-end="url(#f5-g)"/>
+  <path d="M 656 373 H 692" class="ln"/>
+  <path d="M 656 373 H 692" class="flow flow-g s2" marker-end="url(#f5-g)"/>
 </svg>

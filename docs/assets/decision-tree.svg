@@ -1,17 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 460" role="img" aria-labelledby="fig2-title fig2-desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 510" role="img" aria-labelledby="fig2-title fig2-desc">
   <title id="fig2-title">FIG 02 — Workload, Schema and Partitioning Decision Tree</title>
-  <desc id="fig2-desc">Visual left-to-right decision flowchart mapping OLTP, DuckLake Analytics, Shared Origin Cache, and Async Queues to their concrete storage and partitioning patterns.</desc>
+  <desc id="fig2-desc">Left-to-right decision flowchart mapping direct SQL, DuckLake analytics, shared origin range caching, and asynchronous jobs to their concrete storage, partitioning, and ack-first outbox patterns.</desc>
   <defs>
-    <marker id="f2-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f2-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
     </marker>
-    <marker id="f2-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f2-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--success)"/>
     </marker>
-    <marker id="f2-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f2-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--warning)"/>
     </marker>
-    <marker id="f2-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <marker id="f2-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--purple)"/>
     </marker>
   </defs>
@@ -19,42 +19,57 @@
     svg {
       color-scheme: light dark;
       --bg: light-dark(#ffffff, #09090b);
-      --hdr: light-dark(#fafafa, #141418);
-      --panel: light-dark(#fafafa, #18181b);
-      --card: light-dark(#ffffff, #1e1e22);
+      --hdr: light-dark(#fafafa, #121215);
+      --panel: light-dark(#fafafa, #141417);
+      --card: light-dark(#ffffff, #18181b);
+      --pill: light-dark(#f4f4f5, #27272a);
       --border: light-dark(#e4e4e7, #303036);
       --fg: light-dark(#262626, #e5e5e5);
       --muted: light-dark(#71717a, #a1a1aa);
-      --blue: light-dark(#0284c7, #38bdf8);
+      --blue: light-dark(#0369a1, #38bdf8);
       --success: light-dark(#008032, #6cc070);
       --warning: light-dark(#a65b00, #f0a030);
-      --purple: light-dark(#7c3aed, #c084fc);
+      --purple: light-dark(#6d28d9, #c084fc);
+      --danger: light-dark(#d32f2f, #f4807b);
     }
     .bg { fill: var(--bg); }
-    .hdr { fill: var(--hdr); stroke: var(--border); stroke-width: 1; }
-    .box { fill: var(--panel); stroke: var(--border); stroke-width: 1.4; rx: 6; }
-    .box-b { fill: var(--card); stroke: var(--blue); stroke-width: 1.6; rx: 6; }
-    .box-g { fill: var(--card); stroke: var(--success); stroke-width: 1.6; rx: 6; }
-    .box-a { fill: var(--card); stroke: var(--warning); stroke-width: 1.6; rx: 6; }
-    .box-p { fill: var(--card); stroke: var(--purple); stroke-width: 1.6; rx: 6; }
+    .hdr { fill: var(--hdr); }
+    .card { fill: var(--card); stroke: var(--border); stroke-width: 1.2; }
     .fig { fill: var(--blue); font: 700 10.5px ui-monospace, Consolas, monospace; letter-spacing: 0.06em; }
     .title { fill: var(--fg); font: 600 14.5px system-ui, -apple-system, sans-serif; }
     .col-t { fill: var(--muted); font: 700 10.5px system-ui, -apple-system, sans-serif; letter-spacing: 0.08em; }
     .h4 { fill: var(--fg); font: 600 12px system-ui, -apple-system, sans-serif; }
-    .sub { fill: var(--muted); font: 400 10.5px system-ui, -apple-system, sans-serif; }
-    .mono { fill: var(--fg); font: 600 10.5px ui-monospace, Consolas, monospace; }
+    .sub { fill: var(--muted); font: 400 10px system-ui, -apple-system, sans-serif; }
+    .mono { fill: var(--fg); font: 600 10px ui-monospace, Consolas, monospace; }
     .cb { fill: var(--blue); }
     .cg { fill: var(--success); }
     .ca { fill: var(--warning); }
     .cp { fill: var(--purple); }
-    .ln-b { stroke: var(--blue); stroke-width: 2; fill: none; }
-    .ln-g { stroke: var(--success); stroke-width: 2; fill: none; }
-    .ln-a { stroke: var(--warning); stroke-width: 2; fill: none; }
-    .ln-p { stroke: var(--purple); stroke-width: 2; fill: none; }
+    .dot-b { fill: var(--blue); }
+    .dot-g { fill: var(--success); }
+    .dot-a { fill: var(--warning); }
+    .dot-p { fill: var(--purple); }
+    .ln { stroke: var(--border); stroke-width: 1.2; fill: none; }
+    .flow { stroke-width: 1.6; fill: none; stroke-dasharray: 5 7; stroke-linecap: round; animation: dash 1.8s linear infinite; }
+    .flow-b { stroke: var(--blue); }
+    .flow-g { stroke: var(--success); }
+    .flow-a { stroke: var(--warning); }
+    .flow-p { stroke: var(--purple); }
+    .s1 { animation-delay: 0s; }
+    .s2 { animation-delay: 0.3s; }
+    .s3 { animation-delay: 0.6s; }
+    .s4 { animation-delay: 0.9s; }
+    .pulse { animation: pulse 2.4s ease-in-out infinite; }
+    @keyframes dash { to { stroke-dashoffset: -24; } }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; }
+    }
   </style>
 
-  <rect width="1040" height="460" class="bg" rx="8"/>
+  <rect width="1040" height="510" class="bg" rx="8"/>
   <rect x="0" y="0" width="1040" height="44" class="hdr" rx="8"/>
+  <line x1="0" y1="44" x2="1040" y2="44" class="ln"/>
   <text x="24" y="27" class="fig">FIG 02</text>
   <text x="80" y="27" class="title">Workload, Schema &amp; Partitioning Decision Tree</text>
 
@@ -62,83 +77,113 @@
   <text x="316" y="68" class="col-t">2. ENGINE &amp; STATE BOUNDARY</text>
   <text x="616" y="68" class="col-t">3. PHYSICAL LAYOUT &amp; PRUNING</text>
 
-  <!-- Branch 1: OLTP -->
-  <rect x="24" y="82" width="244" height="74" class="box"/>
-  <text x="38" y="106" class="h4 cb">1. Point Reads/Writes (&lt;10 ms p99)</text>
-  <text x="38" y="124" class="sub">Strict ACID · Row-level locking</text>
-  <text x="38" y="142" class="mono">PostgreSQL SQL (guides/postgres.md)</text>
+  <!-- Branch 1: direct SQL and fixed partitioning -->
+  <rect x="24" y="82" width="244" height="92" class="card" rx="6"/>
+  <rect x="24" y="88" width="4" height="80" rx="2" fill="var(--blue)"/>
+  <text x="38" y="106" class="h4 cb">1. Point Reads/Writes</text>
+  <text x="38" y="126" class="mono cb">Direct :5432 / :6432 Pooler</text>
+  <text x="38" y="144" class="sub">Strict ACID · Row-level locking</text>
+  <text x="38" y="162" class="sub">PostgreSQL SQL (guides/postgres.md)</text>
+  <circle cx="254" cy="94" r="3" class="dot-b pulse"/>
 
-  <rect x="308" y="82" width="256" height="74" class="box-b"/>
+  <rect x="308" y="82" width="256" height="92" class="card" rx="6"/>
+  <rect x="308" y="88" width="4" height="80" rx="2" fill="var(--blue)"/>
   <text x="322" y="106" class="h4 cb">PostgreSQL 18 Heap &amp; B-Tree</text>
-  <text x="322" y="124" class="sub">Separate hot narrow row from</text>
-  <text x="322" y="142" class="mono">&gt;2 KiB TOAST / pgvs3 blobs</text>
+  <text x="322" y="126" class="sub">Separate hot narrow row from</text>
+  <text x="322" y="144" class="sub">&gt;2 KiB TOAST / pgvs3 blobs</text>
+  <text x="322" y="162" class="mono">row locks · B-tree point GETs</text>
+  <circle cx="550" cy="94" r="3" class="dot-b pulse"/>
 
-  <rect x="608" y="82" width="408" height="74" class="box-b"/>
+  <rect x="608" y="82" width="408" height="92" class="card" rx="6"/>
   <text x="622" y="104" class="h4">Fixed 32–64 Partitions:</text>
-  <text x="622" y="123" class="mono cb">• Entity: PARTITION BY HASH(tenant_id) MODULUS 32</text>
-  <text x="622" y="141" class="mono">• Space: quantile RANGE(hilbert_id); time RANGE to DROP</text>
+  <text x="622" y="123" class="mono cb">• Entity: PARTITION BY HASH (tenant_id)</text>
+  <text x="622" y="141" class="mono">• 32–64 partitions · Space RANGE(hilbert_id)</text>
+  <text x="622" y="159" class="mono">• Time RANGE by month → DROP, no rewrite</text>
 
-  <path d="M 268 119 L 302 119" class="ln-b" marker-end="url(#f2-b)"/>
-  <path d="M 564 119 L 602 119" class="ln-b" marker-end="url(#f2-b)"/>
+  <path d="M 268 128 H 308" class="ln"/>
+  <path d="M 268 128 H 308" class="flow flow-b s1" marker-end="url(#f2-b)"/>
+  <path d="M 564 128 H 608" class="ln"/>
+  <path d="M 564 128 H 608" class="flow flow-b s1" marker-end="url(#f2-b)"/>
 
-  <!-- Branch 2: Analytics & Billion-Row DuckLake -->
-  <rect x="24" y="172" width="244" height="104" class="box"/>
-  <text x="38" y="196" class="h4 cg">2. Analytical Scans (10M–10B Rows)</text>
-  <text x="38" y="214" class="sub">Aggregations · Wide columns</text>
-  <text x="38" y="232" class="sub">2D spatiotemporal · Batch-for-read</text>
-  <text x="38" y="254" class="mono">DuckLake / Parquet (analytics.md)</text>
+  <!-- Branch 2: analytical scans and prunable Parquet -->
+  <rect x="24" y="190" width="244" height="108" class="card" rx="6"/>
+  <rect x="24" y="196" width="4" height="96" rx="2" fill="var(--success)"/>
+  <text x="38" y="214" class="h4 cg">2. Analytical Scans (10M–10B Rows)</text>
+  <text x="38" y="232" class="sub">Aggregations · Wide columns</text>
+  <text x="38" y="250" class="sub">2D spatiotemporal · Batch-for-read</text>
+  <text x="38" y="272" class="mono">DuckLake / Parquet (analytics.md)</text>
+  <circle cx="254" cy="202" r="3" class="dot-g pulse"/>
 
-  <rect x="308" y="172" width="256" height="104" class="box-g"/>
-  <text x="322" y="196" class="h4 cg">DuckDB 2.0 + DuckLake on pgvs3</text>
-  <text x="322" y="214" class="sub">PG catalog + s3b_/s3c_ Parquet</text>
-  <text x="322" y="232" class="mono">target_file_size = '256MB'</text>
-  <text x="322" y="254" class="mono cg">ZSTD 9–19 + merge / rewrite</text>
+  <rect x="308" y="190" width="256" height="108" class="card" rx="6"/>
+  <rect x="308" y="196" width="4" height="96" rx="2" fill="var(--success)"/>
+  <text x="322" y="214" class="h4 cg">DuckDB 2.0 + DuckLake on pgvs3</text>
+  <text x="322" y="232" class="sub">PG catalog + s3b_/s3c_ Parquet</text>
+  <text x="322" y="252" class="mono">target_file_size = '256MB'</text>
+  <text x="322" y="272" class="mono cg">ZSTD 9–19 + merge / rewrite</text>
+  <circle cx="550" cy="202" r="3" class="dot-g pulse"/>
 
-  <rect x="608" y="172" width="408" height="104" class="box-g"/>
-  <text x="622" y="194" class="h4">Prunable Parquet Layout:</text>
-  <text x="622" y="213" class="mono cg">• Tenant/ID: bucket(32,id) + SORTED BY(ts,id)</text>
-  <text x="622" y="231" class="mono cg">• Skewed 2D: SORTED BY(hilbert_id,ts), no PARTITION</text>
-  <text x="622" y="249" class="mono">• Wide: 32MB row groups + skip_stats + late JOIN</text>
-  <text x="622" y="267" class="sub">• Heavy joins: pre-join rollup or sealed ObjFS</text>
+  <rect x="608" y="190" width="408" height="108" class="card" rx="6"/>
+  <text x="622" y="212" class="h4">Prunable Parquet Layout:</text>
+  <text x="622" y="231" class="mono cg">• Tenant/ID: bucket(32,id) + SORTED BY(ts,id)</text>
+  <text x="622" y="249" class="mono cg">• Skewed 2D: SORTED BY(hilbert_id,ts), no PARTITION</text>
+  <text x="622" y="267" class="mono">• Wide: 32MB row groups + skip_stats + late JOIN</text>
+  <text x="622" y="285" class="sub">• Heavy joins: pre-join rollup or sealed ObjFS</text>
 
-  <path d="M 268 224 L 302 224" class="ln-g" marker-end="url(#f2-g)"/>
-  <path d="M 564 224 L 602 224" class="ln-g" marker-end="url(#f2-g)"/>
+  <path d="M 268 244 H 308" class="ln"/>
+  <path d="M 268 244 H 308" class="flow flow-g s2" marker-end="url(#f2-g)"/>
+  <path d="M 564 244 H 608" class="ln"/>
+  <path d="M 564 244 H 608" class="flow flow-g s2" marker-end="url(#f2-g)"/>
 
-  <!-- Branch 3: Shared Origin Cache & Staging -->
-  <rect x="24" y="292" width="244" height="68" class="box"/>
-  <text x="38" y="316" class="h4 ca">3. Shared S3/HTTP Acceleration</text>
-  <text x="38" y="334" class="sub">Multi-worker hits · Fast large PUT</text>
-  <text x="38" y="350" class="mono">Cache &amp; Staging (guides/cache.md)</text>
+  <!-- Branch 3: shared origin cache, range chunks and ack-first outbox -->
+  <rect x="24" y="314" width="244" height="88" class="card" rx="6"/>
+  <rect x="24" y="320" width="4" height="76" rx="2" fill="var(--warning)"/>
+  <text x="38" y="338" class="h4 ca">3. Shared S3/HTTP Acceleration</text>
+  <text x="38" y="356" class="sub">Multi-worker hits · Fast large PUT</text>
+  <text x="38" y="378" class="mono">Cache &amp; Staging (guides/cache.md)</text>
+  <circle cx="254" cy="326" r="3" class="dot-a pulse"/>
 
-  <rect x="308" y="292" width="256" height="68" class="box-a"/>
-  <text x="322" y="316" class="h4 ca">Origin-Backed s3c_ &amp; s3w_</text>
-  <text x="322" y="334" class="sub">s3c_ read fills (TTL revalidated)</text>
-  <text x="322" y="350" class="mono">s3w_ durable pending writes</text>
+  <rect x="308" y="314" width="256" height="88" class="card" rx="6"/>
+  <rect x="308" y="320" width="4" height="76" rx="2" fill="var(--warning)"/>
+  <text x="322" y="338" class="h4 ca">Origin-Backed s3c_ &amp; s3w_</text>
+  <text x="322" y="356" class="sub">s3c_ range fills (TTL revalidated)</text>
+  <text x="322" y="374" class="sub">s3w_ direct-stream outbox</text>
+  <text x="322" y="392" class="mono">--cache-max-bytes bounds both</text>
+  <circle cx="550" cy="326" r="3" class="dot-a pulse"/>
 
-  <rect x="608" y="292" width="408" height="68" class="box-a"/>
-  <text x="622" y="314" class="h4">Coalesced Fills &amp; Durable Outbox:</text>
-  <text x="622" y="332" class="mono ca">• 1MiB range cache for Parquet footers/columns</text>
-  <text x="622" y="350" class="mono">• &gt;8MiB PUT → s3w_ + pending_uploads before 200</text>
+  <rect x="608" y="314" width="408" height="88" class="card" rx="6"/>
+  <text x="622" y="336" class="h4">Range Chunks &amp; Ack-First Outbox:</text>
+  <text x="622" y="355" class="mono ca">• 1 MiB–8 MiB range chunks (up to 64 MiB spans)</text>
+  <text x="622" y="373" class="mono">• --cache-max-bytes evicts s3c_ + committed s3w_</text>
+  <text x="622" y="391" class="mono">• &gt;8 MiB PUT → s3w_ outbox streams PG → S3</text>
 
-  <path d="M 268 326 L 302 326" class="ln-a" marker-end="url(#f2-a)"/>
-  <path d="M 564 326 L 602 326" class="ln-a" marker-end="url(#f2-a)"/>
+  <path d="M 268 358 H 308" class="ln"/>
+  <path d="M 268 358 H 308" class="flow flow-a s3" marker-end="url(#f2-a)"/>
+  <path d="M 564 358 H 608" class="ln"/>
+  <path d="M 564 358 H 608" class="flow flow-a s3" marker-end="url(#f2-a)"/>
 
-  <!-- Branch 4: Jobs, Outboxes & Streams -->
-  <rect x="24" y="376" width="244" height="68" class="box"/>
-  <text x="38" y="400" class="h4 cp">4. Background Work &amp; Fan-Out</text>
-  <text x="38" y="418" class="sub">Competing workers · Event replay</text>
-  <text x="38" y="434" class="mono">OJS &amp; Streams (guides/jobs.md)</text>
+  <!-- Branch 4: jobs, outboxes and streams -->
+  <rect x="24" y="418" width="244" height="80" class="card" rx="6"/>
+  <rect x="24" y="424" width="4" height="68" rx="2" fill="var(--purple)"/>
+  <text x="38" y="442" class="h4 cp">4. Background Work &amp; Fan-Out</text>
+  <text x="38" y="460" class="sub">Competing workers · Event replay</text>
+  <text x="38" y="482" class="mono">OJS &amp; Streams (guides/jobs.md)</text>
+  <circle cx="254" cy="430" r="3" class="dot-p pulse"/>
 
-  <rect x="308" y="376" width="256" height="68" class="box-p"/>
-  <text x="322" y="400" class="h4 cp">App Outbox + s3q_&lt;name&gt;</text>
-  <text x="322" y="418" class="sub">SQL &amp; HTTP are separate commits</text>
-  <text x="322" y="434" class="mono">OJS Jobs + PgQue 3-Seg Streams</text>
+  <rect x="308" y="418" width="256" height="80" class="card" rx="6"/>
+  <rect x="308" y="424" width="4" height="68" rx="2" fill="var(--purple)"/>
+  <text x="322" y="442" class="h4 cp">App Outbox + s3q_&lt;name&gt;</text>
+  <text x="322" y="460" class="sub">SQL &amp; HTTP are separate commits</text>
+  <text x="322" y="482" class="mono">OJS Jobs + PgQue 3-Seg Streams</text>
+  <circle cx="550" cy="430" r="3" class="dot-p pulse"/>
 
-  <rect x="608" y="376" width="408" height="68" class="box-p"/>
-  <text x="622" y="398" class="h4">Idempotent Producer &amp; Worker:</text>
-  <text x="622" y="416" class="mono cp">• Outbox + SQL → POST /jobs (409 → GET verify)</text>
-  <text x="622" y="434" class="mono">• SQL effect → receipt → POST /workers/ack</text>
+  <rect x="608" y="418" width="408" height="80" class="card" rx="6"/>
+  <text x="622" y="440" class="h4">Idempotent Producer &amp; Worker:</text>
+  <text x="622" y="459" class="mono cp">• Outbox + SQL → POST /jobs (409 → GET verify)</text>
+  <text x="622" y="477" class="mono">• SQL effect → receipt → POST /workers/ack</text>
+  <text x="622" y="494" class="sub">• Lease token fences stale workers</text>
 
-  <path d="M 268 410 L 302 410" class="ln-p" marker-end="url(#f2-p)"/>
-  <path d="M 564 410 L 602 410" class="ln-p" marker-end="url(#f2-p)"/>
+  <path d="M 268 458 H 308" class="ln"/>
+  <path d="M 268 458 H 308" class="flow flow-p s4" marker-end="url(#f2-p)"/>
+  <path d="M 564 458 H 608" class="ln"/>
+  <path d="M 564 458 H 608" class="flow flow-p s4" marker-end="url(#f2-p)"/>
 </svg>
