@@ -43,6 +43,9 @@ func (s *Store) cacheTombstone(ctx context.Context, ref ObjectRef, expiresAt tim
 		Publication: Publication{kind: publicationTombstone, origin: DeletedCacheVersion(NewDeletedCacheToken()).String()},
 		lock:        lock,
 	})
+	if err == nil {
+		s.invalidateChunkKey(ref.NS.Name, ref.Key)
+	}
 	return err
 }
 
@@ -224,6 +227,9 @@ func (c Cache) Set(ctx context.Context, key string, val []byte, opts CacheSetOpt
 		ExpiresAt:    opts.ExpiresAt,
 		KeepTTL:      opts.KeepTTL,
 	})
+	if err == nil {
+		c.s.invalidateChunkKey(c.name, key)
+	}
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -321,6 +327,11 @@ func (c Cache) ReadManyWithTouch(ctx context.Context, keys []string, retention t
 	if c.err != nil {
 		return nil, c.err
 	}
+	if c.s.blocks != nil {
+		if cached, ok := c.readCachedChunks(keys, retention); ok {
+			return cached, nil
+		}
+	}
 	endRead := c.s.beginRead()
 	defer endRead()
 	rows, err := c.s.chunkPool.Query(ctx, `SELECT k.ord, o.size, o.inline_data, o.file_id, o.tableoid, o.expires_at
@@ -338,6 +349,13 @@ func (c Cache) ReadManyWithTouch(ctx context.Context, keys []string, retention t
 	var touch []string
 	var files []*readManyFile
 	byID := map[int64]*readManyFile{}
+	var descs []chunkDesc
+	var descSet, touched []bool
+	if c.s.blocks != nil {
+		descs = make([]chunkDesc, len(keys))
+		descSet = make([]bool, len(keys))
+		touched = make([]bool, len(keys))
+	}
 	for rows.Next() {
 		var ord, size int64
 		var inline []byte
@@ -354,6 +372,24 @@ func (c Cache) ReadManyWithTouch(ctx context.Context, keys []string, retention t
 		}
 		if retention > 0 && expiresAt != nil && time.Until(*expiresAt) < retention/2 {
 			touch = append(touch, keys[idx])
+			if touched != nil {
+				touched[idx] = true
+			}
+		}
+		if descSet != nil {
+			d := chunkDesc{size: size}
+			switch {
+			case inline != nil:
+				d.inline = inline
+			case fileID != nil:
+				d.table, d.fileID = table, *fileID
+			}
+			if retention > 0 && expiresAt != nil {
+				d.touchAt = expiresAt.Add(-retention / 2).UnixNano()
+			} else {
+				d.touchAt = math.MaxInt64
+			}
+			descs[idx], descSet[idx] = d, true
 		}
 		switch {
 		case inline != nil:
@@ -382,9 +418,16 @@ func (c Cache) ReadManyWithTouch(ctx context.Context, keys []string, retention t
 		return nil, err
 	}
 	if len(touch) > 0 {
-		_, _ = c.s.pool.Exec(ctx, `UPDATE `+c.sc+`.objects
+		if _, err := c.s.pool.Exec(ctx, `UPDATE `+c.sc+`.objects
 			SET expires_at = now() + make_interval(secs => $2)
-			WHERE key = ANY($1) AND expires_at IS NOT NULL`, touch, retention.Seconds())
+			WHERE key = ANY($1) AND expires_at IS NOT NULL`, touch, retention.Seconds()); err == nil && touched != nil {
+			now := time.Now()
+			for idx, hit := range touched {
+				if hit {
+					descs[idx].touchAt = now.Add(retention / 2).UnixNano()
+				}
+			}
+		}
 	}
 	if err := c.fetchFiles(ctx, files); err != nil {
 		return nil, err
@@ -398,7 +441,52 @@ func (c Cache) ReadManyWithTouch(ctx context.Context, keys []string, retention t
 			out[idx] = f.buf
 		}
 	}
+	for idx, ok := range descSet {
+		if !ok {
+			continue
+		}
+		d := descs[idx]
+		if d.inline == nil && d.size > 0 {
+			if _, hit := c.s.cachedFile(d.table, d.fileID, d.size); !hit {
+				continue
+			}
+		}
+		c.s.blocks.setChunkDesc(c.name, keys[idx], d)
+	}
 	return out, nil
+}
+
+// readCachedChunks serves range chunks whose descriptors and bytes both remain
+// in the gateway cache, without a PostgreSQL metadata query. A chunk still
+// within its retention touch window is revalidated through the normal path.
+func (c Cache) readCachedChunks(keys []string, retention time.Duration) ([][]byte, bool) {
+	now := time.Now().UnixNano()
+	out := make([][]byte, len(keys))
+	for i, key := range keys {
+		d, ok := c.s.blocks.lookupChunkDesc(c.name, key)
+		if !ok || (retention > 0 && now >= d.touchAt) {
+			return nil, false
+		}
+		switch {
+		case d.inline != nil:
+			raw, err := decompressBlock(nil, d.inline, int(d.size))
+			if err != nil {
+				return nil, false
+			}
+			out[i] = raw
+		case d.size == 0:
+			out[i] = []byte{}
+		case d.table != 0 && d.fileID != 0:
+			data, ok := c.s.cachedFile(d.table, d.fileID, d.size)
+			if !ok {
+				return nil, false
+			}
+			out[i] = data
+		default:
+			return nil, false
+		}
+	}
+	return out, true
 }
 
 // fetchFiles reads the chunk rows of files, split across up to readWorkers
@@ -454,11 +542,21 @@ func (c Cache) fetchFiles(ctx context.Context, files []*readManyFile) error {
 }
 
 func (c Cache) Del(ctx context.Context, keys []string) (int64, error) {
-	return c.s.DeleteMany(ctx, ns.CacheRef(c.name), keys)
+	deleted, err := c.s.DeleteMany(ctx, ns.CacheRef(c.name), keys)
+	if err == nil {
+		for _, key := range keys {
+			c.s.invalidateChunkKey(c.name, key)
+		}
+	}
+	return deleted, err
 }
 
 func (c Cache) DelExpected(ctx context.Context, key, originETag string) (int64, error) {
-	return c.s.DeleteExpected(ctx, ObjectRef{NS: ns.CacheRef(c.name), Key: key}, originETag)
+	deleted, err := c.s.DeleteExpected(ctx, ObjectRef{NS: ns.CacheRef(c.name), Key: key}, originETag)
+	if err == nil {
+		c.s.invalidateChunkKey(c.name, key)
+	}
+	return deleted, err
 }
 
 func (s *Store) DeleteExpected(ctx context.Context, ref ObjectRef, originETag string) (int64, error) {
@@ -656,6 +754,9 @@ func (c Cache) Flush(ctx context.Context) error {
 		}
 		return struct{}{}, nil
 	})
+	if err == nil {
+		c.s.invalidateChunkNS(c.name)
+	}
 	return err
 }
 
@@ -967,6 +1068,15 @@ func (l *LockedObject) CompleteUploadPending(ctx context.Context, uploadID strin
 
 func (l *LockedObject) Tombstone(ctx context.Context, expiresAt time.Time) error {
 	return l.store.cacheTombstone(ctx, l.ref, expiresAt, l)
+}
+
+// Delete removes the locked object without re-acquiring its advisory lock.
+func (l *LockedObject) Delete(ctx context.Context) (bool, error) {
+	n, err := l.store.deleteMany(ctx, l.ref.NS, []string{l.ref.Key}, true)
+	if err == nil && n > 0 {
+		l.store.invalidateChunkKey(l.ref.NS.Name, l.ref.Key)
+	}
+	return n > 0, err
 }
 
 func (s *Store) LockCacheKey(ctx context.Context, kind ns.Kind, namespace, key string) (*LockedObject, error) {

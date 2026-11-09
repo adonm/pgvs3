@@ -46,6 +46,27 @@ func TestBlockCacheResistsOneScan(t *testing.T) {
 	}
 }
 
+func TestChunkDescInvalidation(t *testing.T) {
+	c := newBlockCache(blockShards * blockBytes)
+	c.setChunkDesc("ns", "key", chunkDesc{size: 10})
+	c.setChunkDesc("ns", "other", chunkDesc{size: 10})
+	c.setChunkDesc("ns2", "key", chunkDesc{size: 10})
+	if d, ok := c.lookupChunkDesc("ns", "key"); !ok || d.size != 10 {
+		t.Fatalf("descriptor = %+v %t", d, ok)
+	}
+	c.invalidateChunkKey("ns", "key")
+	if _, ok := c.lookupChunkDesc("ns", "key"); ok {
+		t.Fatal("invalidateChunkKey left the descriptor")
+	}
+	c.invalidateChunkNS("ns")
+	if _, ok := c.lookupChunkDesc("ns", "other"); ok {
+		t.Fatal("invalidateChunkNS left another key")
+	}
+	if _, ok := c.lookupChunkDesc("ns2", "key"); !ok {
+		t.Fatal("invalidateChunkNS removed another namespace")
+	}
+}
+
 func TestBlockCacheDisabled(t *testing.T) {
 	var c *blockCache
 	if newBlockCache(0) != nil {

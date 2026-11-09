@@ -30,7 +30,97 @@ type blockKey struct {
 type blockCache struct {
 	shards [blockShards]blockShard
 
+	// desc caches the immutable metadata of range-chunk objects so a warm
+	// ReadManyWithTouch can skip its s3c_.objects query entirely.
+	desc [blockShards]chunkDescShard
+
 	hits, hitBytes, fills, evictions atomic.Int64
+}
+
+const chunkDescPerShard = 4096
+
+type chunkDescKey struct {
+	ns, key string
+}
+
+type chunkDesc struct {
+	table   uint32
+	fileID  int64
+	size    int64
+	inline  []byte
+	touchAt int64
+}
+
+type chunkDescShard struct {
+	mu sync.Mutex
+	m  map[chunkDescKey]chunkDesc
+}
+
+func (c *blockCache) descShard(ns, key string) *chunkDescShard {
+	h := uint64(len(ns))*0x9e3779b97f4a7c15 ^ hashString(key)
+	return &c.desc[(h>>59)%blockShards]
+}
+
+func hashString(s string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
+}
+
+func (c *blockCache) lookupChunkDesc(ns, key string) (chunkDesc, bool) {
+	sh := c.descShard(ns, key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	d, ok := sh.m[chunkDescKey{ns: ns, key: key}]
+	return d, ok
+}
+
+func (c *blockCache) setChunkDesc(ns, key string, d chunkDesc) {
+	sh := c.descShard(ns, key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.m == nil {
+		sh.m = make(map[chunkDescKey]chunkDesc)
+	}
+	if len(sh.m) >= chunkDescPerShard {
+		clear(sh.m)
+	}
+	sh.m[chunkDescKey{ns: ns, key: key}] = d
+}
+
+func (c *blockCache) invalidateChunkKey(ns, key string) {
+	sh := c.descShard(ns, key)
+	sh.mu.Lock()
+	delete(sh.m, chunkDescKey{ns: ns, key: key})
+	sh.mu.Unlock()
+}
+
+func (c *blockCache) invalidateChunkNS(ns string) {
+	for i := range c.desc {
+		sh := &c.desc[i]
+		sh.mu.Lock()
+		for k := range sh.m {
+			if k.ns == ns {
+				delete(sh.m, k)
+			}
+		}
+		sh.mu.Unlock()
+	}
+}
+
+func (s *Store) invalidateChunkKey(nsName, key string) {
+	if s.blocks != nil {
+		s.blocks.invalidateChunkKey(nsName, key)
+	}
+}
+
+func (s *Store) invalidateChunkNS(nsName string) {
+	if s.blocks != nil {
+		s.blocks.invalidateChunkNS(nsName)
+	}
 }
 
 type blockShard struct {

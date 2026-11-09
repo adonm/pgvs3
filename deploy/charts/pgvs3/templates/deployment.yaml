@@ -4,6 +4,11 @@ metadata:
   name: pgvs3
 spec:
   replicas: {{ .Values.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels: { app: pgvs3 }
   template:
@@ -50,8 +55,20 @@ spec:
                 secretKeyRef: { name: {{ .Values.urlSecretName | quote }}, key: url }
             - { name: PGVS3_POOL_MAX, value: {{ .Values.poolMax | quote }} }
             - { name: PGVS3_SPOOL_MAX_BYTES, value: {{ .Values.spoolMaxBytes | int64 | quote }} }
+            - { name: PGVS3_S3_CONCURRENCY, value: {{ .Values.s3Concurrency | quote }} }
+            - { name: PGVS3_FILL_CONCURRENCY, value: {{ .Values.fillConcurrency | quote }} }
+            - { name: PGVS3_RANGE_CACHE_CHUNK, value: {{ .Values.rangeCacheChunk | int64 | quote }} }
+            - { name: PGVS3_CACHE_MAX_BYTES, value: {{ .Values.cacheMaxBytes | int64 | quote }} }
+            - { name: PGVS3_CACHE_WRITE_BACK, value: {{ .Values.cacheWriteBack | quote }} }
             - { name: PGVS3_READ_CACHE_BYTES, value: {{ .Values.readCacheBytes | int64 | quote }} }
             - { name: GOMEMLIMIT, value: {{ .Values.gomemlimit | quote }} }
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - { containerPort: 8014, name: s3 }
           volumeMounts:

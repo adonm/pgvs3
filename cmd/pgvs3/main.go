@@ -289,7 +289,11 @@ func serve(args []string) int {
 	if err != nil {
 		return 1
 	}
-	origins := objcache.NewRegistry(st, log, runtime, objcache.TierOptions{ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack})
+	origins := objcache.NewRegistry(st, log, runtime, objcache.TierOptions{
+		ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack,
+		TTL: cfg.cacheTTL, Retention: cfg.cacheRetention, MaxFills: cfg.fillConcurrency,
+		RangeChunk: cfg.rangeCacheChunk, MaxBytes: cfg.cacheMaxBytes,
+	})
 	origins.SetDefault(origin)
 	origins.Start(ctx)
 	g := newGateway(ctx, st, cfg, origins, log)
@@ -482,7 +486,7 @@ func stat(args []string) int {
 	var kind, name *string
 	var asJSON *bool
 	return withStore("stat", args, 30*time.Second, false, func(fs *flag.FlagSet) {
-		kind = fs.String("kind", "", "bucket, cache or queue (default: all)")
+		kind = fs.String("kind", "", "filter by namespace kind (bucket, cache, writeback or queue)")
 		name = fs.String("name", "", "namespace name")
 		asJSON = fs.Bool("json", false, "print JSON")
 	}, func(ctx context.Context, st *store.Store, _ []string) int {
@@ -504,9 +508,16 @@ func stat(args []string) int {
 			_ = enc.Encode(s)
 			return 0
 		}
-		fmt.Printf("namespaces=%d buckets=%d objects=%d chunks=%d events=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s\n",
+		fmt.Printf("namespaces=%d buckets=%d objects=%d chunks=%d events=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s",
 			s.Namespaces, s.Buckets, s.Objects, s.Chunks, s.Events, s.LogicalBytes>>20,
 			s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
+		if s.OriginMetadata > 0 {
+			fmt.Printf(" origin_metadata=%d", s.OriginMetadata)
+		}
+		if s.MaxBytes > 0 {
+			fmt.Printf(" max_bytes=%d", s.MaxBytes)
+		}
+		fmt.Println()
 		return 0
 	})
 }

@@ -41,11 +41,29 @@ func (s Spec) Scope() string {
 }
 
 func NewFromSpec(log *slog.Logger, st *store.Store, runtime *Runtime, spec Spec, opts TierOptions) (*Tier, error) {
+	explicit := spec
 	spec, normalized, err := normalizeSpec(spec.Bucket, spec)
 	if err != nil {
 		return nil, err
 	}
 	normalized.ReadOnly, normalized.WriteBack = opts.ReadOnly, opts.WriteBack
+	// Serve flags are cluster defaults for persisted origins: apply them only
+	// where the persisted spec left the field unset.
+	if explicit.TTL == "" && opts.TTL > 0 {
+		normalized.TTL = opts.TTL
+	}
+	if explicit.Retention == "" && opts.Retention > 0 {
+		normalized.Retention = opts.Retention
+	}
+	if explicit.MaxFills == 0 && opts.MaxFills > 0 {
+		normalized.MaxFills = opts.MaxFills
+	}
+	if explicit.RangeChunk == 0 && opts.RangeChunk > 0 {
+		normalized.RangeChunk = min(max(opts.RangeChunk, 64<<10), maxRangeChunk)
+	}
+	if explicit.MaxBytes == 0 && opts.MaxBytes > 0 {
+		normalized.MaxBytes = opts.MaxBytes
+	}
 	return New(log, []byte(spec.Config), st, runtime, normalized)
 }
 

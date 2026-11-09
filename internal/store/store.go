@@ -70,11 +70,12 @@ type Store struct {
 	snapshotReads      atomic.Int64
 	reapPinnedSkips    atomic.Int64
 
-	reapedRows      atomic.Int64
-	reapedFiles     atomic.Int64
-	expiredObjects  atomic.Int64
-	maintenanceRuns atomic.Int64
-	layoutChecked   atomic.Int64
+	reapedRows          atomic.Int64
+	reapedFiles         atomic.Int64
+	expiredObjects      atomic.Int64
+	cacheEvictedObjects atomic.Int64
+	maintenanceRuns     atomic.Int64
+	layoutChecked       atomic.Int64
 }
 
 type OpenOptions struct {
@@ -461,6 +462,7 @@ func (s *Store) WriteMetrics(w io.Writer) {
 	fmt.Fprintf(w, "pgvs3_reaped_rows_total %d\n", s.reapedRows.Load())
 	fmt.Fprintf(w, "pgvs3_reaped_files_total %d\n", s.reapedFiles.Load())
 	fmt.Fprintf(w, "pgvs3_expired_objects_total %d\n", s.expiredObjects.Load())
+	fmt.Fprintf(w, "pgvs3_cache_evicted_objects_total %d\n", s.cacheEvictedObjects.Load())
 	fmt.Fprintf(w, "pgvs3_maintenance_runs_total %d\n", s.maintenanceRuns.Load())
 	fmt.Fprintf(w, "pgvs3_read_pinned_total %d\n", s.pinnedReads.Load())
 	fmt.Fprintf(w, "pgvs3_read_snapshot_total %d\n", s.snapshotReads.Load())
@@ -501,6 +503,9 @@ func (s *Store) ReapedRows() int64 { return s.reapedRows.Load() }
 func (s *Store) ReapedFiles() int64 { return s.reapedFiles.Load() }
 
 func (s *Store) ExpiredObjects() int64 { return s.expiredObjects.Load() }
+
+// CacheEvictedObjects counts objects removed to stay within a cache budget.
+func (s *Store) CacheEvictedObjects() int64 { return s.cacheEvictedObjects.Load() }
 
 // SetCacheMaxBytes registers a byte budget for cache namespace name.
 // Maintenance evicts the oldest cached objects once the namespace exceeds it.
@@ -872,6 +877,9 @@ func (s *Store) DropNamespace(ctx context.Context, kind ns.Kind, name string, fo
 	switch outcome {
 	case "deleted":
 		s.forget(ref)
+		if kind == ns.Cache || kind == ns.WriteBack {
+			s.invalidateChunkNS(name)
+		}
 		return BucketDeleted, nil
 	case "not_empty":
 		return BucketNotEmpty, nil
@@ -1298,16 +1306,18 @@ func checkChunksLayout(ctx context.Context, conn *pgxpool.Conn, schema string) e
 }
 
 type Stats struct {
-	Buckets       int64          `json:"buckets"`
-	Namespaces    int64          `json:"namespaces"`
-	Objects       int64          `json:"objects"`
-	Chunks        int64          `json:"chunks"`
-	Events        int64          `json:"events"`
-	LogicalBytes  int64          `json:"logical_bytes"`
-	PhysicalBytes int64          `json:"physical_bytes"`
-	DatabaseBytes int64          `json:"database_bytes"`
-	GarbageFiles  int64          `json:"garbage_files"`
-	OldestGarbage *time.Duration `json:"oldest_garbage,omitempty"`
+	Buckets        int64          `json:"buckets"`
+	Namespaces     int64          `json:"namespaces"`
+	Objects        int64          `json:"objects"`
+	Chunks         int64          `json:"chunks"`
+	Events         int64          `json:"events"`
+	LogicalBytes   int64          `json:"logical_bytes"`
+	PhysicalBytes  int64          `json:"physical_bytes"`
+	DatabaseBytes  int64          `json:"database_bytes"`
+	GarbageFiles   int64          `json:"garbage_files"`
+	MaxBytes       int64          `json:"max_bytes,omitempty"`
+	OriginMetadata int64          `json:"origin_metadata,omitempty"`
+	OldestGarbage  *time.Duration `json:"oldest_garbage,omitempty"`
 }
 
 func (s *Store) Stat(ctx context.Context) (Stats, error) { return s.StatNamespace(ctx, "", "") }
@@ -1337,6 +1347,26 @@ func (s *Store) StatNamespace(ctx context.Context, kind ns.Kind, name string) (S
 		st.GarbageFiles += u.garbage
 		if n.Kind == ns.Bucket {
 			st.Buckets++
+		}
+		if n.Kind == ns.Cache || n.Kind == ns.WriteBack {
+			budget := n.maxBytes
+			if budget == 0 {
+				if v, ok := s.cacheMaxBytes.Load(n.Name); ok {
+					budget, _ = v.(int64)
+				}
+			}
+			st.MaxBytes += budget
+		}
+		if n.Kind == ns.Cache {
+			var meta int64
+			err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+quoteIdent(n.Schema)+`.origin_metadata`).Scan(&meta)
+			if missingNamespace(ctx, s.pool, quoteIdent(n.Schema), err) {
+				continue
+			}
+			if err != nil {
+				return st, err
+			}
+			st.OriginMetadata += meta
 		}
 		if u.oldest.Valid && (!hasOldest || u.oldest.Float64 > maxOldest) {
 			maxOldest = u.oldest.Float64
@@ -1586,11 +1616,12 @@ func (s *Store) expireNamespace(ctx context.Context, conn *pgxpool.Conn, schema 
 		return total, nil
 	}
 	for range rounds {
-		evicted, err := s.evictCacheOverBudget(ctx, conn, schema, maxBytes, ExpireBatch)
+		evicted, err := s.evictCacheOverBudget(ctx, conn, schema, n.Name, maxBytes, ExpireBatch)
 		if err != nil {
 			return total, err
 		}
 		s.expiredObjects.Add(int64(evicted))
+		s.cacheEvictedObjects.Add(int64(evicted))
 		total += evicted
 		if evicted < ExpireBatch {
 			break
@@ -1603,7 +1634,7 @@ func (s *Store) expireNamespace(ctx context.Context, conn *pgxpool.Conn, schema 
 // namespace is within maxBytes. It locks candidates with SKIP LOCKED so
 // concurrent maintenance or readers are not blocked, and queues their files
 // for the reaper in the same transaction.
-func (s *Store) evictCacheOverBudget(ctx context.Context, conn *pgxpool.Conn, schema string, maxBytes int64, limit int) (int, error) {
+func (s *Store) evictCacheOverBudget(ctx context.Context, conn *pgxpool.Conn, schema, namespace string, maxBytes int64, limit int) (int, error) {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -1671,6 +1702,9 @@ func (s *Store) evictCacheOverBudget(ctx context.Context, conn *pgxpool.Conn, sc
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
+	}
+	if evicted > 0 {
+		s.invalidateChunkNS(namespace)
 	}
 	return evicted, nil
 }

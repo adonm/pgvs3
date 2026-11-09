@@ -1452,6 +1452,52 @@ func TestSub8MiBRangeCaching(t *testing.T) {
 	}
 }
 
+func TestLargeWriteThroughSkipsWriteBackCopy(t *testing.T) {
+	ctx := testCtx
+	f := newFixture(t, TierOptions{TTL: time.Hour, RangeChunk: 1 << 20})
+	data := bytes.Repeat([]byte("0123456789abcdef"), (9<<20)/16)
+	ck := f.tier.key("bkt", "large.bin")
+	stale := []byte("stale cached body")
+	_, err := testStore.PutInline(ctx, f.tier.cacheRef(ck), stale, store.WriteOptions{ContentType: "application/octet-stream"})
+	testutil.Must(t, err)
+
+	if _, err := f.tier.UploadWithOptions(ctx, "bkt", "large.bin", bytes.NewReader(data), UploadOptions{ContentType: "application/octet-stream"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(f.dir, "bkt", "large.bin"))
+	testutil.Must(t, err)
+	if !bytes.Equal(got, data) {
+		t.Fatalf("origin body = %d bytes, want %d", len(got), len(data))
+	}
+
+	if _, err := testStore.Meta(ctx, f.tier.cacheRef(ck)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stale cache entry survived: %v", err)
+	}
+	info, err := testStore.Cache(f.tier.namespace).OriginMetadata(ctx, ck, time.Hour)
+	testutil.Must(t, err)
+	if info == nil || info.Size != int64(len(data)) {
+		t.Fatalf("warm range metadata = %+v", info)
+	}
+	schema, err := ns.WriteBack.Schema(f.tier.namespace)
+	testutil.Must(t, err)
+	var objects, chunks int64
+	testutil.Must(t, testStore.Pool().QueryRow(ctx, `SELECT count(*) FROM "`+schema+`".objects`).Scan(&objects))
+	testutil.Must(t, testStore.Pool().QueryRow(ctx, `SELECT count(*) FROM "`+schema+`".chunks`).Scan(&chunks))
+	if objects != 0 || chunks != 0 {
+		t.Fatalf("large write-through kept a write-back copy: objects=%d chunks=%d", objects, chunks)
+	}
+	if n := f.pending(t, "large.bin"); n != 0 {
+		t.Fatalf("%d pending origin uploads were queued", n)
+	}
+	obj, err := f.tier.Open(ctx, "bkt", "large.bin", store.WholeObjectRange())
+	if err != nil {
+		t.Fatalf("read after large write-through: %v", err)
+	}
+	if got := readObject(t, obj); got != string(data) {
+		t.Fatalf("read after large write-through returned %d bytes", len(got))
+	}
+}
+
 type blockingHeadOrigin struct {
 	*rangeCountingOrigin
 	started chan struct{}

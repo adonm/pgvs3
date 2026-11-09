@@ -12,6 +12,18 @@ gomemlimit: "3GiB"
 poolMax: 64
 # Leave 2 GiB between the spool payload budget and the emptyDir limit.
 spoolMaxBytes: 8589934592
+# Active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown.
+s3Concurrency: 32
+# Process-wide concurrent origin fills and pending-upload workers.
+fillConcurrency: 8
+# Cache aligned ranges of large objects at this byte size (0 disables).
+rangeCacheChunk: 1048576
+# Evict oldest cached objects when a cache namespace exceeds this byte budget
+# (0 disables).
+cacheMaxBytes: 0
+# Acknowledge large unconditional cache writes after the logged write-back
+# commit; the origin upload follows. Conditional writes stay synchronous.
+cacheWriteBack: true
 # Gateway-local memory for hot immutable chunk blocks (0 disables). Count it
 # inside gomemlimit; PostgreSQL stays the shared cache across replicas.
 readCacheBytes: 0
@@ -28,6 +40,9 @@ terminationGracePeriodSeconds: 60
 automountServiceAccountToken: false
 podAnnotations: {}
 podLabels: {}
+# Extra environment variables and envFrom sources for the gateway container.
+extraEnv: []
+extraEnvFrom: []
 podSecurityContext:
   runAsNonRoot: true
   # distroless/static:nonroot runs as 65532; fsGroup makes the /tmp emptyDir

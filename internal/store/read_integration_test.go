@@ -447,9 +447,9 @@ func TestReadCacheServesFilesLargerThanAShard(t *testing.T) {
 	if !bytes.Equal(got[0], data) {
 		t.Fatalf("cached ReadMany got %d bytes, mismatch", len(got[0]))
 	}
-	// The cached pass still queries metadata once; any further acquisition
-	// would be a per-file chunk fetch.
-	if n := st.chunkPool.Stat().AcquireCount(); n != acquires+1 {
-		t.Fatalf("cached ReadMany acquired %d chunk connections, want 1 metadata query", n-acquires)
+	// The cached descriptor serves the second pass without any PostgreSQL
+	// query; an acquisition would be a metadata or per-file chunk fetch.
+	if n := st.chunkPool.Stat().AcquireCount(); n != acquires {
+		t.Fatalf("cached ReadMany acquired %d chunk connections, want 0", n-acquires)
 	}
 }

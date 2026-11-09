@@ -36,6 +36,7 @@ type check struct {
 // Gateways == 0 means the fleet size is unknown, so capacity is only reported.
 type fleetPlan struct {
 	Gateways, Surge, PoolMax, Other int
+	QuackWorkers                    int
 }
 
 func (p fleetPlan) perGateway() int { return p.PoolMax + min(p.PoolMax, 64) }
@@ -48,6 +49,7 @@ func doctor(args []string) int {
 		fs.IntVar(&plan.Surge, "surge", 1, "extra gateways that run during a rolling update")
 		fs.IntVar(&plan.PoolMax, "pool-max", envInt("PGVS3_POOL_MAX", 64), "gateway --pool-max")
 		fs.IntVar(&plan.Other, "other-connections", 0, "connections reserved for applications, poolers and admin")
+		fs.IntVar(&plan.QuackWorkers, "quack-workers", 0, "Quack compute worker count to include in the PostgreSQL connection check (each worker budgets 24 DuckLake catalog connections)")
 		asJSON = fs.Bool("json", false, "print JSON")
 	}, func(ctx context.Context, st *store.Store, _ []string) int {
 		d, err := st.Diagnose(ctx)
@@ -115,6 +117,30 @@ func checkOriginSpecs(ctx context.Context, st *store.Store) check {
 	}
 	if len(invalid) > 0 {
 		return check{statusFail, "origin specs", strings.Join(invalid, "; "), "re-run pgvs3 origin set or clear the invalid origin"}
+	}
+	var over []string
+	for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
+		infos, err := st.Namespaces(ctx, kind)
+		if err != nil {
+			return check{statusFail, "origin specs", err.Error(), "fix database access, then re-run pgvs3 doctor"}
+		}
+		for _, n := range infos {
+			budget, _ := n.Attrs["max_bytes"].(float64)
+			if budget <= 0 {
+				continue
+			}
+			stats, err := st.StatNamespace(ctx, kind, n.Name)
+			if err != nil {
+				return check{statusFail, "origin specs", err.Error(), "fix database access, then re-run pgvs3 doctor"}
+			}
+			if stats.LogicalBytes > int64(2*budget) {
+				over = append(over, fmt.Sprintf("%s %s uses %d bytes over 2 × %d", kind, n.Name, stats.LogicalBytes, int64(budget)))
+			}
+		}
+	}
+	if len(over) > 0 {
+		return check{statusWarn, "origin specs", fmt.Sprintf("%d persisted, all valid; %s", len(namespaces), strings.Join(over, "; ")),
+			"raise --cache-max-bytes or let `pgvs3 serve` maintenance catch up"}
 	}
 	return check{statusPass, "origin specs", fmt.Sprintf("%d persisted, all valid", len(namespaces)), ""}
 }
@@ -200,16 +226,21 @@ func doctorChecks(d store.Diagnosis, f store.ServerFacts, plan fleetPlan) []chec
 func connectionCheck(f store.ServerFacts, plan fleetPlan) check {
 	maxConns := atoi(f.Settings["max_connections"])
 	usable := maxConns - atoi(f.Settings["superuser_reserved_connections"]) - atoi(f.Settings["reserved_connections"])
-	if plan.Gateways <= 0 {
-		return check{statusInfo, "connections", fmt.Sprintf("%d usable, %d in use; each gateway at --pool-max %d needs up to %d (pass --gateways to check a fleet)",
-			usable, f.ClientBackends, plan.PoolMax, plan.perGateway()), ""}
+	other := plan.Other + plan.QuackWorkers*24
+	quack := ""
+	if plan.QuackWorkers > 0 {
+		quack = fmt.Sprintf(" quack_workers=%d", plan.QuackWorkers)
 	}
-	need := (plan.Gateways+plan.Surge)*plan.perGateway() + plan.Other
-	detail := fmt.Sprintf("need %d = (%d gateways + %d surge) × (%d main + %d chunk) + %d other; %d usable",
-		need, plan.Gateways, plan.Surge, plan.PoolMax, min(plan.PoolMax, 64), plan.Other, usable)
+	if plan.Gateways <= 0 {
+		return check{statusInfo, "connections", fmt.Sprintf("%d usable, %d in use; each gateway at --pool-max %d needs up to %d (pass --gateways to check a fleet)%s",
+			usable, f.ClientBackends, plan.PoolMax, plan.perGateway(), quack), ""}
+	}
+	need := (plan.Gateways+plan.Surge)*plan.perGateway() + other
+	detail := fmt.Sprintf("need %d = (%d gateways + %d surge) × (%d main + %d chunk) + %d other; %d usable%s",
+		need, plan.Gateways, plan.Surge, plan.PoolMax, min(plan.PoolMax, 64), other, usable, quack)
 	switch {
 	case need > usable:
-		perGW := max((usable-plan.Other)/max(plan.Gateways+plan.Surge, 1), 0)
+		perGW := max((usable-other)/max(plan.Gateways+plan.Surge, 1), 0)
 		return check{statusFail, "connections", detail, fmt.Sprintf("raise max_connections to at least %d, or run --pool-max %d",
 			need+maxConns-usable, max(perGW/2, 1))}
 	case need*10 > usable*9:

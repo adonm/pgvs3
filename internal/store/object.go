@@ -465,6 +465,85 @@ func (r *cacheMetadataRow) Scan(dest ...any) error {
 	return r.err
 }
 
+type metaOriginRow struct {
+	pgx.Row
+	kind     pgtype.Text
+	priority pgtype.Int4
+	info     []byte
+	err      error
+}
+
+func (r *metaOriginRow) Scan(dest ...any) error {
+	r.err = r.Row.Scan(append(dest, &r.kind, &r.priority, &r.info)...)
+	return r.err
+}
+
+// MetadataOrOrigin resolves a cache key and, when originMaxAge is positive and
+// no live object row exists, the parent origin metadata remembered by a warm
+// range cache. Both lookups share one round trip so a warm range read does not
+// pay for a second query.
+func (c Cache) MetadataOrOrigin(ctx context.Context, key string, withInline bool, originMaxAge time.Duration) (*Meta, ns.Ref, *ObjectInfo, error) {
+	if originMaxAge <= 0 {
+		m, ref, err := c.Metadata(ctx, key, withInline)
+		return m, ref, nil, err
+	}
+	write, err := nsSQLIdent(ns.WriteBack, c.name)
+	if err != nil {
+		return nil, ns.Ref{}, nil, err
+	}
+	read, _ := nsSQLIdent(ns.Cache, c.name)
+	body := metadataHeader
+	if withInline {
+		body = metadataDecoded
+	}
+	cols := metadataColumns(body)
+	row := &metaOriginRow{Row: c.s.pool.QueryRow(ctx, `WITH obj AS (
+		SELECT * FROM (
+			SELECT `+cols+`, 'writeback'::text AS kind, 0 AS source_priority FROM `+write+`.objects
+			 WHERE key=$1 AND (expires_at IS NULL OR expires_at > now())
+			UNION ALL
+			SELECT `+cols+`, 'cache'::text AS kind, 1 FROM `+read+`.objects
+			 WHERE key=$1 AND (expires_at IS NULL OR expires_at > now())
+			) c ORDER BY source_priority LIMIT 1
+		), om AS (
+		SELECT info FROM `+read+`.origin_metadata
+		 WHERE key = $1 AND expires_at > now()
+		   AND validated_at > now() - make_interval(secs => $2)
+		   AND NOT EXISTS (SELECT 1 FROM obj)
+		)
+		SELECT * FROM (
+			SELECT obj.*, NULL::jsonb AS info FROM obj
+			UNION ALL
+			SELECT 0::int8, 0::int8, ''::bytea, 'epoch'::timestamptz, NULL::int8[], NULL::int8[],
+				''::text, '{}'::text[], ''::text, ''::text, NULL::timestamptz,
+				''::text, ''::text, ''::text, NULL::bytea, false, NULL::timestamptz, ''::text, 0::oid,
+				NULL::text, 0, (SELECT info FROM om)
+		) rows ORDER BY kind IS NULL LIMIT 1`, key, originMaxAge.Seconds())}
+	m, err := scanMetadata(row, body)
+	if missingNamespace(ctx, c.s.pool, write, row.err) || missingNamespace(ctx, c.s.pool, read, row.err) {
+		m, ref, err := c.Metadata(ctx, key, withInline)
+		if !errors.Is(err, ErrNotFound) {
+			return m, ref, nil, err
+		}
+		info, err := c.OriginMetadata(ctx, key, originMaxAge)
+		return nil, ns.Ref{}, info, err
+	}
+	if err != nil {
+		return nil, ns.Ref{}, nil, err
+	}
+	if row.kind.String != "" {
+		return m, ns.Ref{Kind: ns.Kind(row.kind.String), Name: c.name}, nil, nil
+	}
+	if row.info != nil {
+		var info ObjectInfo
+		if err := json.Unmarshal(row.info, &info); err != nil {
+			return nil, ns.Ref{}, nil, err
+		}
+		return nil, ns.Ref{}, &info, nil
+	}
+	return nil, ns.Ref{}, nil, ErrNotFound
+}
+
 var (
 	ErrNotFound     = errors.New("object not found")
 	ErrInvalidRange = errors.New("invalid range")
@@ -1163,6 +1242,10 @@ func (s *Store) Delete(ctx context.Context, ref ObjectRef) (bool, error) {
 }
 
 func (s *Store) DeleteMany(ctx context.Context, ref ns.Ref, keys []string) (int64, error) {
+	return s.deleteMany(ctx, ref, keys, false)
+}
+
+func (s *Store) deleteMany(ctx context.Context, ref ns.Ref, keys []string, locked bool) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
@@ -1171,9 +1254,11 @@ func (s *Store) DeleteMany(ctx context.Context, ref ns.Ref, keys []string) (int6
 	return withSchema(ctx, s, ref, ErrNoBucket, nil, func(sc string) (int64, error) {
 		schema := strings.Trim(sc, `"`)
 		return withTx(ctx, s, func(tx pgx.Tx) (int64, error) {
-			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1 || E'\x1f' || k, 0))
-				FROM unnest($2::text[]) AS k`, schema, sorted); err != nil {
-				return 0, err
+			if !locked {
+				if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1 || E'\x1f' || k, 0))
+					FROM unnest($2::text[]) AS k`, schema, sorted); err != nil {
+					return 0, err
+				}
 			}
 			var deleted int64
 			err := tx.QueryRow(ctx, `WITH doomed AS (

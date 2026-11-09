@@ -98,6 +98,7 @@ Check the database, its settings and fleet connection capacity; print fixes.
 | `--json` | `false` | print JSON |
 | `--other-connections` | `0` | connections reserved for applications, poolers and admin |
 | `--pool-max` | `64` | gateway --pool-max |
+| `--quack-workers` | `0` | Quack compute worker count to include in the PostgreSQL connection check (each worker budgets 24 DuckLake catalog connections) |
 | `--surge` | `1` | extra gateways that run during a rolling update |
 | `--url` | `postgres://localhost/pgvs3` | PostgreSQL URL |
 
@@ -108,7 +109,7 @@ Print namespace, object, chunk and storage-overhead counts.
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--json` | `false` | print JSON |
-| `--kind` | — | bucket, cache or queue (default: all) |
+| `--kind` | — | filter by namespace kind (bucket, cache, writeback or queue) |
 | `--name` | — | namespace name |
 | `--url` | `postgres://localhost/pgvs3` | PostgreSQL URL |
 
@@ -196,6 +197,7 @@ No flags.
 | `pgvs3_chunk_pool_max_lifetime_destroy_count_total` | counter | — |
 | `pgvs3_chunk_pool_new_conns_count_total` | counter | — |
 | `pgvs3_chunk_pool_total_conns` | gauge | — |
+| `pgvs3_cache_evicted_objects_total` | counter | — |
 | `pgvs3_expired_objects_total` | counter | — |
 | `pgvs3_maintenance_runs_total` | counter | — |
 | `pgvs3_ojs_request_duration_seconds_bucket` | histogram | `le` |

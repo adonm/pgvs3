@@ -313,8 +313,20 @@ type cacheResolution struct {
 
 func (t *Tier) resolveCache(ctx context.Context, ck string, deleteStale, withInline, skipAttributesOnMiss bool) (cacheResolution, error) {
 	res := cacheResolution{ref: t.cacheRef(ck), state: store.CacheLive}
-	m, ref, err := t.lookupCached(ctx, ck, withInline)
-	if err != nil {
+	var m *store.Meta
+	var ref store.ObjectRef
+	var info *store.ObjectInfo
+	var err error
+	if !skipAttributesOnMiss && t.rangeSize > 0 && t.ttl > 0 {
+		// One query resolves both the mutable cache row and the warm parent
+		// origin metadata that a range cache writes before its first chunk.
+		var cref ns.Ref
+		m, cref, info, err = t.store.Cache(t.namespace).MetadataOrOrigin(ctx, ck, withInline, t.ttl)
+		ref = store.ObjectRef{NS: cref, Key: ck}
+	} else {
+		m, ref, err = t.lookupCached(ctx, ck, withInline)
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return res, err
 	}
 	if m != nil {
@@ -328,24 +340,17 @@ func (t *Tier) resolveCache(ctx context.Context, ck string, deleteStale, withInl
 			res.valid = true
 			return res, nil
 		}
+	} else if info != nil {
+		res.info = *info
+		res.attrs = originAttrs{Size: info.Size, ETag: info.OriginETag,
+			LastModified: info.LastModified(), ContentType: info.ContentType,
+			ContentEncoding: info.ContentEncoding, UserMetadata: info.UserMetadata}
+		res.attrsValid = true
+		return res, nil
 	} else if skipAttributesOnMiss {
 		return res, nil
 	}
 
-	if m == nil && t.rangeSize > 0 && t.ttl > 0 {
-		info, err := t.store.Cache(t.namespace).OriginMetadata(ctx, ck, t.ttl)
-		if err != nil {
-			return res, err
-		}
-		if info != nil {
-			res.info = *info
-			res.attrs = originAttrs{Size: info.Size, ETag: info.OriginETag,
-				LastModified: info.LastModified(), ContentType: info.ContentType,
-				ContentEncoding: info.ContentEncoding, UserMetadata: info.UserMetadata}
-			res.attrsValid = true
-			return res, nil
-		}
-	}
 	validated := time.Now()
 	// A cold Parquet range read heads the parent object before any chunk is
 	// fetched. DuckDB opens many column ranges on the same file at once, so
@@ -1440,6 +1445,23 @@ func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body i
 	if err != nil {
 		return nil, err
 	}
+	if !t.writeBack && sp.size > writeBackMin {
+		// Writing a second multi-MiB copy into s3w_ would double the durable
+		// cost of an object the origin already has. Retire any stale copies and
+		// answer reads from the origin instead. A tombstone would make the new
+		// object unreadable because no live write-back row shadows it.
+		cleanupCtx := context.WithoutCancel(ctx)
+		_, _ = unlock.object.Delete(cleanupCtx)
+		if _, err := t.store.Cache(t.namespace).Del(cleanupCtx, []string{ck}); err != nil {
+			t.log.Warn("clearing stale origin cache entry", "bucket", bucket, "key", key, "err", err)
+		}
+		_ = t.store.Cache(t.namespace).ClearPendingUploads(cleanupCtx, ck)
+		if t.rangeSize > 0 && t.ttl > 0 {
+			_ = t.store.Cache(t.namespace).RememberOriginMetadata(cleanupCtx, ck,
+				attrs.objectInfo(), time.Now(), min(t.ttl, t.retention))
+		}
+		return &store.Meta{ObjectInfo: attrs.objectInfo()}, nil
+	}
 	writeOpts.Publication, writeOpts.OriginModified = store.NormalPublication(versionFor(attrs)), attrs.LastModified
 	m, cacheErr := t.storeSpooled(ctx, t.writeRef(ck), sp, writeOpts, unlock.object)
 
@@ -1447,6 +1469,9 @@ func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body i
 	_ = t.store.Cache(t.namespace).ClearPendingUploads(context.WithoutCancel(ctx), ck)
 	if cacheErr != nil {
 		t.log.Warn("populating durable origin write cache", "bucket", bucket, "key", key, "err", cacheErr)
+		if errors.Is(cacheErr, store.ErrQuotaExceeded) {
+			return &store.Meta{ObjectInfo: attrs.objectInfo()}, nil
+		}
 		return nil, fmt.Errorf("populate durable origin write cache: %w", cacheErr)
 	}
 	return m, nil

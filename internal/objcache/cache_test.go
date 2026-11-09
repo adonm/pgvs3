@@ -174,6 +174,28 @@ func TestCacheRuntimeIsolation(t *testing.T) {
 	}
 }
 
+func TestRegistryAppliesServeDefaultsToPersistedSpecs(t *testing.T) {
+	r := NewRegistry(nil, nil, NewRuntime(RuntimeOptions{}), TierOptions{
+		ReadOnly: true, TTL: time.Hour, Retention: 2 * time.Hour,
+		MaxFills: 3, RangeChunk: 1 << 20, MaxBytes: 4096,
+	})
+	r.replace(map[string]Spec{
+		"":         {Namespace: "global", Config: `{"type":"ephemeral"}`},
+		"explicit": {Namespace: "explicit", Config: `{"type":"ephemeral"}`, TTL: "30m", Retention: "1h", MaxFills: 5, RangeChunk: 128 << 10, MaxBytes: 8192},
+	})
+	defer r.Close()
+	def := r.tiers[""].tier
+	if def.rangeSize != 1<<20 || def.maxBytes != 4096 || cap(def.fills) != 3 || def.ttl != time.Hour || def.retention != 2*time.Hour {
+		t.Fatalf("defaults not applied: range=%d max=%d fills=%d ttl=%s retention=%s",
+			def.rangeSize, def.maxBytes, cap(def.fills), def.ttl, def.retention)
+	}
+	explicit := r.tiers["explicit"].tier
+	if explicit.rangeSize != 128<<10 || explicit.maxBytes != 8192 || cap(explicit.fills) != 5 || explicit.ttl != 30*time.Minute || explicit.retention != time.Hour {
+		t.Fatalf("explicit spec overridden: range=%d max=%d fills=%d ttl=%s retention=%s",
+			explicit.rangeSize, explicit.maxBytes, cap(explicit.fills), explicit.ttl, explicit.retention)
+	}
+}
+
 func TestWriteValidationReleasesLocalLock(t *testing.T) {
 	tier := &Tier{}
 	want := errors.New("invalid body")
