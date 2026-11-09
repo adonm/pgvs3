@@ -158,7 +158,7 @@ def check_body(base, path, body, cache=None, span=None, etag=None):
 
 
 @contextmanager
-def gateway(label, database, read_only=False):
+def gateway(label, database, read_only=False, extra=()):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -167,6 +167,7 @@ def gateway(label, database, read_only=False):
         args = [BIN, "serve", "--url", database, "--addr", f"127.0.0.1:{port}", "--pool-max", "8", "--log-level", "warn"]
         if read_only:
             args.append("--read-only")
+        args.extend(extra)
         process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
         try:
             def ready():
@@ -1108,6 +1109,255 @@ def ortho():
           f"point lookup {point['gets']} GETs / {point['bytes']} bytes; warm origin reads "
           f"region={warm['region']['origin_reads']} scan={warm['scan']['origin_reads']}; native, origin-cache and "
           f"write-through match the local oracle", flush=True)
+
+
+OVERTURE_RELEASE = os.environ.get("PGVS3_OVERTURE_RELEASE", "2026-10-21.0")
+OVERTURE_S3_BUCKET = "overturemaps-us-west-2"
+OVERTURE_S3_ENDPOINT = "s3.us-west-2.amazonaws.com"
+OVERTURE_S3_REGION = "us-west-2"
+OVERTURE_BBOX = (115.80, -32.00, 115.92, -31.90)
+OVERTURE_STAC = f"https://stac.overturemaps.org/{OVERTURE_RELEASE}/collections.parquet"
+OVERTURE_CACHE = "overture"
+OVERTURE_RANGE_CHUNK = 1 << 20
+OVERTURE_READ_CACHE = 256 << 20
+
+
+def overture_cache_stat():
+    raw = command("stat", "--url", DATABASE, "--kind", "cache", "--name", OVERTURE_CACHE, "--json")
+    return json.loads(raw)
+
+
+def overture_origin():
+    """Store an anonymous S3 origin. Empty AWS_* values keep origin set from
+    falling back to local credentials when the public bucket needs none."""
+    env = {**os.environ, "AWS_ACCESS_KEY_ID": "", "AWS_SECRET_ACCESS_KEY": ""}
+    return subprocess.check_output([
+        BIN, "origin", "--url", DATABASE, "--bucket", OVERTURE_CACHE,
+        "--s3-endpoint", OVERTURE_S3_ENDPOINT, "--s3-bucket", OVERTURE_S3_BUCKET,
+        "--s3-region", OVERTURE_S3_REGION, "--cache-namespace", OVERTURE_CACHE,
+        "--cache-ttl", "1h", "--range-cache-chunk", str(OVERTURE_RANGE_CHUNK),
+        "--cache-max-bytes", str(10 << 30), "--fill-concurrency", "32", "set",
+    ], text=True, stderr=subprocess.STDOUT, timeout=120, env=env).strip()
+
+
+def overture_files():
+    """Resolve the Perth CBD place and building Parquet files through the STAC
+    collections index, as a client would instead of hard-coding release keys."""
+    import duckdb
+    xmin, ymin, xmax, ymax = OVERTURE_BBOX
+    connection = duckdb.connect()
+    try:
+        connection.execute("SET enable_external_file_cache=false; SET parquet_metadata_cache=false")
+        started = time.perf_counter()
+        rows = connection.execute(f"""
+            SELECT collection, assets.aws.alternate.s3.href, assets.aws."file:size",
+                   num_row_groups, num_rows
+            FROM read_parquet({sql_str(OVERTURE_STAC)})
+            WHERE collection IN ('place', 'building')
+              AND bbox.xmin <= {xmax} AND bbox.xmax >= {xmin}
+              AND bbox.ymin <= {ymax} AND bbox.ymax >= {ymin}
+            ORDER BY collection
+        """).fetchall()
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+    finally:
+        connection.close()
+    files = {}
+    for collection, href, size, groups, count in rows:
+        assert href.startswith(f"s3://{OVERTURE_S3_BUCKET}/"), href
+        files[collection] = {
+            "href": href,
+            "key": href.split(f"s3://{OVERTURE_S3_BUCKET}/", 1)[1],
+            "bytes": int(size),
+            "row_groups": int(groups),
+            "rows": int(count),
+        }
+    assert set(files) == {"place", "building"}, files
+    return files, elapsed
+
+
+def overture_queries(files):
+    xmin, ymin, xmax, ymax = OVERTURE_BBOX
+    bbox = (f"bbox.xmin <= {xmax} AND bbox.xmax >= {xmin} "
+            f"AND bbox.ymin <= {ymax} AND bbox.ymax >= {ymin}")
+    return {
+        "place": f"SELECT count(*) FROM read_parquet('s3://{{bucket}}/{files['place']['key']}') "
+                 f"WHERE {bbox} AND basic_category = 'restaurant'",
+        "building": f"SELECT count(*), round(avg(height), 3) FROM read_parquet('s3://{{bucket}}/{files['building']['key']}') "
+                    f"WHERE {bbox} AND class = 'residential'",
+    }
+
+
+def overture_connection(endpoint):
+    import duckdb
+    connection = duckdb.connect()
+    connection.execute("SET enable_external_file_cache=false; SET parquet_metadata_cache=false")
+    connection.execute("CALL enable_logging('HTTP')")
+    if endpoint is None:
+        connection.execute("SET s3_access_key_id=''; SET s3_secret_access_key=''")
+        connection.execute(f"SET s3_region='{OVERTURE_S3_REGION}'")
+    else:
+        connection.execute(
+            f"CREATE SECRET (TYPE s3, KEY_ID 'test', SECRET 'test', REGION '{OVERTURE_S3_REGION}', "
+            f"ENDPOINT '{urlsplit(endpoint).netloc}', URL_STYLE 'path', USE_SSL false)")
+    return connection
+
+
+def overture_run(connection, statement):
+    connection.execute("CALL truncate_duckdb_logs()")
+    started = time.perf_counter()
+    rows = connection.execute(statement).fetchall()
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    gets, read_bytes = connection.execute(
+        "SELECT count(*), coalesce(sum(CAST(response.headers['Content-Length'] AS BIGINT)), 0) "
+        "FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET'").fetchone()
+    return {"rows": rows, "ms": elapsed, "gets": int(gets), "bytes": int(read_bytes)}
+
+
+def overture_matches(name, rows):
+    if name == "place":
+        return rows == [(1637,)]
+    return len(rows) == 1 and rows[0][0] == 3756 and abs(float(rows[0][1]) - 5.217) < 0.001
+
+
+def overture_state(connection, queries, bucket, repeats):
+    runs = []
+    for _ in range(repeats):
+        run = {}
+        for name, statement in queries.items():
+            result = overture_run(connection, statement.format(bucket=bucket))
+            assert overture_matches(name, result["rows"]), (name, result["rows"])
+            run[name] = result
+        run["total_ms"] = round(sum(run[name]["ms"] for name in queries), 1)
+        run["gets"] = sum(run[name]["gets"] for name in queries)
+        run["bytes"] = sum(run[name]["bytes"] for name in queries)
+        runs.append(run)
+    return runs
+
+
+def overture_summary(runs):
+    summary = timing_summary([run["total_ms"] for run in runs])
+    summary["gets"] = int(statistics.median(run["gets"] for run in runs))
+    summary["bytes"] = int(statistics.median(run["bytes"] for run in runs))
+    return summary
+
+
+def overture():
+    """Anonymous Overture Maps S3 + STAC discovery, measured directly and
+    through a 1 MiB shared range cache and a 256 MiB gateway block cache."""
+    direct_repeat = int(os.environ.get("PGVS3_OVERTURE_DIRECT_REPEAT", "3"))
+    warm_repeat = int(os.environ.get("PGVS3_OVERTURE_REPEAT", "5"))
+    files, stac_ms = overture_files()
+    queries = overture_queries(files)
+    prefix = f"release/{OVERTURE_RELEASE}/theme=places/type=place/"
+    list_path = f"/{OVERTURE_CACHE}?list-type=2&prefix={quote(prefix, safe='')}&max-keys=3"
+    origin_output = overture_origin()
+
+    def listed():
+        try:
+            _, body = request(A, list_path, timeout=120)
+            return parse_s3_objects(body)
+        except AssertionError:
+            return []
+
+    objects = eventually("anonymous Overture ListObjectsV2", listed, 120)
+    assert objects and all(key.startswith(prefix) for key, _ in objects), objects
+
+    connection = overture_connection(None)
+    try:
+        direct_runs = overture_state(connection, queries, OVERTURE_S3_BUCKET, direct_repeat)
+        direct = overture_summary(direct_runs)
+    finally:
+        connection.close()
+
+    cache_before = overture_cache_stat()
+    assert cache_before["logical_bytes"] == 0, cache_before
+    connection = overture_connection(A)
+    try:
+        cold_before = pool_metrics(A)
+        cold_runs = overture_state(connection, queries, OVERTURE_CACHE, 1)
+        cold_after = pool_metrics(A)
+    finally:
+        connection.close()
+    cache_cold = overture_cache_stat()
+    assert cache_cold["logical_bytes"] > 0, cache_cold
+
+    cache_warm_before = overture_cache_stat()
+    connection = overture_connection(A)
+    try:
+        warm_before = pool_metrics(A)
+        warm_runs = overture_state(connection, queries, OVERTURE_CACHE, warm_repeat)
+        warm_after = pool_metrics(A)
+    finally:
+        connection.close()
+    cache_warm = overture_cache_stat()
+    assert cache_warm["logical_bytes"] == cache_warm_before["logical_bytes"], (cache_warm_before, cache_warm)
+
+    with gateway("overture-block", DATABASE, extra=("--read-cache-bytes", str(OVERTURE_READ_CACHE))) as block:
+        connection = overture_connection(block)
+        try:
+            block_before = pool_metrics(block)
+            block_warmup = overture_state(connection, queries, OVERTURE_CACHE, 1)
+            block_warmed = pool_metrics(block)
+            block_runs = overture_state(connection, queries, OVERTURE_CACHE, warm_repeat)
+            block_after = pool_metrics(block)
+        finally:
+            connection.close()
+    cache_block = overture_cache_stat()
+    assert cache_block["logical_bytes"] == cache_warm["logical_bytes"], (cache_warm, cache_block)
+
+    block_timed = pool_metric_delta(block_warmed, block_after)
+    block_fill = pool_metric_delta(block_before, block_warmed)
+    assert block_timed["pgvs3_chunk_pool_acquire_count_total"] == 0, block_timed
+    assert block_timed["pgvs3_read_cache_hits_total"] > 0, block_timed
+    assert block_timed["pgvs3_read_cache_fills_total"] == 0, block_timed
+    assert block_fill["pgvs3_read_cache_fills_total"] > 0, block_fill
+
+    cold = overture_summary(cold_runs)
+    warm = overture_summary(warm_runs)
+    block_summary = overture_summary(block_runs)
+    file_bytes = sum(meta["bytes"] for meta in files.values())
+    selectivity = round(cache_cold["logical_bytes"] / file_bytes, 4)
+    ratios = {
+        "cold_vs_direct": round(direct["median_ms"] / cold["median_ms"], 2),
+        "warm_shared_vs_direct": round(direct["median_ms"] / warm["median_ms"], 2),
+        "warm_block_vs_direct": round(direct["median_ms"] / block_summary["median_ms"], 2),
+        "warm_shared_vs_cold": round(cold["median_ms"] / warm["median_ms"], 2),
+    }
+    report = {
+        "complete": True,
+        "release": OVERTURE_RELEASE,
+        "stac": OVERTURE_STAC,
+        "stac_discovery_ms": stac_ms,
+        "bbox": {"xmin": OVERTURE_BBOX[0], "ymin": OVERTURE_BBOX[1],
+                 "xmax": OVERTURE_BBOX[2], "ymax": OVERTURE_BBOX[3]},
+        "files": files,
+        "anonymous_origin": {"service": "s3", "bucket": OVERTURE_S3_BUCKET,
+                             "endpoint": OVERTURE_S3_ENDPOINT, "region": OVERTURE_S3_REGION,
+                             "access_key": "", "secret_key": "", "set": origin_output},
+        "list_objects_v2": {"prefix": prefix, "returned": len(objects),
+                            "first": objects[0][0]},
+        "queries": queries,
+        "direct": {"repeat": direct_repeat, "runs": direct_runs, **direct},
+        "cold": {"runs": cold_runs, **cold, "gateway": pool_metric_delta(cold_before, cold_after)},
+        "warm_shared": {"repeat": warm_repeat, "runs": warm_runs, **warm,
+                        "gateway": pool_metric_delta(warm_before, warm_after)},
+        "warm_gateway_cache": {"read_cache_bytes": OVERTURE_READ_CACHE, "repeat": warm_repeat,
+                               "warmup": overture_summary(block_warmup), "runs": block_runs,
+                               **block_summary, "warmup_gateway": block_fill, "timed_gateway": block_timed},
+        "cache": {"namespace": OVERTURE_CACHE, "range_chunk": OVERTURE_RANGE_CHUNK,
+                  "before": cache_before, "after_cold": cache_cold,
+                  "after_warm_shared": cache_warm, "after_warm_block": cache_block,
+                  "file_bytes": file_bytes, "selectivity": selectivity},
+        "ratios": ratios,
+    }
+    (RUN / "overture.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"overture: {OVERTURE_RELEASE} Perth CBD place+building, "
+          f"{file_bytes / (1 << 20):.0f} MiB source Parquet; direct {direct['median_ms']:.0f} ms, "
+          f"cold fill {cold['median_ms']:.0f} ms, warm s3c_ {warm['median_ms']:.0f} ms, "
+          f"warm 256 MiB block {block_summary['median_ms']:.0f} ms; "
+          f"1 MiB chunks {cache_cold['logical_bytes'] / (1 << 20):.1f} MiB = "
+          f"{selectivity:.1%} of source; block cache {block_timed['pgvs3_chunk_pool_acquire_count_total']:.0f} "
+          f"chunk-pool acquires", flush=True)
 
 
 ICEBERG_ROWS = 20000
@@ -2827,6 +3077,7 @@ def trino():
 
 if __name__ == "__main__":
     scenarios = {"analytics": analytics, "replication": replication, "guides": guides, "raquet": raquet, "ortho": ortho,
-                 "iceberg": iceberg, "trino": trino, "compute": compute, "compute_pool": compute_pool}
+                 "overture": overture, "iceberg": iceberg, "trino": trino, "compute": compute,
+                 "compute_pool": compute_pool}
     for name in sys.argv[1:]:
         scenarios[name]()

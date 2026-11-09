@@ -102,6 +102,28 @@ func TestRequestAddressing(t *testing.T) {
 	if req.URL.Host != "s3.us-east-1.amazonaws.com" || req.URL.EscapedPath() != "/my.bucket/a" {
 		t.Fatalf("dotted target = %q", req.URL.String())
 	}
+
+	anonymous, err := New(Config{
+		Endpoint: "s3.us-west-2.amazonaws.com", Region: "us-west-2", Bucket: "overturemaps-us-west-2",
+	})
+	if err != nil {
+		t.Fatalf("New anonymous: %v", err)
+	}
+	if anonymous.client.signer != nil {
+		t.Fatal("anonymous client has a signer")
+	}
+	req, err = anonymous.client.newRequest(ctx, http.MethodGet, "release/2026-10-21.0/data.parquet", nil, nil, -1)
+	if err != nil {
+		t.Fatalf("anonymous newRequest: %v", err)
+	}
+	if req.URL.Host != "overturemaps-us-west-2.s3.us-west-2.amazonaws.com" {
+		t.Fatalf("anonymous host = %q", req.URL.Host)
+	}
+	for _, header := range []string{"Authorization", "X-Amz-Date", "X-Amz-Content-Sha256", "X-Amz-Security-Token"} {
+		if value := req.Header.Get(header); value != "" {
+			t.Fatalf("anonymous request has %s=%q", header, value)
+		}
+	}
 }
 
 func TestConfigValidation(t *testing.T) {
@@ -114,6 +136,7 @@ func TestConfigValidation(t *testing.T) {
 		{"invalid bucket", Config{Bucket: "bad/name", AccessKey: "AKID", SecretKey: "SECRET"}},
 		{"missing access key", Config{Bucket: "bucket", SecretKey: "SECRET"}},
 		{"missing secret", Config{Bucket: "bucket", AccessKey: "AKID"}},
+		{"session token without keys", Config{Bucket: "bucket", SessionToken: "tok"}},
 		{"bad scheme", Config{Bucket: "bucket", Endpoint: "ftp://example.com", AccessKey: "AKID", SecretKey: "SECRET"}},
 		{"endpoint query", Config{Bucket: "bucket", Endpoint: "https://example.com?x=1", AccessKey: "AKID", SecretKey: "SECRET"}},
 	}
@@ -130,6 +153,9 @@ func TestConfigValidation(t *testing.T) {
 	}
 	if b.client.signer.region != "us-east-1" || b.client.signer.service != "s3" {
 		t.Fatalf("default signer = %+v", b.client.signer)
+	}
+	if _, err := New(Config{Bucket: "overturemaps-us-west-2", Region: "us-west-2"}); err != nil {
+		t.Fatalf("anonymous config: %v", err)
 	}
 
 	//lint:ignore SA1012 verifying nil-context rejection

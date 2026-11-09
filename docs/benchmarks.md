@@ -26,6 +26,7 @@ claim.
 | Speed of light (`just sol`) | S3 HTTP | 256 MiB GET **3,311 MiB/s** (83% of floor); 1 GiB GET **2,077 MiB/s** (84%); 256 MiB PUT **384 MiB/s** (83%). |
 | 20M-row DuckLake row-group tuning (`just bench tuning`) | DuckDB `httpfs` | DuckDB 2.0.0, ~823 MiB stored: 122,880 rows/group loads in **8.79 s**, projected full scan **159 ms** (**130.6 MiB** read), 1% range **66 ms** (**3.4 MiB** in 7 GETs), point lookup **64 ms** (**1.2 MiB** in 3 GETs). |
 | 1.14 GB LINZ Wellington orthophoto (`just bench ortho`) | DuckDB `httpfs` | 16 tiles/row-group: point lookup **25 q/s** (1w, **39 ms** p50, **4.1 MB** in 10 GETs) and **111 q/s** (16w); 9% central region **0.92 s** (**117 MiB**). |
+| Overture Maps `2026-10-21.0` + STAC (`just overture`) | DuckDB `httpfs` | Anonymous public S3, Perth CBD place+building: direct `us-west-2` median **3.62 s** (first pass **7.36 s**), cold 1 MiB range fill **7.56 s**, warm PostgreSQL `s3c_` **79 ms** (**46×**), warm 256 MiB gateway block cache **57 ms** (**64×**). Cached **22.1 MiB** = **1.8%** of **1.23 GiB** source Parquet. |
 | Official-base `pgvs3-duckdb:2.0.0` server (`just duckdb-integration-bench`) | DuckDB Quack | 1M-row DuckLake (42.7 MiB): projection **13.0 ms**, 1% range **11.9 ms**, point lookup **16.9 ms**. 1.14 GB LINZ orthophoto: z21 point **38.2 ms**, z16 overview **31.7 ms**, 9% region (704 tiles) **291.2 ms**. 5k-row spatial RTree **2.96 ms** vs **10.17 ms** lake scan; 5k×32 vector HNSW **3.19 ms** (10/10 recall) vs **13.26 ms** lake scan (earlier sample; see the dated section below). |
 | 100-snapshot Iceberg (`just iceberg`) | DuckDB `httpfs` | 20–60 ms origin: warm `count(*)` **6 ms** vs **115–316 ms** direct; 100-snapshot group-by **67 ms** vs **434–1,079 ms** direct. |
 | Trino 484 + Nessie (`just trino`) | Trino S3 | 20 ms origin: standalone paired 3 GiB cache beats Alluxio across all 7 queries (**36–520 ms** vs **78–529 ms**, paired ratios **0.46–0.97**). |
@@ -460,6 +461,64 @@ S3 admission slots long enough that the default 1 s `--s3-queue-wait` returns
 chunk. These cold figures predate a fix to the test origin proxy, whose 5-entry
 listen backlog stalled bursts of new connections for about 1 s; they overstate
 cold time and should be re-measured.
+
+## Anonymous Overture Maps + STAC (`just overture`)
+
+`just overture` starts the disposable PostgreSQL 18 fixture, resolves the Perth
+CBD files through the public STAC collections index, stores an S3 origin with
+empty credentials, lists a release prefix through `ListObjectsV2`, and measures
+the same bounding-box + attribute query directly and through the cache tier.
+DuckDB runs with `enable_external_file_cache=false` and
+`parquet_metadata_cache=false`, so the client adds no file or Parquet metadata
+cache of its own.
+
+The measured release is `2026-10-21.0`; STAC discovery took **137 ms** and
+returned one file per theme:
+
+| Theme | Object | Size | Row groups |
+| --- | --- | ---: | ---: |
+| `places/place` | `part-00013-6c366648-...-c000.zstd.parquet` | 719,333,214 B | 256 |
+| `buildings/building` | `part-00330-d83f5528-...-c000.zstd.parquet` | 567,357,602 B | 256 |
+| **Total** | | **1,286,690,816 B (1.23 GiB)** | |
+
+The query bbox is `[115.80, -32.00, 115.92, -31.90]` (Perth CBD). Places filter
+`basic_category = 'restaurant'` (**1,637** rows); buildings filter
+`class = 'residential'` (**3,756** rows, mean height **5.217 m**). The S3 origin
+uses `overturemaps-us-west-2` in `us-west-2` with no access key, secret key or
+session token; the gateway's `ListObjectsV2` over
+`release/2026-10-21.0/theme=places/type=place/` returned the expected keys.
+
+Measured 2026-11-10 on the 16-core laptop (single host, single session; direct
+3 runs, warm states 5 runs):
+
+| State | Cache / transport | Median | GETs / response bytes | Gateway PostgreSQL |
+| --- | --- | ---: | ---: | --- |
+| Direct | DuckDB to `s3://overturemaps-us-west-2/...`, `us-west-2`, unsigned | **3,616.8 ms** (3,116.5–7,357.0; first **7,357.0**) | 24 / 6,268,891 | none |
+| `pgvs3` cold fill | 1 MiB aligned range chunks, `--read-cache-bytes 0` | **7,562.5 ms** (one pass) | 24 / 6,268,891 | 157 main / 28 chunk pool |
+| `pgvs3` warm shared | PostgreSQL `s3c_`, `--read-cache-bytes 0` | **79.1 ms** (76.5–86.1) | 24 / 6,268,891 | 270 main / 270 chunk pool |
+| `pgvs3` warm block | 256 MiB gateway cache, zero-copy | **56.7 ms** (53.7–62.8; warm-up **106.3 ms**) | 24 / 6,268,891 | 261 main / **0** chunk pool |
+
+Warm shared `s3c_` reads are **45.7×** faster than the direct median; the warm
+256 MiB gateway block cache is **63.8×** faster and records **160** read-cache
+hits, **0** fills and **0** `chunkPool` acquires during the timed runs. The
+block cache bypasses bytes only: every request still resolves metadata in
+PostgreSQL (261 main-pool acquires over 120 GETs in the timed runs). A cold
+1 MiB fill is **7.56 s**, essentially the first direct pass (**7.36 s**); the
+direct median is lower because later runs reuse client DNS/TLS/HTTP state.
+Range alignment makes the cold fill slower than the direct median while still
+downloading a small subset of the source.
+
+`pgvs3 stat --kind cache --name overture` after the cold fill records
+**23,156,736 logical bytes (22.1 MiB)**, **24 objects**, **2,872** 32-row chunk
+blocks and **2** origin metadata rows (24.9 MiB physical). That is **1.80%** of
+the **1.23 GiB** source Parquet: aligned 1 MiB chunks over-fetch about 3.7× the
+**6.27 MiB** the query itself requested, but skip **98.2%** of the two files.
+Warm shared and warm block runs leave the shared cache size unchanged.
+
+Report: `.tmp/verify/analytics.hMbmhY/overture.json`, SHA-256
+`e7557a617a3fc478227689941de3ea93b940a8f1a53246bd61c8fbe15e597689`.
+The report retains every run, per-query timings and bytes, gateway metric
+deltas, cache statistics and the resolved STAC keys.
 
 ## Official-base DuckDB 2.0 + Quack container (`just duckdb-integration-bench`)
 

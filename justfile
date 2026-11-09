@@ -127,6 +127,14 @@ ortho:
 iceberg:
     PGVS3_ANALYTICS=iceberg bash deploy/bench/stack.sh analytics
 
+# Anonymous Overture Maps release + STAC discovery: direct us-west-2 S3, cold
+# 1 MiB shared range fill, warm PostgreSQL s3c_, then a warm 256 MiB gateway
+# block cache. PGVS3_OVERTURE_RELEASE, PGVS3_OVERTURE_DIRECT_REPEAT=3 and
+# PGVS3_OVERTURE_REPEAT=5. Reads only the Perth CBD row groups, not the files.
+[group('bench')]
+overture:
+    PGVS3_ANALYTICS=overture bash deploy/bench/stack.sh analytics
+
 # Trino 484 + Nessie 0.109 (JDBC version store in the same PostgreSQL) on TPC-H
 # lineitem committed month by month plus one large-file CTAS: direct origin,
 # cache tier, Trino's Alluxio cache, then a one-snapshot rebuild and sorted

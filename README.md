@@ -107,6 +107,10 @@ mise exec go -- go run ./cmd/pgvs3 origin --bucket lake \
 `--s3-path-style` selects path-style addressing for MinIO and similar,
 `--s3-insecure` allows a plain-HTTP endpoint, and every origin flag also reads
 `PGVS3_<FLAG>` (`PGVS3_S3_ENDPOINT`, `PGVS3_S3_ACCESS_KEY`, ...).
+Public buckets such as `overturemaps-us-west-2` need no credentials: omit
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `--s3-access-key` and
+`--s3-secret-key`, and the gateway sends unsigned requests. `just overture`
+exercises this path against Overture Maps and STAC.
 `--range-cache-chunk 1048576` caches aligned 1 MiB chunks, so Parquet footer and
 column-chunk reads stay in PostgreSQL instead of downloading whole files.
 `--cache-max-bytes` evicts the oldest cached objects once the cache namespace

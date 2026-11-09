@@ -64,6 +64,10 @@ func NotFound, Precondition, Conflict, Unsupported, InvalidRange(error) bool
 
 ## Deliberate behavior
 
+- Anonymous (unsigned) access is supported for public S3 buckets when both
+  `AccessKey` and `SecretKey` are empty; requests then omit SigV4 headers. A
+  session token without keys is rejected. Credentials are still required for
+  writes and for buckets that reject unsigned reads.
 - Exact ranged reads reject an origin that ignores `Range` and returns a
   different window.
 - Conditional writes apply conditions to final-object completion for

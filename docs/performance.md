@@ -361,6 +361,14 @@ lake query** and **31–32** connections with the cache off. Median lake through
 at `C >= 8` rose from **212** to **254 q/s**; the cache did not raise the
 single-gateway ceiling beyond about 286 q/s.
 
+The same effect holds for a real public S3 origin: `just overture` measured a
+Perth CBD place + building query through the range cache at **79 ms** warm from
+shared PostgreSQL `s3c_` and **57 ms** with a warm 256 MiB gateway block cache,
+against **3.62 s** direct to `us-west-2`. Timed block-cache runs recorded **0**
+`chunkPool` acquires, and the 1 MiB range cache held **22.1 MiB (1.8%)** of the
+**1.23 GiB** source Parquet. See
+[benchmarks](benchmarks.md#anonymous-overture-maps--stac-just-overture).
+
 **Tier 4 — PostgreSQL 18 and the S3 origin.** DuckLake catalog connections go
 directly from each worker to PostgreSQL and bypass pgvs3. Add them to the gateway
 envelope:

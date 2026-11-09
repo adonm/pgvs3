@@ -100,8 +100,11 @@ func prepareClient(cfg Config) (*client, error) {
 	if !validBucketName(cfg.Bucket) {
 		return nil, fmt.Errorf("s3: invalid bucket %q", cfg.Bucket)
 	}
-	if cfg.AccessKey == "" || cfg.SecretKey == "" {
-		return nil, errors.New("s3: access key and secret key are required")
+	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
+		return nil, errors.New("s3: access key and secret key must both be set or both be empty")
+	}
+	if cfg.AccessKey == "" && cfg.SessionToken != "" {
+		return nil, errors.New("s3: session token requires access key and secret key")
 	}
 	region := strings.TrimSpace(cfg.Region)
 	if region == "" {
@@ -119,8 +122,12 @@ func prepareClient(cfg Config) (*client, error) {
 		host = cfg.Bucket + "." + host
 	}
 
+	var s *signer
+	if cfg.AccessKey != "" {
+		s = newSigner(region, cfg.AccessKey, cfg.SecretKey, cfg.SessionToken)
+	}
 	return &client{
-		signer:       newSigner(region, cfg.AccessKey, cfg.SecretKey, cfg.SessionToken),
+		signer:       s,
 		bucket:       cfg.Bucket,
 		prefix:       normalizePrefix(cfg.Prefix),
 		scheme:       scheme,
@@ -236,12 +243,6 @@ func (c *client) newRequest(ctx context.Context, method, object string, query ur
 		RawPath:  escaped,
 		RawQuery: rawQuery,
 	}
-	var marker []byte
-	if body != nil {
-		marker = []byte{}
-	}
-	date, payloadHash, auth := c.signer.signRequest(nil, []byte(method), []byte(escaped), []byte(rawQuery), []byte(c.host), marker, extra...)
-
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, err
@@ -249,12 +250,19 @@ func (c *client) newRequest(ctx context.Context, method, object string, query ur
 	for _, h := range extra {
 		req.Header.Set(h[0], h[1])
 	}
-	req.Header.Set("X-Amz-Date", string(date))
-	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-	if c.signer.token != "" {
-		req.Header.Set("X-Amz-Security-Token", c.signer.token)
+	if c.signer != nil {
+		var marker []byte
+		if body != nil {
+			marker = []byte{}
+		}
+		date, payloadHash, auth := c.signer.signRequest(nil, []byte(method), []byte(escaped), []byte(rawQuery), []byte(c.host), marker, extra...)
+		req.Header.Set("X-Amz-Date", string(date))
+		req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+		if c.signer.token != "" {
+			req.Header.Set("X-Amz-Security-Token", c.signer.token)
+		}
+		req.Header.Set("Authorization", string(auth))
 	}
-	req.Header.Set("Authorization", string(auth))
 	if body != nil {
 		if size < 0 {
 			return nil, fmt.Errorf("s3: %s %s: unknown body size", method, object)
