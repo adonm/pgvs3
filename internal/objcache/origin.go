@@ -462,10 +462,15 @@ func (b *s3Bucket) Upload(ctx context.Context, key string, r io.Reader, size int
 	case store.IfMatch:
 		ifMatch = in.Precondition.ETag
 	}
-	meta, err := b.client.WriteReader(ctx, key, r, size, s3client.PutOptions{
+	opts := s3client.PutOptions{
 		UserMetadata: in.UserMetadata, ContentType: in.ContentType, ContentEncoding: in.ContentEncoding,
 		IfMatch: ifMatch, IfNoneMatch: ifNone,
-	})
+	}
+	if in.Checksum != nil {
+		opts.ChecksumAlgorithm = in.Checksum.Name
+		opts.ChecksumValue = in.Checksum.Value
+	}
+	meta, err := b.client.WriteReader(ctx, key, r, size, opts)
 	if err != nil {
 		return originAttrs{}, err
 	}

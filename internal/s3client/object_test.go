@@ -16,6 +16,7 @@
 package s3client
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
@@ -24,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -805,6 +807,52 @@ func TestCalculatePartSize(t *testing.T) {
 	}
 }
 
+func TestPutChecksumPassThrough(t *testing.T) {
+	mock, server := newTestServer(t)
+	bucket := newTestBucket(t, server, "")
+	bucket.client.maxSinglePut, bucket.client.minPartSize = 20, 8
+	ctx := context.Background()
+	const value = "AAAAAAAAAAA="
+
+	if _, err := bucket.WriteReader(ctx, "single", strings.NewReader("payload"), 7, PutOptions{
+		ChecksumAlgorithm: "x-amz-checksum-CRC64NVME", ChecksumValue: value,
+	}); err != nil {
+		t.Fatalf("single checksum PUT: %v", err)
+	}
+	mock.mu.Lock()
+	header := mock.lastChecksumHeader
+	mock.mu.Unlock()
+	if header != value {
+		t.Fatalf("single checksum header = %q, want %q", header, value)
+	}
+
+	body := strings.Repeat("0123456789abcdef", 2)
+	if _, err := bucket.WriteReader(ctx, "multipart", strings.NewReader(body), int64(len(body)), PutOptions{
+		ChecksumAlgorithm: "crc64nvme", ChecksumValue: value,
+	}); err != nil {
+		t.Fatalf("multipart checksum PUT: %v", err)
+	}
+	mock.mu.Lock()
+	createSawChecksum := mock.lastCreateSawChecksum
+	stored := mock.objects["multipart"]
+	mock.mu.Unlock()
+	if createSawChecksum {
+		t.Fatal("checksum header was sent on CreateMultipartUpload")
+	}
+	if stored == nil || string(stored.data) != body {
+		t.Fatalf("stored multipart object = %+v", stored)
+	}
+
+	for _, tc := range []PutOptions{
+		{ChecksumAlgorithm: "md5", ChecksumValue: value},
+		{ChecksumAlgorithm: "crc32", ChecksumValue: "bad\x00value"},
+	} {
+		if _, err := bucket.WriteReader(ctx, "bad", strings.NewReader("x"), 1, tc); err == nil {
+			t.Fatalf("invalid checksum options %+v were accepted", tc)
+		}
+	}
+}
+
 type mockObject struct {
 	data        []byte
 	etag        string
@@ -838,9 +886,11 @@ type mockS3 struct {
 	startAfterCalls int
 
 	lastCreateSawConditions bool
+	lastCreateSawChecksum   bool
 	lastCompleteIfMatch     string
 	lastCompleteIfNone      string
 	lastPartCount           int
+	lastChecksumHeader      string
 
 	rejectConditionalComplete bool
 	listContentType           bool
@@ -1023,6 +1073,7 @@ func (m *mockS3) put(w http.ResponseWriter, r *http.Request, key string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.lastChecksumHeader = r.Header.Get("x-amz-checksum-crc64nvme")
 	current, exists := m.objects[key]
 	if m.checkConditions(w, r, current, exists) {
 		return
@@ -1123,6 +1174,13 @@ func (m *mockS3) createUpload(w http.ResponseWriter, r *http.Request, key string
 	m.nextID++
 	id := "upload-" + strconv.Itoa(m.nextID)
 	m.lastCreateSawConditions = r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
+	m.lastCreateSawChecksum = false
+	for name := range r.Header {
+		if strings.HasPrefix(strings.ToLower(name), "x-amz-checksum-") {
+			m.lastCreateSawChecksum = true
+			break
+		}
+	}
 	m.uploads[id] = &mockUpload{
 		key: key, contentType: r.Header.Get("Content-Type"), meta: testMeta(r.Header),
 		parts: map[int][]byte{}, etags: map[int]string{},
@@ -1382,4 +1440,146 @@ func newTestBucket(t *testing.T, server *httptest.Server, prefix string) *Bucket
 	}
 	t.Cleanup(func() { _ = bucket.Close() })
 	return bucket
+}
+
+// faultRoundTripper injects deterministic transient failures so retry and
+// multipart-cleanup paths are exercised without a flaky origin.
+type faultRoundTripper struct {
+	base http.RoundTripper
+	rnd  *rand.Rand
+
+	mu          sync.Mutex
+	consecutive map[string]int
+	faults      int
+}
+
+func (f *faultRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	key := req.Method + " " + req.URL.RequestURI()
+	f.mu.Lock()
+	failures := f.consecutive[key]
+	inject := failures < 2 && f.rnd.Float64() < 0.35
+	var kind int
+	if inject {
+		f.consecutive[key] = failures + 1
+		f.faults++
+		kind = f.rnd.Intn(3)
+	} else {
+		delete(f.consecutive, key)
+	}
+	f.mu.Unlock()
+	if !inject {
+		return f.base.RoundTrip(req)
+	}
+	switch kind {
+	case 0:
+		return faultResponse(req, http.StatusServiceUnavailable, "SlowDown"), nil
+	case 1:
+		return faultResponse(req, http.StatusTooManyRequests, "TooManyRequests"), nil
+	default:
+		return nil, io.ErrUnexpectedEOF
+	}
+}
+
+func faultResponse(req *http.Request, status int, code string) *http.Response {
+	body := fmt.Sprintf(`<Error><Code>%s</Code><Message>injected</Message></Error>`, code)
+	return &http.Response{
+		StatusCode:    status,
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:        http.Header{"Content-Type": {"application/xml"}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}
+}
+
+func TestDeterministicFaultInjection(t *testing.T) {
+	ctx := context.Background()
+	const checksum = "AAAAAAAAAAA="
+	single := []byte("single-payload")
+	multipart := bytes.Repeat([]byte("0123456789abcdef"), 2)
+	for _, seed := range []int64{1, 7, 42} {
+		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
+			mock, server := newTestServer(t)
+			bucket := newTestBucket(t, server, "")
+			bucket.client.maxSinglePut, bucket.client.minPartSize = 20, 8
+			faults := &faultRoundTripper{
+				base:        server.Client().Transport,
+				rnd:         rand.New(rand.NewSource(seed)),
+				consecutive: map[string]int{},
+			}
+			bucket.client.http.Transport = faults
+
+			if _, err := bucket.WriteReader(ctx, "single.parquet", bytes.NewReader(single), int64(len(single)), PutOptions{
+				ChecksumAlgorithm: "crc64nvme", ChecksumValue: checksum,
+			}); err != nil {
+				t.Fatalf("single WriteReader: %v", err)
+			}
+			if _, err := bucket.WriteReader(ctx, "multipart.parquet", bytes.NewReader(multipart), int64(len(multipart)), PutOptions{
+				ChecksumAlgorithm: "x-amz-checksum-crc64nvme", ChecksumValue: checksum,
+			}); err != nil {
+				t.Fatalf("multipart WriteReader: %v", err)
+			}
+
+			info, err := bucket.Stat(ctx, "single.parquet")
+			if err != nil {
+				t.Fatalf("Stat: %v", err)
+			}
+			if info.Size != int64(len(single)) {
+				t.Fatalf("Stat size = %d, want %d", info.Size, len(single))
+			}
+
+			rc, err := bucket.Get(ctx, "multipart.parquet", 3, 9, "")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			got, err := io.ReadAll(rc)
+			_ = rc.Close()
+			if err != nil {
+				t.Fatalf("Get read: %v", err)
+			}
+			if !bytes.Equal(got, multipart[3:12]) {
+				t.Fatalf("Get bytes = %q, want %q", got, multipart[3:12])
+			}
+
+			keys := map[string]bool{}
+			for obj, err := range bucket.WalkAfter(ctx, "", "a") {
+				if err != nil {
+					t.Fatalf("WalkAfter: %v", err)
+				}
+				keys[obj.Key] = true
+			}
+			for _, key := range []string{"single.parquet", "multipart.parquet"} {
+				if !keys[key] {
+					t.Fatalf("WalkAfter missing %q in %v", key, keys)
+				}
+			}
+
+			errs, err := bucket.DeleteObjects(ctx, []string{"single.parquet", "multipart.parquet"})
+			if err != nil {
+				t.Fatalf("DeleteObjects: %v", err)
+			}
+			for i, err := range errs {
+				if err != nil {
+					t.Fatalf("DeleteObjects[%d]: %v", i, err)
+				}
+			}
+
+			mock.mu.Lock()
+			uploads := len(mock.uploads)
+			stored := len(mock.objects)
+			mock.mu.Unlock()
+			if uploads != 0 {
+				t.Fatalf("%d multipart uploads left behind", uploads)
+			}
+			if stored != 0 {
+				t.Fatalf("%d objects left behind", stored)
+			}
+			faults.mu.Lock()
+			injected := faults.faults
+			faults.mu.Unlock()
+			if injected == 0 {
+				t.Fatal("no faults were injected")
+			}
+		})
+	}
 }

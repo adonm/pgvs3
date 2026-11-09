@@ -688,9 +688,24 @@ func newCRC64NVME() *crc64NVME { return &crc64NVME{crc: ^uint64(0)} }
 func (c *crc64NVME) Write(p []byte) (int, error) {
 	n := len(p)
 	crc := c.crc
+	t := &crc64NVMETables
+	for len(p) >= 32 {
+		crc ^= binary.LittleEndian.Uint64(p)
+		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
+			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
+		crc ^= binary.LittleEndian.Uint64(p[8:])
+		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
+			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
+		crc ^= binary.LittleEndian.Uint64(p[16:])
+		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
+			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
+		crc ^= binary.LittleEndian.Uint64(p[24:])
+		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
+			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
+		p = p[32:]
+	}
 	for len(p) >= 8 {
 		crc ^= binary.LittleEndian.Uint64(p)
-		t := &crc64NVMETables
 		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
 			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
 		p = p[8:]

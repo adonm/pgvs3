@@ -55,6 +55,28 @@ type PutOptions struct {
 	IfMatch string
 
 	IfNoneMatch string
+
+	ChecksumAlgorithm string
+	ChecksumValue     string
+}
+
+var multipartBufPool sync.Pool
+
+func getMultipartBuf(size int64) ([]byte, *[]byte) {
+	if v := multipartBufPool.Get(); v != nil {
+		bp := v.(*[]byte)
+		if int64(cap(*bp)) >= size {
+			return (*bp)[:size], bp
+		}
+	}
+	b := make([]byte, size, max(size, defaultMinPartSize))
+	return b, &b
+}
+
+func putMultipartBuf(bp *[]byte) {
+	if bp != nil && cap(*bp) <= 16<<20 {
+		multipartBufPool.Put(bp)
+	}
 }
 
 func (b *Bucket) Stat(ctx context.Context, key string) (ObjectInfo, error) {
@@ -476,12 +498,14 @@ func (b *Bucket) putMultipartStream(ctx context.Context, key string, r io.Reader
 		g.SetLimit(4)
 		for number, remaining := int64(1), size; remaining > 0; number++ {
 			want := min(partSize, remaining)
-			buf := make([]byte, want)
+			buf, bp := getMultipartBuf(want)
 			if _, err := io.ReadFull(r, buf); err != nil {
+				putMultipartBuf(bp)
 				_ = g.Wait()
 				return ObjectInfo{}, fmt.Errorf("s3: PUT %s: reading part %d: %w", key, number, err)
 			}
 			g.Go(func() error {
+				defer putMultipartBuf(bp)
 				return u.uploadPart(gctx, number, bytes.NewReader(buf), want)
 			})
 			remaining -= want
@@ -548,6 +572,18 @@ func putHeaders(opts PutOptions) ([][2]string, []string, error) {
 	if ifNone != "" {
 		headers = append(headers, [2]string{"if-none-match", "*"})
 	}
+	if opts.ChecksumAlgorithm != "" && opts.ChecksumValue != "" {
+		alg := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(opts.ChecksumAlgorithm), "x-amz-checksum-"))
+		switch alg {
+		case "crc32", "crc32c", "crc64nvme", "sha1", "sha256":
+		default:
+			return nil, nil, fmt.Errorf("s3: unsupported checksum algorithm %q", opts.ChecksumAlgorithm)
+		}
+		if !validHeaderValue(opts.ChecksumValue) {
+			return nil, nil, errors.New("s3: invalid checksum value")
+		}
+		headers = append(headers, [2]string{"x-amz-checksum-" + alg, opts.ChecksumValue})
+	}
 	return headers, userMeta, nil
 }
 
@@ -564,9 +600,10 @@ func conditionalHeaders(headers [][2]string) [][2]string {
 func nonConditionalHeaders(headers [][2]string) [][2]string {
 	out := make([][2]string, 0, len(headers))
 	for _, h := range headers {
-		if h[0] != "if-match" && h[0] != "if-none-match" {
-			out = append(out, h)
+		if h[0] == "if-match" || h[0] == "if-none-match" || strings.HasPrefix(h[0], "x-amz-checksum-") {
+			continue
 		}
+		out = append(out, h)
 	}
 	return out
 }

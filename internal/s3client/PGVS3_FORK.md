@@ -35,11 +35,13 @@ type ObjectInfo struct {
 }
 
 type PutOptions struct {
-    UserMetadata    []string
-    ContentType     string
-    ContentEncoding string
-    IfMatch         string
-    IfNoneMatch     string
+    UserMetadata      []string
+    ContentType       string
+    ContentEncoding   string
+    IfMatch           string
+    IfNoneMatch       string
+    ChecksumAlgorithm string
+    ChecksumValue     string
 }
 
 func (*Bucket) Stat(ctx, key) (ObjectInfo, error)
@@ -72,9 +74,20 @@ func NotFound, Precondition, Conflict, Unsupported, InvalidRange(error) bool
   different window.
 - Conditional writes apply conditions to final-object completion for
   multipart uploads.
-- `WriteReader` streams and never retries a part. When the calculated part size
-  is at most 16 MiB, it reads parts into memory and uploads four at a time;
-  larger parts use sequential streaming to keep memory bounded.
+- `WriteReader` streams and does not retry non-replayable bodies. When the
+  calculated part size is at most 16 MiB, it reads parts from a pooled buffer
+  (capped at 16 MiB) and uploads four at a time; larger parts use sequential
+  streaming to keep memory bounded.
+- Optional object checksums are passed through as `x-amz-checksum-<algorithm>`
+  on single PUTs. Known algorithms are `crc32`, `crc32c`, `crc64nvme`, `sha1`
+  and `sha256`; header names may be given with or without the
+  `x-amz-checksum-` prefix. Checksum headers are stripped from
+  `CreateMultipartUpload`, because multipart part checksums are not attached
+  separately.
+- The HTTP transport resolves each S3 hostname on a fixed one-minute interval
+  and dials the returned front-end IPs round-robin, retrying the next address
+  when one is unreachable. Idle keep-alive connections default to a 90-second
+  timeout so they rotate across front-end IPs.
 - The HTTP transport disables transparent compression.
 - `Walk` validates continuation-token progress. `WalkAfter` sends `start-after`
   on the first list page, then uses the continuation token, so deep pages do not
@@ -84,6 +97,10 @@ func NotFound, Precondition, Conflict, Unsupported, InvalidRange(error) bool
 - Replayable requests (no body or a seekable body) retry up to three attempts on
   429/5xx responses and transport errors with short exponential backoff.
   Non-replayable uploads are left to the caller's retry loop.
+- `TestDeterministicFaultInjection` drives single and multipart PUTs, `Stat`,
+  ranged `Get`, `WalkAfter` and `DeleteObjects` through a seeded-PRNG transport
+  that injects 503, 429 and `io.ErrUnexpectedEOF` failures, and verifies that
+  payloads survive and no multipart upload is left behind.
 - User metadata is sorted, bare name/value pairs.
 
 The package is used by `internal/objcache` for the production S3 origin and by

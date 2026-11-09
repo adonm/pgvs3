@@ -18,10 +18,14 @@ package s3client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -316,3 +320,113 @@ func TestPublicSignerMatchesFastPath(t *testing.T) {
 		t.Fatalf("authorization = %q, want %q", got, auth)
 	}
 }
+
+func TestDNSCacheDialerRoundRobinAndFallback(t *testing.T) {
+	ctx := context.Background()
+	ips := []net.IPAddr{
+		{IP: net.ParseIP("192.0.2.10")},
+		{IP: net.ParseIP("192.0.2.11")},
+	}
+	var lookups atomic.Int64
+	var unreachable atomic.Bool
+	var lookupErr atomic.Bool
+	var mu sync.Mutex
+	var attempts []string
+	d := newDNSCacheDialer(func(_ context.Context, _, addr string) (net.Conn, error) {
+		mu.Lock()
+		attempts = append(attempts, addr)
+		mu.Unlock()
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		if host == "192.0.2.11" && unreachable.Load() {
+			return nil, errors.New("unreachable")
+		}
+		return &stubConn{addr: addr}, nil
+	}, time.Hour, func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "s3.example.com" {
+			t.Errorf("lookup host = %q", host)
+		}
+		lookups.Add(1)
+		if lookupErr.Load() {
+			return nil, errors.New("lookup failed")
+		}
+		return ips, nil
+	})
+
+	for i := range 5 {
+		conn, err := d.DialContext(ctx, "tcp", "s3.example.com:443")
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		if conn == nil {
+			t.Fatalf("dial %d returned no connection", i)
+		}
+	}
+	if got := lookups.Load(); got != 1 {
+		t.Fatalf("lookups = %d, want 1 within the refresh interval", got)
+	}
+	mu.Lock()
+	got := append([]string(nil), attempts...)
+	mu.Unlock()
+	want := []string{
+		"192.0.2.10:443", "192.0.2.11:443", "192.0.2.10:443",
+		"192.0.2.11:443", "192.0.2.10:443",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("attempts = %v, want %v", got, want)
+	}
+
+	unreachable.Store(true)
+	conn, err := d.DialContext(ctx, "tcp", "s3.example.com:443")
+	if err != nil {
+		t.Fatalf("fallback dial: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("fallback dial returned no connection")
+	}
+	mu.Lock()
+	got = append([]string(nil), attempts[5:]...)
+	mu.Unlock()
+	want = []string{"192.0.2.11:443", "192.0.2.10:443"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("fallback attempts = %v, want %v", got, want)
+	}
+
+	// An expired entry is served stale when the lookup fails.
+	lookupErr.Store(true)
+	d.interval = -1
+	if _, err := d.DialContext(ctx, "tcp", "s3.example.com:443"); err != nil {
+		t.Fatalf("stale fallback dial: %v", err)
+	}
+
+	// Literal IPs and localhost bypass the cache entirely.
+	before := lookups.Load()
+	for _, addr := range []string{"127.0.0.1:443", "localhost:443"} {
+		if _, err := d.DialContext(ctx, "tcp", addr); err != nil {
+			t.Fatalf("bypass dial %s: %v", addr, err)
+		}
+	}
+	if after := lookups.Load(); after != before {
+		t.Fatalf("bypass dials performed %d lookups", after-before)
+	}
+}
+
+type stubConn struct {
+	addr string
+}
+
+func (c *stubConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *stubConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c *stubConn) Close() error                     { return nil }
+func (c *stubConn) LocalAddr() net.Addr              { return stubAddr("local") }
+func (c *stubConn) RemoteAddr() net.Addr             { return stubAddr(c.addr) }
+func (c *stubConn) SetDeadline(time.Time) error      { return nil }
+func (c *stubConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *stubConn) SetWriteDeadline(time.Time) error { return nil }
+
+type stubAddr string
+
+func (a stubAddr) Network() string { return "tcp" }
+func (a stubAddr) String() string  { return string(a) }

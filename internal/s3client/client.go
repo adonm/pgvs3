@@ -29,6 +29,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -579,6 +581,95 @@ type TransportOptions struct {
 	ResponseHeaderTimeout time.Duration
 }
 
+type dnsCacheEntry struct {
+	ips []net.IPAddr
+	at  time.Time
+}
+
+// dnsCacheDialer resolves hostnames on a fixed interval and dials the returned
+// addresses round-robin, so one long-lived process spreads connections across
+// S3 front-end IPs instead of pinning a stale answer.
+type dnsCacheDialer struct {
+	base     func(ctx context.Context, network, addr string) (net.Conn, error)
+	lookup   func(ctx context.Context, host string) ([]net.IPAddr, error)
+	interval time.Duration
+	rr       atomic.Uint64
+
+	mu      sync.RWMutex
+	entries map[string]dnsCacheEntry
+}
+
+func newDNSCacheDialer(base func(ctx context.Context, network, addr string) (net.Conn, error), interval time.Duration, lookup func(ctx context.Context, host string) ([]net.IPAddr, error)) *dnsCacheDialer {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIPAddr
+	}
+	if base == nil {
+		base = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
+	return &dnsCacheDialer{
+		base:     base,
+		lookup:   lookup,
+		interval: interval,
+		entries:  make(map[string]dnsCacheEntry),
+	}
+}
+
+func (d *dnsCacheDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || net.ParseIP(strings.Trim(host, "[]")) != nil || host == "localhost" {
+		return d.base(ctx, network, addr)
+	}
+	ips, err := d.resolve(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("s3: no addresses for %s", host)
+	}
+	start := int(d.rr.Add(1) - 1)
+	var lastErr error
+	for i := range ips {
+		ip := ips[(start+i)%len(ips)]
+		conn, err := d.base(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+	}
+	return nil, lastErr
+}
+
+func (d *dnsCacheDialer) resolve(ctx context.Context, host string) ([]net.IPAddr, error) {
+	now := time.Now()
+	d.mu.RLock()
+	entry, ok := d.entries[host]
+	d.mu.RUnlock()
+	if ok && now.Sub(entry.at) < d.interval {
+		return entry.ips, nil
+	}
+
+	ips, err := d.lookup(ctx, host)
+	if err == nil && len(ips) > 0 {
+		d.mu.Lock()
+		d.entries[host] = dnsCacheEntry{ips: ips, at: time.Now()}
+		d.mu.Unlock()
+		return ips, nil
+	}
+	if ok {
+		return entry.ips, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("s3: no addresses for %s", host)
+}
+
 func NewTransport(opts TransportOptions) *http.Transport {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DisableCompression = true
@@ -590,6 +681,10 @@ func NewTransport(opts TransportOptions) *http.Transport {
 	}
 	if opts.IdleConnTimeout > 0 {
 		tr.IdleConnTimeout = opts.IdleConnTimeout
+	} else {
+		// Rotate idle keep-alive connections periodically so a long-lived
+		// gateway spreads load across S3 front-end IPs.
+		tr.IdleConnTimeout = 90 * time.Second
 	}
 	if opts.ResponseHeaderTimeout > 0 {
 		tr.ResponseHeaderTimeout = opts.ResponseHeaderTimeout
@@ -602,5 +697,6 @@ func NewTransport(opts TransportOptions) *http.Transport {
 		}
 		tr.TLSClientConfig.InsecureSkipVerify = true
 	}
+	tr.DialContext = newDNSCacheDialer(tr.DialContext, time.Minute, net.DefaultResolver.LookupIPAddr).DialContext
 	return tr
 }
