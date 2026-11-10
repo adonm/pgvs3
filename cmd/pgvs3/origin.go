@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 )
@@ -101,6 +102,120 @@ func (c originConfig) spec(raw []byte) objcache.Spec {
 		MaxBytes:   c.cacheMaxBytes,
 		Config:     string(raw),
 	}
+}
+
+// parseS3OriginFlag parses "[local=]s3://origin-bucket[/prefix][?query]" into
+// a bucket-scoped origin spec. It is used by `pgvs3 serve --s3-origin` so a
+// writable gateway can attach an origin in the same command that starts it.
+func parseS3OriginFlag(spec string, cfg serveConfig) (string, objcache.Spec, error) {
+	var empty objcache.Spec
+	raw := strings.TrimSpace(spec)
+	if raw == "" {
+		return "", empty, fmt.Errorf("empty --s3-origin")
+	}
+	localBucket := ""
+	if before, after, ok := strings.Cut(raw, "="); ok && !strings.Contains(before, "://") {
+		localBucket = strings.TrimSpace(before)
+		raw = strings.TrimSpace(after)
+	}
+	if !strings.HasPrefix(strings.ToLower(raw), "s3://") {
+		return "", empty, fmt.Errorf("--s3-origin must start with s3://, got %q", spec)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", empty, fmt.Errorf("invalid --s3-origin %q: %w", spec, err)
+	}
+	originBucket := u.Host
+	if originBucket == "" {
+		return "", empty, fmt.Errorf("--s3-origin %q has no bucket name", spec)
+	}
+	prefix := strings.Trim(u.Path, "/")
+	if localBucket == "" {
+		localBucket = originBucket
+	}
+	if !ns.ValidName(localBucket) {
+		return "", empty, fmt.Errorf("invalid local bucket %q: use local=s3://%s%s", localBucket, originBucket, u.Path)
+	}
+	q := u.Query()
+	region := q.Get("region")
+	if region == "" {
+		region = env("AWS_REGION", env("AWS_DEFAULT_REGION", "us-east-1"))
+	}
+	accessKey := os.Getenv("PGVS3_S3_ACCESS_KEY")
+	if accessKey == "" {
+		accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+	}
+	secretKey := os.Getenv("PGVS3_S3_SECRET_KEY")
+	if secretKey == "" {
+		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	}
+	lookup := "auto"
+	if truthyFlag(q.Get("path_style")) {
+		lookup = "path"
+	}
+	config := struct {
+		Type   string `json:"type"`
+		Prefix string `json:"prefix"`
+		Config struct {
+			Bucket           string `json:"bucket"`
+			Endpoint         string `json:"endpoint"`
+			Region           string `json:"region"`
+			AccessKey        string `json:"access_key"`
+			SecretKey        string `json:"secret_key"`
+			Insecure         bool   `json:"insecure"`
+			BucketLookupType string `json:"bucket_lookup_type"`
+			StripBucket      bool   `json:"strip_bucket"`
+		} `json:"config"`
+	}{Type: "s3", Prefix: prefix}
+	config.Config.Bucket = originBucket
+	config.Config.Endpoint = q.Get("endpoint")
+	config.Config.Region = region
+	config.Config.AccessKey = accessKey
+	config.Config.SecretKey = secretKey
+	config.Config.Insecure = truthyFlag(q.Get("insecure"))
+	config.Config.BucketLookupType = lookup
+	config.Config.StripBucket = true
+	rawConfig, err := json.Marshal(config)
+	if err != nil {
+		return "", empty, err
+	}
+	namespace := cfg.cacheNamespace
+	if namespace == "" || namespace == "origin" {
+		namespace = "origin-" + localBucket
+	}
+	rangeChunk := cfg.rangeCacheChunk
+	if rangeChunk <= 0 {
+		rangeChunk = 1 << 20
+	}
+	originSpec := objcache.Spec{
+		Namespace:  namespace,
+		TTL:        cfg.cacheTTL.String(),
+		Retention:  cfg.cacheRetention.String(),
+		MaxFills:   cfg.fillConcurrency,
+		RangeChunk: rangeChunk,
+		MaxBytes:   cfg.cacheMaxBytes,
+		Config:     string(rawConfig),
+	}
+	return localBucket, originSpec, nil
+}
+
+func truthyFlag(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func s3OriginBucket(spec objcache.Spec) string {
+	var parsed struct {
+		Config struct {
+			Bucket string `json:"bucket"`
+		} `json:"config"`
+	}
+	_ = json.Unmarshal([]byte(spec.Config), &parsed)
+	return parsed.Config.Bucket
 }
 
 func (c originConfig) buildS3JSON() ([]byte, error) {

@@ -156,6 +156,8 @@ type serveConfig struct {
 	logLevel                string
 	pprofAddr               string
 	originConfig            string
+	s3Origin                string
+	autoBucket              string
 	cacheTTL                time.Duration
 	cacheRetention          time.Duration
 	cacheNamespace          string
@@ -197,6 +199,8 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "optional loopback address for net/http/pprof, e.g. 127.0.0.1:6060")
 	fs.StringVar(&cfg.originConfig, "origin-config", "", "process-local fallback origin JSON; prefer pgvs3 origin set, which every gateway discovers")
+	fs.StringVar(&cfg.s3Origin, "s3-origin", "", "attach a bucket-scoped S3 origin on writable startup as [bucket=]s3://origin-bucket[/prefix][?region=...&endpoint=...&path_style=true&insecure=true]")
+	fs.StringVar(&cfg.autoBucket, "auto-bucket", "", "comma-separated native buckets to ensure on writable startup")
 	fs.DurationVar(&cfg.cacheTTL, "cache-ttl", time.Minute, "origin revalidation interval (0 always revalidates)")
 	fs.DurationVar(&cfg.cacheRetention, "cache-retention", 24*time.Hour, "evict cached objects after this idle period")
 	fs.StringVar(&cfg.cacheNamespace, "cache-namespace", "origin", "cache namespace for origin objects")
@@ -234,6 +238,16 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	}
 	if cfg.cacheMaxBytes < 0 {
 		return serveConfig{}, fmt.Errorf("--cache-max-bytes must be non-negative")
+	}
+	if cfg.s3Origin != "" {
+		if _, _, err := parseS3OriginFlag(cfg.s3Origin, cfg); err != nil {
+			return serveConfig{}, err
+		}
+	}
+	for _, name := range autoBucketNames(cfg.autoBucket) {
+		if !ns.ValidName(name) {
+			return serveConfig{}, fmt.Errorf("invalid --auto-bucket name %q", name)
+		}
 	}
 	if cfg.dbStatementTimeout < 0 || cfg.dbLockTimeout < 0 || cfg.dbIdleTxTimeout < 0 ||
 		cfg.dbMaxConnLifetime < 0 || cfg.dbMaxConnLifetimeJitter < 0 ||
@@ -345,7 +359,36 @@ func prepareStore(ctx context.Context, st *store.Store, cfg serveConfig, log *sl
 	if cfg.readOnly {
 		return noop, nil
 	}
+	for _, name := range autoBucketNames(cfg.autoBucket) {
+		if err := st.CreateBucket(ctx, name); err != nil {
+			log.Error("creating startup bucket", "bucket", name, "err", err)
+			return noop, err
+		}
+	}
+	if cfg.s3Origin != "" {
+		localBucket, spec, err := parseS3OriginFlag(cfg.s3Origin, cfg)
+		if err != nil {
+			log.Error("parsing s3 origin", "err", err)
+			return noop, err
+		}
+		if err := objcache.SaveSpec(ctx, st, localBucket, spec); err != nil {
+			log.Error("saving s3 origin", "bucket", localBucket, "err", err)
+			return noop, err
+		}
+		log.Info("attached s3 origin", "bucket", localBucket, "s3_bucket", s3OriginBucket(spec),
+			"range_chunk", spec.RangeChunk, "duckdb_path", "s3://"+localBucket+"/")
+	}
 	return startMaintenance(ctx, st, cfg.reapGrace, log), nil
+}
+
+func autoBucketNames(raw string) []string {
+	var names []string
+	for name := range strings.SplitSeq(raw, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func startMaintenance(ctx context.Context, st *store.Store, reapGrace time.Duration, log *slog.Logger) func() {

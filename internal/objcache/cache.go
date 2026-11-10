@@ -419,6 +419,55 @@ func cachedInfo(ref store.ObjectRef, m *store.Meta) store.ObjectInfo {
 	return info
 }
 
+// RangeChunkSize reports the aligned range size this tier fills, or zero when
+// range caching is disabled.
+func (t *Tier) RangeChunkSize() int64 { return t.rangeSize }
+
+// HeadCached resolves metadata from the local cache only. It never contacts the
+// origin, so archive member lookups can check whether a literal object shadows
+// the member without a wasted origin HEAD.
+func (t *Tier) HeadCached(ctx context.Context, bucket, key string) (store.ObjectInfo, bool, error) {
+	m, ref, err := t.lookupCached(ctx, t.key(bucket, key), false)
+	if err != nil {
+		return store.ObjectInfo{}, false, err
+	}
+	if m == nil {
+		return store.ObjectInfo{}, false, nil
+	}
+	if store.ParseCacheVersion(m.OriginETag).State == store.CacheDeleted {
+		return store.ObjectInfo{}, false, store.ErrNotFound
+	}
+	return cachedInfo(ref, m), true, nil
+}
+
+// OpenCached opens a cached object without contacting the origin.
+func (t *Tier) OpenCached(ctx context.Context, bucket, key string, rng store.ByteRange) (*Object, bool, error) {
+	m, ref, err := t.lookupCached(ctx, t.key(bucket, key), true)
+	if err != nil {
+		return nil, false, err
+	}
+	if m == nil {
+		return nil, false, nil
+	}
+	if store.ParseCacheVersion(m.OriginETag).State == store.CacheDeleted {
+		return nil, false, store.ErrNotFound
+	}
+	span, err := rng.Resolve(m.Size)
+	if err != nil {
+		return nil, false, err
+	}
+	info := cachedInfo(ref, m)
+	if info.ContentType == "" {
+		info.ContentType = contentTypeFor(key)
+	}
+	view := readView{ObjectInfo: info, start: span.Start, end: span.End, ranged: span.Ranged, hit: true}
+	obj, err := t.openCached(ctx, ref, m, view)
+	if err != nil {
+		return nil, false, err
+	}
+	return obj, true, nil
+}
+
 func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 	ck := t.key(bucket, key)
 	res, err := t.resolveCache(ctx, ck, false, false, false)

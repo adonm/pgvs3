@@ -40,18 +40,33 @@ Permanent non-goals are listed in [design.md](design.md#scope-boundaries).
   `GET /{bucket}` serves `/{bucket}/index.html` when present, and `Content-Type`
   falls back to the filename extension.
 
-### ZIP and ZIP64 virtual folders
+### Archive virtual folders (ZIP, ZIP64, TAR and seekable TAR.ZST)
 
-`GET` and `HEAD` accept `<archive>.zip/<member>` (and case-insensitive
-`<archive>.ZIP/...`) when no literal object with that key exists. The first
-read of any `.zip` reads the last 256 KiB, parses the ZIP32 or ZIP64 central
-directory (EOCD, ZIP64 EOCD locator/record, `0x0001` extra fields, extended
-timestamps and bit-3 data descriptors) in one pass, and caches an immutable
-member index keyed by the archive bucket, ETag and size. If the directory is
-larger than the tail, one additional ranged GET reads it. Each member's exact
-data offset is learned on its first read and kept in the cached index; there is
-no sidecar file to create or consult.
+`GET` and `HEAD` accept `<archive>/<member>` when no literal object with that
+key exists. The suffixes are case-insensitive: `.zip` (ZIP32/ZIP64), `.tar`,
+`.tar.zst` and `.tzst`. A `.tar.zst` or `.tzst` archive uses the Zstandard
+Seekable Format. The first read of any archive caches an immutable member index
+keyed by the archive bucket, ETag and size; there is no sidecar file to create
+or consult.
 
+- **ZIP and ZIP64:** the first read reads the last 256 KiB, parses the central
+  directory (EOCD, ZIP64 EOCD locator/record, `0x0001` extra fields, extended
+  timestamps and bit-3 data descriptors) in one pass. If the directory is larger
+  than the tail, one additional ranged GET reads it. Each member's exact data
+  offset is learned on its first read and kept in the cached index.
+- **TAR:** indexing walks only 512-byte headers plus small PAX/GNU (`x`, `L`)
+  metadata payloads, skipping member bodies by offset. A 512 MiB uncompressed
+  TAR therefore costs header ranges, not a full download. USTAR prefixes, GNU
+  long names, PAX `path`/`size`/`mtime` and regular-file members are supported;
+  the index limit is 512 MiB of archive and 64,000 members.
+- **Seekable Zstandard:** a `.tar.zst`/`.tzst` whose tail carries the seek table
+  skippable frame (`0x184D2A5E`, footer magic `0x8F92EAB1`) is indexed by
+  hopping uncompressed headers using the jump table, then serves member ranges
+  by reading only the compressed frames that intersect the requested bytes.
+  Large Zstd ZIP members (method 93, over 16 MiB) also use a per-member seek
+  table when present, so a middle range read does not decompress from byte zero.
+  A `.tar.zst` without a seek table is streamed once and cached when it is at
+  most 64 MiB; larger ones fall back to normal object semantics.
 - **Listing:** `ListObjectsV2` treats members as virtual keys. `prefix`,
   `delimiter=/` (nested folders become `CommonPrefixes`), `max-keys`,
   `start-after` and continuation tokens all work, so `aws s3 ls
@@ -70,10 +85,19 @@ no sidecar file to create or consult.
   cache, so later whole or ranged reads copy from memory. Zstd is recommended
   for new archives: it decompresses about 4–6× faster than Deflate at similar
   ratios, and pgvs3 decompresses it natively.
-- **Limits:** the index cache holds 64 archives / 64,000 members; archives
+- **Origin-backed archives:** archive metadata resolves through the cache tier,
+  and a member lookup first checks cached literal objects. Missing members are
+  answered from the cached archive index; the gateway does not issue a WAN
+  `HEAD`/`GET` for the virtual member or record a 404 at the origin. When the
+  archive itself is origin-backed, the tail read aligns to
+  `--range-cache-chunk` so the footer and central directory join the cached
+  range chunks instead of being fetched again as a one-off WAN range.
+- **Limits:** the index cache holds 64 archives / 64,000 members; ZIP archives
   whose central directory exceeds 64 MiB fall back to normal object semantics.
   Encrypted, spanned/multi-disk and self-extracting archives are not supported,
   and writes always create literal S3 keys rather than modifying an archive.
+  Concatenated or non-seekable `.tar.zst` remains supported only through the
+  bounded streaming path.
 
 ## Core: origin-backed cache and write-back
 

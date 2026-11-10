@@ -1,6 +1,6 @@
 # Focused roadmap
 
-Updated 2026-10-29. The three priorities below are implemented on layout v25;
+Updated 2026-11-11. The three priorities below are implemented on layout v25;
 [data-plane-results.md](data-plane-results.md) records the proof and measurements.
 
 **Make the PostgreSQL object data plane easy to explain, demonstrate and
@@ -12,6 +12,40 @@ This is the current focus and evidence map, not an expansion of protocol scope.
 [design.md](design.md) defines the architecture;
 [CONTRIBUTING.md](https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#change-admission) defines the feature filter.
 Historical proposals are research, not the active backlog.
+
+## Delivered: S3 origin acceleration, Quack pool model and archive virtual folders (v0.8.0)
+
+- **Bounded origin cache:** `--cache-max-bytes` evicts the oldest `s3c_` and
+  committed `s3w_` objects instead of growing without limit. Aligned range
+  chunks up to 64 MiB keep Parquet footers and column chunks in PostgreSQL, so
+  warm ranged reads stay local. See [cache modes](operations.md#cache-modes).
+- **One round trip for warm range metadata:** `MetadataOrOrigin` resolves a
+  cached object and the parent origin metadata in one statement, so a warm
+  range hit does not pay a second PostgreSQL query.
+- **Anonymous public S3 and measured speedup:** the S3 origin accepts empty
+  credentials and sends unsigned requests. `just overture` queries 1.23 GiB of
+  Overture Maps Parquet through STAC; warm shared `s3c_` reads are **45.7×**
+  and the 256 MiB gateway block cache **63.8×** faster than the direct median
+  while caching only **1.80%** of source bytes. See
+  [Overture measurements](benchmarks.md#anonymous-overture-maps--stac-just-overture).
+- **S3 client hardening:** TigerBeetle-derived pooling and DNS lessons landed as
+  reusable multipart part buffers, fixed-interval S3 host resolution with
+  round-robin dialing, checksum pass-through on single PUTs, and seeded-PRNG
+  fault-injection tests for retries and multipart cleanup.
+- **Quack `C × W` pool model:** documented client/worker/gateway/PostgreSQL
+  capacity limits with [FIG 07](index.md#fig-07--quack-client-to-worker-pool-gateway-admission--postgresql-capacity),
+  a [sizing procedure](operations.md#sizing-a-quack-worker-pool) and measured
+  aggregate pool rates. See
+  [benchmarks](benchmarks.md#c-clients-x-w-worker-pool-benchmark).
+- **Single-command origin startup:** `pgvs3 serve --s3-origin
+  overture=s3://overturemaps-us-west-2?region=us-west-2 --auto-bucket lake`
+  creates the local bucket and attaches the origin on writable startup, with no
+  separate `origin set` process.
+- **Archive virtual folders:** `.zip`/`.zip64`, `.tar`, and seekable
+  `.tar.zst`/`.tzst` keys resolve members with one metadata query, index TAR
+  headers by offset, jump Zstd frames through the `0x8F92EAB1` seek table on
+  large members, and answer origin-backed missing members without a WAN 404.
+  See [interfaces and scope](interfaces.md).
 
 ## Starting point
 

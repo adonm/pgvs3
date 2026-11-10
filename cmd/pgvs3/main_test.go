@@ -55,6 +55,7 @@ func clearServeEnv(t *testing.T) {
 		"PGVS3_URL", "PGVS3_ADDR", "PGVS3_POOL_MAX", "PGVS3_MAX_CONNS",
 		"PGVS3_MAX_DB_BYTES", "PGVS3_REAP_GRACE", "PGVS3_READ_ONLY",
 		"PGVS3_LOG_LEVEL", "PGVS3_PPROF_ADDR", "PGVS3_ORIGIN_CONFIG",
+		"PGVS3_S3_ORIGIN", "PGVS3_AUTO_BUCKET",
 		"PGVS3_CACHE_TTL", "PGVS3_CACHE_RETENTION", "PGVS3_CACHE_NAMESPACE",
 		"PGVS3_FILL_CONCURRENCY", "PGVS3_RANGE_CACHE_CHUNK",
 		"PGVS3_CACHE_MAX_BYTES",
@@ -140,6 +141,8 @@ func TestParseServeConfigFlags(t *testing.T) {
 		"--db-max-conn-lifetime", "30m", "--db-max-conn-lifetime-jitter", "2m",
 		"--reap-grace", "2m", "--read-only", "--log-level", "warn",
 		"--pprof-addr", "127.0.0.1:6060", "--origin-config", "/tmp/origin.json",
+		"--s3-origin", "overture=s3://overturemaps-us-west-2?region=us-west-2",
+		"--auto-bucket", "lake, edge",
 		"--cache-ttl", "30s", "--cache-retention", "1h", "--cache-namespace", "cache",
 		"--fill-concurrency", "3", "--range-cache-chunk", "4096",
 		"--cache-max-bytes", "1048576",
@@ -171,6 +174,8 @@ func TestParseServeConfigFlags(t *testing.T) {
 		logLevel:                "warn",
 		pprofAddr:               "127.0.0.1:6060",
 		originConfig:            "/tmp/origin.json",
+		s3Origin:                "overture=s3://overturemaps-us-west-2?region=us-west-2",
+		autoBucket:              "lake, edge",
 		cacheTTL:                30 * time.Second,
 		cacheRetention:          time.Hour,
 		cacheNamespace:          "cache",
@@ -189,6 +194,81 @@ func TestParseServeConfigFlags(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("config = %+v, want %+v", cfg, want)
+	}
+}
+
+func TestParseS3OriginFlag(t *testing.T) {
+	clearServeEnv(t)
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	cfg := serveConfig{
+		cacheNamespace: "origin", cacheTTL: time.Minute, cacheRetention: 24 * time.Hour,
+		fillConcurrency: 8, cacheMaxBytes: 1 << 30,
+	}
+	local, spec, err := parseS3OriginFlag("overture=s3://overturemaps-us-west-2?region=us-west-2", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local != "overture" || spec.Namespace != "origin-overture" || spec.TTL != "1m0s" ||
+		spec.Retention != "24h0m0s" || spec.MaxFills != 8 || spec.RangeChunk != 1<<20 || spec.MaxBytes != 1<<30 {
+		t.Fatalf("spec = %+v local=%q", spec, local)
+	}
+	var parsed struct {
+		Type   string `json:"type"`
+		Prefix string `json:"prefix"`
+		Config struct {
+			Bucket           string `json:"bucket"`
+			Endpoint         string `json:"endpoint"`
+			Region           string `json:"region"`
+			AccessKey        string `json:"access_key"`
+			SecretKey        string `json:"secret_key"`
+			Insecure         bool   `json:"insecure"`
+			BucketLookupType string `json:"bucket_lookup_type"`
+			StripBucket      bool   `json:"strip_bucket"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal([]byte(spec.Config), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Type != "s3" || parsed.Config.Bucket != "overturemaps-us-west-2" ||
+		parsed.Config.Region != "us-west-2" || parsed.Prefix != "" ||
+		parsed.Config.BucketLookupType != "auto" || !parsed.Config.StripBucket {
+		t.Fatalf("origin config = %+v (%s)", parsed, spec.Config)
+	}
+
+	t.Setenv("AWS_DEFAULT_REGION", "eu-west-1")
+	t.Setenv("PGVS3_S3_ACCESS_KEY", "key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	cfg.cacheNamespace, cfg.rangeCacheChunk = "cache", 4096
+	local, spec, err = parseS3OriginFlag("s3://warehouse/data/?endpoint=http://127.0.0.1:9000&path_style=1&insecure=true", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local != "warehouse" || spec.Namespace != "cache" || spec.RangeChunk != 4096 {
+		t.Fatalf("local=%q namespace=%q range=%d", local, spec.Namespace, spec.RangeChunk)
+	}
+	if err := json.Unmarshal([]byte(spec.Config), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Prefix != "data" || parsed.Config.Endpoint != "http://127.0.0.1:9000" ||
+		parsed.Config.Region != "eu-west-1" || parsed.Config.AccessKey != "key" ||
+		parsed.Config.SecretKey != "secret" || !parsed.Config.Insecure || parsed.Config.BucketLookupType != "path" {
+		t.Fatalf("origin config = %+v (%s)", parsed, spec.Config)
+	}
+
+	if _, _, err := parseS3OriginFlag("Lake=s3://bucket", cfg); err == nil || !strings.Contains(err.Error(), "local=s3://bucket") {
+		t.Fatalf("uppercase local bucket error = %v", err)
+	}
+	if _, _, err := parseS3OriginFlag("s3://MyBucket", cfg); err == nil || !strings.Contains(err.Error(), "local=s3://MyBucket") {
+		t.Fatalf("uppercase origin bucket error = %v", err)
+	}
+	if _, _, err := parseS3OriginFlag("ftp://bucket", cfg); err == nil {
+		t.Fatal("non-s3 origin accepted")
+	}
+	if _, _, err := parseS3OriginFlag("s3://", cfg); err == nil {
+		t.Fatal("empty origin bucket accepted")
 	}
 }
 
@@ -403,6 +483,8 @@ func TestParseServeConfigRejectsInvalidLimits(t *testing.T) {
 		{"--s3-queue-wait", "-1s"},
 		{"--http-read-timeout", "-1s"},
 		{"--cache-max-bytes", "-1"},
+		{"--auto-bucket", "Bad Name"},
+		{"--s3-origin", "ftp://bucket"},
 	} {
 		if _, err := parseServeConfig(args); err == nil {
 			t.Fatalf("parseServeConfig(%v) succeeded, want error", args)

@@ -81,11 +81,22 @@ type zipDecompressed struct {
 	lastUsed time.Time
 }
 
+type archiveKind uint8
+
+const (
+	archiveZip archiveKind = iota
+	archiveTar
+	archiveTarZstd
+)
+
 type zipIndex struct {
 	archiveKey  string
 	archiveETag string
 	archiveSize int64
 	createdAt   time.Time
+	kind        archiveKind
+	seekTable   *zstdSeekTable
+	tarDataKey  string
 	entries     []zipMember
 	byName      map[string]int
 }
@@ -99,7 +110,16 @@ type zipMember struct {
 	crc32            uint32
 	method           uint16
 	modified         time.Time
+	seekz            *zstdSeekState
 }
+
+type zstdSeekState struct {
+	table atomic.Pointer[zstdSeekTable]
+}
+
+// noZstdSeek marks a member whose tail was checked and is not seekable, so
+// later range reads do not spend another request on the same tail.
+var noZstdSeek = &zstdSeekTable{}
 
 func (idx *zipIndex) member(name string) (*zipMember, bool) {
 	i, ok := idx.byName[name]
@@ -172,20 +192,56 @@ func (idx *zipIndex) prefixEnd(full func(int) string, from int, prefix string) i
 	})
 }
 
-// splitZipKey turns "datasets/sample.zip/inner/quant.sf" into
-// ("datasets/sample.zip", "inner/quant.sf"). The caller only uses it after a
-// literal key lookup failed, so a real S3 object always shadows a member.
+// splitArchiveKey turns "datasets/sample.zip/inner/quant.sf" into
+// ("datasets/sample.zip", "inner/quant.sf", archiveZip, true). The caller only
+// uses it after a literal key lookup failed, so a real S3 object always shadows
+// a member. Suffixes are matched case-insensitively; ".tar.zst/" is checked
+// before ".tar/" so the compressed TAR suffix wins.
+func splitArchiveKey(key string) (archiveKey, memberPath string, kind archiveKind, ok bool) {
+	lower := strings.ToLower(key)
+	suffixes := []struct {
+		text string
+		kind archiveKind
+	}{
+		{".tar.zst/", archiveTarZstd},
+		{".tzst/", archiveTarZstd},
+		{".zip/", archiveZip},
+		{".tar/", archiveTar},
+	}
+	best := -1
+	for _, candidate := range suffixes {
+		i := strings.Index(lower, candidate.text)
+		if i < 0 || (best >= 0 && i >= best) {
+			continue
+		}
+		best = i
+		archiveKey = key[:i+len(candidate.text)-1]
+		memberPath = key[i+len(candidate.text):]
+		kind = candidate.kind
+		ok = true
+	}
+	if !ok || !safeZipMemberPath(memberPath) {
+		return "", "", archiveZip, false
+	}
+	return archiveKey, memberPath, kind, true
+}
+
+// splitZipKey is the ZIP-only form used by callers that predate TAR support.
 func splitZipKey(key string) (archiveKey, memberPath string, ok bool) {
-	i := strings.Index(strings.ToLower(key), ".zip/")
-	if i < 0 {
-		return "", "", false
+	archiveKey, memberPath, kind, ok := splitArchiveKey(key)
+	return archiveKey, memberPath, ok && kind == archiveZip
+}
+
+func archiveKindForKey(key string) archiveKind {
+	lower := strings.ToLower(key)
+	switch {
+	case strings.HasSuffix(lower, ".tar.zst"), strings.HasSuffix(lower, ".tzst"):
+		return archiveTarZstd
+	case strings.HasSuffix(lower, ".tar"):
+		return archiveTar
+	default:
+		return archiveZip
 	}
-	archiveKey = key[:i+len(".zip")]
-	memberPath = key[i+len(".zip/"):]
-	if !safeZipMemberPath(memberPath) {
-		return "", "", false
-	}
-	return archiveKey, memberPath, true
 }
 
 func safeZipMemberPath(memberPath string) bool {
@@ -391,6 +447,12 @@ func zipDecompressedKey(bucket string, idx *zipIndex, member *zipMember) string 
 }
 
 func (s *Server) buildZipIndex(ctx context.Context, backend readBackend, bucket, archiveKey string, info store.ObjectInfo, archiveMeta *store.Meta) (*zipIndex, error) {
+	switch archiveKindForKey(archiveKey) {
+	case archiveTar:
+		return s.buildTarIndex(ctx, backend, bucket, archiveKey, info, archiveMeta)
+	case archiveTarZstd:
+		return s.buildTarZstdIndex(ctx, backend, bucket, archiveKey, info, archiveMeta)
+	}
 	ra, err := newZipRangeReaderAt(ctx, backend, bucket, archiveKey, info.Size, archiveMeta)
 	if err != nil {
 		return nil, err
@@ -404,10 +466,12 @@ func (s *Server) buildZipIndex(ctx context.Context, backend readBackend, bucket,
 		archiveETag: info.ETag,
 		archiveSize: info.Size,
 		createdAt:   time.Now(),
+		kind:        archiveZip,
 		entries:     entries,
 		byName:      make(map[string]int, len(entries)),
 	}
 	for i := range entries {
+		entries[i].seekz = &zstdSeekState{}
 		idx.byName[entries[i].name] = i
 	}
 	return idx, nil
@@ -429,7 +493,14 @@ func newZipRangeReaderAt(ctx context.Context, backend readBackend, bucket, key s
 		return nil, zip.ErrFormat
 	}
 	ra := &zipRangeReaderAt{ctx: ctx, backend: backend, bucket: bucket, key: key, size: size, meta: meta}
-	n := min(size, zipTailSize)
+	tailSize := int64(zipTailSize)
+	if ob, ok := backend.(originBackend); ok && ob.RangeChunkSize() > tailSize {
+		// Align the archive tail to --range-cache-chunk so the footer and
+		// central directory land in a cached s3c_ chunk instead of a one-off
+		// WAN range that the next request repeats.
+		tailSize = ob.RangeChunkSize()
+	}
+	n := min(size, tailSize)
 	ra.tailOffset = size - n
 	body, err := openZipArchiveRange(ctx, backend, bucket, key, ra.tailOffset, size-1, meta)
 	if err != nil {
@@ -758,7 +829,7 @@ func findZip64End(ra io.ReaderAt, eocdOffset int64) (int64, []byte, bool, error)
 }
 
 func (s *Server) resolveZipMember(ctx context.Context, backend readBackend, bucket, key string) (*zipIndex, *zipMember, *store.Meta, bool) {
-	archiveKey, memberPath, ok := splitZipKey(key)
+	archiveKey, memberPath, _, ok := splitArchiveKey(key)
 	if !ok {
 		return nil, nil, nil, false
 	}
@@ -779,7 +850,7 @@ func (s *Server) resolveZipMember(ctx context.Context, backend readBackend, buck
 // resolveZipMemberWithMeta resolves a member using archive metadata that the
 // caller already fetched, so the request pays one metadata query in total.
 func (s *Server) resolveZipMemberWithMeta(ctx context.Context, backend readBackend, bucket, key string, archiveMeta *store.Meta) (*zipIndex, *zipMember, bool) {
-	archiveKey, memberPath, ok := splitZipKey(key)
+	archiveKey, memberPath, _, ok := splitArchiveKey(key)
 	if !ok {
 		return nil, nil, false
 	}
@@ -894,6 +965,12 @@ func (s *Server) openZipMemberBody(ctx context.Context, backend readBackend, buc
 	if member.uncompressedSize == 0 {
 		return http.NoBody, nil
 	}
+	if member.method == archiveMethodSeekZstd {
+		return s.openTarSeekMember(ctx, backend, bucket, idx, member, archiveMeta, span)
+	}
+	if idx.tarDataKey != "" {
+		return s.openTarDataMember(ctx, backend, bucket, idx, member, archiveMeta, span)
+	}
 	switch member.method {
 	case zip.Store:
 		return s.openZipStoredMember(ctx, backend, bucket, idx, member, archiveMeta, span)
@@ -973,6 +1050,15 @@ func (s *Server) openZipCompressedMember(ctx context.Context, backend readBacken
 		s.cacheDecompressed(key, data)
 		return io.NopCloser(bytes.NewReader(data[span.Start : span.End+1])), nil
 	}
+	if ranged && member.method == zstd.ZipMethodWinZip && member.uncompressedSize > zipMaxDecompressedMember {
+		body, ok, err := s.openZipSeekableZstdMember(ctx, backend, bucket, idx, member, archiveMeta, span)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return body, nil
+		}
+	}
 	out, err := s.openZipCompressedStream(ctx, backend, bucket, idx, member, archiveMeta)
 	if err != nil {
 		return nil, err
@@ -994,6 +1080,64 @@ func (s *Server) openZipCompressedMember(ctx context.Context, backend readBacken
 		out.reader = io.LimitReader(out.decomp, span.End-span.Start+1)
 	}
 	return out, nil
+}
+
+func (s *Server) openZipSeekableZstdMember(ctx context.Context, backend readBackend, bucket string, idx *zipIndex, member *zipMember, archiveMeta *store.Meta, span store.Span) (io.ReadCloser, bool, error) {
+	table, err := s.zipMemberSeekTable(ctx, backend, bucket, idx, member, archiveMeta)
+	if err != nil || table == nil || len(table.frames) == 0 {
+		return nil, false, err
+	}
+	openRange := func(start, length int64) (io.ReadCloser, error) {
+		return s.openZipMemberData(ctx, backend, bucket, idx, member, archiveMeta, start, length)
+	}
+	body, err := openSeekableZstdRange(ctx, openRange, table, span.Start, span.End)
+	if err != nil {
+		return nil, false, err
+	}
+	return body, true, nil
+}
+
+func (s *Server) zipMemberSeekTable(ctx context.Context, backend readBackend, bucket string, idx *zipIndex, member *zipMember, archiveMeta *store.Meta) (*zstdSeekTable, error) {
+	if cached := member.seekz.table.Load(); cached != nil {
+		if cached == noZstdSeek || len(cached.frames) == 0 {
+			return nil, nil
+		}
+		return cached, nil
+	}
+	readTail := func(length int64) ([]byte, error) {
+		body, err := s.openZipMemberData(ctx, backend, bucket, idx, member, archiveMeta, member.compressedSize-length, length)
+		if err != nil {
+			return nil, err
+		}
+		defer body.Close()
+		data, err := io.ReadAll(io.LimitReader(body, length))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(data)) != length {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return data, nil
+	}
+	n := min(int64(zstdSeekTailSize), member.compressedSize)
+	tail, err := readTail(n)
+	if err != nil {
+		return nil, err
+	}
+	table, required, ok := parseZstdSeekTable(tail, member.compressedSize)
+	if !ok && required > int64(len(tail)) && required <= member.compressedSize {
+		tail, err = readTail(required)
+		if err != nil {
+			return nil, err
+		}
+		table, _, ok = parseZstdSeekTable(tail, member.compressedSize)
+	}
+	if !ok {
+		member.seekz.table.Store(noZstdSeek)
+		return nil, nil
+	}
+	member.seekz.table.Store(table)
+	return table, nil
 }
 
 func (s *Server) readZipCompressedMember(ctx context.Context, backend readBackend, bucket string, idx *zipIndex, member *zipMember, archiveMeta *store.Meta) ([]byte, error) {

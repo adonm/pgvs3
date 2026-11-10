@@ -33,6 +33,7 @@ Run the S3/OJS/HTTP/RESP gateway (default when no command is given).
 | Flag | Environment | Default | Description |
 | --- | --- | --- | --- |
 | `--addr` | `PGVS3_ADDR` | `0.0.0.0:8014` | listen address for S3/HTTP/RESP2/OJS, /healthz, /readyz and /metrics |
+| `--auto-bucket` | `PGVS3_AUTO_BUCKET` | — | comma-separated native buckets to ensure on writable startup |
 | `--cache-max-bytes` | `PGVS3_CACHE_MAX_BYTES` | `0` | evict oldest cached objects when cache namespace exceeds this byte budget (0 disables) |
 | `--cache-namespace` | `PGVS3_CACHE_NAMESPACE` | `origin` | cache namespace for origin objects |
 | `--cache-retention` | `PGVS3_CACHE_RETENTION` | `24h0m0s` | evict cached objects after this idle period |
@@ -61,6 +62,7 @@ Run the S3/OJS/HTTP/RESP gateway (default when no command is given).
 | `--reap-grace` | `PGVS3_REAP_GRACE` | `10m0s` | how long overwritten or deleted files stay readable before garbage collection |
 | `--resp-concurrency` | `PGVS3_RESP_CONCURRENCY` | `32` | concurrent RESP batches |
 | `--s3-concurrency` | `PGVS3_S3_CONCURRENCY` | `32` | active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown |
+| `--s3-origin` | `PGVS3_S3_ORIGIN` | — | attach a bucket-scoped S3 origin on writable startup as [bucket=]s3://origin-bucket[/prefix][?region=...&endpoint=...&path_style=true&insecure=true] |
 | `--s3-queue-wait` | `PGVS3_S3_QUEUE_WAIT` | `1s` | maximum S3 admission wait (0 rejects excess immediately) |
 | `--simulate-bandwidth` | `PGVS3_SIMULATE_BANDWIDTH` | `0` | benchmark-only per-request bandwidth in bytes/sec (0 disables) |
 | `--simulate-latency` | `PGVS3_SIMULATE_LATENCY` | `0s` | benchmark-only one-way delay added to S3 requests and responses (20ms is about a 40ms RTT) |

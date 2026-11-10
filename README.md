@@ -39,8 +39,16 @@ export PGVS3_URL='postgres://postgres:postgres@127.0.0.1:5432/pgvs3_bench?sslmod
 mise exec go -- go run ./cmd/pgvs3 serve --addr 127.0.0.1:8014
 ```
 
+One command can also create buckets and attach an S3 origin on writable startup:
+
+```sh
+mise exec go -- go run ./cmd/pgvs3 serve --addr 127.0.0.1:8014 \
+  --auto-bucket lake,overture \
+  --s3-origin overture=s3://overturemaps-us-west-2?region=us-west-2
+```
+
 In another terminal, check the database and create a bucket. A write to a missing
-bucket returns `NoSuchBucket` rather than creating it:
+bucket returns `NoSuchBucket` unless it was listed in `--auto-bucket`:
 
 ```sh
 mise exec go -- go run ./cmd/pgvs3 doctor --gateways 1 --surge 0   # PASS/WARN/FAIL with fixes
@@ -72,10 +80,11 @@ GROUP BY group_id ORDER BY group_id LIMIT 5;
 Each group has 10,000 rows. The dummy credentials satisfy the client; they do not
 enable authentication.
 
-### Query files inside ZIP / ZIP64 archives
+### Query files inside archive virtual folders
 
-An archive is also a virtual folder. Append `/<member>` to a `.zip` key and use
-it like any other object:
+ZIP, ZIP64, TAR and seekable Zstandard TAR archives are also virtual folders.
+Append `/<member>` to a `.zip`, `.tar`, `.tar.zst` (or `.tzst`) key and use it
+like any other object:
 
 ```sql
 -- Parquet and CSV members are read with ranged GETs; no extraction step.
@@ -95,7 +104,19 @@ then serves each member with one cut-through range request when it is stored,
 or a sequential range when it is compressed. `Store` (0) members
 are zero-copy; `Deflate` (8) and `Zstd` (method 93, which decompresses
 about 4–6× faster than Deflate and is recommended for new archives) are
-decompressed natively. `ListObjectsV2` supports prefixes,
+decompressed natively.
+
+TAR indexing walks 512-byte headers only, so a 512 MiB uncompressed `.tar`
+costs a few hundred KiB of header ranges rather than its full size. A
+`.tar.zst`/`.tzst` with a
+[Seekable Zstd](https://github.com/facebook/zstd/blob/dev/contrib/seekable_format/zstd_seekable_compression_format.md)
+jump table (`0x8F92EAB1`) jumps straight to the frames covering a member range;
+a very large Zstd ZIP member with the same table gets the same frame-level
+random access instead of decompressing from byte zero. Origin-backed archives
+resolve members from cached metadata, so a missing member does not spend a
+WAN `HEAD`/`GET` or leave a 404 at the origin.
+
+`ListObjectsV2` supports prefixes,
 `delimiter=/` (subdirectories become `CommonPrefixes`), `max-keys` and
 `start-after`/continuation tokens. Members support `HEAD`, whole `GET`, byte
 ranges and `If-None-Match`; a real object at the same key always shadows the
@@ -122,8 +143,19 @@ The DuckLake catalog and the pgvs3 objects share a cluster but commit in
 
 ### Attach an existing S3 bucket in one command
 
-Store the origin in PostgreSQL once; every gateway discovers it without a local
-config file:
+For a single process, attach the origin while starting the gateway and let it
+create the local bucket in the same command:
+
+```sh
+mise exec go -- go run ./cmd/pgvs3 serve --auto-bucket overture \
+  --s3-origin overture=s3://overturemaps-us-west-2?region=us-west-2
+```
+
+`--s3-origin` accepts `[local=]s3://origin-bucket[/prefix]` plus `region`,
+`endpoint`, `path_style` and `insecure` query parameters; credentials come from
+`PGVS3_S3_ACCESS_KEY`/`PGVS3_S3_SECRET_KEY` or the standard `AWS_*` variables.
+Omit them for a public bucket. For a fleet, store the origin in PostgreSQL once
+instead, so every gateway discovers it without a local config file:
 
 ```sh
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1

@@ -202,7 +202,7 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 		return err
 	}
 	source := s.newListSource(r.Context(), bucket, req)
-	if archiveKey, _, ok := splitZipKey(req.prefix); ok {
+	if archiveKey, _, _, ok := splitArchiveKey(req.prefix); ok {
 		if idx, _, zipErr := s.loadZipIndex(r.Context(), s.backendFor(r.Context(), bucket), bucket, archiveKey); zipErr == nil {
 			source = zipListSource(source, idx, archiveKey, req.prefix, req.delimiter)
 		}
