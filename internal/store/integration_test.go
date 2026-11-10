@@ -820,6 +820,33 @@ func TestMetadataRoundTrip(t *testing.T) {
 	})
 }
 
+func TestMetaPair(t *testing.T) {
+	ctx := testCtx
+	bucket := unique("pair")
+	testutil.Must(t, testStore.CreateBucket(ctx, bucket))
+	dropOnCleanup(t, ns.Bucket, bucket)
+	memberRef := ObjectRef{NS: ns.BucketRef(bucket), Key: "bundle.zip/member"}
+	archiveRef := ObjectRef{NS: ns.BucketRef(bucket), Key: "bundle.zip"}
+	if _, err := testStore.PutInline(ctx, memberRef, []byte("member"), WriteOptions{ContentType: "text/plain"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.PutInline(ctx, archiveRef, []byte("archive"), WriteOptions{ContentType: "application/zip"}); err != nil {
+		t.Fatal(err)
+	}
+	primary, fallback, err := testStore.MetaPair(ctx, memberRef, archiveRef.Key, true)
+	testutil.Must(t, err)
+	if primary == nil || string(primary.Inline) != "member" || primary.ContentType != "text/plain" {
+		t.Fatalf("primary = %+v", primary)
+	}
+	if fallback == nil || string(fallback.Inline) != "archive" || fallback.ContentType != "application/zip" {
+		t.Fatalf("fallback = %+v", fallback)
+	}
+	primary, fallback, err = testStore.MetaPair(ctx, ObjectRef{NS: ns.BucketRef(bucket), Key: "missing.zip/member"}, "missing.zip", false)
+	if !errors.Is(err, ErrNotFound) || primary != nil || fallback != nil {
+		t.Fatalf("missing pair = %+v/%+v err=%v", primary, fallback, err)
+	}
+}
+
 func TestOpenWithOptionsAppliesSessionPolicy(t *testing.T) {
 	ctx := context.Background()
 	other, err := OpenWithOptions(ctx, testStore.pool.Config().ConnString(), OpenOptions{

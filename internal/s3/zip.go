@@ -259,12 +259,42 @@ func (s *Server) loadZipIndex(ctx context.Context, backend readBackend, bucket, 
 	if info.Size <= 0 {
 		return nil, nil, zip.ErrFormat
 	}
+	idx, err := s.zipIndexFor(ctx, backend, bucket, archiveKey, info, archiveMeta)
+	return idx, archiveMeta, err
+}
+
+// loadZipIndexWithMeta builds or reuses an archive index from metadata that a
+// caller already resolved, avoiding a second metadata round trip.
+func (s *Server) loadZipIndexWithMeta(ctx context.Context, backend readBackend, bucket, archiveKey string, archiveMeta *store.Meta) (*zipIndex, error) {
+	if archiveMeta == nil {
+		idx, _, err := s.loadZipIndex(ctx, backend, bucket, archiveKey)
+		return idx, err
+	}
+	if archiveMeta.Size <= 0 {
+		return nil, zip.ErrFormat
+	}
+	meta := archiveMeta
+	if meta.FileID == 0 && meta.Inline == nil {
+		// Inline archives have no chunk rows, so the header-only metadata from
+		// a HEAD lookup cannot build an index. Fetch the decoded row once.
+		if lb, isLocal := backend.(localBackend); isLocal && lb.store != nil {
+			decoded, err := lb.store.Meta(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: archiveKey})
+			if err != nil {
+				return nil, err
+			}
+			meta = decoded
+		}
+	}
+	return s.zipIndexFor(ctx, backend, bucket, archiveKey, meta.ObjectInfo, meta)
+}
+
+func (s *Server) zipIndexFor(ctx context.Context, backend readBackend, bucket, archiveKey string, info store.ObjectInfo, archiveMeta *store.Meta) (*zipIndex, error) {
 	cacheKey := bucket + "\x00" + archiveKey
 	s.zip.mu.Lock()
 	cached := s.zip.indexes[cacheKey]
 	s.zip.mu.Unlock()
 	if cached != nil && cached.archiveETag == info.ETag && cached.archiveSize == info.Size {
-		return cached, archiveMeta, nil
+		return cached, nil
 	}
 	flightKey := cacheKey + "\x00" + info.ETag
 	value, err, _ := s.zip.group.Do(flightKey, func() (any, error) {
@@ -276,13 +306,13 @@ func (s *Server) loadZipIndex(ctx context.Context, backend readBackend, bucket, 
 		return idx, nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	idx, _ := value.(*zipIndex)
 	if idx == nil {
-		return nil, nil, zip.ErrFormat
+		return nil, zip.ErrFormat
 	}
-	return idx, archiveMeta, nil
+	return idx, nil
 }
 
 func (s *Server) cacheZipIndex(cacheKey string, idx *zipIndex) {
@@ -739,14 +769,40 @@ func (s *Server) resolveZipMember(ctx context.Context, backend readBackend, buck
 		}
 		return nil, nil, nil, false
 	}
-	member, ok := idx.member(memberPath)
-	if !ok && (memberPath == "" || strings.HasSuffix(memberPath, "/")) {
-		member, ok = idx.member(memberPath + "index.html")
-	}
+	member, ok := zipMemberForPath(idx, memberPath)
 	if !ok {
 		return nil, nil, nil, false
 	}
 	return idx, member, archiveMeta, true
+}
+
+// resolveZipMemberWithMeta resolves a member using archive metadata that the
+// caller already fetched, so the request pays one metadata query in total.
+func (s *Server) resolveZipMemberWithMeta(ctx context.Context, backend readBackend, bucket, key string, archiveMeta *store.Meta) (*zipIndex, *zipMember, bool) {
+	archiveKey, memberPath, ok := splitZipKey(key)
+	if !ok {
+		return nil, nil, false
+	}
+	idx, err := s.loadZipIndexWithMeta(ctx, backend, bucket, archiveKey, archiveMeta)
+	if err != nil {
+		if s.log != nil {
+			s.log.Debug("zip index unavailable", "bucket", bucket, "archive", archiveKey, "err", err)
+		}
+		return nil, nil, false
+	}
+	member, ok := zipMemberForPath(idx, memberPath)
+	if !ok {
+		return nil, nil, false
+	}
+	return idx, member, true
+}
+
+func zipMemberForPath(idx *zipIndex, memberPath string) (*zipMember, bool) {
+	member, ok := idx.member(memberPath)
+	if !ok && (memberPath == "" || strings.HasSuffix(memberPath, "/")) {
+		member, ok = idx.member(memberPath + "index.html")
+	}
+	return member, ok
 }
 
 func zipListSource(base listSource, idx *zipIndex, archiveKey, keyPrefix, delimiter string) listSource {
@@ -849,12 +905,20 @@ func (s *Server) openZipMemberBody(ctx context.Context, backend readBackend, buc
 }
 
 func (s *Server) openZipStoredMember(ctx context.Context, backend readBackend, bucket string, idx *zipIndex, member *zipMember, archiveMeta *store.Meta, span store.Span) (io.ReadCloser, error) {
-	length := span.End - span.Start + 1
-	dataOff := atomic.LoadInt64(&member.dataOffset)
-	if dataOff >= 0 {
-		return s.openZipRangeBody(ctx, backend, bucket, idx.archiveKey, dataOff+span.Start, length, archiveMeta)
+	return s.openZipMemberData(ctx, backend, bucket, idx, member, archiveMeta, span.Start, span.End-span.Start+1)
+}
+
+// openZipMemberData returns length bytes of a member starting at
+// offsetInMember. The first access probes the local header to learn where the
+// member data begins; later accesses cut straight to the range.
+func (s *Server) openZipMemberData(ctx context.Context, backend readBackend, bucket string, idx *zipIndex, member *zipMember, archiveMeta *store.Meta, offsetInMember, length int64) (io.ReadCloser, error) {
+	if dataOff := atomic.LoadInt64(&member.dataOffset); dataOff >= 0 {
+		return s.openZipRangeBody(ctx, backend, bucket, idx.archiveKey, dataOff+offsetInMember, length, archiveMeta)
 	}
-	end := zipRangeEnd(member.headerOffset, int64(zipLocalHeaderLen)+int64(len(member.name))+256, span.End, idx.archiveSize)
+	if length <= 0 {
+		return http.NoBody, nil
+	}
+	end := zipRangeEnd(member.headerOffset, int64(zipLocalHeaderLen)+int64(len(member.name))+256, offsetInMember+length-1, idx.archiveSize)
 	body, err := openZipArchiveRange(ctx, backend, bucket, idx.archiveKey, member.headerOffset, end, archiveMeta)
 	if err != nil {
 		return nil, err
@@ -876,8 +940,8 @@ func (s *Server) openZipStoredMember(ctx context.Context, backend readBackend, b
 		return nil, zip.ErrFormat
 	}
 	atomic.StoreInt64(&member.dataOffset, actual)
-	if zipAddClamp(actual, span.End, idx.archiveSize-1) <= end {
-		skip := nameLen + extraLen + span.Start
+	if zipAddClamp(actual, offsetInMember+length-1, idx.archiveSize-1) <= end {
+		skip := nameLen + extraLen + offsetInMember
 		if skip > 0 {
 			if _, err := io.CopyN(io.Discard, body, skip); err != nil {
 				body.Close()
@@ -887,7 +951,7 @@ func (s *Server) openZipStoredMember(ctx context.Context, backend readBackend, b
 		return &zipLimitedBody{r: io.LimitReader(body, length), c: body}, nil
 	}
 	body.Close()
-	return s.openZipRangeBody(ctx, backend, bucket, idx.archiveKey, actual+span.Start, length, archiveMeta)
+	return s.openZipRangeBody(ctx, backend, bucket, idx.archiveKey, actual+offsetInMember, length, archiveMeta)
 }
 
 func (s *Server) openZipCompressedMember(ctx context.Context, backend readBackend, bucket string, idx *zipIndex, member *zipMember, archiveMeta *store.Meta, span store.Span, ranged bool) (io.ReadCloser, error) {
@@ -952,59 +1016,11 @@ func (s *Server) readZipCompressedMember(ctx context.Context, backend readBacken
 }
 
 func (s *Server) openZipCompressedStream(ctx context.Context, backend readBackend, bucket string, idx *zipIndex, member *zipMember, archiveMeta *store.Meta) (*zipDecompressBody, error) {
-	var (
-		body       io.ReadCloser
-		compressed io.Reader
-		err        error
-	)
-	dataOff := atomic.LoadInt64(&member.dataOffset)
-	if dataOff >= 0 {
-		body, err = s.openZipRangeBody(ctx, backend, bucket, idx.archiveKey, dataOff, member.compressedSize, archiveMeta)
-		if err != nil {
-			return nil, err
-		}
-		compressed = io.LimitReader(body, member.compressedSize)
-	} else {
-		end := zipRangeEnd(member.headerOffset, int64(zipLocalHeaderLen)+int64(len(member.name))+256, member.compressedSize-1, idx.archiveSize)
-		body, err = openZipArchiveRange(ctx, backend, bucket, idx.archiveKey, member.headerOffset, end, archiveMeta)
-		if err != nil {
-			return nil, err
-		}
-		header := make([]byte, zipLocalHeaderLen)
-		if _, err := io.ReadFull(body, header); err != nil {
-			body.Close()
-			return nil, err
-		}
-		if binary.LittleEndian.Uint32(header) != zipLocalSignature {
-			body.Close()
-			return nil, zip.ErrFormat
-		}
-		nameLen := int64(binary.LittleEndian.Uint16(header[26:]))
-		extraLen := int64(binary.LittleEndian.Uint16(header[28:]))
-		actual := member.headerOffset + int64(zipLocalHeaderLen) + nameLen + extraLen
-		if actual < 0 || actual > idx.archiveSize {
-			body.Close()
-			return nil, zip.ErrFormat
-		}
-		atomic.StoreInt64(&member.dataOffset, actual)
-		if zipAddClamp(actual, member.compressedSize-1, idx.archiveSize-1) <= end {
-			skip := nameLen + extraLen
-			if skip > 0 {
-				if _, err := io.CopyN(io.Discard, body, skip); err != nil {
-					body.Close()
-					return nil, err
-				}
-			}
-			compressed = io.LimitReader(body, member.compressedSize)
-		} else {
-			body.Close()
-			body, err = s.openZipRangeBody(ctx, backend, bucket, idx.archiveKey, actual, member.compressedSize, archiveMeta)
-			if err != nil {
-				return nil, err
-			}
-			compressed = io.LimitReader(body, member.compressedSize)
-		}
+	body, err := s.openZipMemberData(ctx, backend, bucket, idx, member, archiveMeta, 0, member.compressedSize)
+	if err != nil {
+		return nil, err
 	}
+	compressed := io.LimitReader(body, member.compressedSize)
 	var decomp io.ReadCloser
 	switch member.method {
 	case zip.Deflate:

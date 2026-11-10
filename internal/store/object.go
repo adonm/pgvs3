@@ -417,6 +417,54 @@ func (s *Store) metaRef(ctx context.Context, ref ObjectRef, body metadataBody) (
 	})
 }
 
+// MetaPair resolves the literal object and one fallback key in a single round
+// trip. ZIP member reads use it to decide between a real object and the
+// archive that contains the requested member without a second metadata query.
+func (s *Store) MetaPair(ctx context.Context, ref ObjectRef, fallbackKey string, withInline bool) (*Meta, *Meta, error) {
+	body := metadataHeader
+	if withInline {
+		body = metadataDecoded
+	}
+	return withSchema2(ctx, s, ref.NS, ErrNoBucket, ErrNotFound, func(schema string) (*Meta, *Meta, error) {
+		rows, err := s.pool.Query(ctx, `SELECT key, `+metadataColumns(body)+` FROM `+schema+`.objects
+			WHERE key IN ($1, $2) AND (expires_at IS NULL OR expires_at > now())`, ref.Key, fallbackKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer rows.Close()
+		var primary, fallback *Meta
+		for rows.Next() {
+			var key string
+			m, err := scanMetadata(metaPairRow{rows: rows, key: &key}, body)
+			if err != nil {
+				return nil, nil, err
+			}
+			if key == ref.Key {
+				primary = m
+			} else if key == fallbackKey {
+				fallback = m
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, nil, err
+		}
+		if primary == nil && fallback == nil {
+			return nil, nil, ErrNotFound
+		}
+		return primary, fallback, nil
+	})
+}
+
+// metaPairRow prepends the object key to the metadata column scan.
+type metaPairRow struct {
+	rows pgx.Rows
+	key  *string
+}
+
+func (r metaPairRow) Scan(dest ...any) error {
+	return r.rows.Scan(append([]any{r.key}, dest...)...)
+}
+
 func (c Cache) Metadata(ctx context.Context, key string, withInline bool) (*Meta, ns.Ref, error) {
 	refs := []ns.Ref{ns.WriteBackRef(c.name), ns.CacheRef(c.name)}
 	write, err := nsSQLIdent(ns.WriteBack, c.name)
