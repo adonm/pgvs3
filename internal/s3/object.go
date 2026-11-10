@@ -339,7 +339,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		head, err = backend.Head(r.Context(), bucket, key)
 	}
 	if errors.Is(err, store.ErrNotFound) {
-		if idx, member, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
+		if idx, member, _, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
 			_, hasPart, partErr := parsePartNumber(r.URL.Query())
 			if partErr != nil {
 				return partErr
@@ -437,11 +437,11 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		res, err = openObject(r.Context(), backend, bucket, key, rng, cond)
 	}
 	if errors.Is(err, store.ErrNotFound) {
-		if idx, member, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
+		if idx, member, archiveMeta, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
 			if hasPart {
 				return errNotImplemented()
 			}
-			return s.serveZipMember(w, r, backend, bucket, key, idx, member, rng)
+			return s.serveZipMember(w, r, backend, bucket, key, idx, member, archiveMeta, rng)
 		}
 	}
 	if err != nil {
@@ -1509,8 +1509,8 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 	}
 	source := s.newListSource(r.Context(), bucket, req)
 	if archiveKey, _, ok := splitZipKey(req.prefix); ok {
-		if idx, zipErr := s.loadZipIndex(r.Context(), s.backendFor(r.Context(), bucket), bucket, archiveKey); zipErr == nil {
-			source = zipListSource(source, idx, archiveKey, req.prefix)
+		if idx, _, zipErr := s.loadZipIndex(r.Context(), s.backendFor(r.Context(), bucket), bucket, archiveKey); zipErr == nil {
+			source = zipListSource(source, idx, archiveKey, req.prefix, req.delimiter)
 		}
 	}
 	page, err := foldList(req, iterListed(source, req.after))

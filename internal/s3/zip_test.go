@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -371,6 +372,9 @@ func TestZipMemberHeadGetRangeListing(t *testing.T) {
 	if got := resp.Header.Get("Content-Type"); got != "text/tab-separated-values" {
 		t.Fatalf("HEAD content-type=%q", got)
 	}
+	if got := resp.Header.Get("Last-Modified"); got != time.Unix(1_700_000_000, 0).UTC().Format(http.TimeFormat) {
+		t.Fatalf("HEAD last-modified=%q", got)
+	}
 	etag := resp.Header.Get("ETag")
 	if etag == "" || !strings.HasPrefix(etag, `"etag-`) {
 		t.Fatalf("HEAD etag=%q", etag)
@@ -483,7 +487,7 @@ func TestZipMemberHeadGetRangeListing(t *testing.T) {
 		t.Fatalf("start-after contents = %+v", page.Contents)
 	}
 
-	idx, err := srv.loadZipIndex(context.Background(), backend, "bucket", "sample.zip")
+	idx, _, err := srv.loadZipIndex(context.Background(), backend, "bucket", "sample.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,11 +510,11 @@ func TestZipStoreCutThroughCachesDataOffset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	offsets, err := readZipCentralOffsets(bytes.NewReader(archive), int64(len(archive)))
-	if err != nil || len(offsets) != 1 {
-		t.Fatalf("central offsets=%v err=%v", offsets, err)
+	entries, err := parseZipCentralDirectory(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("central entries=%v err=%v", entries, err)
 	}
-	headerOffset := offsets[0]
+	headerOffset := entries[0].headerOffset
 
 	srv, ts := newZipTestServer(t, backend)
 	resp, _ := zipHTTP(t, ts, http.MethodHead, "/bucket/sample.zip/data/events.parquet", nil)
@@ -546,17 +550,17 @@ func TestZipStoreCutThroughCachesDataOffset(t *testing.T) {
 		t.Fatalf("cached data offset range = %+v, want [%d,%d]", ops, dataOffset+1000, dataOffset+1999)
 	}
 
-	idx, err := srv.loadZipIndex(context.Background(), backend, "bucket", "sample.zip")
+	idx, _, err := srv.loadZipIndex(context.Background(), backend, "bucket", "sample.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
 	member, ok := idx.member("data/events.parquet")
-	if !ok || member.dataOffset.Load() != dataOffset {
+	if !ok || atomic.LoadInt64(&member.dataOffset) != dataOffset {
 		t.Fatalf("cached member offset = %v, want %d", member, dataOffset)
 	}
 }
 
-func TestZipManifestSidecarPrepopulatesOffsets(t *testing.T) {
+func TestZipIndexBuildsAndLearnsOffsets(t *testing.T) {
 	backend := newZipTestBackend()
 	parquet := bytes.Repeat([]byte("PAR1payload"), 5000)
 	quant := []byte(strings.Repeat("name\tlength\n", 400))
@@ -567,59 +571,177 @@ func TestZipManifestSidecarPrepopulatesOffsets(t *testing.T) {
 		{name: "meta.json", method: zstd.ZipMethodWinZip, body: meta},
 	})
 	backend.put("sample.zip", archive)
-	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var manifest strings.Builder
-	for _, f := range zr.File {
-		offset, err := f.DataOffset()
-		if err != nil {
-			t.Fatal(err)
-		}
-		method := "stored"
-		switch f.Method {
-		case zip.Deflate:
-			method = "deflate"
-		case zstd.ZipMethodWinZip:
-			method = "zstd"
-		}
-		fmt.Fprintf(&manifest, "%s\t%d\t-\t%d\t%d\t%s\t%08x\n", f.Name, f.UncompressedSize64, offset, f.CompressedSize64, method, f.CRC32)
-	}
-	backend.put("sample.zip.manifest.tsv", []byte(manifest.String()))
 
 	srv, ts := newZipTestServer(t, backend)
-	resp, _ := zipHTTP(t, ts, http.MethodHead, "/bucket/sample.zip/data/events.parquet", nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("HEAD status=%d", resp.StatusCode)
-	}
-	idx, err := srv.loadZipIndex(context.Background(), backend, "bucket", "sample.zip")
+	idx, _, err := srv.loadZipIndex(context.Background(), backend, "bucket", "sample.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
 	member, ok := idx.member("data/events.parquet")
-	if !ok || member.dataOffset.Load() < 0 {
-		t.Fatalf("manifest did not prepopulate offset: %+v", member)
+	if !ok || atomic.LoadInt64(&member.dataOffset) != -1 {
+		t.Fatalf("index did not start with an unknown data offset: %+v", member)
 	}
-	dataOffset := member.dataOffset.Load()
+	headerOffset := member.headerOffset
+
 	backend.resetOps()
 	resp, body := zipHTTP(t, ts, http.MethodGet, "/bucket/sample.zip/data/events.parquet", map[string]string{"Range": "bytes=100-199"})
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(body, parquet[100:200]) {
-		t.Fatalf("manifest range status=%d len=%d", resp.StatusCode, len(body))
+		t.Fatalf("range status=%d len=%d", resp.StatusCode, len(body))
 	}
 	ops := backend.opensFor("sample.zip")
-	if len(ops) != 1 || ops[0].first != dataOffset+100 || ops[0].last != dataOffset+199 {
-		t.Fatalf("manifest cut-through = %+v", ops)
+	if len(ops) != 1 || ops[0].first != headerOffset {
+		t.Fatalf("first range read = %+v, want local header %d", ops, headerOffset)
+	}
+	dataOffset := atomic.LoadInt64(&member.dataOffset)
+	if dataOffset < 0 {
+		t.Fatalf("data offset not learned: %+v", member)
 	}
 
-	// The zstd row must be accepted too.
-	member, ok = idx.member("meta.json")
-	if !ok || member.dataOffset.Load() < 0 {
-		t.Fatalf("zstd manifest row not applied: %+v", member)
+	backend.resetOps()
+	resp, body = zipHTTP(t, ts, http.MethodGet, "/bucket/sample.zip/data/events.parquet", map[string]string{"Range": "bytes=500-599"})
+	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(body, parquet[500:600]) {
+		t.Fatalf("learned range status=%d len=%d", resp.StatusCode, len(body))
 	}
-	resp, body = zipHTTP(t, ts, http.MethodGet, "/bucket/sample.zip/meta.json", nil)
-	if resp.StatusCode != http.StatusOK || !bytes.Equal(body, meta) {
-		t.Fatalf("zstd manifest GET status=%d body=%q", resp.StatusCode, body)
+	ops = backend.opensFor("sample.zip")
+	if len(ops) != 1 || ops[0].first != dataOffset+500 || ops[0].last != dataOffset+599 {
+		t.Fatalf("learned cut-through = %+v, want [%d,%d]", ops, dataOffset+500, dataOffset+599)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"quant.sf", quant},
+		{"meta.json", meta},
+	} {
+		resp, body = zipHTTP(t, ts, http.MethodGet, "/bucket/sample.zip/"+tc.name, nil)
+		if resp.StatusCode != http.StatusOK || !bytes.Equal(body, tc.body) {
+			t.Fatalf("%s GET status=%d body=%q", tc.name, resp.StatusCode, body)
+		}
+	}
+}
+
+func TestZipCompressedMemberCachesDecompressedBytes(t *testing.T) {
+	backend := newZipTestBackend()
+	deflated := bytes.Repeat([]byte("deflate payload 0123456789\n"), 20_000)
+	compressed := bytes.Repeat([]byte("zstd payload 0123456789\n"), 20_000)
+	backend.put("sample.zip", buildZip(t, []zipTestFile{
+		{name: "data/deflate.txt", method: zip.Deflate, body: deflated},
+		{name: "data/zstd.txt", method: zstd.ZipMethodWinZip, body: compressed},
+	}))
+	srv, ts := newZipTestServer(t, backend)
+	if _, _, err := srv.loadZipIndex(context.Background(), backend, "bucket", "sample.zip"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"data/deflate.txt", deflated},
+		{"data/zstd.txt", compressed},
+	} {
+		backend.resetOps()
+		resp, body := zipHTTP(t, ts, http.MethodGet, "/bucket/sample.zip/"+tc.name, map[string]string{"Range": "bytes=100-199"})
+		if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(body, tc.body[100:200]) {
+			t.Fatalf("%s first range status=%d len=%d", tc.name, resp.StatusCode, len(body))
+		}
+		if ops := backend.opensFor("sample.zip"); len(ops) == 0 {
+			t.Fatalf("%s first range read no archive bytes", tc.name)
+		}
+
+		backend.resetOps()
+		resp, body = zipHTTP(t, ts, http.MethodGet, "/bucket/sample.zip/"+tc.name, map[string]string{"Range": "bytes=1000-1099"})
+		if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(body, tc.body[1000:1100]) {
+			t.Fatalf("%s cached range status=%d len=%d", tc.name, resp.StatusCode, len(body))
+		}
+		if ops := backend.opensFor("sample.zip"); len(ops) != 0 {
+			t.Fatalf("%s cached range read archive bytes: %+v", tc.name, ops)
+		}
+
+		backend.resetOps()
+		resp, body = zipHTTP(t, ts, http.MethodGet, "/bucket/sample.zip/"+tc.name, nil)
+		if resp.StatusCode != http.StatusOK || !bytes.Equal(body, tc.body) {
+			t.Fatalf("%s cached whole GET status=%d len=%d", tc.name, resp.StatusCode, len(body))
+		}
+		if ops := backend.opensFor("sample.zip"); len(ops) != 0 {
+			t.Fatalf("%s cached whole GET read archive bytes: %+v", tc.name, ops)
+		}
+	}
+}
+
+func TestZipListingDelimiterJumpsPrefixes(t *testing.T) {
+	backend := newZipTestBackend()
+	files := make([]zipTestFile, 0, 10_000)
+	for dir := range 100 {
+		for file := range 100 {
+			files = append(files, zipTestFile{
+				name:   fmt.Sprintf("d%02d/f%03d.txt", dir, file),
+				method: zip.Store,
+				body:   []byte("x"),
+			})
+		}
+	}
+	backend.put("big.zip", buildZip(t, files))
+	srv, ts := newZipTestServer(t, backend)
+	idx, _, err := srv.loadZipIndex(context.Background(), backend, "bucket", "big.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := idx.listing("big.zip", "big.zip/", "/", "", 10)
+	if len(rows) != 10 || rows[0].Key != "big.zip/d00/f000.txt" || rows[9].Key != "big.zip/d09/f000.txt" {
+		t.Fatalf("first delimiter page = %+v", rows)
+	}
+	rows = idx.listing("big.zip", "big.zip/", "/", rows[9].Key, 10)
+	if len(rows) != 10 || rows[0].Key != "big.zip/d10/f000.txt" {
+		t.Fatalf("continuation delimiter page = %+v", rows)
+	}
+
+	var prefixes []string
+	token := ""
+	for {
+		query := "prefix=big.zip/&delimiter=/&max-keys=10"
+		if token != "" {
+			query += "&continuation-token=" + token
+		}
+		page := listZip(t, ts, "bucket", query)
+		if len(page.Contents) != 0 {
+			t.Fatalf("delimiter listing returned contents: %+v", page.Contents)
+		}
+		for _, cp := range page.CommonPrefixes {
+			prefixes = append(prefixes, cp.Prefix)
+		}
+		if !page.IsTruncated {
+			break
+		}
+		token = page.NextContinuationToken
+		if token == "" {
+			t.Fatal("truncated page without continuation token")
+		}
+	}
+	if len(prefixes) != 100 || prefixes[0] != "big.zip/d00/" || prefixes[99] != "big.zip/d99/" {
+		t.Fatalf("delimited prefixes = %d first=%q last=%q", len(prefixes), prefixes[0], prefixes[len(prefixes)-1])
+	}
+}
+
+func TestZipDuplicateMemberKeepsFirst(t *testing.T) {
+	backend := newZipTestBackend()
+	archive := buildZip(t, []zipTestFile{
+		{name: "same.txt", method: zip.Store, body: []byte("first")},
+		{name: "same.txt", method: zip.Store, body: []byte("second")},
+	})
+	entries, err := parseZipCentralDirectory(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].uncompressedSize != int64(len("first")) {
+		t.Fatalf("duplicate handling = %+v", entries)
+	}
+	backend.put("sample.zip", archive)
+	_, ts := newZipTestServer(t, backend)
+	resp, body := zipHTTP(t, ts, http.MethodGet, "/bucket/sample.zip/same.txt", nil)
+	if resp.StatusCode != http.StatusOK || string(body) != "first" {
+		t.Fatalf("duplicate GET status=%d body=%q", resp.StatusCode, body)
 	}
 }
 
@@ -679,12 +801,15 @@ func TestZip64ExplicitExtraAndDataDescriptors(t *testing.T) {
 	if len(zr.File) != 3 {
 		t.Fatalf("stdlib parsed %d entries", len(zr.File))
 	}
-	offsets, err := readZipCentralOffsets(bytes.NewReader(archive), int64(len(archive)))
-	if err != nil || len(offsets) != 3 {
-		t.Fatalf("central offsets=%v err=%v", offsets, err)
+	entries, err := parseZipCentralDirectory(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil || len(entries) != 3 {
+		t.Fatalf("central entries=%v err=%v", entries, err)
 	}
-	if offsets[1] <= offsets[0] || offsets[2] <= offsets[1] {
-		t.Fatalf("ZIP64 local offsets not increasing: %v", offsets)
+	for _, entry := range entries {
+		if entry.headerOffset < 0 || entry.headerOffset+4 > int64(len(archive)) ||
+			binary.LittleEndian.Uint32(archive[entry.headerOffset:]) != zipLocalSignature {
+			t.Fatalf("ZIP64 local header not found for %s at %d", entry.name, entry.headerOffset)
+		}
 	}
 	backend.put("sample.zip", archive)
 	_, ts := newZipTestServer(t, backend)
@@ -761,7 +886,7 @@ func TestZipRangeReaderAtPrefetchAndSegment(t *testing.T) {
 	backend := newZipTestBackend()
 	data := bytes.Repeat([]byte("0123456789abcdef"), 40_000)
 	backend.put("blob", data)
-	ra, err := newZipRangeReaderAt(context.Background(), backend, "bucket", "blob", int64(len(data)))
+	ra, err := newZipRangeReaderAt(context.Background(), backend, "bucket", "blob", int64(len(data)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

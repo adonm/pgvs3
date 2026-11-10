@@ -43,34 +43,33 @@ Permanent non-goals are listed in [design.md](design.md#scope-boundaries).
 ### ZIP and ZIP64 virtual folders
 
 `GET` and `HEAD` accept `<archive>.zip/<member>` (and case-insensitive
-`<archive>.ZIP/...`) when no literal object with that key exists. A leading
-`GET`/`HEAD` on the archive reads the last 256 KiB, parses the ZIP32 or ZIP64
-central directory (EOCD, ZIP64 EOCD locator/record, `0x0001` extra fields and
-bit-3 data descriptors), and caches an immutable member index keyed by the
-archive ETag. If the directory is larger than the tail, one additional ranged
-GET reads it; a one-entry range window lets `archive/zip` parse it without
-re-fetching.
+`<archive>.ZIP/...`) when no literal object with that key exists. The first
+read of any `.zip` reads the last 256 KiB, parses the ZIP32 or ZIP64 central
+directory (EOCD, ZIP64 EOCD locator/record, `0x0001` extra fields, extended
+timestamps and bit-3 data descriptors) in one pass, and caches an immutable
+member index keyed by the archive bucket, ETag and size. If the directory is
+larger than the tail, one additional ranged GET reads it. Each member's exact
+data offset is learned on its first read and kept in the cached index; there is
+no sidecar file to create or consult.
 
 - **Listing:** `ListObjectsV2` treats members as virtual keys. `prefix`,
   `delimiter=/` (nested folders become `CommonPrefixes`), `max-keys`,
   `start-after` and continuation tokens all work, so `aws s3 ls
-  s3://bucket/archive.zip/` browses the archive. Literal objects shadow members
-  with the same key.
+  s3://bucket/archive.zip/` browses the archive. Delimiter pagination
+  binary-searches past a common prefix already emitted instead of scanning its
+  members. Literal objects shadow members with the same key.
 - **Member reads:** `HEAD`, whole `GET`, byte ranges, `If-Match`/`If-None-Match`
   and `Accept-Ranges` work. The member ETag is
   `<archive-etag>-<crc32>`; `Content-Type` comes from the member name
   (`.parquet` → `application/vnd.apache.parquet`, `.tsv`/`.sf` →
   `text/tab-separated-values`, `.csv`, `.json`, …).
 - **Compression:** `Store` (method 0) cuts through with one exact range
-  request; `Deflate` (method 8) and `Zstd` (method 93) stream through the
-  `klauspost/compress` inflater or pooled Zstd decoder. Zstd is recommended for
-  new archives: it decompresses about 4–6× faster than Deflate at similar
+  request; `Deflate` (method 8) and `Zstd` (method 93) stream through a pooled
+  `klauspost/compress` inflater or the pooled Zstd decoder. Compressed members
+  up to 16 MiB are decompressed once, CRC-checked and kept in a bounded 64 MiB
+  cache, so later whole or ranged reads copy from memory. Zstd is recommended
+  for new archives: it decompresses about 4–6× faster than Deflate at similar
   ratios, and pgvs3 decompresses it natively.
-- **Sidecar:** if `<archive>.zip.manifest.tsv` exists (≤ 16 MiB) with
-  `member_path`, `size_bytes`, `sha256`, `data_offset`, `compressed_size`,
-  `method`, `crc32`, its `data_offset` values skip the local-header probe. The
-  `method` column accepts `stored`, `deflate` and `zstd`; the central directory
-  remains authoritative and a mismatch falls back to parsing the local header.
 - **Limits:** the index cache holds 64 archives / 64,000 members; archives
   whose central directory exceeds 64 MiB fall back to normal object semantics.
   Encrypted, spanned/multi-disk and self-extracting archives are not supported,
