@@ -72,6 +72,34 @@ GROUP BY group_id ORDER BY group_id LIMIT 5;
 Each group has 10,000 rows. The dummy credentials satisfy the client; they do not
 enable authentication.
 
+### Query files inside ZIP / ZIP64 archives
+
+An archive is also a virtual folder. Append `/<member>` to a `.zip` key and use
+it like any other object:
+
+```sql
+-- Parquet and CSV members are read with ranged GETs; no extraction step.
+SELECT count(*) FROM read_parquet('s3://lake/batch.zip/events/part-0.parquet');
+SELECT * FROM read_csv('s3://lake/batch.zip/events.csv', header = true);
+```
+
+```sh
+aws s3 ls s3://lake/batch.zip/ --endpoint-url http://127.0.0.1:8014
+curl -fsS -r 0-1023 \
+  http://127.0.0.1:8014/lake/batch.zip/events/part-0.parquet -o header.bin
+```
+
+`pgvs3` reads the archive tail (256 KiB), parses the ZIP32/ZIP64 central
+directory once, then serves each member with one cut-through range request when
+it is stored, or a sequential range when it is compressed. `Store` (0) members
+are zero-copy; `Deflate` (8) and `Zstd` (method 93, which decompresses
+about 4–6× faster than Deflate and is recommended for new archives) are
+decompressed natively. `ListObjectsV2` supports prefixes,
+`delimiter=/` (subdirectories become `CommonPrefixes`), `max-keys` and
+`start-after`/continuation tokens. Members support `HEAD`, whole `GET`, byte
+ranges and `If-None-Match`; a real object at the same key always shadows the
+archive member. Writes still target literal S3 keys.
+
 ### Use with DuckLake (catalog and objects on one cluster)
 
 In the same DuckDB session:

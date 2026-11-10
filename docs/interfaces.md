@@ -40,6 +40,42 @@ Permanent non-goals are listed in [design.md](design.md#scope-boundaries).
   `GET /{bucket}` serves `/{bucket}/index.html` when present, and `Content-Type`
   falls back to the filename extension.
 
+### ZIP and ZIP64 virtual folders
+
+`GET` and `HEAD` accept `<archive>.zip/<member>` (and case-insensitive
+`<archive>.ZIP/...`) when no literal object with that key exists. A leading
+`GET`/`HEAD` on the archive reads the last 256 KiB, parses the ZIP32 or ZIP64
+central directory (EOCD, ZIP64 EOCD locator/record, `0x0001` extra fields and
+bit-3 data descriptors), and caches an immutable member index keyed by the
+archive ETag. If the directory is larger than the tail, one additional ranged
+GET reads it; a one-entry range window lets `archive/zip` parse it without
+re-fetching.
+
+- **Listing:** `ListObjectsV2` treats members as virtual keys. `prefix`,
+  `delimiter=/` (nested folders become `CommonPrefixes`), `max-keys`,
+  `start-after` and continuation tokens all work, so `aws s3 ls
+  s3://bucket/archive.zip/` browses the archive. Literal objects shadow members
+  with the same key.
+- **Member reads:** `HEAD`, whole `GET`, byte ranges, `If-Match`/`If-None-Match`
+  and `Accept-Ranges` work. The member ETag is
+  `<archive-etag>-<crc32>`; `Content-Type` comes from the member name
+  (`.parquet` → `application/vnd.apache.parquet`, `.tsv`/`.sf` →
+  `text/tab-separated-values`, `.csv`, `.json`, …).
+- **Compression:** `Store` (method 0) cuts through with one exact range
+  request; `Deflate` (method 8) and `Zstd` (method 93) stream through the
+  `klauspost/compress` inflater or pooled Zstd decoder. Zstd is recommended for
+  new archives: it decompresses about 4–6× faster than Deflate at similar
+  ratios, and pgvs3 decompresses it natively.
+- **Sidecar:** if `<archive>.zip.manifest.tsv` exists (≤ 16 MiB) with
+  `member_path`, `size_bytes`, `sha256`, `data_offset`, `compressed_size`,
+  `method`, `crc32`, its `data_offset` values skip the local-header probe. The
+  `method` column accepts `stored`, `deflate` and `zstd`; the central directory
+  remains authoritative and a mismatch falls back to parsing the local header.
+- **Limits:** the index cache holds 64 archives / 64,000 members; archives
+  whose central directory exceeds 64 MiB fall back to normal object semantics.
+  Encrypted, spanned/multi-disk and self-extracting archives are not supported,
+  and writes always create literal S3 keys rather than modifying an archive.
+
 ## Core: origin-backed cache and write-back
 
 Read-through and write-through/write-back `GET`/`HEAD`/`PUT`/`CopyObject`/

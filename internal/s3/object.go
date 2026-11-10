@@ -338,6 +338,18 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		key += "index.html"
 		head, err = backend.Head(r.Context(), bucket, key)
 	}
+	if errors.Is(err, store.ErrNotFound) {
+		if idx, member, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
+			_, hasPart, partErr := parsePartNumber(r.URL.Query())
+			if partErr != nil {
+				return partErr
+			}
+			if hasPart {
+				return errNotImplemented()
+			}
+			return s.headZipMember(w, r, idx, member)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -423,6 +435,14 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
 		key += "index.html"
 		res, err = openObject(r.Context(), backend, bucket, key, rng, cond)
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		if idx, member, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
+			if hasPart {
+				return errNotImplemented()
+			}
+			return s.serveZipMember(w, r, backend, bucket, key, idx, member, rng)
+		}
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotModified) {
@@ -1487,7 +1507,13 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 	if err != nil {
 		return err
 	}
-	page, err := foldList(req, iterListed(s.newListSource(r.Context(), bucket, req), req.after))
+	source := s.newListSource(r.Context(), bucket, req)
+	if archiveKey, _, ok := splitZipKey(req.prefix); ok {
+		if idx, zipErr := s.loadZipIndex(r.Context(), s.backendFor(r.Context(), bucket), bucket, archiveKey); zipErr == nil {
+			source = zipListSource(source, idx, archiveKey, req.prefix)
+		}
+	}
+	page, err := foldList(req, iterListed(source, req.after))
 	if err != nil {
 		return err
 	}

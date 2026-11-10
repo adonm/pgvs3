@@ -48,6 +48,7 @@ type Server struct {
 	queued            atomic.Uint64
 	rejected          atomic.Uint64
 	waitNanos         atomic.Uint64
+	zip               zipIndexCache
 }
 
 func (s *Server) SetMetricsHook(f func(io.Writer)) { s.metricsHook = f }
