@@ -13,6 +13,8 @@ for key, value in {
     "PGVS3_TEST_ENDPOINT_B": "http://example.invalid/b",
     "PGVS3_TEST_ORIGIN_ENDPOINT": "http://example.invalid/origin",
     "PGVS3_TEST_PSQL": str(ROOT / "test/psql.py"),
+    "PGVS3_ACCESS_KEY": "test-access",
+    "PGVS3_SECRET_KEY": "test-secret",
 }.items():
     os.environ.setdefault(key, value)
 sys.path.insert(0, str(ROOT / "test"))
@@ -54,6 +56,38 @@ class ComputeHelperTests(unittest.TestCase):
         self.assertEqual(config["autoload_known_extensions"], "false")
         self.assertEqual(config["allow_unsigned_extensions"], "false")
 
+    def test_compute_image_user_is_the_hardcharger_account(self):
+        self.assertEqual(data_plane.CHARGE_ADMIN_USER, "pgvs3")
+        self.assertNotIn("65532", data_plane.CHARGE_ADMIN_USER)
+
+    def test_hardcharger_env_replaces_the_quack_token(self):
+        names = data_plane.compute_names("compute.Qw1")
+        env = data_plane.compute_environment(names, "http://127.0.0.1:8014", 31337,
+                                             "token-value", 31338)
+        self.assertEqual(env["HARDCHARGER_ADMIN_USERNAME"], "pgvs3")
+        self.assertEqual(env["HARDCHARGER_ADMIN_PASSWORD"], "token-value")
+        self.assertEqual(env["HARDCHARGER_PORT"], "31337")
+        self.assertEqual(env["HARDCHARGER_HEALTH_PORT"], "31338")
+        self.assertEqual(env["HARDCHARGER_MEMORY_LIMIT"], "1GB")
+        self.assertEqual(env["DUCKDB_MEMORY_LIMIT"], "1GB")
+        self.assertEqual(env["DUCKDB_THREADS"], "4")
+        self.assertFalse([key for key in env if key.startswith("QUACK_")])
+
+    def test_compute_container_args_are_read_only_and_need_no_stdin(self):
+        args = data_plane.compute_container_args(
+            {"PGVS3_URL": "postgres://x"}, Path("/tmp/run/chargewire-init-a.sql"))
+        self.assertIn("--read-only", args)
+        self.assertIn("/tmp:rw,size=2g", args)
+        self.assertNotIn("-i", args)
+        self.assertNotIn("--init", args)
+        self.assertIn("PGVS3_URL=postgres://x", args)
+        self.assertIn("/tmp/run/chargewire-init-a.sql:/opt/pgvs3-duckdb/init.sql:ro", args)
+
+    def test_rendered_init_is_mounted_over_the_baked_template(self):
+        args = data_plane.compute_container_args({}, Path("/tmp/init.sql"))
+        mounted = [args[index + 1] for index, arg in enumerate(args) if arg == "-v"]
+        self.assertEqual(mounted, ["/tmp/init.sql:/opt/pgvs3-duckdb/init.sql:ro"])
+
     def test_sql_str_and_timing_summary_preserve_raw_samples(self):
         self.assertEqual(data_plane.sql_str("a'b"), "'a''b'")
         timings = data_plane.timing_summary([9, 4, 6, 5])
@@ -71,7 +105,7 @@ class ComputeHelperTests(unittest.TestCase):
         })
 
 
-class QuackPoolHelperTests(unittest.TestCase):
+class ChargeWirePoolHelperTests(unittest.TestCase):
     def test_application_name_preserves_existing_query(self):
         self.assertEqual(
             data_plane.with_application_name(

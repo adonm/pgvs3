@@ -238,7 +238,7 @@ Python/shell) has its own [build and integration guide](deploy/duckdb/README.md)
 - [Design](docs/design.md): trust model, envelope, limits and safety invariants.
 - [Interfaces and scope](docs/interfaces.md): S3, origin cache, RESP2, OJS, experiments.
 - [Performance](docs/performance.md) and [benchmarks](docs/benchmarks.md): layout, I/O paths, measured results.
-- [DuckDB 2.0 + Quack container](deploy/duckdb/README.md): prebuilt official-base analytics image, catalog/endpoint wiring and measured samples.
+- [DuckDB 2.0 + Hardcharger (ChargeWire) container](deploy/duckdb/README.md): prebuilt analytics image with `lake` as the default catalog, catalog/endpoint wiring and measured samples.
 - [Roadmap](docs/roadmap.md): ranked work and acceptance criteria.
 
 ## License

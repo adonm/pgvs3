@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Host-side verification for the native official-DuckDB image.
+"""Host-side verification for the Hardcharger (ChargeWire) DuckDB image.
 
 This runs on the host and drives Docker. Nothing here is copied into the
-image. It verifies the image entrypoint/user, the baked CLI and extension
-bytes against the lock, and loads all nine modules with autoinstall/autoload
-and unsigned loading disabled in a read-only, non-root container.
+image. It verifies the image entrypoint/user/environment, the baked CLI and
+extension bytes against the lock, and loads all eight modules with
+autoinstall/autoload and unsigned loading disabled in a read-only, non-root
+container.
 """
 
 from __future__ import annotations
@@ -28,12 +29,12 @@ MODULES = (
     "postgres_scanner",
     "fts",
     "vss",
-    "quack",
     "httpfs",
     "raquet",
     "differential",
 )
-EXTENSION_DIR = "/opt/duckdb/.duckdb/extensions/v2.0.0/linux_amd64"
+EXTENSION_DIR = "/var/lib/hardcharger/.duckdb/extensions/v2.0.0/linux_amd64"
+SQL_DIR = "/opt/pgvs3-duckdb"
 
 
 class CheckError(RuntimeError):
@@ -115,7 +116,7 @@ def verify_bytes(image: str, lock: dict) -> None:
         raise CheckError("image has no /duckdb binary")
     length, digest = binaries["duckdb"]
     if length != cli["bytes"] or digest != cli["sha256"]:
-        raise CheckError("image CLI hash or size differs from extensions.lock")
+        raise CheckError("one-shot CLI hash or size differs from extensions.lock")
     for module in lock["extensions"]:
         name = module["name"]
         for suffix, field, length_field in (
@@ -131,28 +132,62 @@ def verify_bytes(image: str, lock: dict) -> None:
 
 
 def verify_config(image: str) -> None:
+    lock = json.loads(LOCK_PATH.read_text())
+    server = lock["server"]
     entrypoint = json.loads(docker_inspect(image, "{{json .Config.Entrypoint}}"))
-    command = json.loads(docker_inspect(image, "{{json .Config.Cmd}}"))
     user = docker_inspect(image, "{{.Config.User}}")
     workdir = docker_inspect(image, "{{.Config.WorkingDir}}")
-    environment = docker_inspect(image, "{{json .Config.Env}}")
-    if entrypoint != ["/duckdb"]:
+    environment = json.loads(docker_inspect(image, "{{json .Config.Env}}"))
+    ports = json.loads(docker_inspect(image, "{{json .Config.ExposedPorts}}"))
+    stop_signal = docker_inspect(image, "{{.Config.StopSignal}}")
+    if entrypoint != server["entrypoint"]:
         raise CheckError(f"unexpected entrypoint: {entrypoint!r}")
-    if user != "65532:65532":
+    if user != server["user"]:
         raise CheckError(f"unexpected image user: {user!r}")
-    if workdir != "/tmp":
+    if workdir != "/var/lib/hardcharger":
         raise CheckError(f"unexpected working directory: {workdir!r}")
-    if not isinstance(command, list) or "-init" not in command or "-bail" not in command:
-        raise CheckError(f"unexpected command: {command!r}")
-    if "HOME=/opt/duckdb" not in json.loads(environment):
-        raise CheckError("HOME is not /opt/duckdb")
-    for binary, args in (
-        ("/bin/sh", ("-c", "true")),
-        ("/usr/bin/python3", ("--version",)),
-    ):
-        result = docker("run", "--rm", "--entrypoint", binary, image, *args)
-        if result.returncode == 0:
-            raise CheckError(f"unexpected executable in final image: {binary}")
+    if stop_signal not in ("SIGTERM", "15"):
+        raise CheckError(f"unexpected stop signal: {stop_signal!r}")
+    for port in (f"{server['port']}/tcp", f"{server['health_port']}/tcp"):
+        if port not in ports:
+            raise CheckError(f"image does not expose {port}")
+    wanted = {
+        "HOME=/var/lib/hardcharger",
+        "DUCKDB_MEMORY_LIMIT=2GB",
+        "DUCKDB_THREADS=4",
+        "DUCKDB_TEMP_DIRECTORY=/tmp/duckdb",
+        "PGVS3_ENDPOINT=127.0.0.1:8014",
+        "PGVS3_PREFIX=ducklake",
+        "PGVS3_METADATA_SCHEMA=ducklake_pgvs3",
+        "PGVS3_S3_ACCESS_KEY=pgvs3",
+        "PGVS3_S3_SECRET_KEY=pgvs3",
+        "PGVS3_S3_REGION=us-east-1",
+        "PGVS3_S3_USE_SSL=",
+        "HARDCHARGER_HOST=0.0.0.0",
+        f"HARDCHARGER_PORT={server['port']}",
+        f"HARDCHARGER_HEALTH_PORT={server['health_port']}",
+        "HARDCHARGER_ALLOW_UNSIGNED_EXTENSIONS=false",
+        f"HARDCHARGER_INIT_SQL_COMMANDS_FILE={SQL_DIR}/init.sql",
+        "HARDCHARGER_DEFAULT_CATALOG=lake",
+        "HARDCHARGER_ADMIN_USERNAME=pgvs3",
+        "HARDCHARGER_GRACEFUL_SHUTDOWN=true",
+        "HARDCHARGER_SHUTDOWN_GRACE_PERIOD_SECONDS=15",
+        "HARDCHARGER_MEMORY_LIMIT=2GB",
+    }
+    missing = wanted - set(environment)
+    if missing:
+        raise CheckError(f"missing image environment: {sorted(missing)}")
+    if any(value.startswith("HARDCHARGER_ADMIN_PASSWORD=") for value in environment):
+        raise CheckError("image bakes an administrator password")
+    result = docker("run", "--rm", "--entrypoint", "/usr/bin/python3", image, "--version")
+    if result.returncode == 0:
+        raise CheckError("unexpected executable in image: /usr/bin/python3")
+    result = docker(
+        "run", "--rm", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--entrypoint", "/bin/sh",
+        image, "-c", "test -r /opt/pgvs3-duckdb/init.sql && test -r " + EXTENSION_DIR + "/spatial.duckdb_extension",
+    )
+    if result.returncode != 0:
+        raise CheckError(f"baked SQL or extension path is not readable: {result.stderr.strip()}")
 
 
 def check_sql(lock: dict) -> str:
@@ -220,8 +255,8 @@ def verify_modules(image: str, lock: dict) -> None:
         if origin != expected[name]["origin"]:
             raise CheckError(f"extension origin mismatch: {name} {origin}")
     print(
-        f"ok duckdb={meta[0][1]} modules={len(extensions)}/9 "
-        "signed=required autoinstall=off autoload=off read-only=yes nonroot=65532"
+        f"ok duckdb={meta[0][1]} modules={len(extensions)}/8 "
+        "signed=required autoinstall=off autoload=off read-only=yes nonroot=hardcharger"
     )
 
 

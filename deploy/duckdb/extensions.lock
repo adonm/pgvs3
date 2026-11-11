@@ -97,19 +97,6 @@
       "info_b64": "ZAABZQBHaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvdnNzLmR1Y2tkYl9leHRlbnNpb24uZ3pmABxodHRwOi8vZXh0ZW5zaW9ucy5kdWNrZGIub3JnZwAKMzY4NTEzMWVhY2gAIiJiZGNlYWU4Mjg5Yzg5MGViN2M4ZWMwYzBmNDM3OTk4YyJqAARjb3JlawBHc2hhMjU2OmEzMTlkZTFmMTNiYzg1YTBhZjBjNTFkNWNhNDdlM2FmZjk2ODBkODMzM2U4OTVhM2EzNWU1ZmY5N2E2OWRjMTL//w=="
     },
     {
-      "name": "quack",
-      "origin": "core",
-      "version": "f96420ed46",
-      "url": "https://extensions.duckdb.org/v2.0.0/linux_amd64/quack.duckdb_extension.gz",
-      "sha256_gz": "f9a5c0d2e0eef0f7546aba4579ab80d75d167cdf48830459faf67378ab2000fe",
-      "bytes_gz": 18983283,
-      "sha256": "9c893bd543ec2c5253d0c47d5614f90a1bfa1791c735dc6bbcea4e8bd3811a97",
-      "bytes": 59756486,
-      "sha256_info": "38bbc29ae2bba0e69a0c9f72fde65a23f0cf6f3b987aa8c2e09d3f4185825fe9",
-      "bytes_info": 243,
-      "info_b64": "ZAABZQBJaHR0cDovL2V4dGVuc2lvbnMuZHVja2RiLm9yZy92Mi4wLjAvbGludXhfYW1kNjQvcXVhY2suZHVja2RiX2V4dGVuc2lvbi5nemYAHGh0dHA6Ly9leHRlbnNpb25zLmR1Y2tkYi5vcmdnAApmOTY0MjBlZDQ2aAAiIjliNWE1ZjA3YWI0Y2FiNzY0OTkzZTdkZGY2YzYyY2VhImoABGNvcmVrAEdzaGEyNTY6YTMxOWRlMWYxM2JjODVhMGFmMGM1MWQ1Y2E0N2UzYWZmOTY4MGQ4MzMzZTg5NWEzYTM1ZTVmZjk3YTY5ZGMxMv//"
-    },
-    {
       "name": "httpfs",
       "origin": "core",
       "version": "77392a7207",
@@ -151,5 +138,19 @@
       "info_b64": "ZAABZQBaaHR0cDovL2NvbW11bml0eS1leHRlbnNpb25zLmR1Y2tkYi5vcmcvdjIuMC4wL2xpbnV4X2FtZDY0L2RpZmZlcmVudGlhbC5kdWNrZGJfZXh0ZW5zaW9uLmd6ZgAmaHR0cDovL2NvbW11bml0eS1leHRlbnNpb25zLmR1Y2tkYi5vcmdnAAZ2MS4xLjBoACIiMmU0NTI4MWQyNjZlZmQ1ZDMyMmExMTEzZmYwNGRhNjQiaQABagAJY29tbXVuaXR5awBHc2hhMjU2OmI5YWFjNzBhOWIxZGU4OTYwNzkwNDFkNzY2OTEyODRhY2VlYzQ0YzRlZWY3NWE1MGM5MGFiMmU5OWY5ZDU0ZDH//w==",
       "source_commit": "43203569f46b3a7f0c3a88fa8b4c34a50052ceb0"
     }
-  ]
+  ],
+  "server": {
+    "image": "ghcr.io/gizmodata/hardcharger:2.10.0",
+    "digest": "sha256:35e7e1616b575ecf04f07b3308ca7435029fb26b24f0ec9ea38248375a27ed36",
+    "manifest": "sha256:f52722973d07d2a2aae41a596226d06b0925b54847afd8cbcfe03c0d43e02f12",
+    "duckdb": "v2.0.0",
+    "chargewire": "2.4.0",
+    "user": "hardcharger",
+    "uid": 999,
+    "entrypoint": [
+      "hardcharger-server"
+    ],
+    "port": 31337,
+    "health_port": 31338
+  }
 }

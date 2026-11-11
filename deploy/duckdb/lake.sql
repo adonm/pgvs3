@@ -1,57 +1,60 @@
--- One-shot DuckLake setup, also read by init.sql before Quack starts.
--- Secrets are built from getenv() so SQL text and logs never contain the
--- PostgreSQL URL, credentials or token. A literal ATTACH URI leaks the URL,
--- so do not add one here.
-.read /opt/pgvs3-duckdb/extensions.sql
+-- DuckLake secret + attach, as a renderable template shared by the ChargeWire
+-- init and the one-shot CLI check. Render with deploy/duckdb/render_init.py.
+--
+-- Hardcharger's embedded DuckDB deliberately omits getenv(), so no statement
+-- here reads the environment: the renderer substitutes the __PGVS3_*__
+-- sentinels with SQL-escaped literals and writes the result to a private path.
+-- A template that reaches the server unrendered trips the first guard below,
+-- which names the variable and never a value.
 
-SELECT CASE WHEN coalesce(getenv('PGVS3_URL'), '') = ''
+SELECT CASE WHEN position('__PGVS3_' IN '__PGVS3_URL__') = 1
   THEN error('PGVS3_URL is required (existing libpq-compatible database URL)') END;
-SELECT CASE WHEN NOT regexp_matches(getenv('PGVS3_URL'), '^postgres(ql)?://')
+SELECT CASE WHEN NOT regexp_matches('__PGVS3_URL__', '^postgres(ql)?://')
   THEN error('PGVS3_URL must use a postgres or postgresql URL scheme') END;
-SELECT CASE WHEN coalesce(getenv('PGVS3_BUCKET'), '') = ''
+SELECT CASE WHEN position('__PGVS3_' IN '__PGVS3_BUCKET__') = 1
   THEN error('PGVS3_BUCKET is required; the bucket must already exist') END;
-SELECT CASE WHEN NOT regexp_matches(getenv('PGVS3_BUCKET'), '^[a-z0-9._-]{1,58}$')
+SELECT CASE WHEN NOT regexp_matches('__PGVS3_BUCKET__', '^[a-z0-9._-]{1,58}$')
   THEN error('PGVS3_BUCKET is not a safe bucket name') END;
-SELECT CASE WHEN NOT regexp_matches(coalesce(getenv('PGVS3_PREFIX'), ''), '^[A-Za-z0-9._/-]*$')
+SELECT CASE WHEN NOT regexp_matches('__PGVS3_PREFIX__', '^[A-Za-z0-9._/-]*$')
   THEN error('PGVS3_PREFIX contains an unsafe character') END;
-SELECT CASE WHEN regexp_matches(coalesce(getenv('PGVS3_PREFIX'), ''), '(^|/)\.\.?(/|$)')
+SELECT CASE WHEN regexp_matches('__PGVS3_PREFIX__', '(^|/)\.\.?(/|$)')
   THEN error('PGVS3_PREFIX contains an unsafe path component') END;
-SELECT CASE WHEN coalesce(getenv('PGVS3_ENDPOINT'), '') = ''
+SELECT CASE WHEN position('__PGVS3_' IN '__PGVS3_ENDPOINT__') = 1
   THEN error('PGVS3_ENDPOINT is required') END;
-SELECT CASE WHEN coalesce(getenv('PGVS3_S3_ACCESS_KEY'), '') = ''
-  OR coalesce(getenv('PGVS3_S3_SECRET_KEY'), '') = ''
+SELECT CASE WHEN position('__PGVS3_' IN '__PGVS3_S3_ACCESS_KEY__') = 1
+  OR position('__PGVS3_' IN '__PGVS3_S3_SECRET_KEY__') = 1
   THEN error('PGVS3_S3_ACCESS_KEY and PGVS3_S3_SECRET_KEY must not be empty') END;
-SELECT CASE WHEN NOT regexp_matches(coalesce(getenv('PGVS3_METADATA_SCHEMA'), ''), '^[a-z_][a-z0-9_]*$')
-  OR length(getenv('PGVS3_METADATA_SCHEMA')) > 63
+SELECT CASE WHEN NOT regexp_matches('__PGVS3_METADATA_SCHEMA__', '^[a-z_][a-z0-9_]*$')
+  OR length('__PGVS3_METADATA_SCHEMA__') > 63
   THEN error('PGVS3_METADATA_SCHEMA must be a lower-case SQL identifier') END;
 
 CREATE TEMP SECRET pgvs3_pg (
   TYPE postgres,
-  URI getenv('PGVS3_URL')
+  URI '__PGVS3_URL__'
 );
 CREATE TEMP SECRET pgvs3_s3 (
   TYPE s3,
-  KEY_ID getenv('PGVS3_S3_ACCESS_KEY'),
-  SECRET getenv('PGVS3_S3_SECRET_KEY'),
-  REGION getenv('PGVS3_S3_REGION'),
-  ENDPOINT regexp_replace(getenv('PGVS3_ENDPOINT'), '^https?://', ''),
+  KEY_ID '__PGVS3_S3_ACCESS_KEY__',
+  SECRET '__PGVS3_S3_SECRET_KEY__',
+  REGION '__PGVS3_S3_REGION__',
+  ENDPOINT regexp_replace('__PGVS3_ENDPOINT__', '^https?://', ''),
   URL_STYLE 'path',
-  USE_SSL CAST(coalesce(
-    nullif(getenv('PGVS3_S3_USE_SSL'), ''),
-    CASE WHEN getenv('PGVS3_ENDPOINT') LIKE 'https://%' THEN 'true' ELSE 'false' END
-  ) AS BOOLEAN)
+  USE_SSL CAST(
+    CASE WHEN '__PGVS3_S3_USE_SSL__' = ''
+      THEN CASE WHEN '__PGVS3_ENDPOINT__' LIKE 'https://%' THEN 'true' ELSE 'false' END
+      ELSE '__PGVS3_S3_USE_SSL__'
+    END AS BOOLEAN
+  )
 );
 CREATE TEMP SECRET pgvs3_lake (
   TYPE ducklake,
   METADATA_PATH '',
-  METADATA_SCHEMA getenv('PGVS3_METADATA_SCHEMA'),
-  DATA_PATH 's3://' || getenv('PGVS3_BUCKET') || '/' ||
-    CASE WHEN trim(getenv('PGVS3_PREFIX'), '/') = ''
+  METADATA_SCHEMA '__PGVS3_METADATA_SCHEMA__',
+  DATA_PATH 's3://__PGVS3_BUCKET__/' || CASE WHEN '__PGVS3_PREFIX__' = ''
       THEN ''
-      ELSE trim(getenv('PGVS3_PREFIX'), '/') || '/'
+      ELSE '__PGVS3_PREFIX__' || '/'
     END,
   METADATA_PARAMETERS MAP {'TYPE': 'postgres', 'SECRET': 'pgvs3_pg'}
 );
 ATTACH 'ducklake:pgvs3_lake' AS lake (AUTOMATIC_MIGRATION false);
-USE lake;
 SELECT 'PGVS3_LAKE_OK';

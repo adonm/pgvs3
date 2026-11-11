@@ -196,7 +196,7 @@ an unrelated session option.
 ## Schema, wide-column, spatiotemporal and write-for-read modeling
 
 The executable SQL below validates mechanics on a **40,000-row** disposable
-fixture; measured **20M-row** row-group tuning and multi-GB raster/Quack results
+fixture; measured **20M-row** row-group tuning and multi-GB raster/ChargeWire results
 live in [benchmarks.md](../benchmarks.md).
 
 When scaling DuckLake and Parquet on pgvs3 to **large-table collections**, **wide

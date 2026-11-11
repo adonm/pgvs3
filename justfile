@@ -249,9 +249,10 @@ image push="false":
       KO_DOCKER_REPO=ko.local mise exec go ko -- ko build "${kwargs[@]}" --local ./cmd/pgvs3
     fi
 
-# Pinned DuckDB 2.0.0 + nine signed extensions + native Quack.
+# Pinned Hardcharger 2.10.0 (ChargeWire) + DuckDB v2.0.0 + eight signed extensions.
 DUCKDB_IMAGE := env("DUCKDB_IMAGE", "pgvs3-duckdb:2.0.0")
 DUCKDB_IMAGE_REPO := env("DUCKDB_IMAGE_REPO", "ghcr.io/adonm/pgvs3-duckdb")
+CHARGE_CONNECT := "--with adbc-driver-chargewire --with adbc-driver-manager --with pyarrow"
 
 # Fetch/verify the pinned artifacts, build and check the amd64 image, and
 # optionally push it to GHCR.
@@ -277,19 +278,24 @@ duckdb-check:
 # Host-driven local no-PG/no-S3 functional smoke and illustrative timings.
 [group('test')]
 duckdb-smoke:
-    python3 deploy/duckdb/smoke.py "{{ DUCKDB_IMAGE }}"
+    mise exec uv -- uv run --quiet --no-project {{ CHARGE_CONNECT }} python deploy/duckdb/smoke.py "{{ DUCKDB_IMAGE }}"
 
-# One-shot PG/S3 DuckLake attach without starting Quack (next-phase integration).
+# One-shot PG/S3 DuckLake attach without starting ChargeWire (next-phase integration).
 [group('test')]
 duckdb-no-daemon:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rendered=$(mktemp -d)/lake-only.sql
+    python3 deploy/duckdb/render_init.py --one-shot --output "$rendered" --mode 644
     docker run --rm --read-only --tmpfs /tmp:rw,size=1g \
+      -v "$rendered:/opt/pgvs3-duckdb/lake-only.sql:ro" \
       -e PGVS3_URL -e PGVS3_BUCKET -e PGVS3_PREFIX -e PGVS3_ENDPOINT \
       -e PGVS3_S3_USE_SSL -e PGVS3_S3_ACCESS_KEY -e PGVS3_S3_SECRET_KEY \
       --entrypoint /duckdb "{{ DUCKDB_IMAGE }}" \
       -no-agent -batch -bail -init /opt/pgvs3-duckdb/lake-only.sql
 
 # Functional compute image on the disposable pgvs3 stack: same PG database,
-# native S3 bucket through gateways A/B, native Quack and a fresh-container restart.
+# native S3 bucket through gateways A/B, native ChargeWire and a fresh-container restart.
 [group('test')]
 duckdb-integration:
     PGVS3_ANALYTICS=compute bash deploy/bench/stack.sh analytics
@@ -299,8 +305,8 @@ duckdb-integration:
 duckdb-integration-bench:
     PGVS3_DUCKDB_BENCH=1 PGVS3_ANALYTICS=compute bash deploy/bench/stack.sh analytics
 
-# C clients x W native Quack workers against DuckLake, a native RTree and one
-# cache-controlled gateway; writes quack_pool.json into the kept run directory.
+# C ChargeWire clients x W Hardcharger workers against DuckLake, a native RTree
+# and one cache-controlled gateway; writes chargewire_pool.json into the kept run directory.
 [group('bench')]
 duckdb-pool-bench:
     bash deploy/bench/stack.sh pool

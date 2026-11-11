@@ -96,11 +96,11 @@ Check the database, its settings and fleet connection capacity; print fixes.
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--compute-workers` | `0` | DuckDB/ChargeWire compute worker count to include in the PostgreSQL connection check (each worker budgets 24 DuckLake catalog connections) |
 | `--gateways` | `0` | writable+read-only gateways sharing this database (0 skips the capacity check) |
 | `--json` | `false` | print JSON |
 | `--other-connections` | `0` | connections reserved for applications, poolers and admin |
 | `--pool-max` | `64` | gateway --pool-max |
-| `--quack-workers` | `0` | Quack compute worker count to include in the PostgreSQL connection check (each worker budgets 24 DuckLake catalog connections) |
 | `--surge` | `1` | extra gateways that run during a rolling update |
 | `--url` | `postgres://localhost/pgvs3` | PostgreSQL URL |
 

@@ -13,7 +13,7 @@ This is the current focus and evidence map, not an expansion of protocol scope.
 [CONTRIBUTING.md](https://github.com/adonm/pgvs3/blob/main/CONTRIBUTING.md#change-admission) defines the feature filter.
 Historical proposals are research, not the active backlog.
 
-## Delivered: S3 origin acceleration, Quack pool model and archive virtual folders (v0.8.0)
+## Delivered: S3 origin acceleration, ChargeWire pool model and archive virtual folders (v0.8.0)
 
 - **Bounded origin cache:** `--cache-max-bytes` evicts the oldest `s3c_` and
   committed `s3w_` objects instead of growing without limit. Aligned range
@@ -32,10 +32,14 @@ Historical proposals are research, not the active backlog.
   reusable multipart part buffers, fixed-interval S3 host resolution with
   round-robin dialing, checksum pass-through on single PUTs, and seeded-PRNG
   fault-injection tests for retries and multipart cleanup.
-- **Quack `C × W` pool model:** documented client/worker/gateway/PostgreSQL
-  capacity limits with [FIG 07](index.md#fig-07--quack-client-to-worker-pool-gateway-admission--postgresql-capacity),
-  a [sizing procedure](operations.md#sizing-a-quack-worker-pool) and measured
-  aggregate pool rates. See
+- **ChargeWire `C × W` pool model:** the compute image moved from the DuckDB
+  CLI + Quack extension to Hardcharger 2.10.0 serving ChargeWire 2.4.0 on the
+  same embedded DuckDB 2.0.0, with `lake` as every session's default catalog and
+  a PID-1 daemon that stops cleanly. Documented the client/worker/gateway/
+  PostgreSQL capacity limits with
+  [FIG 07](index.md#fig-07--chargewire-client-to-worker-pool-gateway-admission--postgresql-capacity),
+  a [sizing procedure](operations.md#sizing-a-chargewire-worker-pool) and
+  measured aggregate pool rates. See
   [benchmarks](benchmarks.md#c-clients-x-w-worker-pool-benchmark).
 - **Single-command origin startup:** `pgvs3 serve --s3-origin
   overture=s3://overturemaps-us-west-2?region=us-west-2 --auto-bucket lake`

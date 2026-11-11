@@ -2,11 +2,12 @@
 """Fetch and verify the pinned DuckDB 2.0.0 signed extensions.
 
 Run this before ``docker build`` (``just duckdb-image`` does). The final image
-uses the official DuckDB binary; this fetcher only prepares the nine extension
-artifacts. The lock file is the source of truth: every archive, extracted
-extension and every DuckDB ``.info`` installation-metadata sidecar is checked
-before it is placed in the build context. The official CLI hash is retained in
-the lock so host checks can verify the image binary.
+is the Hardcharger (ChargeWire) server, which embeds DuckDB v2.0.0; this
+fetcher only prepares the eight extension artifacts and the one-shot DuckDB
+CLI. The lock file is the source of truth: every archive, extracted extension
+and every DuckDB ``.info`` installation-metadata sidecar is checked before it is
+placed in the build context. The official CLI hash is retained in the lock so
+one-shot ``lake-only.sql`` runs and host checks use the exact official binary.
 
 The fetcher is deliberately boring: Python's standard library, pinned URLs and
 SHA-256 hashes, atomic writes. A pre-populated ``--cache`` directory is accepted
@@ -38,7 +39,6 @@ MODULES = (
     "postgres_scanner",
     "fts",
     "vss",
-    "quack",
     "httpfs",
     "raquet",
     "differential",
@@ -202,7 +202,7 @@ def validate_lock(lock: dict, platform: str) -> None:
         if len(info) != module["bytes_info"]:
             raise FetchError(f"{module['name']} embedded .info size mismatch")
     if tuple(sorted(names)) != tuple(sorted(MODULES)):
-        raise FetchError(f"lock modules differ from the expected nine: {sorted(names)}")
+        raise FetchError(f"lock modules differ from the expected eight: {sorted(names)}")
     cli = lock["cli"]
     for field in ("sha256_tar", "sha256"):
         if not HASH_RE.fullmatch(cli[field]):
@@ -211,6 +211,13 @@ def validate_lock(lock: dict, platform: str) -> None:
         raise FetchError("base image digest is not pinned")
     if lock["base"]["image"] != "duckdb/duckdb:2.0.0":
         raise FetchError("base image is not the pinned official DuckDB image")
+    server = lock.get("server", {})
+    if server.get("image") != "ghcr.io/gizmodata/hardcharger:2.10.0":
+        raise FetchError("server image is not the pinned Hardcharger release")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", server.get("digest", "")):
+        raise FetchError("server image digest is not pinned")
+    if server.get("duckdb") != lock["duckdb"]["version"]:
+        raise FetchError("server DuckDB version differs from the extension lock")
     expat = lock.get("libexpat", {})
     if not HASH_RE.fullmatch(expat.get("sha256", "")):
         raise FetchError("libexpat hash is not pinned")

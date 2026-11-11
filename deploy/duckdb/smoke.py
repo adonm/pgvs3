@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Host-side, local, no-PG/no-S3 smoke for the baked native DuckDB image.
+"""Host-side, local, no-PG/no-S3 smoke for the Hardcharger (ChargeWire) image.
 
-This script drives the image's own /duckdb CLI through Docker. It does not run
-Python or a shell inside the image, does not use ``docker exec python``, and
-does not start a custom SQL service. The tests exercise the exact signed
-artifacts baked into the image: module versions/unsigned-off, spatial RTree,
-VSS HNSW recall, FTS token search, RaQuet function presence, a local
-Differential snapshot, Quack memory and a local DuckLake restart.
+This script drives Docker from the host. It runs the copied official /duckdb
+CLI through ``docker exec`` for the pure extension checks, then starts the
+image's own ``hardcharger-server`` entrypoint in a read-only, non-root
+container and talks to it with ``adbc-driver-chargewire``. It covers all eight
+baked modules with unsigned loading off, spatial RTree, VSS HNSW recall, FTS,
+RaQuet function presence, a local Differential snapshot, ChargeWire readiness
+via the plaintext ``/health`` port, unqualified writes landing in ``lake``,
+``?`` bind parameters, a DuckLake restart and a clean ``docker stop`` exit 0
+with no ``-i`` and no ``--init``.
 """
 
 from __future__ import annotations
@@ -15,11 +18,12 @@ import csv
 import json
 import math
 import os
+import shutil
 import socket
 import subprocess
 import sys
-import threading
 import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -30,7 +34,6 @@ MODULES = (
     "postgres_scanner",
     "fts",
     "vss",
-    "quack",
     "httpfs",
     "raquet",
     "differential",
@@ -45,6 +48,8 @@ PRELUDE = "\n".join(
         *(f"LOAD {module};" for module in MODULES),
     ]
 )
+SQL_DIR = "/opt/pgvs3-duckdb"
+ADMIN_USER = "pgvs3"
 
 
 class SmokeError(RuntimeError):
@@ -59,135 +64,6 @@ def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
-
-
-class Holder:
-    """A read-only, non-root container used as the native CLI execution sandbox."""
-
-    def __init__(self, image: str) -> None:
-        self.image = image
-        self.name = f"pgvs3-duckdb-smoke-{os.getpid()}"
-        docker("rm", "-f", self.name)
-        result = docker(
-            "run",
-            "-d",
-            "-i",
-            "--init",
-            "--rm",
-            "--name",
-            self.name,
-            "--read-only",
-            "--tmpfs",
-            "/tmp:rw,size=2g",
-            "--tmpfs",
-            "/smoke:rw,size=2g",
-            "--entrypoint",
-            "/duckdb",
-            image,
-            "-no-agent",
-            "-batch",
-            "-bail",
-        )
-        if result.returncode != 0:
-            raise SmokeError(f"cannot start smoke container: {result.stderr.strip()}")
-
-    def exec_sql(self, sql: str, timeout: float = 180) -> str:
-        result = docker(
-            "exec",
-            "-i",
-            self.name,
-            "/duckdb",
-            "-no-agent",
-            "-batch",
-            "-noheader",
-            "-csv",
-            "-bail",
-            input_text=PRELUDE + "\n" + sql + "\n",
-            timeout=timeout,
-        )
-        if result.returncode != 0:
-            raise SmokeError((result.stderr or result.stdout).strip())
-        return result.stdout.strip()
-
-    def start_server(self, sql: str) -> "Server":
-        command = [
-            "docker",
-            "exec",
-            "-i",
-            self.name,
-            "/duckdb",
-            "-no-agent",
-            "-batch",
-            "-noheader",
-            "-csv",
-            "-bail",
-        ]
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdin is not None
-        process.stdin.write(PRELUDE + "\n" + sql + "\n")
-        process.stdin.flush()
-        return Server(process)
-
-    def close(self) -> None:
-        docker("rm", "-f", self.name)
-
-
-class Server:
-    def __init__(self, process: subprocess.Popen[str]) -> None:
-        self.process = process
-        self.lines: list[str] = []
-        self.lock = threading.Lock()
-        self.thread = threading.Thread(target=self._read, name="quack-output", daemon=True)
-        self.thread.start()
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            with self.lock:
-                ready = any(line.strip() == "READY" for line in self.lines)
-            if ready:
-                return
-            if process.poll() is not None:
-                raise SmokeError("Quack server exited before ready:\n" + self.detail())
-            time.sleep(0.1)
-        self.stop()
-        raise SmokeError("Quack server did not become ready:\n" + self.detail())
-
-    def _read(self) -> None:
-        assert self.process.stdout is not None
-        for raw in self.process.stdout:
-            with self.lock:
-                self.lines.append(raw.rstrip())
-                if len(self.lines) > 100:
-                    del self.lines[:50]
-
-    def detail(self) -> str:
-        with self.lock:
-            return "\n".join(self.lines[-20:])
-
-    def stop(self) -> None:
-        try:
-            if self.process.stdin is not None:
-                self.process.stdin.write(".quit\n")
-                self.process.stdin.flush()
-                self.process.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-        try:
-            self.process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        self.thread.join(1)
 
 
 def docker(*args: str, input_text: str | None = None, timeout: float = 300) -> subprocess.CompletedProcess:
@@ -218,6 +94,163 @@ def locked_modules() -> dict[str, dict]:
     return {module["name"]: module for module in lock["extensions"]}
 
 
+class Holder:
+    """A read-only, non-root container used as the native CLI execution sandbox."""
+
+    def __init__(self, image: str) -> None:
+        self.image = image
+        self.name = f"pgvs3-duckdb-smoke-{os.getpid()}"
+        docker("rm", "-f", self.name)
+        result = docker(
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            self.name,
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,size=2g",
+            "--entrypoint",
+            "sleep",
+            image,
+            "infinity",
+        )
+        if result.returncode != 0:
+            raise SmokeError(f"cannot start smoke container: {result.stderr.strip()}")
+
+    def exec_sql(self, sql: str, timeout: float = 180) -> str:
+        result = docker(
+            "exec",
+            "-i",
+            self.name,
+            "/duckdb",
+            "-no-agent",
+            "-batch",
+            "-noheader",
+            "-csv",
+            "-bail",
+            input_text=PRELUDE + "\n" + sql + "\n",
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise SmokeError((result.stderr or result.stdout).strip())
+        return result.stdout.strip()
+
+    def close(self) -> None:
+        docker("rm", "-f", self.name)
+
+
+def chargewire_connect(port: int, password: str):
+    from adbc_driver_chargewire import dbapi
+
+    return dbapi.connect(
+        f"chargewire://127.0.0.1:{port}?tls=false",
+        username=ADMIN_USER,
+        password=password,
+    )
+
+
+class ChargeWire:
+    """The image's own hardcharger-server entrypoint, no stdin and no init."""
+
+    def __init__(self, image: str, state: Path) -> None:
+        self.image = image
+        self.name = f"pgvs3-chargewire-smoke-{os.getpid()}"
+        self.port = free_port()
+        self.health_port = free_port()
+        self.password = os.urandom(16).hex()
+        self.state = state
+        state.mkdir(parents=True, exist_ok=True)
+        os.chmod(state, 0o777)
+        # Hardcharger's DuckDB has no getenv(): render the concrete init SQL
+        # from a local DuckLake template before the container starts.
+        init_sql = state / "lake-init.sql"
+        init_sql.write_text(
+            "SET extension_directories=['/opt/pgvs3-duckdb/extensions'];\n"
+            "SET autoinstall_known_extensions=false;\n"
+            "SET autoload_known_extensions=false;\n"
+            "SET allow_unsigned_extensions=false;\n"
+            + "".join(f"LOAD {module};\n" for module in MODULES)
+            + f"ATTACH 'ducklake:/state/smoke.ducklake' AS lake "
+              f"(DATA_PATH '/state/data/', AUTOMATIC_MIGRATION false);\n"
+        )
+        os.chmod(init_sql, 0o644)
+        docker("rm", "-f", self.name)
+        args = [
+            "run",
+            "-d",
+            "--name",
+            self.name,
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,size=1g",
+            "-v",
+            f"{state}:/state:rw",
+            "-v",
+            f"{init_sql}:/opt/pgvs3-duckdb/init.sql:ro",
+            "-p",
+            f"127.0.0.1:{self.port}:31337",
+            "-p",
+            f"127.0.0.1:{self.health_port}:31338",
+            "-e",
+            f"HARDCHARGER_ADMIN_USERNAME={ADMIN_USER}",
+            "-e",
+            f"HARDCHARGER_ADMIN_PASSWORD={self.password}",
+            "-e",
+            "HARDCHARGER_MEMORY_LIMIT=1GB",
+            "-e",
+            "DUCKDB_MEMORY_LIMIT=1GB",
+            "-e",
+            "DUCKDB_THREADS=4",
+        ]
+        result = docker(*args, image, timeout=120)
+        if result.returncode != 0:
+            raise SmokeError(f"cannot start ChargeWire container: {result.stderr.strip()}")
+        try:
+            self.wait_ready()
+        except SmokeError:
+            self.logs()
+            raise
+
+    def health(self) -> dict:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{self.health_port}/health", timeout=2
+        ) as response:
+            return json.loads(response.read())
+
+    def wait_ready(self, seconds: float = 90) -> None:
+        deadline = time.monotonic() + seconds
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                health = self.health()
+                if health.get("status") == "serving":
+                    return
+                last = health
+            except OSError as error:
+                last = error
+            state = json.loads(
+                docker("inspect", "--format", "{{json .State}}", self.name).stdout or "{}"
+            )
+            if state.get("Status") == "exited":
+                raise SmokeError("ChargeWire server exited before ready:\n" + self.logs())
+            time.sleep(0.1)
+        raise SmokeError(f"ChargeWire server did not become ready: {last}")
+
+    def logs(self) -> str:
+        return docker("logs", self.name).stdout + docker("logs", self.name).stderr
+
+    def stop(self) -> dict:
+        started = time.perf_counter()
+        docker("stop", "--timeout", "20", self.name, timeout=60)
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        state = json.loads(docker("inspect", "--format", "{{json .State}}", self.name).stdout)
+        return {"exit_code": state["ExitCode"], "oom_killed": state["OOMKilled"], "stop_ms": elapsed}
+
+    def close(self) -> None:
+        docker("rm", "-f", self.name)
+
+
 def test_modules(holder: Holder) -> float:
     started = time.perf_counter()
     names = ",".join(sql_literal(module) for module in MODULES)
@@ -234,7 +267,7 @@ def test_modules(holder: Holder) -> float:
     expected = locked_modules()
     extensions = rows[1:]
     if len(extensions) != len(MODULES):
-        raise SmokeError(f"modules: expected 9 rows, got {extensions!r}")
+        raise SmokeError(f"modules: expected {len(MODULES)} rows, got {extensions!r}")
     for name, version, origin, loaded in extensions:
         if name not in expected:
             raise SmokeError(f"modules: unexpected extension {name}")
@@ -319,7 +352,7 @@ def test_raquet(holder: Holder) -> float:
 def test_differential(holder: Holder) -> float:
     started = time.perf_counter()
     first = holder.exec_sql(
-        f"SET differential_repository={sql_literal('/smoke/differential/repo')};\n"
+        f"SET differential_repository={sql_literal('/tmp/differential/repo')};\n"
         "ATTACH 'differential:smoke' AS d;\n"
         "USE d;\n"
         "CREATE TABLE t (id INTEGER);\n"
@@ -335,7 +368,7 @@ def test_differential(holder: Holder) -> float:
     if first.splitlines()[-1] != "1":
         raise SmokeError(f"differential: snapshot failed: {first!r}")
     second = holder.exec_sql(
-        f"SET differential_repository={sql_literal('/smoke/differential/repo')};\n"
+        f"SET differential_repository={sql_literal('/tmp/differential/repo')};\n"
         "ATTACH 'differential:smoke' AS d2;\n"
         "SELECT count(*) FROM d2.main.t;\n"
         "DETACH d2;"
@@ -344,79 +377,72 @@ def test_differential(holder: Holder) -> float:
     return (time.perf_counter() - started) * 1000
 
 
-def test_quack_memory(holder: Holder) -> float:
+def test_chargewire(holder: Holder, server: ChargeWire) -> float:
+    """Readiness, unqualified lake writes, ``?`` binds, native memory tables."""
     started = time.perf_counter()
-    port = free_port()
-    token = f"smoke-token-{os.getpid()}"
-    server = holder.start_server(
-        ".output /dev/null\n"
-        "CREATE TABLE memory_t (id INTEGER, s VARCHAR);\n"
-        "INSERT INTO memory_t VALUES (1,'one'),(2,'two');\n"
-        f"CALL quack_serve('quack:0.0.0.0:{port}', disable_ssl=true, "
-        f"allow_other_hostname=true, token={sql_literal(token)});\n"
-        ".output\n"
-        "SELECT 'READY';"
-    )
+    health = server.health()
+    if health != {"status": "serving"}:
+        raise SmokeError(f"health: unexpected body {health!r}")
+    connection = chargewire_connect(server.port, server.password)
     try:
-        output = holder.exec_sql(
-            "LOAD quack;\n"
-            f"ATTACH 'quack:127.0.0.1:{port}' AS q (TYPE quack, TOKEN {sql_literal(token)});\n"
-            "SELECT * FROM q.main.memory_t ORDER BY id;"
+        cursor = connection.cursor()
+        cursor.execute("SELECT current_catalog(), current_schema()")
+        if cursor.fetchall() != [("lake", "main")]:
+            raise SmokeError("chargewire: default catalog is not lake")
+        cursor.execute("CREATE TABLE persisted (id INTEGER, s VARCHAR)")
+        cursor.execute("INSERT INTO persisted VALUES (?, ?)", [7, "seven"])
+        cursor.execute("INSERT INTO persisted VALUES (?, ?)", [8, "eight"])
+        cursor.execute("SELECT * FROM persisted ORDER BY id")
+        if cursor.fetchall() != [(7, "seven"), (8, "eight")]:
+            raise SmokeError("chargewire: unqualified inserts did not round-trip")
+        cursor.execute(
+            "SELECT table_catalog FROM information_schema.tables WHERE table_name='persisted'"
         )
-        if output.splitlines() != ["1,one", "2,two"]:
-            raise SmokeError(f"quack memory: unexpected output {output!r}")
+        if cursor.fetchall() != [("lake",)]:
+            raise SmokeError("chargewire: persisted did not land in lake")
+        cursor.execute("CALL ducklake_flush_inlined_data('lake')")
+        cursor.execute("CREATE TABLE memory.main.native_t (id INTEGER)")
+        cursor.execute("INSERT INTO memory.main.native_t VALUES (1)")
+        cursor.execute("SELECT count(*) FROM memory.main.native_t")
+        if cursor.fetchall() != [(1,)]:
+            raise SmokeError("chargewire: native memory table failed")
+        cursor.execute("SELECT count(*) FROM persisted")
+        if cursor.fetchall() != [(2,)]:
+            raise SmokeError("chargewire: the client left the lake catalog")
+        cursor.close()
     finally:
-        server.stop()
-    return (time.perf_counter() - started) * 1000
+        connection.close()
 
+    stopped = server.stop()
+    if stopped["exit_code"] != 0:
+        raise SmokeError(f"chargewire: docker stop exited {stopped['exit_code']}: {server.logs()[-1500:]}")
+    if stopped["oom_killed"]:
+        raise SmokeError("chargewire: container was OOM killed")
 
-def test_quack_lake_restart(holder: Holder) -> float:
-    started = time.perf_counter()
-    port = free_port()
-    token = f"smoke-token-lake-{os.getpid()}"
-    catalog = "/smoke/catalog.ducklake"
-    files = "/smoke/lake-data/"
-    server_sql = (
-        ".output /dev/null\n"
-        f"ATTACH {sql_literal('ducklake:' + catalog)} AS lake "
-        f"(DATA_PATH {sql_literal(files)}, AUTOMATIC_MIGRATION false);\n"
-        "USE lake;\n"
-        f"CALL quack_serve('quack:0.0.0.0:{port}', disable_ssl=true, "
-        f"allow_other_hostname=true, token={sql_literal(token)});\n"
-        ".output\n"
-        "SELECT 'READY';"
-    )
-    server = holder.start_server(server_sql)
+    restarted = ChargeWire(server.image, server.state)
     try:
-        output = holder.exec_sql(
-            "LOAD quack;\n"
-            f"ATTACH 'quack:127.0.0.1:{port}' AS q (TYPE quack, TOKEN {sql_literal(token)});\n"
-            "CREATE TABLE q.lake.main.persisted (id INTEGER);\n"
-            "INSERT INTO q.lake.main.persisted VALUES (7),(8);\n"
-            "SELECT count(*) FROM q.lake.main.persisted;"
-        )
-        if output.splitlines()[-1] != "2":
-            raise SmokeError(f"quack lake write: unexpected output {output!r}")
+        connection = chargewire_connect(restarted.port, restarted.password)
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT count(*) FROM persisted")
+            if cursor.fetchall() != [(2,)]:
+                raise SmokeError("chargewire: persisted rows did not survive restart")
+            cursor.close()
+        finally:
+            connection.close()
+        restarted_stop = restarted.stop()
+        if restarted_stop["exit_code"] != 0:
+            raise SmokeError(f"chargewire: restart stop exited {restarted_stop['exit_code']}")
     finally:
-        server.stop()
-
-    server = holder.start_server(server_sql)
-    try:
-        output = holder.exec_sql(
-            "LOAD quack;\n"
-            f"ATTACH 'quack:127.0.0.1:{port}' AS q (TYPE quack, TOKEN {sql_literal(token)});\n"
-            "SELECT * FROM q.lake.main.persisted ORDER BY id;"
-        )
-        if output.splitlines() != ["7", "8"]:
-            raise SmokeError(f"quack lake restart: unexpected output {output!r}")
-    finally:
-        server.stop()
+        restarted.close()
     return (time.perf_counter() - started) * 1000
 
 
 def run(image: str) -> int:
     holder = Holder(image)
     timings: list[tuple[str, float]] = []
+    state = Path("/tmp") / f"pgvs3-chargewire-smoke-{os.getpid()}"
+    server = ChargeWire(image, state)
     try:
         for name, function in (
             ("modules", test_modules),
@@ -425,17 +451,20 @@ def run(image: str) -> int:
             ("fts", test_fts),
             ("raquet", test_raquet),
             ("differential", test_differential),
-            ("quack_memory", test_quack_memory),
-            ("quack_lake_restart", test_quack_lake_restart),
         ):
             elapsed = function(holder)
             timings.append((name, elapsed))
             print(f"ok {name} {elapsed:.1f}ms", flush=True)
+        elapsed = test_chargewire(holder, server)
+        timings.append(("chargewire", elapsed))
+        print(f"ok chargewire {elapsed:.1f}ms", flush=True)
     except (SmokeError, subprocess.TimeoutExpired) as error:
         print(f"smoke failed: {error}", file=sys.stderr)
         return 1
     finally:
+        server.close()
         holder.close()
+        shutil.rmtree(state, ignore_errors=True)
     print(
         "smoke ok; illustrative process-level timings: "
         + " ".join(f"{name}={elapsed:.1f}ms" for name, elapsed in timings)

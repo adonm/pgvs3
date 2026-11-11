@@ -3,6 +3,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import date, timedelta
+import decimal
 import hashlib
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +58,8 @@ def sql(statement, database=DATABASE):
 DUCKDB_IMAGE = os.environ.get("PGVS3_DUCKDB_IMAGE", "pgvs3-duckdb:2.0.0")
 DUCKDB_EXTENSION_VERSION = "v2.0.0"
 DUCKDB_EXTENSION_PLATFORM = "linux_amd64"
+CHARGE_ADMIN_USER = "pgvs3"
+CHARGE_PORT_BASE = 31337
 
 
 def sql_str(value):
@@ -93,8 +96,8 @@ def parse_s3_objects(body):
 
 
 def duckdb_client_config(extension_directory):
-    """Offline, signed host-client configuration. The caller copies quack and
-    httpfs plus their .info sidecars out of the image into this directory."""
+    """Offline, signed host-client configuration. The caller copies httpfs,
+    spatial and raquet plus their .info sidecars out of the image."""
     return {
         "extension_directory": str(extension_directory),
         "autoinstall_known_extensions": "false",
@@ -1522,8 +1525,9 @@ def container(name, image, *args):
 
 
 def copy_client_extensions(image, extension_directory):
-    """Copy only the signed quack/httpfs artifacts and .info sidecars out of
-    the image for the host Python 2.0 client. No runtime INSTALL is used."""
+    """Copy only the signed httpfs/spatial/raquet artifacts and .info sidecars
+    out of the image for the local DuckDB 2.0 value oracle. No runtime INSTALL
+    is used. The ChargeWire client is a separate ADBC driver."""
     import_target = Path(extension_directory) / DUCKDB_EXTENSION_VERSION / DUCKDB_EXTENSION_PLATFORM
     import_target.mkdir(parents=True, exist_ok=True)
     helper = f"pgvs3-{RUN.name}-extcopy"
@@ -1531,9 +1535,9 @@ def copy_client_extensions(image, extension_directory):
     subprocess.check_output(["docker", "create", "--name", helper, image], text=True,
                             stderr=subprocess.STDOUT)
     try:
-        for extension in ("httpfs", "quack", "spatial", "raquet"):
+        for extension in ("httpfs", "spatial", "raquet"):
             for suffix in ("", ".info"):
-                source = (f"{helper}:/opt/duckdb/.duckdb/extensions/"
+                source = (f"{helper}:/var/lib/hardcharger/.duckdb/extensions/"
                           f"{DUCKDB_EXTENSION_VERSION}/{DUCKDB_EXTENSION_PLATFORM}/"
                           f"{extension}.duckdb_extension{suffix}")
                 subprocess.check_output(["docker", "cp", source, str(import_target) + "/"],
@@ -1543,54 +1547,76 @@ def copy_client_extensions(image, extension_directory):
     return Path(extension_directory)
 
 
-def host_client(extension_directory, port=None, token=None):
-    """The host analytics uv client, using signed image artifacts offline and
-    an existing connection for every functional/benchmark query."""
+def chargewire_connect(port, token):
+    """One ChargeWire client session on the pinned Hardcharger worker. ADBC
+    keeps the session (and its default ``lake`` catalog) across calls."""
+    from adbc_driver_chargewire import dbapi
+    return dbapi.connect(f"chargewire://127.0.0.1:{port}?tls=false",
+                         username=CHARGE_ADMIN_USER, password=token)
+
+
+def host_client(extension_directory):
+    """The host analytics uv client, using signed image artifacts offline for
+    the local value oracles (no server session)."""
     import duckdb
     connection = duckdb.connect(config=duckdb_client_config(extension_directory))
-    connection.execute("LOAD httpfs; LOAD quack;")
+    connection.execute("LOAD httpfs;")
     connection.execute("SET enable_external_file_cache=false; SET parquet_metadata_cache=false;")
-    if port is not None:
-        connection.execute(
-            f"ATTACH 'quack:127.0.0.1:{port}' AS q (TYPE quack, TOKEN {sql_str(token)})"
-        )
     return connection
 
 
-def q_sql(client, statement):
-    """Execute SQL on the native Quack server, not a new CLI process."""
-    return client.execute("FROM q.query(" + sql_str(statement) + ")").fetchall()
+def arrow_value(value):
+    """ADBC sends DuckDB's 128-bit aggregates as Arrow decimal128, which the
+    Python driver surfaces as Decimal. Keep them exact but JSON-serializable."""
+    if isinstance(value, decimal.Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
 
 
-def q_exec(client, statement):
+def q_sql(client, statement, params=None):
+    """Execute SQL on the ChargeWire worker over ADBC, not a new CLI process."""
+    cursor = client.cursor()
+    try:
+        cursor.execute(statement, params) if params is not None else cursor.execute(statement)
+        return [tuple(arrow_value(value) for value in row) for row in cursor.fetchall()]
+    finally:
+        cursor.close()
+
+
+def q_exec(client, statement, params=None):
     started = time.perf_counter()
-    rows = q_sql(client, statement)
+    rows = q_sql(client, statement, params)
     return round((time.perf_counter() - started) * 1000, 3), rows
 
 
-def q_timed(client, statement, repeat=3):
+def q_timed(client, statement, repeat=3, params=None):
     samples, rows = [], None
     for _ in range(repeat):
         started = time.perf_counter()
-        rows = q_sql(client, statement)
+        rows = q_sql(client, statement, params)
         samples.append((time.perf_counter() - started) * 1000)
     return timing_summary(samples), rows
 
 
-def wait_compute(extension_directory, port, token):
+def health(port):
+    """The plaintext /health port body: ``{"status":"serving"}`` once the
+    ChargeWire listener and its DuckDB session store are up."""
+    with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+        return json.loads(response.read())
+
+
+def wait_compute(port, health_port, token):
     def ready():
+        assert health(health_port) == {"status": "serving"}
+        connection = chargewire_connect(port, token)
         try:
-            connection = host_client(extension_directory, port, token)
-            try:
-                return connection.execute("SELECT 1").fetchone() == (1,)
-            finally:
-                connection.close()
-        except Exception:
-            return False
-    eventually("compute Quack readiness", ready, 120)
+            return q_sql(connection, "SELECT 1") == [(1,)]
+        finally:
+            connection.close()
+    eventually("compute ChargeWire readiness", ready, 120)
 
 
-def compute_environment(names, endpoint, port, token, database=None):
+def compute_environment(names, endpoint, port, token, health_port, database=None):
     return {
         "PGVS3_URL": database or DATABASE,
         "PGVS3_BUCKET": names["bucket"],
@@ -1600,20 +1626,42 @@ def compute_environment(names, endpoint, port, token, database=None):
         "PGVS3_S3_SECRET_KEY": os.environ["PGVS3_SECRET_KEY"],
         "PGVS3_S3_USE_SSL": "false",
         "PGVS3_METADATA_SCHEMA": names["schema"],
-        "QUACK_TOKEN": token,
-        "QUACK_BIND": f"127.0.0.1:{port}",
-        "QUACK_ALLOW_OTHER_HOSTNAME": "false",
+        "HARDCHARGER_ADMIN_USERNAME": CHARGE_ADMIN_USER,
+        "HARDCHARGER_ADMIN_PASSWORD": token,
+        "HARDCHARGER_PORT": str(port),
+        "HARDCHARGER_HEALTH_PORT": str(health_port),
+        "HARDCHARGER_MEMORY_LIMIT": "1GB",
         "DUCKDB_MEMORY_LIMIT": "1GB",
         "DUCKDB_THREADS": "4",
         "DUCKDB_TEMP_DIRECTORY": "/tmp/duckdb",
     }
 
 
-def compute_container_args(environment):
-    # Native DuckDB is PID 1 by default: without -i it sees stdin EOF and exits,
-    # and without an init it ignores SIGTERM. One host Docker init plus open
-    # stdin keeps Quack alive and turns docker stop into a normal 143 exit.
-    args = ["-i", "--init", "--read-only", "--tmpfs", "/tmp:rw,size=2g"]
+def render_compute_init(environment, label):
+    """Render the baked ChargeWire init template for this worker.
+
+    Hardcharger's embedded DuckDB deliberately omits getenv(), so init SQL is a
+    concrete file, not a template evaluated in the database. The rendered file
+    is 0600 in the run directory and bind-mounted over the image's template."""
+    output = RUN / f"chargewire-init-{label}.sql"
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/duckdb/render_init.py"),
+         "--output", str(output), "--mode", "644"],
+        env={**os.environ, **environment}, text=True, capture_output=True, timeout=60,
+    )
+    assert result.returncode == 0, (result.stdout[-800:], result.stderr[-800:])
+    return output
+
+
+def compute_container_args(environment, init_sql):
+    # hardcharger-server is a real PID-1 daemon: it needs no stdin keepalive,
+    # no tini/--init and drains SIGTERM inside its own grace period. Only /tmp
+    # must be writable; /var/lib/hardcharger holds the baked extensions and is
+    # left alone (the server logs a warning and loads them read-only).
+    args = [
+        "--read-only", "--tmpfs", "/tmp:rw,size=2g",
+        "-v", f"{init_sql}:/opt/pgvs3-duckdb/init.sql:ro",
+    ]
     for key, value in environment.items():
         args.extend(["-e", f"{key}={value}"])
     return args
@@ -1621,29 +1669,19 @@ def compute_container_args(environment):
 
 def stop_compute(name):
     started = time.perf_counter()
-    subprocess.run(["docker", "stop", "--time", "20", name], check=True,
+    subprocess.run(["docker", "stop", "--timeout", "20", name], check=True,
                    capture_output=True, text=True, timeout=40)
     elapsed = round((time.perf_counter() - started) * 1000, 1)
     state = json.loads(docker_inspect(name, "{{json .State}}"))
     logs = subprocess.run(["docker", "logs", name], text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           timeout=30).stdout
-    assert state["ExitCode"] == 143, ("compute SIGTERM exit", state)
-    assert "PGVS3_READY" in logs, logs[-2000:]
-    assert "warning Quack sessions start in the memory catalog" in logs, logs[-2000:]
+    assert state["ExitCode"] == 0, ("compute SIGTERM exit", state)
+    assert not state["OOMKilled"], state
+    assert "Hardcharger is ready" in logs, logs[-2000:]
+    assert "HARDCHARGER_ADMIN_PASSWORD" not in logs, logs[-2000:]
     return {"sigterm": True, "exit_code": state["ExitCode"], "stop_ms": elapsed,
-            "ready_log": True, "memory_catalog_warning": True}
-
-
-def client_s3_secret(client, endpoint):
-    host = endpoint.split("://", 1)[-1]
-    client.execute(
-        "CREATE SECRET pgvs3_native (TYPE s3, "
-        f"KEY_ID {sql_str(os.environ['PGVS3_ACCESS_KEY'])}, "
-        f"SECRET {sql_str(os.environ['PGVS3_SECRET_KEY'])}, "
-        "REGION 'us-east-1', "
-        f"ENDPOINT {sql_str(host)}, URL_STYLE 'path', USE_SSL false)"
-    )
+            "ready_log": True, "graceful_shutdown": True}
 
 
 def lake_parquet_objects(bucket, prefix):
@@ -1659,7 +1697,7 @@ def lake_object_keys(bucket, prefix):
 @contextmanager
 def raquet_local(extension_directory):
     """Signed spatial/raquet artifacts copied from the image, loaded offline as
-    a local oracle for the Quack measurements."""
+    a local oracle for the ChargeWire measurements."""
     import duckdb
     connection = duckdb.connect(config=duckdb_client_config(extension_directory))
     try:
@@ -1669,9 +1707,9 @@ def raquet_local(extension_directory):
         connection.close()
 
 
-def parquet_digest(client, bucket, keys):
+def parquet_digest(local, bucket, keys):
     paths = "[" + ",".join(sql_str(f"s3://{bucket}/{key}") for key in keys) + "]"
-    return client.execute(
+    return local.execute(
         f"SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) FROM read_parquet({paths})"
     ).fetchone()
 
@@ -1718,8 +1756,8 @@ def unsupported_index(client, statement):
 
 def compute_large(client, names, extension_directory):
     """The opt-in large datasets: a 1M-row DuckLake table and the real LINZ
-    Wellington orthophoto. Loads and timings go through the live Quack server;
-    local signed spatial/raquet artifacts are only the value oracle."""
+    Wellington orthophoto. Loads and timings go through the live ChargeWire
+    worker; local signed spatial/raquet artifacts are only the value oracle."""
     import hashlib
     import raquet_ortho
 
@@ -1803,7 +1841,7 @@ def compute_large(client, names, extension_directory):
 
     metadata_timing, metadata_rows = q_timed(
         client, f"SELECT metadata FROM read_raquet_metadata('{url}')")
-    assert json.loads(metadata_rows[0][0]) == metadata, "Quack metadata differs"
+    assert json.loads(metadata_rows[0][0]) == metadata, "ChargeWire metadata differs"
     native_timing, native_rows = q_timed(client, lookup())
     assert native_rows == local_native, (native_rows, local_native)
     overview_timing, overview_rows = q_timed(client, lookup(", 16"))
@@ -1821,7 +1859,7 @@ def compute_large(client, names, extension_directory):
     mib = 1 << 20
     return {
         "ducklake": {
-            "table": "q.lake.main.large_events",
+            "table": "lake.main.large_events",
             "server_table": "lake.main.large_events",
             "rows": 1000000,
             "load_ms": load_ms,
@@ -1906,13 +1944,16 @@ def compute_bench(client, names, extension_directory):
         "WHERE ST_Within(geom, ST_MakeEnvelope(10,10,50,50))",
     )
     points_copy_ms, _ = q_exec(
-        client, "CREATE TABLE native_points AS SELECT * FROM lake.main.bench_points"
+        client,
+        "CREATE TABLE memory.main.native_points AS "
+        "SELECT * FROM lake.main.bench_points",
     )
     points_index_ms, _ = q_exec(
-        client, "CREATE INDEX native_points_rtree ON native_points USING RTREE (geom)"
+        client,
+        "CREATE INDEX native_points_rtree ON memory.main.native_points USING RTREE (geom)",
     )
     spatial_statement = (
-        "SELECT count(*) FROM native_points "
+        "SELECT count(*) FROM memory.main.native_points "
         "WHERE ST_Within(geom, ST_MakeEnvelope(10,10,50,50))"
     )
     spatial_native, native_spatial = q_timed(client, spatial_statement)
@@ -1922,7 +1963,7 @@ def compute_bench(client, names, extension_directory):
     )
     q_exec(client, "INSERT INTO lake.main.bench_points VALUES (5000, ST_Point(500,500))")
     lakes_after = q_sql(client, "SELECT count(*) FROM lake.main.bench_points")[0][0]
-    native_after = q_sql(client, "SELECT count(*) FROM native_points")[0][0]
+    native_after = q_sql(client, "SELECT count(*) FROM memory.main.native_points")[0][0]
     assert lakes_after == 5001 and native_after == 5000, (lakes_after, native_after)
 
     vec_build_ms, _ = q_exec(
@@ -1941,15 +1982,16 @@ def compute_bench(client, names, extension_directory):
     columns = ", ".join(f"vec[{j}]::FLOAT" for j in range(1, 33))
     vector_copy_ms, _ = q_exec(
         client,
-        f"CREATE TABLE native_vecs AS SELECT id, array_value({columns}) AS vec "
+        f"CREATE TABLE memory.main.native_vecs AS SELECT id, array_value({columns}) AS vec "
         "FROM lake.main.bench_vecs",
     )
     vector_index_ms, _ = q_exec(
         client,
-        "CREATE INDEX native_vec_hnsw ON native_vecs USING HNSW (vec) WITH (metric='cosine')",
+        "CREATE INDEX native_vec_hnsw ON memory.main.native_vecs USING HNSW (vec) "
+        "WITH (metric='cosine')",
     )
     vector_statement = (
-        "SELECT id FROM native_vecs "
+        "SELECT id FROM memory.main.native_vecs "
         f"ORDER BY array_cosine_distance(vec, {literal}) LIMIT 10"
     )
     vector_native, native_ids = q_timed(client, vector_statement)
@@ -1961,27 +2003,37 @@ def compute_bench(client, names, extension_directory):
     )
 
     docs_build_ms, _ = q_exec(
-        client, "CREATE TABLE native_docs (id INTEGER NOT NULL, body VARCHAR)"
+        client, "CREATE TABLE memory.main.native_docs (id INTEGER NOT NULL, body VARCHAR)"
     )
-    q_exec(client, "INSERT INTO native_docs SELECT i, 'doc ' || i FROM range(20) t(i)")
+    q_exec(
+        client,
+        "INSERT INTO memory.main.native_docs SELECT i, 'doc ' || i FROM range(20) t(i)",
+    )
+    # FTS resolves the index schema (fts_main_<table>) in the session's current
+    # catalog, so the build and every match run while the session is in memory.
+    # DuckLake also rejects the triggers an incremental FTS index needs. One
+    # `USE memory` per timed region; the session returns to lake afterwards.
+    q_exec(client, "USE memory")
     fts_build_ms, _ = q_exec(
         client,
-        "PRAGMA create_fts_index('native_docs','id','body', incremental=true, overwrite=1)",
+        "PRAGMA create_fts_index('memory.main.native_docs','id','body', "
+        "incremental=true, overwrite=1)",
     )
     fts_statement = (
         "SELECT count(*) FROM (SELECT *, "
-        "fts_main_native_docs.match_bm25(id,'zebra') AS score FROM native_docs) "
-        "WHERE score IS NOT NULL"
+        "fts_main_native_docs.match_bm25(id,'zebra') AS score "
+        "FROM memory.main.native_docs) WHERE score IS NOT NULL"
     )
     fts_before, _ = q_timed(client, fts_statement)
-    q_exec(client, "INSERT INTO native_docs VALUES (100, 'zebra')")
+    q_exec(client, "INSERT INTO memory.main.native_docs VALUES (100, 'zebra')")
     fts_insert = q_sql(client, fts_statement)[0][0]
-    q_exec(client, "DELETE FROM native_docs WHERE id=100")
+    q_exec(client, "DELETE FROM memory.main.native_docs WHERE id=100")
     fts_delete = q_sql(client, fts_statement)[0][0]
-    q_exec(client, "INSERT INTO native_docs VALUES (101, 'zebra')")
-    q_exec(client, "UPDATE native_docs SET body='wombat' WHERE id=101")
+    q_exec(client, "INSERT INTO memory.main.native_docs VALUES (101, 'zebra')")
+    q_exec(client, "UPDATE memory.main.native_docs SET body='wombat' WHERE id=101")
     fts_after_update = q_sql(client, fts_statement)[0][0]
     wombat = q_sql(client, fts_statement.replace("'zebra'", "'wombat'"))[0][0]
+    q_exec(client, "USE lake")
     assert fts_insert == 1 and fts_delete == 0, (fts_insert, fts_delete)
 
     return {
@@ -2018,20 +2070,22 @@ def compute_bench(client, names, extension_directory):
             "note": "incremental INSERT/DELETE maintained; UPDATE remains stale in DuckDB 2.0.0",
         },
         "large": compute_large(client, names, extension_directory),
-        "caveat": "native copies are ephemeral memory objects, not lake indexes; timings are "
-                  "native Quack round-trip samples, not storage or throughput claims",
+        "caveat": "native copies are ephemeral memory.main objects, not lake indexes; "
+                  "timings are ChargeWire round-trip samples, not storage or throughput claims",
     }
 
 
 def compute():
     """The actual deployment shape: one existing pgvs3 PostgreSQL database,
-    native S3 buckets through gateways A/B, the non-root/read-only DuckDB image
-    with native Quack, and a restart with no persistent local database."""
+    native S3 buckets through gateways A/B, the non-root/read-only Hardcharger
+    (ChargeWire) image with ``lake`` as the default catalog, and a restart with
+    no persistent local database."""
     names = compute_names(RUN.name)
     image = DUCKDB_IMAGE
     extension_directory = RUN / "duckdb-client-extensions"
     copy_client_extensions(image, extension_directory)
     import duckdb
+    from adbc_driver_chargewire import __version__ as chargewire_client_version
     image_id = docker_inspect(image, "{{.Id}}")
     parts = urlsplit(DATABASE)
     report = {
@@ -2040,10 +2094,10 @@ def compute():
         "complete": False,
         "image": {"tag": image, "id": image_id},
         "providers": {
-            "compute": "pgvs3-duckdb 2.0.0 image, native Quack",
+            "compute": "pgvs3-duckdb 2.0.0 image, Hardcharger 2.10.0 ChargeWire",
             "object_store": "pgvs3 native bucket through gateways A/B",
             "catalog": "PostgreSQL 18 pgvs3 database",
-            "client": "host Python duckdb 2.0.0 with signed image quack/httpfs",
+            "client": "adbc-driver-chargewire (ADBC) with duckdb 2.0.0 value oracles",
         },
         "config": {
             "pg_host": parts.hostname,
@@ -2055,9 +2109,10 @@ def compute():
             "endpoint_a": A,
             "endpoint_b": B,
             "readonly_rootfs": True,
-            "nonroot_user": "65532:65532",
+            "nonroot_user": "hardcharger",
             "duckdb_memory_limit": "1GB",
             "duckdb_threads": 4,
+            "default_catalog": "lake",
         },
         "versions": {},
         "functional": {},
@@ -2074,38 +2129,50 @@ def compute():
     request(A, f"/{names['bucket']}", "PUT", b"")
     token = os.urandom(16).hex()
     port = free_port()
-    env = compute_environment(names, A, port, token)
+    health_port = free_port()
+    env = compute_environment(names, A, port, token, health_port)
     name = f"pgvs3-{RUN.name}-compute-a"
-    with container(name, image, *compute_container_args(env)):
-        wait_compute(extension_directory, port, token)
-        client = host_client(extension_directory, port, token)
+    with container(name, image, *compute_container_args(env, render_compute_init(env, "a"))):
+        wait_compute(port, health_port, token)
+        client = chargewire_connect(port, token)
+        oracle = host_client(extension_directory)
         try:
-            client_s3_secret(client, B)
+            oracle.execute(
+                "CREATE SECRET pgvs3_native (TYPE s3, "
+                f"KEY_ID {sql_str(os.environ['PGVS3_ACCESS_KEY'])}, "
+                f"SECRET {sql_str(os.environ['PGVS3_SECRET_KEY'])}, "
+                "REGION 'us-east-1', "
+                f"ENDPOINT {sql_str(B.split('://', 1)[-1])}, URL_STYLE 'path', USE_SSL false)"
+            )
             server_version = q_sql(client, "SELECT version()")[0][0]
             server_modules = q_sql(
                 client,
                 "SELECT extension_name, extension_version, installed_from, loaded "
                 "FROM duckdb_extensions() WHERE extension_name IN "
-                "('spatial','ducklake','postgres_scanner','fts','vss','quack','httpfs',"
+                "('spatial','ducklake','postgres_scanner','fts','vss','httpfs',"
                 "'raquet','differential') ORDER BY 1",
             )
             client_version = duckdb.__version__
             client_modules = client.execute(
                 "SELECT extension_name, extension_version, installed_from, loaded "
-                "FROM duckdb_extensions() WHERE extension_name IN ('quack','httpfs') ORDER BY 1"
+                "FROM duckdb_extensions() "
+                "WHERE extension_name IN ('httpfs','spatial','raquet') ORDER BY 1"
             ).fetchall()
             report["versions"] = {
                 "server_duckdb": server_version,
                 "client_duckdb": client_version,
+                "chargewire_client": chargewire_client_version,
                 "server_modules": [dict(zip(("name", "version", "origin", "loaded"), row))
                                    for row in server_modules],
                 "client_modules": [dict(zip(("name", "version", "origin", "loaded"), row))
                                    for row in client_modules],
             }
             assert server_version.startswith("v2.0.0"), server_version
+            assert len(server_modules) == 8, server_modules
             assert all(row[1] for row in server_modules), server_modules
-            assert all(row[1] for row in client_modules), client_modules
             assert all(row[3] for row in server_modules), server_modules
+            assert len(client_modules) == 3 and all(row[3] for row in client_modules), \
+                client_modules
 
             schema_tables = int(sql(
                 "SELECT count(*) FROM information_schema.tables WHERE table_schema = "
@@ -2122,19 +2189,43 @@ def compute():
             _, native_body = request(B, f"/{names['bucket']}/{native_key}")
             assert native_body == b"native-object", native_body
 
-            client.execute("CREATE TABLE q.lake.main.events (id INTEGER, payload VARCHAR)")
-            client.execute(
-                "INSERT INTO q.lake.main.events SELECT i, 'value-' || i FROM range(100) t(i)"
+            # Unqualified DDL and DML: HARDCHARGER_DEFAULT_CATALOG=lake means
+            # every new ChargeWire session starts in lake, not in memory.
+            q_sql(client, "CREATE TABLE events (id INTEGER, payload VARCHAR)")
+            q_exec(
+                client,
+                "INSERT INTO events SELECT i, 'value-' || i FROM range(100) t(i)",
+            )
+            q_exec(
+                client,
+                "INSERT INTO events VALUES (?, ?), (?, ?)",
+                [100, "bound-0", 101, "bound-1"],
+            )
+            q_exec(
+                client,
+                "SELECT count(*) FROM events WHERE id = ?",
+                [101],
             )
             q_exec(client, "CALL ducklake_flush_inlined_data('lake', table_name => 'events')")
-            lake_rows = client.execute(
-                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) "
-                "FROM q.lake.main.events"
-            ).fetchone()
-            assert lake_rows[0] == 100 and lake_rows[1] == 4950, lake_rows
+            lake_rows = q_sql(
+                client,
+                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) FROM events",
+            )[0]
+            assert lake_rows[0] == 102 and lake_rows[1] == 5151, lake_rows
+            table_catalog = q_sql(
+                client,
+                "SELECT table_catalog FROM information_schema.tables WHERE table_name='events'",
+            )
+            assert table_catalog == [("lake",)], table_catalog
+            memory_rows = q_sql(
+                client,
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_catalog='memory' AND table_name='events'",
+            )
+            assert memory_rows == [(0,)], memory_rows
             keys = lake_object_keys(names["bucket"], names["prefix"])
             assert keys, "DuckLake stored no Parquet keys"
-            parquet_rows = parquet_digest(client, names["bucket"], keys)
+            parquet_rows = parquet_digest(oracle, names["bucket"], keys)
             assert parquet_rows == lake_rows, (parquet_rows, lake_rows)
 
             report["functional"] = {
@@ -2142,8 +2233,10 @@ def compute():
                 "metadata_schema_tables": schema_tables,
                 "same_database_native_namespace": namespace_rows,
                 "native_put_get_after_ducklake": True,
-                "qualified_read": "q.lake.main.events",
-                "qualified_create_insert": True,
+                "default_catalog": table_catalog[0][0],
+                "unqualified_create_insert": True,
+                "bind_parameters": "? placeholders for INSERT and SELECT",
+                "memory_events_tables": memory_rows[0][0],
                 "rows": lake_rows[0],
                 "id_sum": lake_rows[1],
                 "hash": str(lake_rows[2]),
@@ -2156,8 +2249,9 @@ def compute():
                     "WHERE function_name IN ('read_raquet_metadata','read_raquet_at')",
                 )[0][0],
                 "differential": differential_local(name),
-                "qualified_note": "q.lake.main.* writes are durable; unqualified "
-                                  "q.<table> writes land in the ephemeral memory catalog",
+                "qualified_note": "HARDCHARGER_DEFAULT_CATALOG=lake starts every "
+                                  "session in lake; memory.main.* is the ephemeral "
+                                  "catalog, and DETACH/ATTACH is not needed",
             }
             assert report["functional"]["raquet_functions"] == 2
             report["raw_samples"]["functional"] = {
@@ -2170,32 +2264,39 @@ def compute():
             stopping = stop_compute(name)
         finally:
             client.close()
+            oracle.close()
     report["restart"]["shutdown"] = stopping
 
     port2 = free_port()
-    env2 = compute_environment(names, B, port2, token)
+    health_port2 = free_port()
+    env2 = compute_environment(names, B, port2, token, health_port2)
     name2 = f"pgvs3-{RUN.name}-compute-b"
-    with container(name2, image, *compute_container_args(env2)):
-        wait_compute(extension_directory, port2, token)
-        client2 = host_client(extension_directory, port2, token)
+    with container(name2, image, *compute_container_args(env2, render_compute_init(env2, "b"))):
+        wait_compute(port2, health_port2, token)
+        client2 = chargewire_connect(port2, token)
+        oracle2 = host_client(extension_directory)
         try:
-            client_s3_secret(client2, B)
-            rows_after = client2.execute(
-                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) "
-                "FROM q.lake.main.events"
-            ).fetchone()
-            assert rows_after == lake_rows, (rows_after, lake_rows)
-            client2.execute(
-                "INSERT INTO q.lake.main.events VALUES (100, 'after-restart')"
+            oracle2.execute(
+                "CREATE SECRET pgvs3_native (TYPE s3, "
+                f"KEY_ID {sql_str(os.environ['PGVS3_ACCESS_KEY'])}, "
+                f"SECRET {sql_str(os.environ['PGVS3_SECRET_KEY'])}, "
+                "REGION 'us-east-1', "
+                f"ENDPOINT {sql_str(B.split('://', 1)[-1])}, URL_STYLE 'path', USE_SSL false)"
             )
+            rows_after = q_sql(
+                client2,
+                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) FROM events",
+            )[0]
+            assert rows_after == lake_rows, (rows_after, lake_rows)
+            q_exec(client2, "INSERT INTO events VALUES (?, ?)", [102, "after-restart"])
             q_exec(client2, "CALL ducklake_flush_inlined_data('lake', table_name => 'events')")
-            rows_after_write = client2.execute(
-                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) "
-                "FROM q.lake.main.events"
-            ).fetchone()
-            assert rows_after_write[0] == 101, rows_after_write
+            rows_after_write = q_sql(
+                client2,
+                "SELECT count(*), sum(id), sum(hash(id,payload)::HUGEINT) FROM events",
+            )[0]
+            assert rows_after_write[0] == 103, rows_after_write
             keys_after = lake_object_keys(names["bucket"], names["prefix"])
-            parquet_after = parquet_digest(client2, names["bucket"], keys_after)
+            parquet_after = parquet_digest(oracle2, names["bucket"], keys_after)
             assert parquet_after == rows_after_write, (parquet_after, rows_after_write)
             report["restart"].update({
                 "endpoint": "gateway B",
@@ -2229,13 +2330,20 @@ def compute():
             report["restart"]["shutdown_b"] = stop_compute(name2)
         finally:
             client2.close()
+            oracle2.close()
 
     missing_bucket = f"compute-absent-{names['slug']}"[:63]
     request(B, f"/{missing_bucket}", "GET", want=404)
     missing_bucket_error = None
     probe_client = host_client(extension_directory)
     try:
-        client_s3_secret(probe_client, B)
+        probe_client.execute(
+            "CREATE SECRET pgvs3_native (TYPE s3, "
+            f"KEY_ID {sql_str(os.environ['PGVS3_ACCESS_KEY'])}, "
+            f"SECRET {sql_str(os.environ['PGVS3_SECRET_KEY'])}, "
+            "REGION 'us-east-1', "
+            f"ENDPOINT {sql_str(B.split('://', 1)[-1])}, URL_STYLE 'path', USE_SSL false)"
+        )
         try:
             probe_client.execute(
                 f"SELECT * FROM read_parquet({sql_str(f's3://{missing_bucket}/absent.parquet')})"
@@ -2253,10 +2361,22 @@ def compute():
     missing_env = dict(env)
     missing_env["PGVS3_URL"] = missing_url
     missing_env["PGVS3_METADATA_SCHEMA"] = f"{names['schema']}_missing"[:63]
-    missing_args = ["docker", "run", "--rm", "--read-only", "--tmpfs", "/tmp:rw,size=1g"]
+    one_shot = RUN / "lake-only-rendered.sql"
+    rendered = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/duckdb/render_init.py"),
+         "--one-shot", "--output", str(one_shot), "--mode", "644"],
+        env={**os.environ, **missing_env}, text=True, capture_output=True, timeout=60,
+    )
+    assert rendered.returncode == 0, rendered.stderr[-800:]
+    missing_args = [
+        "docker", "run", "--rm", "--read-only", "--tmpfs", "/tmp:rw,size=1g",
+        "--entrypoint", "/duckdb",
+        "-v", f"{one_shot}:/opt/pgvs3-duckdb/lake-only.sql:ro",
+    ]
     for key, value in missing_env.items():
         missing_args.extend(["-e", f"{key}={value}"])
-    # Native lake-only check: no Quack token/server, just secret + attach.
+    # One-shot lake-only check through the copied official CLI: no ChargeWire
+    # listener, just the temporary secrets and the DuckLake attach.
     missing_args.extend([
         image, "-no-agent", "-batch", "-bail",
         "-init", "/opt/pgvs3-duckdb/lake-only.sql",
@@ -2287,7 +2407,8 @@ def compute():
     report["complete"] = True
     save()
     print(
-        f"compute: image {image_id[:19]} DuckDB {server_version} client {client_version}; "
+        f"compute: image {image_id[:19]} DuckDB {server_version} "
+        f"ChargeWire {chargewire_client_version}; "
         f"schema {names['schema']} rows {lake_rows[0]} -> {rows_after_write[0]}; "
         f"keys {len(keys)} -> {len(keys_after)}; native ops, restart, absence checks passed",
         flush=True,
@@ -2309,14 +2430,19 @@ POOL_LAKE_CREATE = (
     "'payload-' || md5(i::VARCHAR) || md5((i + 1)::VARCHAR) AS payload "
     "FROM range(1000000) t(i)"
 )
+# The per-worker RTree is a native memory.main object: DuckLake rejects
+# indexes, and ChargeWire sessions now start in lake.
 POOL_NATIVE_CREATE = (
-    "CREATE OR REPLACE TABLE native_points AS "
+    "CREATE OR REPLACE TABLE memory.main.native_points AS "
     "SELECT i AS id, ST_Point((i % 100)::DOUBLE, (i // 100)::DOUBLE) AS geom "
     "FROM range(5000) t(i)"
 )
-POOL_NATIVE_INDEX = "CREATE OR REPLACE INDEX native_points_rtree ON native_points USING RTREE (geom)"
+POOL_NATIVE_INDEX = (
+    "CREATE OR REPLACE INDEX native_points_rtree "
+    "ON memory.main.native_points USING RTREE (geom)"
+)
 POOL_NATIVE_QUERY = (
-    "SELECT count(*) FROM native_points "
+    "SELECT count(*) FROM memory.main.native_points "
     "WHERE ST_Within(geom, ST_MakeEnvelope(10,10,50,50))"
 )
 POOL_METRICS = (
@@ -2439,13 +2565,11 @@ def pool_digest(rows, columns):
     return [len(rows)] + [round(sum(float(row[index]) for row in rows), 3) for index in columns]
 
 
-def pool_cell(extension_directory, ports, token, gateway_port, statement, workload, clients_count,
+def pool_cell(ports, token, gateway_port, statement, workload, clients_count,
               cache_bytes, repeat, columns, expected=None):
-    """Runs C independent host Quack connections over W attached workers and
-    records aggregate rate, per-query latency and sampled PostgreSQL activity."""
-    import duckdb
-
-    clients = [host_client(extension_directory, ports[index % len(ports)], token)
+    """Runs C independent ChargeWire client sessions over W workers and records
+    aggregate rate, per-query latency and sampled PostgreSQL activity."""
+    clients = [chargewire_connect(ports[index % len(ports)], token)
                for index in range(clients_count)]
     before = pool_metrics(f"http://127.0.0.1:{gateway_port}")
     try:
@@ -2544,17 +2668,19 @@ def pool_cell(extension_directory, ports, token, gateway_port, statement, worklo
             client.close()
 
 
-def pool_start_worker(stack, image, extension_directory, names, database, endpoint, token, index):
+def pool_start_worker(stack, image, names, database, endpoint, token, index):
     port = free_port()
-    env = compute_environment(names, endpoint, port, token, database)
+    health_port = free_port()
+    env = compute_environment(names, endpoint, port, token, health_port, database)
     name = f"pgvs3-{RUN.name}-pool-w{index}"
-    stack.enter_context(container(name, image, *compute_container_args(env)))
-    wait_compute(extension_directory, port, token)
+    stack.enter_context(container(
+        name, image, *compute_container_args(env, render_compute_init(env, f"w{index}"))))
+    wait_compute(port, health_port, token)
     return port
 
 
-def pool_native_fixture(extension_directory, port, token):
-    client = host_client(extension_directory, port, token)
+def pool_native_fixture(port, token):
+    client = chargewire_connect(port, token)
     try:
         q_exec(client, "SET enable_external_file_cache=false; SET parquet_metadata_cache=false")
         q_exec(client, POOL_NATIVE_CREATE)
@@ -2567,19 +2693,20 @@ def pool_native_fixture(extension_directory, port, token):
 
 
 def compute_pool():
-    """Measure C host Quack clients across W native Quack worker containers
-    attached to one DuckLake catalog and one pgvs3 gateway. Every client holds
-    its own persistent connection; ports round-robin across workers. The
-    gateway is restarted between read-cache states, and the disposable stack is
-    removed on exit."""
+    """Measure C ChargeWire client sessions across W Hardcharger worker
+    containers attached to one DuckLake catalog and one pgvs3 gateway. Every
+    client holds its own persistent ADBC connection; ports round-robin across
+    workers. The gateway is restarted between read-cache states, and the
+    disposable stack is removed on exit."""
     import duckdb
+    from adbc_driver_chargewire import __version__ as chargewire_client_version
 
     names = compute_names(RUN.name)
     names = {
         **names,
-        "bucket": f"quackpool-{names['slug']}"[:63],
-        "prefix": f"quackpool/{names['slug']}/lake",
-        "schema": f"quack_pool_{names['slug']}"[:63],
+        "bucket": f"chargewirepool-{names['slug']}"[:63],
+        "prefix": f"chargewirepool/{names['slug']}/lake",
+        "schema": f"chargewire_pool_{names['slug']}"[:63],
     }
     image = DUCKDB_IMAGE
     extension_directory = RUN / "duckdb-pool-client-extensions"
@@ -2596,16 +2723,19 @@ def compute_pool():
         "host": {"platform": platform.platform(), "machine": platform.machine(),
                  "cpu_count": os.cpu_count()},
         "binary_sha256": hashlib.sha256(Path(BIN).read_bytes()).hexdigest(),
+        "versions": {"client_chargewire": chargewire_client_version,
+                     "client_duckdb": duckdb.__version__},
         "config": {
             "gateway_pool_max": 32,
             "gateway_read_cache_bytes": list(POOL_READ_CACHE),
             "worker_duckdb_threads": 4,
             "worker_duckdb_memory_limit": "1GB",
+            "worker_default_catalog": "lake",
             "workers": list(POOL_WORKERS),
             "clients": list(POOL_CLIENTS),
             "lake_repeat": POOL_LAKE_REPEAT,
             "native_repeat": POOL_NATIVE_REPEAT,
-            "routing": "client i -> worker i mod W; one persistent connection per client",
+            "routing": "client i -> worker i mod W; one persistent ADBC connection per client",
             "client_caches": "enable_external_file_cache=false; parquet_metadata_cache=false",
         },
         "fixture": {},
@@ -2613,22 +2743,21 @@ def compute_pool():
         "notes": [
             "single host, loopback; not a fleet capacity claim",
             "one warm-up query per client before each timed cell",
-            "q/s counts one q.query(...) round trip; p99 at C=1 is the maximum of the repeat count",
+            "q/s counts one ChargeWire/ADBC round trip; p99 at C=1 is the maximum of the repeat count",
             "pgvs3_pool and ducklake_pool connections are separated by application_name",
         ],
     }
 
     def save():
-        (RUN / "quack_pool.json").write_text(json.dumps(report, indent=2) + "\n")
+        (RUN / "chargewire_pool.json").write_text(json.dumps(report, indent=2) + "\n")
 
     ports = []
     try:
         gateway.start(0, "cache0-initial")
         base = gateway.endpoint
         request(base, f"/{names['bucket']}", "PUT", b"")
-        ports.append(pool_start_worker(stack, image, extension_directory, names,
-                                       worker_database, base, token, 0))
-        client = host_client(extension_directory, ports[0], token)
+        ports.append(pool_start_worker(stack, image, names, worker_database, base, token, 0))
+        client = chargewire_connect(ports[0], token)
         try:
             create_ms, _ = q_exec(client, POOL_LAKE_CREATE)
             flush_ms, _ = q_exec(
@@ -2668,16 +2797,16 @@ def compute_pool():
         finally:
             client.close()
         report["fixture"].setdefault("native_index", {})["w0"] = \
-            pool_native_fixture(extension_directory, ports[0], token)
+            pool_native_fixture(ports[0], token)
         save()
 
         for workers in POOL_WORKERS:
             while len(ports) < workers:
                 index = len(ports)
-                ports.append(pool_start_worker(stack, image, extension_directory, names,
-                                               worker_database, base, token, index))
+                ports.append(pool_start_worker(stack, image, names, worker_database,
+                                               base, token, index))
                 report["fixture"].setdefault("native_index", {})[f"w{index}"] = \
-                    pool_native_fixture(extension_directory, ports[index], token)
+                    pool_native_fixture(ports[index], token)
                 save()
 
             gateway.stop()
@@ -2685,7 +2814,7 @@ def compute_pool():
 
             for clients_count in POOL_CLIENTS:
                 cell, expected = pool_cell(
-                    extension_directory, ports[:workers], token, gateway.port, POOL_LAKE_QUERY,
+                    ports[:workers], token, gateway.port, POOL_LAKE_QUERY,
                     "lake-read-cache-0", clients_count, 0, POOL_LAKE_REPEAT, (1, 2))
                 report["cells"].append(cell)
                 report["fixture"].setdefault("lake_result_digest", expected)
@@ -2694,7 +2823,7 @@ def compute_pool():
                       f"{cell['qps']} q/s p50 {cell['p50_ms']} ms", flush=True)
             for clients_count in POOL_CLIENTS:
                 cell, expected = pool_cell(
-                    extension_directory, ports[:workers], token, gateway.port, POOL_NATIVE_QUERY,
+                    ports[:workers], token, gateway.port, POOL_NATIVE_QUERY,
                     "native-rtree", clients_count, 0, POOL_NATIVE_REPEAT, (0,))
                 report["cells"].append(cell)
                 report["fixture"].setdefault("native_result_digest", expected)
@@ -2706,7 +2835,7 @@ def compute_pool():
             gateway.start(POOL_READ_CACHE[1], f"cache256-w{workers}")
             for clients_count in POOL_CLIENTS:
                 cell, expected = pool_cell(
-                    extension_directory, ports[:workers], token, gateway.port, POOL_LAKE_QUERY,
+                    ports[:workers], token, gateway.port, POOL_LAKE_QUERY,
                     "lake-read-cache-256mib", clients_count, POOL_READ_CACHE[1],
                     POOL_LAKE_REPEAT, (1, 2))
                 report["cells"].append(cell)
@@ -2718,8 +2847,9 @@ def compute_pool():
         report["complete"] = True
         report["success"] = True
         save()
-        print(f"compute pool: image {image_id[:19]} DuckDB {duckdb.__version__}; "
-              f"{len(report['cells'])} cells; {RUN / 'quack_pool.json'}", flush=True)
+        print(f"compute pool: image {image_id[:19]} DuckDB {duckdb.__version__} "
+              f"ChargeWire {chargewire_client_version}; "
+              f"{len(report['cells'])} cells; {RUN / 'chargewire_pool.json'}", flush=True)
     finally:
         stack.close()
         gateway.stop()

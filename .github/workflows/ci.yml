@@ -73,7 +73,7 @@ jobs:
             --tags "${tags}" \
             --ldflags "-s -w -X main.version=${ver}" \
             ./cmd/pgvs3
-          # amd64 DuckDB/Quack compute image from the pinned official base.
+          # amd64 Hardcharger/ChargeWire compute image from the pinned official base.
           duckdb_image="ghcr.io/${GITHUB_REPOSITORY}-duckdb:2.0.0"
           mise exec python -- python deploy/duckdb/fetch_artifacts.py
           docker build --platform linux/amd64 -t "${duckdb_image}" deploy/duckdb

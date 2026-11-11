@@ -50,7 +50,7 @@ func TestDoctorConnectionArithmetic(t *testing.T) {
 		{fleetPlan{Gateways: 2, PoolMax: 16, Surge: 1, Other: 100}, statusPass, "need 196"},
 		{fleetPlan{Gateways: 3, PoolMax: 16, Surge: 1, Other: 100}, statusWarn, "need 228"},
 		{fleetPlan{Gateways: 1, PoolMax: 100, Surge: 0}, statusPass, "(100 main + 64 chunk)"},
-		{fleetPlan{Gateways: 1, PoolMax: 16, Surge: 0, QuackWorkers: 2}, statusPass, "quack_workers=2"},
+		{fleetPlan{Gateways: 1, PoolMax: 16, Surge: 0, ComputeWorkers: 2}, statusPass, "compute_workers=2"},
 	}
 	for _, tc := range cases {
 		c := connectionCheck(f, tc.plan)

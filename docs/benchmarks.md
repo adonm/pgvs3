@@ -27,7 +27,7 @@ claim.
 | 20M-row DuckLake row-group tuning (`just bench tuning`) | DuckDB `httpfs` | DuckDB 2.0.0, ~823 MiB stored: 122,880 rows/group loads in **8.79 s**, projected full scan **159 ms** (**130.6 MiB** read), 1% range **66 ms** (**3.4 MiB** in 7 GETs), point lookup **64 ms** (**1.2 MiB** in 3 GETs). |
 | 1.14 GB LINZ Wellington orthophoto (`just bench ortho`) | DuckDB `httpfs` | 16 tiles/row-group: point lookup **25 q/s** (1w, **39 ms** p50, **4.1 MB** in 10 GETs) and **111 q/s** (16w); 9% central region **0.92 s** (**117 MiB**). |
 | Overture Maps `2026-10-21.0` + STAC (`just overture`) | DuckDB `httpfs` | Anonymous public S3, Perth CBD place+building: direct `us-west-2` median **3.62 s** (first pass **7.36 s**), cold 1 MiB range fill **7.56 s**, warm PostgreSQL `s3c_` **79 ms** (**46×**), warm 256 MiB gateway block cache **57 ms** (**64×**). Cached **22.1 MiB** = **1.8%** of **1.23 GiB** source Parquet. |
-| Official-base `pgvs3-duckdb:2.0.0` server (`just duckdb-integration-bench`) | DuckDB Quack | 1M-row DuckLake (42.7 MiB): projection **13.0 ms**, 1% range **11.9 ms**, point lookup **16.9 ms**. 1.14 GB LINZ orthophoto: z21 point **38.2 ms**, z16 overview **31.7 ms**, 9% region (704 tiles) **291.2 ms**. 5k-row spatial RTree **2.96 ms** vs **10.17 ms** lake scan; 5k×32 vector HNSW **3.19 ms** (10/10 recall) vs **13.26 ms** lake scan (earlier sample; see the dated section below). |
+| Hardcharger/ChargeWire `pgvs3-duckdb:2.0.0` server (`just duckdb-integration-bench`) | DuckDB / ChargeWire | 1M-row DuckLake (42.9 MiB): projection **14.8 ms**, 1% range **13.5 ms**, point lookup **20.9 ms**. 1.14 GB LINZ orthophoto: z21 point **44.9 ms**, z16 overview **40.3 ms**, 9% region (704 tiles) **589.8 ms**. 5k-row spatial RTree **7.7 ms** vs **16.8 ms** lake scan; 5k×32 vector HNSW **8.7 ms** (10/10 recall) vs **21.2 ms** lake scan (see the dated section below). |
 | 100-snapshot Iceberg (`just iceberg`) | DuckDB `httpfs` | 20–60 ms origin: warm `count(*)` **6 ms** vs **115–316 ms** direct; 100-snapshot group-by **67 ms** vs **434–1,079 ms** direct. |
 | Trino 484 + Nessie (`just trino`) | Trino S3 | 20 ms origin: standalone paired 3 GiB cache beats Alluxio across all 7 queries (**36–520 ms** vs **78–529 ms**, paired ratios **0.46–0.97**). |
 | ZIP / ZIP64 virtual folders | S3 HTTP & DuckDB `httpfs` | 64 MiB Store member **12.86 GiB/s** (8w, 256 MiB cache; **1.01×** direct object) and **3.34 GiB/s** uncached (**0.90×**); 16 MiB Zstd (method 93) **2.75 GiB/s** (**1.8–2.0×** Deflate); 10k × 4 KiB parallel retrieval **35.8k GET/s** (Store), **37.3k GET/s** (Zstd) and **40.5k HEAD/s** at 1.000 PG lookup/req; 10k-member `delimiter=/` listing **1.11 ms**; DuckDB 1M-row Parquet inside `.zip` within **0–1.2 ms** of standalone. |
@@ -664,154 +664,160 @@ Report: `.tmp/verify/analytics.hMbmhY/overture.json`, SHA-256
 The report retains every run, per-query timings and bytes, gateway metric
 deltas, cache statistics and the resolved STAC keys.
 
-## Official-base DuckDB 2.0 + Quack container (`just duckdb-integration-bench`)
+## Hardcharger / ChargeWire DuckDB 2.0 container (`just duckdb-integration-bench`)
 
-`just duckdb-integration-bench` runs the prebuilt `pgvs3-duckdb:2.0.0` image
-(official DuckDB 2.0.0 distroless base, `sha256:40e76ebda4abf91529e0c1978bca50c6887714b69348b5febfe940c858c8dfd1`)
-against the same PostgreSQL database and `PGVS3_ENDPOINT` gateway, with clients
-using native Quack over `:9494`. Measured 2026-11-06 on the 16-core laptop
-(`.tmp/duckdb-large-bench-20261106/compute.json`, SHA-256
-`b5d355cb3f14fdab4509940d2d5fa094d59320ca2833a2d36cba864b0f988388`); these are
-single-host Quack round-trip samples, not storage-throughput claims.
+`just duckdb-integration-bench` runs the prebuilt `pgvs3-duckdb:2.0.0` image —
+Hardcharger 2.10.0 (ChargeWire 2.4.0) on embedded DuckDB v2.0.0,
+`sha256:7791b1e6b9272e94d8fe64038846e940a72d2b7933ccdd498654f75232f2f11a` —
+against the same PostgreSQL database and `PGVS3_ENDPOINT` gateway. Clients use
+`adbc-driver-chargewire` over `:31337` with `HARDCHARGER_DEFAULT_CATALOG=lake`,
+so every statement is unqualified (`CREATE TABLE events`, not
+`CREATE TABLE lake.main.events`). Measured 2026-11-12 on the 16-core host
+(`.tmp/verify/analytics.fuB5a2/compute.json`); these are single-host ChargeWire
+round-trip samples, not storage-throughput claims.
 
-The 5,000-row sample compares a lake scan with a native table plus a local index:
+The 5,000-row sample compares a lake scan with a native `memory.main` table plus
+a local index:
 
 | Sample | Lake scan | Native materialization | Native query |
 | --- | ---: | --- | ---: |
-| Spatial, 5,000 points | 17.3 ms warm (44.7 ms first) | copy 9.9 ms + RTree 4.1 ms | 4.07 ms warm (3.8 ms first), 1,521 rows |
-| Vector, 5,000 × 32 dimensions | 18.3 ms warm (53.7 ms first) | copy 27.0 ms + HNSW 42.3 ms | 4.79 ms, 10/10 recall at 10 |
-| FTS, 20 documents | unsupported on DuckLake | native build 44.8 ms | 12.9 ms |
+| Spatial, 5,000 points | 16.8 ms warm (47.3 ms first) | copy 10.1 ms + RTree 4.5 ms | 7.65 ms warm (7.9 ms first), 1,521 rows |
+| Vector, 5,000 × 32 dimensions | 21.2 ms warm (57.3 ms first) | copy 30.0 ms + HNSW 40.4 ms | 8.75 ms, 10/10 recall at 10 |
+| FTS, 20 documents | unsupported on DuckLake | native build 49.9 ms | 17.2 ms |
 
-An earlier official-base sample (`.tmp/duckdb-official-perf-20261106T020735Z/compute.json`,
-SHA-256 `ebfc41428689a21d321ba083c15767c9597885a426ee119c1b69f257bcaf3471`)
-measured lower 5k-row medians (RTree 2.96 ms vs 10.17 ms lake scan; HNSW
-3.19 ms vs 13.26 ms lake scan). Absolute times vary between runs; compare ratios
-within one session. Incremental INSERT and DELETE were visible immediately,
-while UPDATE left the FTS index stale in DuckDB 2.0.0.
-
-### C clients x W worker pool benchmark
-
-`just duckdb-pool-bench` measures 45 cells: `W = 1, 2, 4` native Quack workers
-× `C = 1, 4, 8, 16, 32` independent host clients. Each client holds one
-persistent `ATTACH 'quack:...'` and routes to worker `i mod W`; every worker is
-`pgvs3-duckdb:2.0.0` with `DUCKDB_THREADS=4` and `DUCKDB_MEMORY_LIMIT=1GB`.
-One dedicated gateway runs at `--pool-max 32`; it is restarted with
-`--read-cache-bytes 0` and then `268435456` (256 MiB). The fixture is a
-1,000,000-row DuckLake `lake.main.events` (42.7 MiB, one Parquet object) plus a
-5,000-point native RTree rebuilt in each worker. Each client disables its own
-external-file and Parquet metadata caches, runs one warm-up query, then 20 timed
-`FROM q.query(...)` round trips. `q/s` is total timed statements divided by wall
-time; `C=1` p99 is the maximum of its 20 samples. PostgreSQL activity is sampled
-from `pg_stat_activity` by `application_name` (`pgvs3_pool` versus
-`ducklake_pool`); active counts miss sub-sample queries, so total connections are
-the capacity figure.
-
-The two single-client samples above are separate 1-query-at-a-time runs, not two
-capacity points or a range: the dated 2026-11-06 pass measured RTree 4.07 ms and
-lake 13.0/11.9/16.9 ms, while the earlier pass measured RTree 2.96 ms and HNSW
-3.19 ms. The pool table below is a different experiment (aggregate `C × W`
-throughput, repeated 20-query cells) and neither supersedes nor averages those
-single-client medians. Its `W=1, C=1` lake p50 (14.94 ms cache off) is close to
-the 13.0 ms single-client projection only because the same host and 1M-row shape
-were used; do not compare percentiles across the two protocols.
-
-**Lake range/aggregation, `--read-cache-bytes 0`** (`SELECT group_id, count(*),
-sum(val) ... WHERE group_id BETWEEN 100 AND 199 GROUP BY group_id`):
-
-| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 66.9 | 14.94 | 16.18 | 16.40 | 0/18 | 8 | 0/1 |
-| 1 | 4 | 153.4 | 24.14 | 30.55 | 50.33 | 1/34 | 18 | 0/4 |
-| 1 | 8 | 204.4 | 37.45 | 52.15 | 55.99 | 1/39 | 18 | 1/8 |
-| 1 | 16 | 236.0 | 65.04 | 85.56 | 97.09 | 3/48 | 24 | 1/16 |
-| 1 | 32 | 180.7 | 172.16 | 247.15 | 270.28 | 3/56 | 31 | 4/27 |
-| 2 | 1 | 57.2 | 17.41 | 19.10 | 19.56 | 0/18 | 8 | 0/25 |
-| 2 | 4 | 172.9 | 21.95 | 27.19 | 29.90 | 0/34 | 18 | 0/26 |
-| 2 | 8 | 212.1 | 35.17 | 51.62 | 67.76 | 0/47 | 24 | 1/28 |
-| 2 | 16 | 242.2 | 64.27 | 85.91 | 91.89 | 1/56 | 32 | 2/32 |
-| 2 | 32 | 247.0 | 125.98 | 175.40 | 197.16 | 1/61 | 32 | 1/40 |
-| 4 | 1 | 69.2 | 14.35 | 15.43 | 15.72 | 0/18 | 8 | 0/42 |
-| 4 | 4 | 164.8 | 23.02 | 31.14 | 33.34 | 0/39 | 19 | 0/42 |
-| 4 | 8 | 206.2 | 36.98 | 44.89 | 49.05 | 1/52 | 27 | 1/44 |
-| 4 | 16 | 208.6 | 74.81 | 97.58 | 104.49 | 0/59 | 31 | 3/48 |
-| 4 | 32 | 231.3 | 131.02 | 188.94 | 215.63 | 3/62 | 32 | 1/56 |
-
-**Lake range/aggregation, `--read-cache-bytes 256 MiB`.** Warm-up fills the
-block cache; every timed cell recorded zero `chunkPool` acquires and zero fills:
-
-| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 77.8 | 12.79 | 14.32 | 14.72 | 0/18 | 7 | 0/24 |
-| 1 | 4 | 224.8 | 17.14 | 20.76 | 26.03 | 0/30 | 7 | 1/24 |
-| 1 | 8 | 271.4 | 27.23 | 40.05 | 47.57 | 0/30 | 7 | 2/24 |
-| 1 | 16 | 190.5 | 81.31 | 120.83 | 135.65 | 1/41 | 7 | 2/24 |
-| 1 | 32 | 222.4 | 138.23 | 193.97 | 226.16 | 1/41 | 7 | 3/26 |
-| 2 | 1 | 78.8 | 12.62 | 14.16 | 14.20 | 0/18 | 7 | 0/40 |
-| 2 | 4 | 213.2 | 17.97 | 22.41 | 23.39 | 0/32 | 7 | 0/40 |
-| 2 | 8 | 175.6 | 39.94 | 68.53 | 73.25 | 1/35 | 7 | 3/40 |
-| 2 | 16 | 285.9 | 54.12 | 72.32 | 79.42 | 1/41 | 7 | 2/40 |
-| 2 | 32 | 275.5 | 109.82 | 165.79 | 189.32 | 1/41 | 7 | 1/40 |
-| 4 | 1 | 75.3 | 13.15 | 14.31 | 14.54 | 0/18 | 8 | 0/56 |
-| 4 | 4 | 187.3 | 18.53 | 28.83 | 30.34 | 0/32 | 8 | 1/56 |
-| 4 | 8 | 133.0 | 57.89 | 81.04 | 85.47 | 0/35 | 8 | 0/56 |
-| 4 | 16 | 283.7 | 54.50 | 68.77 | 76.41 | 1/41 | 8 | 1/56 |
-| 4 | 32 | 253.7 | 119.13 | 171.42 | 195.10 | 0/41 | 8 | 2/56 |
-
-**Native 5,000-point RTree in each worker** (pure Quack RPC + worker CPU, no
-gateway request in the timed path):
-
-| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 258.7 | 3.77 | 4.33 | 4.84 | 0/56 | 31 | 0/24 |
-| 1 | 4 | 944.5 | 4.03 | 4.89 | 5.01 | 0/56 | 31 | 0/24 |
-| 1 | 8 | 1,181.6 | 5.27 | 11.39 | 13.34 | 0/56 | 31 | 0/24 |
-| 1 | 16 | 1,356.7 | 9.98 | 20.44 | 24.48 | 0/56 | 31 | 0/24 |
-| 1 | 32 | 1,271.0 | 21.71 | 47.23 | 54.25 | 0/56 | 31 | 0/24 |
-| 2 | 1 | 259.3 | 3.69 | 5.47 | 5.49 | 0/61 | 32 | 0/40 |
-| 2 | 4 | 1,049.2 | 3.68 | 4.29 | 4.52 | 0/61 | 32 | 0/40 |
-| 2 | 8 | 1,580.8 | 4.55 | 6.88 | 8.00 | 0/61 | 32 | 0/40 |
-| 2 | 16 | 2,139.9 | 6.19 | 11.36 | 13.51 | 0/61 | 32 | 0/40 |
-| 2 | 32 | 2,353.4 | 11.35 | 24.04 | 35.29 | 0/61 | 32 | 0/40 |
-| 4 | 1 | 207.5 | 4.79 | 5.25 | 5.37 | 0/62 | 32 | 0/56 |
-| 4 | 4 | 1,001.1 | 3.90 | 4.54 | 4.73 | 0/62 | 32 | 0/56 |
-| 4 | 8 | 863.9 | 8.56 | 12.35 | 14.76 | 0/62 | 32 | 0/56 |
-| 4 | 16 | 1,454.1 | 8.72 | 16.41 | 21.01 | 0/62 | 32 | 0/56 |
-| 4 | 32 | 2,037.5 | 13.09 | 26.30 | 32.15 | 0/62 | 32 | 0/56 |
-
-What the run says:
-
-- **Native RPC scales to two workers, then hits host CPU.** At `C=32`, W=1
-  delivered 1,271 q/s, W=2 2,353 q/s (1.85×), and W=4 2,038 q/s. Four workers ×
-  four threads fill all 16 cores; adding workers beyond that raised p99 instead
-  of throughput.
-- **A lake scan through one gateway plateaus near 230–285 q/s.** W=1/2/4 at
-  `C=32` delivered 181/247/231 q/s cache off and 222/276/254 q/s with the 256 MiB
-  cache. Worker count does not create PostgreSQL chunk throughput.
-- **The 256 MiB cache removed timed PostgreSQL chunk traffic.** Cache-off cells
-  acquired the chunk pool 10 times per lake query (one per GET) and kept 31–32
-  chunk connections; cache-on cells recorded 0 acquires and 7–8 connections.
-  Median q/s at `C >= 8` rose from 212 to 254 (+20%), with no help for one-pass
-  scans or the single-gateway ceiling.
-- **Every worker count needs catalog headroom.** DuckLake connections grew from 24
-  (W=1) to 56 (W=4), independent of pgvs3 pools; the gateway's own total reached
-  62. Size `max_connections` from the sum in
-  [operations](operations.md#sizing-a-quack-worker-pool), not from `P` alone.
-
-Report: `.tmp/verify/pool.mH6Prx/quack_pool.json`, SHA-256
-`3add9c71c3250a48bab62747535c588ce6a1f43ae7719a32213f100705bb7429`.
-Single host, one session; non-monotonic cells (for example W=4, C=8) are run
-noise, not a scaling claim.
+Absolute times vary between runs and protocols; compare ratios within one
+session. Incremental FTS INSERT and DELETE were visible immediately, while
+UPDATE left the index stale in DuckDB 2.0.0. FTS also resolves its index schema
+(`fts_main_<table>`) in the session's current catalog, so both the build and the
+query run with `USE memory`; `USE lake` restores the default.
 
 The larger pass adds a 1,000,000-row DuckLake table and the 1.14 GB LINZ
 Wellington orthophoto:
 
 | Dataset | Stored / upload | Timings |
 | --- | ---: | --- |
-| 1M-row DuckLake `large_events` | 42.7 MiB, load 677 ms | projection 13.0 ms; 1% range 11.9 ms; point lookup 16.9 ms |
-| 1.14 GB LINZ orthophoto, 7,140 tiles | upload 3.94 s at 275 MiB/s | metadata 5.6 ms; z21 point 38.2 ms; z16 overview 31.7 ms; 9% region (704 tiles) 291.2 ms; region stats 983.8 ms |
+| 1M-row DuckLake `large_events` | 42.9 MiB, load 729 ms | projection 14.8 ms; 1% range 13.5 ms; point lookup 20.9 ms |
+| 1.14 GB LINZ orthophoto, 7,140 tiles | upload 5.26 s at 206 MiB/s | metadata 10.8 ms; z21 point 44.9 ms; z16 overview 40.3 ms; 9% region (704 tiles) 589.8 ms; region stats 1,123.9 ms |
+
+Lifecycle and durability in the same run: unqualified `CREATE TABLE events`
+landed in `lake.main` with **0** rows in `memory`; 102 rows including `?` bind
+inserts, a matching row hash in a **fresh container** through gateway B, and row
+103 written there; three Parquet keys over two container lifetimes; `docker stop`
+exited **0** in **197 ms** (479 ms for the second container) with a read-only
+root filesystem, one mount (the rendered init SQL), no `-i` and no `--init`. A
+missing bucket returned 404 without re-creation, and a missing database stayed
+uncreated with no credential in the failure output.
+
+### C clients x W worker pool benchmark
+
+`just duckdb-pool-bench` measures 45 cells: `W = 1, 2, 4` Hardcharger workers
+× `C = 1, 4, 8, 16, 32` independent host clients. Each client holds one
+persistent ADBC connection and routes to worker `i mod W`; every worker is
+`pgvs3-duckdb:2.0.0` with `DUCKDB_THREADS=4`,
+`HARDCHARGER_MEMORY_LIMIT=1GB` and `HARDCHARGER_DEFAULT_CATALOG=lake`. One
+dedicated gateway runs at `--pool-max 32`; it is restarted with
+`--read-cache-bytes 0` and then `268435456` (256 MiB). The fixture is a
+1,000,000-row DuckLake `lake.main.events` (42.9 MiB, one Parquet object, created
+in 673 ms) plus a 5,000-point native RTree rebuilt in each worker's
+`memory.main`. Each client disables its own external-file and Parquet metadata
+caches, runs one warm-up query, then 20 timed statements. `q/s` is total timed
+statements divided by wall time; `C=1` p99 is the maximum of its 20 samples.
+PostgreSQL activity is sampled from `pg_stat_activity` by `application_name`
+(`pgvs3_pool` versus `ducklake_pool`); active counts miss sub-sample queries, so
+total connections are the capacity figure.
+
+The single-client table above is a separate 1-query-at-a-time run, not a second
+capacity point; the pool tables below are aggregate `C × W` throughput and
+neither supersedes nor averages those medians.
+
+**Lake range/aggregation, `--read-cache-bytes 0`** (`SELECT group_id, count(*),
+sum(val) ... WHERE group_id BETWEEN 100 AND 199 GROUP BY group_id`):
+
+| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 61.3 | 16.36 | 17.54 | 18.42 | 5/18 | 8 | 0/1 |
+| 1 | 4 | 153.1 | 24.30 | 33.66 | 40.94 | 6/39 | 20 | 0/4 |
+| 1 | 8 | 181.0 | 43.00 | 51.42 | 55.13 | 0/48 | 25 | 0/8 |
+| 1 | 16 | 197.8 | 78.96 | 101.44 | 108.39 | 2/49 | 26 | 3/16 |
+| 1 | 32 | 199.1 | 156.11 | 217.06 | 243.99 | 4/57 | 32 | 4/25 |
+| 2 | 1 | 60.9 | 16.37 | 17.43 | 17.65 | 0/18 | 8 | 0/25 |
+| 2 | 4 | 155.1 | 24.75 | 31.37 | 32.90 | 0/35 | 19 | 0/26 |
+| 2 | 8 | 178.3 | 44.67 | 50.84 | 52.87 | 0/57 | 32 | 2/28 |
+| 2 | 16 | 197.9 | 79.69 | 97.78 | 111.08 | 6/62 | 32 | 1/32 |
+| 2 | 32 | 192.0 | 161.48 | 235.34 | 263.36 | 2/62 | 32 | 2/40 |
+| 4 | 1 | 60.0 | 16.45 | 18.30 | 18.42 | 0/18 | 8 | 0/42 |
+| 4 | 4 | 142.6 | 27.47 | 32.75 | 34.80 | 0/46 | 23 | 1/42 |
+| 4 | 8 | 172.1 | 44.77 | 54.27 | 60.99 | 2/55 | 32 | 1/44 |
+| 4 | 16 | 193.3 | 81.17 | 100.81 | 107.65 | 1/59 | 32 | 2/48 |
+| 4 | 32 | 200.9 | 148.19 | 195.75 | 218.19 | 3/60 | 32 | 1/56 |
+
+**Lake range/aggregation, `--read-cache-bytes 256 MiB`.** Warm-up fills the
+block cache, so every timed cell kept 7–8 chunk connections:
+
+| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 65.6 | 15.05 | 16.64 | 16.71 | 0/18 | 7 | 0/24 |
+| 1 | 4 | 171.4 | 22.39 | 26.23 | 28.30 | 0/34 | 7 | 0/24 |
+| 1 | 8 | 207.7 | 37.36 | 46.56 | 49.02 | 0/34 | 7 | 0/24 |
+| 1 | 16 | 231.7 | 67.81 | 85.07 | 90.92 | 0/34 | 7 | 2/24 |
+| 1 | 32 | 236.4 | 131.98 | 173.32 | 187.90 | 2/41 | 7 | 2/24 |
+| 2 | 1 | 65.3 | 15.29 | 16.11 | 16.14 | 0/18 | 7 | 0/40 |
+| 2 | 4 | 173.5 | 22.82 | 26.09 | 30.93 | 1/28 | 7 | 0/40 |
+| 2 | 8 | 202.9 | 38.40 | 46.79 | 49.77 | 0/40 | 7 | 0/40 |
+| 2 | 16 | 234.0 | 67.24 | 84.00 | 90.80 | 1/41 | 7 | 1/40 |
+| 2 | 32 | 241.9 | 128.78 | 174.91 | 190.43 | 1/41 | 7 | 2/40 |
+| 4 | 1 | 65.5 | 15.13 | 16.34 | 18.02 | 0/18 | 8 | 0/56 |
+| 4 | 4 | 164.8 | 24.14 | 28.01 | 28.96 | 0/30 | 8 | 0/56 |
+| 4 | 8 | 202.8 | 37.77 | 48.05 | 52.78 | 2/34 | 8 | 0/56 |
+| 4 | 16 | 226.2 | 69.35 | 86.02 | 93.08 | 1/41 | 8 | 2/56 |
+| 4 | 32 | 242.3 | 128.40 | 170.07 | 187.16 | 1/41 | 8 | 4/56 |
+
+**Native 5,000-point RTree in each worker** (pure ChargeWire round trip +
+worker CPU, no gateway request in the timed path):
+
+| `W` | `C` | q/s | p50 ms | p95 ms | p99 ms | pgvs3 act/total | chunk conns | DuckLake act/total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 127.8 | 7.79 | 8.67 | 8.94 | 0/57 | 32 | 0/24 |
+| 1 | 4 | 413.8 | 8.92 | 11.73 | 12.46 | 0/57 | 32 | 1/24 |
+| 1 | 8 | 666.6 | 11.56 | 14.65 | 17.09 | 0/57 | 32 | 1/24 |
+| 1 | 16 | 795.0 | 19.23 | 26.29 | 29.32 | 0/57 | 32 | 1/24 |
+| 1 | 32 | 956.6 | 31.54 | 44.85 | 52.80 | 0/57 | 32 | 1/24 |
+| 2 | 1 | 123.7 | 7.98 | 8.98 | 9.03 | 0/62 | 32 | 0/40 |
+| 2 | 4 | 432.7 | 9.05 | 10.22 | 11.13 | 0/62 | 32 | 0/40 |
+| 2 | 8 | 703.5 | 10.86 | 13.06 | 15.20 | 0/62 | 32 | 0/40 |
+| 2 | 16 | 891.7 | 17.24 | 22.15 | 24.12 | 0/62 | 32 | 1/40 |
+| 2 | 32 | 976.0 | 31.20 | 43.75 | 49.80 | 0/62 | 32 | 0/40 |
+| 4 | 1 | 129.2 | 7.71 | 8.12 | 8.34 | 0/60 | 32 | 0/56 |
+| 4 | 4 | 433.8 | 9.04 | 10.46 | 11.05 | 0/60 | 32 | 0/56 |
+| 4 | 8 | 702.7 | 11.22 | 13.12 | 14.46 | 0/60 | 32 | 0/56 |
+| 4 | 16 | 861.3 | 17.83 | 22.65 | 23.97 | 0/60 | 32 | 2/56 |
+| 4 | 32 | 1,026.5 | 30.03 | 38.41 | 44.86 | 0/60 | 32 | 2/56 |
+
+What the run says:
+
+- **Native RTree scales with clients, then flattens at host CPU.** At `C=32`,
+  W=1/2/4 delivered 957/976/1,027 q/s. One worker's four threads already serve
+  the tiny index at low `C`, so extra workers mostly add concurrency headroom
+  rather than throughput.
+- **A lake scan through one gateway plateaus near 200–240 q/s.** W=1/2/4 at
+  `C=32` delivered 199/192/201 q/s cache off and 236/242/242 q/s with the
+  256 MiB cache. Worker count does not create PostgreSQL chunk throughput.
+- **The 256 MiB cache removed timed chunk-pool pressure.** Cache-off cells kept
+  8–32 chunk connections (growing with `C`); cache-on cells stayed at 7–8 and
+  lifted `C=32` from 199–201 to 236–242 q/s.
+- **Every worker count needs catalog headroom.** DuckLake connections grew from
+  24 (W=1) to 56 (W=4), independent of pgvs3 pools; the gateway's own total
+  reached 62. Size `max_connections` from the sum in
+  [operations](operations.md#sizing-a-chargewire-worker-pool), not from `P`
+  alone.
+
+Report: `.tmp/verify/pool.UzzpKf/chargewire_pool.json`, SHA-256
+`46dc5c065f74b660466b8c36bfcb3db93005b21ac4297ad925a87b38b47315ff`.
+Single host, one session; non-monotonic cells (for example W=2, C=32 lake
+slightly below W=1) are run noise, not a scaling claim.
 
 **DuckLake 1.1 does not support indexes directly.** The native RTree, HNSW and
-FTS measurements operate on materialized native DuckDB tables, which are
+FTS measurements operate on materialized native `memory.main` tables, which are
 snapshots: they must be rebuilt when lake freshness matters. The lake table
 remains the durable copy.
 

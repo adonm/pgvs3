@@ -106,13 +106,13 @@ See [Jobs, Outboxes & Streams](guides/jobs.md) and [Queue & Stream Model](queue-
 
 ---
 
-### FIG 07 — Quack Client-to-Worker Pool, Gateway Admission & PostgreSQL Capacity
+### FIG 07 — ChargeWire Client-to-Worker Pool, Gateway Admission & PostgreSQL Capacity
 
-`C` Quack clients hold one active statement per persistent connection and route across `W` `pgvs3-duckdb:2.0.0` workers, each one `DatabaseInstance` with shared `T = 4` threads, an `A = min(4 × CPU, 256)` async HTTP pool, a `256 MiB ≤ M/4` stream buffer, and per-worker native RTree/HNSW memory. `G` gateways admit `32` active + `64` queued S3 requests each (`G ≥ ⌈R/32⌉` zero queue, `G ≥ ⌈R/96⌉` burst), reserve `1 + w` chunk connections per multi-piece read, and can bypass the chunk pool with a bounded `--read-cache-bytes` block cache. PostgreSQL `max_connections` must cover `(G + surge) × (P + min(P, 64)) + Σ a_w` because DuckLake catalog connections bypass pgvs3.
+`C` ChargeWire clients (ADBC, JDBC, JavaScript or plain HTTP with Arrow IPC results, `?` and `$1` bind parameters, async poll/resume) route across `W` `pgvs3-duckdb:2.0.0` Hardcharger workers. Each worker is one PID-1 daemon on `:31337` with a plaintext `:31338/health` drain endpoint, `default_catalog = lake`, shared `T = 4` threads, an `A = min(4 × CPU, 256)` async HTTP pool, and per-worker native RTree/HNSW in `memory.main`. `G` gateways admit `32` active + `64` queued S3 requests each (`G ≥ ⌈R/32⌉` zero queue, `G ≥ ⌈R/96⌉` burst), reserve `1 + w` chunk connections per multi-piece read, and can bypass the chunk pool with a bounded `--read-cache-bytes` block cache. PostgreSQL `max_connections` must cover `(G + surge) × (P + min(P, 64)) + Σ a_w` because DuckLake catalog connections bypass pgvs3; budget them with `pgvs3 doctor --compute-workers`.
 
-![FIG 07 — Quack Client-to-Worker Pool, Gateway Admission and PostgreSQL Capacity Model](assets/quack-worker-pool.svg)
+![FIG 07 — ChargeWire Client-to-Worker Pool, Gateway Admission and PostgreSQL Capacity Model](assets/chargewire-worker-pool.svg)
 
-See [Quack client-to-worker pool capacity model](performance.md#quack-client-to-worker-pool-capacity-model), [worker-pool sizing](operations.md#sizing-a-quack-worker-pool), and the [measured `C × W` pool](benchmarks.md#c-clients-x-w-worker-pool-benchmark).
+See [ChargeWire client-to-worker pool capacity model](performance.md#chargewire-client-to-worker-pool-capacity-model), [worker-pool sizing](operations.md#sizing-a-chargewire-worker-pool), and the [measured `C × W` pool](benchmarks.md#c-clients-x-w-worker-pool-benchmark).
 
 ---
 

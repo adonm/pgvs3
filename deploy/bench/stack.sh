@@ -9,6 +9,7 @@ if [ "$mode" = analytics ] || [ "$mode" = guides ] || [ "$mode" = sol ] || [ "$m
 parts=${2:-s3,compat,tuning}
 raquet_deps=(--with quadbin==0.2.2 --with pyarrow==26.0.0 --with numpy==2.5.4)
 iceberg_deps=(--with 'pyiceberg[pyarrow,sql-sqlite]==0.12.0')
+chargewire_deps=(--with adbc-driver-chargewire --with adbc-driver-manager --with pyarrow)
 if [[ ",$parts," = *,differential,* || ",$parts," = *,object-storage,* ]]; then test_keep_artifacts=true; fi
 
 shared_buffers=1GB
@@ -86,13 +87,14 @@ contract)
 analytics)
   # shellcheck disable=SC2086 # PGVS3_ANALYTICS is a word list of scenarios
   mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 "${raquet_deps[@]}" "${iceberg_deps[@]}" \
-    python test/data_plane.py ${PGVS3_ANALYTICS:-analytics raquet}
+    "${chargewire_deps[@]}" python test/data_plane.py ${PGVS3_ANALYTICS:-analytics raquet}
   ;;
 guides)
   mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py guides
   ;;
 pool)
-  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 python test/data_plane.py compute_pool
+  mise exec uv -- uv run --quiet --no-project --with duckdb==2.0.0 "${chargewire_deps[@]}" \
+    python test/data_plane.py compute_pool
   ;;
 fault)
   bash test/fault.sh

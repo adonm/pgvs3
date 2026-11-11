@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 560" role="img" aria-labelledby="fig7-title fig7-desc">
-  <title id="fig7-title">FIG 07 — Quack Client-to-Worker Pool, Gateway Admission and PostgreSQL Capacity Model</title>
-  <desc id="fig7-desc">Four left-to-right capacity tiers: C host Quack clients with one active statement per persistent connection and round-robin or sticky routing across W native Quack workers; W pgvs3-duckdb 2.0.0 workers, each one DatabaseInstance sharing T = 4 CPU threads, an async HTTP pool A = min(4 times CPU, 256), a 256 MiB stream buffer bounded by M/4, and per-worker native RTree or HNSW memory; G pgvs3 gateways admitting 32 active plus 64 queued S3 requests per gateway with a chunkPool guard plus workers per multi-piece read and an optional zero-copy block cache; and PostgreSQL 18 plus an S3 origin, where direct DuckLake catalog connections a_w per active transaction bypass pgvs3 and the total gateway pool envelope must fit max_connections.</desc>
+  <title id="fig7-title">FIG 07 — ChargeWire Client-to-Worker Pool, Gateway Admission and PostgreSQL Capacity Model</title>
+  <desc id="fig7-desc">Four left-to-right capacity tiers: C ChargeWire clients over ADBC, JDBC, JavaScript or plain HTTP with Arrow IPC results, question-mark or dollar-one bind parameters and async poll/resume, routed round-robin across W Hardcharger workers for stateless lake queries; W pgvs3-duckdb 2.0.0 Hardcharger workers, each a PID-1 daemon on port 31337 with a plaintext 31338 health listener for drain, default_catalog lake, shared T = 4 CPU threads, an async HTTP pool A = min(4 times CPU, 256) and per-worker native RTree or HNSW in memory dot main; G pgvs3 gateways admitting 32 active plus 64 queued S3 requests per gateway with a chunkPool guard plus workers per multi-piece read and an optional zero-copy block cache; and PostgreSQL 18 plus an S3 origin, where direct DuckLake catalog connections a_w per active transaction bypass pgvs3 and the total gateway pool envelope must fit max_connections.</desc>
   <defs>
     <marker id="f7-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)"/>
@@ -77,25 +77,25 @@
   <rect x="0" y="0" width="1280" height="44" class="hdr" rx="8"/>
   <line x1="0" y1="44" x2="1280" y2="44" class="ln"/>
   <text x="24" y="27" class="fig">FIG 07</text>
-  <text x="80" y="27" class="title">Quack Client-to-Worker Pool &amp; PostgreSQL Capacity Envelope</text>
+  <text x="80" y="27" class="title">ChargeWire Client-to-Worker Pool &amp; PostgreSQL Capacity Envelope</text>
   <text x="884" y="26" class="mono-s cg">C × W measured · 4-tier admission model</text>
 
-  <!-- Tier 1: C Quack clients -->
+  <!-- Tier 1: C ChargeWire clients -->
   <rect x="20" y="62" width="286" height="432" class="stage" rx="8"/>
   <text x="36" y="86" class="fig">TIER 1</text>
-  <text x="36" y="108" class="h3 cb">C Quack Clients</text>
+  <text x="36" y="108" class="h3 cb">C ChargeWire Clients</text>
 
   <rect x="36" y="120" width="254" height="62" class="card" rx="6"/>
   <rect x="36" y="126" width="4" height="50" rx="2" fill="var(--blue)"/>
   <text x="48" y="145" class="eq">C ≤ W × Q</text>
-  <text x="48" y="164" class="mono-xs">Q = 1,024 connections / worker</text>
+  <text x="48" y="164" class="mono-xs">Q = server max_sessions (0: unlimited)</text>
   <circle cx="270" cy="131" r="3" class="dot-b pulse"/>
 
   <rect x="36" y="194" width="254" height="104" class="card" rx="6"/>
   <rect x="36" y="200" width="4" height="92" rx="2" fill="var(--blue)"/>
-  <text x="48" y="214" class="mono cb">1 active statement / connection</text>
-  <text x="48" y="232" class="sub">persistent ATTACH per client</text>
-  <text x="48" y="248" class="sub">R_statements = C</text>
+  <text x="48" y="214" class="mono cb">ADBC · JDBC · JS · HTTP + Arrow IPC</text>
+  <text x="48" y="232" class="sub">? and $1 bind parameters</text>
+  <text x="48" y="248" class="sub">async poll / resumable results</text>
   <circle cx="58" cy="272" r="5" class="dot-b conn"/>
   <circle cx="82" cy="272" r="5" class="dot-b conn" style="animation-delay:0.25s"/>
   <circle cx="106" cy="272" r="5" class="dot-b conn" style="animation-delay:0.5s"/>
@@ -105,42 +105,42 @@
   <rect x="36" y="310" width="254" height="98" class="card" rx="6"/>
   <rect x="36" y="316" width="4" height="86" rx="2" fill="var(--success)"/>
   <text x="48" y="330" class="mono cg">routing = client i → worker i mod W</text>
-  <text x="48" y="348" class="sub">round-robin for stateless lake.main.*</text>
-  <text x="48" y="364" class="sub">sticky for temp / memory objects</text>
+  <text x="48" y="348" class="sub">round-robin for stateless lake queries</text>
+  <text x="48" y="364" class="sub">sticky while a session holds state</text>
   <text x="48" y="386" class="mono-xs">one session never splits a statement</text>
 
   <rect x="36" y="420" width="254" height="58" class="card" rx="6"/>
   <rect x="36" y="426" width="4" height="46" rx="2" fill="var(--warning)"/>
-  <text x="48" y="440" class="mono ca">Pool cap is per worker instance</text>
-  <text x="48" y="458" class="sub">C above W × 1,024 needs another worker</text>
+  <text x="48" y="440" class="mono ca">Sessions are per worker</text>
+  <text x="48" y="458" class="sub">W is a scale-out unit, not a shard</text>
 
   <!-- Tier 2: W workers -->
   <rect x="332" y="62" width="286" height="432" class="stage" rx="8"/>
   <text x="348" y="86" class="fig">TIER 2</text>
-  <text x="348" y="108" class="h3 cg">W Quack Workers</text>
+  <text x="348" y="108" class="h3 cg">W Hardcharger Workers</text>
   <text x="348" y="123" class="mono-xs cg">pgvs3-duckdb:2.0.0</text>
 
   <rect x="348" y="134" width="254" height="62" class="card" rx="6"/>
   <rect x="348" y="140" width="4" height="50" rx="2" fill="var(--success)"/>
-  <text x="360" y="159" class="eq-s">R ≤ W × min(A, H)</text>
-  <text x="360" y="177" class="mono-xs">A = min(4 × CPU, 256) async HTTP</text>
+  <text x="360" y="159" class="eq-s">PID-1 daemon · :31337 · /health :31338</text>
+  <text x="360" y="177" class="mono-xs">graceful drain · docker stop → 0</text>
   <circle cx="582" cy="145" r="3" class="dot-g pulse"/>
 
   <rect x="348" y="208" width="254" height="122" class="card" rx="6"/>
   <rect x="348" y="214" width="4" height="110" rx="2" fill="var(--success)"/>
-  <text x="360" y="228" class="mono cg">1 DatabaseInstance / worker</text>
+  <text x="360" y="228" class="mono cg">default_catalog = lake</text>
   <text x="360" y="246" class="sub">T = 4 shared CPU threads</text>
   <rect x="360" y="256" width="52" height="8" rx="2" class="cb grow"/>
   <rect x="418" y="256" width="52" height="8" rx="2" class="cb grow s1"/>
   <rect x="476" y="256" width="52" height="8" rx="2" class="cb grow s2"/>
   <rect x="534" y="256" width="52" height="8" rx="2" class="cb grow s3"/>
-  <text x="360" y="282" class="mono-xs">S = 256 MiB ≤ M / 4 stream buffer</text>
+  <text x="360" y="282" class="mono-xs">A = min(4 × CPU, 256) async HTTP pool</text>
   <text x="360" y="300" class="sub">threads, not sessions, bound scan CPU</text>
   <text x="360" y="316" class="mono-xs">memory_limit M covers buffer manager</text>
 
   <rect x="348" y="342" width="254" height="136" class="card" rx="6"/>
   <rect x="348" y="348" width="4" height="124" rx="2" fill="var(--purple)"/>
-  <text x="360" y="362" class="mono cp">native RTree / HNSW in RAM</text>
+  <text x="360" y="362" class="mono cp">native RTree / HNSW in memory.main</text>
   <text x="360" y="380" class="sub">per-worker snapshot materialization</text>
   <text x="360" y="396" class="sub">not covered by memory_limit</text>
   <text x="360" y="416" class="mono-xs">index build is a one-time worker cost</text>
@@ -195,7 +195,7 @@
   <text x="984" y="230" class="mono ca">DuckLake catalog: direct a_w</text>
   <text x="984" y="248" class="sub">per active transaction, bypasses pgvs3</text>
   <text x="984" y="266" class="sub">G_peak = G + rollout surge</text>
-  <text x="984" y="286" class="mono-xs">a_w is independent of gateway P</text>
+  <text x="984" y="286" class="mono-xs">budget it with --compute-workers</text>
 
   <rect x="972" y="312" width="272" height="86" class="card" rx="6"/>
   <rect x="972" y="318" width="4" height="74" rx="2" fill="var(--blue)"/>
@@ -213,7 +213,7 @@
   <!-- Animated flows between tiers -->
   <path d="M 306 250 H 332" class="ln"/>
   <path d="M 306 250 H 332" class="flow flow-b s1" marker-end="url(#f7-b)"/>
-  <text x="319" y="238" text-anchor="middle" class="mono-xs cb">ATTACH</text>
+  <text x="319" y="238" text-anchor="middle" class="mono-xs cb">ADBC</text>
   <text x="319" y="270" text-anchor="middle" class="sub">1 stmt</text>
 
   <path d="M 618 250 H 644" class="ln"/>
@@ -236,6 +236,6 @@
 
   <!-- Footer -->
   <line x1="20" y1="508" x2="1260" y2="508" class="ln"/>
-  <text x="20" y="526" class="mono-xs cg">Measured 2026-11-07 · 45 cells: W = 1, 2, 4 × C = 1, 4, 8, 16, 32 · 1M-row DuckLake + 5k-point native RTree · T = 4, M = 1 GiB</text>
-  <text x="20" y="544" class="sub">A 256 MiB gateway read cache removed timed chunkPool acquires (0 vs 10 per lake query); lake q/s stayed near 230–285 at one gateway, while native RTree reached ~2.4k q/s at W = 2, C = 32.</text>
+  <text x="20" y="526" class="mono-xs cg">Measured 2026-11-12 · 45 cells: W = 1, 2, 4 × C = 1, 4, 8, 16, 32 · 1M-row DuckLake + 5k-point native RTree · T = 4, M = 1 GiB</text>
+  <text x="20" y="544" class="sub">A 256 MiB gateway read cache removed timed chunkPool acquires (7 vs up to 32 chunk connections); lake q/s reached ~200–242 at every W, while native RTree reached ~1,026 q/s at W = 4, C = 32.</text>
 </svg>

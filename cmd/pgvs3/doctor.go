@@ -36,7 +36,7 @@ type check struct {
 // Gateways == 0 means the fleet size is unknown, so capacity is only reported.
 type fleetPlan struct {
 	Gateways, Surge, PoolMax, Other int
-	QuackWorkers                    int
+	ComputeWorkers                  int
 }
 
 func (p fleetPlan) perGateway() int { return p.PoolMax + min(p.PoolMax, 64) }
@@ -49,7 +49,7 @@ func doctor(args []string) int {
 		fs.IntVar(&plan.Surge, "surge", 1, "extra gateways that run during a rolling update")
 		fs.IntVar(&plan.PoolMax, "pool-max", envInt("PGVS3_POOL_MAX", 64), "gateway --pool-max")
 		fs.IntVar(&plan.Other, "other-connections", 0, "connections reserved for applications, poolers and admin")
-		fs.IntVar(&plan.QuackWorkers, "quack-workers", 0, "Quack compute worker count to include in the PostgreSQL connection check (each worker budgets 24 DuckLake catalog connections)")
+		fs.IntVar(&plan.ComputeWorkers, "compute-workers", 0, "DuckDB/ChargeWire compute worker count to include in the PostgreSQL connection check (each worker budgets 24 DuckLake catalog connections)")
 		asJSON = fs.Bool("json", false, "print JSON")
 	}, func(ctx context.Context, st *store.Store, _ []string) int {
 		d, err := st.Diagnose(ctx)
@@ -226,18 +226,18 @@ func doctorChecks(d store.Diagnosis, f store.ServerFacts, plan fleetPlan) []chec
 func connectionCheck(f store.ServerFacts, plan fleetPlan) check {
 	maxConns := atoi(f.Settings["max_connections"])
 	usable := maxConns - atoi(f.Settings["superuser_reserved_connections"]) - atoi(f.Settings["reserved_connections"])
-	other := plan.Other + plan.QuackWorkers*24
-	quack := ""
-	if plan.QuackWorkers > 0 {
-		quack = fmt.Sprintf(" quack_workers=%d", plan.QuackWorkers)
+	other := plan.Other + plan.ComputeWorkers*24
+	computeWorkers := ""
+	if plan.ComputeWorkers > 0 {
+		computeWorkers = fmt.Sprintf(" compute_workers=%d", plan.ComputeWorkers)
 	}
 	if plan.Gateways <= 0 {
 		return check{statusInfo, "connections", fmt.Sprintf("%d usable, %d in use; each gateway at --pool-max %d needs up to %d (pass --gateways to check a fleet)%s",
-			usable, f.ClientBackends, plan.PoolMax, plan.perGateway(), quack), ""}
+			usable, f.ClientBackends, plan.PoolMax, plan.perGateway(), computeWorkers), ""}
 	}
 	need := (plan.Gateways+plan.Surge)*plan.perGateway() + other
 	detail := fmt.Sprintf("need %d = (%d gateways + %d surge) × (%d main + %d chunk) + %d other; %d usable%s",
-		need, plan.Gateways, plan.Surge, plan.PoolMax, min(plan.PoolMax, 64), other, usable, quack)
+		need, plan.Gateways, plan.Surge, plan.PoolMax, min(plan.PoolMax, 64), other, usable, computeWorkers)
 	switch {
 	case need > usable:
 		perGW := max((usable-other)/max(plan.Gateways+plan.Surge, 1), 0)
