@@ -1,6 +1,6 @@
 module github.com/adonm/pgvs3/test/s3clients
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/adonm/pgvs3 v0.0.0

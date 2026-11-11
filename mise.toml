@@ -2,7 +2,7 @@
 # System packages only bootstrap Docker.
 [tools]
 just = "1.59.0"
-go = "1.27.3"
+go = "1.27.4"
 ko = "0.19.1"
 uv = "0.13.5"
 python = "3.12.15"
