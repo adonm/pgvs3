@@ -83,8 +83,10 @@ or consult.
   `klauspost/compress` inflater or the pooled Zstd decoder. Compressed members
   up to 16 MiB are decompressed once, CRC-checked and kept in a bounded 64 MiB
   cache, so later whole or ranged reads copy from memory. Zstd is recommended
-  for new archives: it decompresses about 4–6× faster than Deflate at similar
-  ratios, and pgvs3 decompresses it natively.
+  for new archives: it measured **1.8–2.0×** higher streaming decompression
+  throughput than SIMD Deflate on 16 MiB TSV members, with ≤16 MiB hot members
+  served from the bounded 64 MiB decompressed cache. See the
+  [archive virtual-folder benchmarks](benchmarks.md#archive-virtual-folders-zip--zip64).
 - **Origin-backed archives:** archive metadata resolves through the cache tier,
   and a member lookup first checks cached literal objects. Missing members are
   answered from the cached archive index; the gateway does not issue a WAN

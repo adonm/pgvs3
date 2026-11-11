@@ -30,6 +30,7 @@ claim.
 | Official-base `pgvs3-duckdb:2.0.0` server (`just duckdb-integration-bench`) | DuckDB Quack | 1M-row DuckLake (42.7 MiB): projection **13.0 ms**, 1% range **11.9 ms**, point lookup **16.9 ms**. 1.14 GB LINZ orthophoto: z21 point **38.2 ms**, z16 overview **31.7 ms**, 9% region (704 tiles) **291.2 ms**. 5k-row spatial RTree **2.96 ms** vs **10.17 ms** lake scan; 5k×32 vector HNSW **3.19 ms** (10/10 recall) vs **13.26 ms** lake scan (earlier sample; see the dated section below). |
 | 100-snapshot Iceberg (`just iceberg`) | DuckDB `httpfs` | 20–60 ms origin: warm `count(*)` **6 ms** vs **115–316 ms** direct; 100-snapshot group-by **67 ms** vs **434–1,079 ms** direct. |
 | Trino 484 + Nessie (`just trino`) | Trino S3 | 20 ms origin: standalone paired 3 GiB cache beats Alluxio across all 7 queries (**36–520 ms** vs **78–529 ms**, paired ratios **0.46–0.97**). |
+| ZIP / ZIP64 virtual folders | S3 HTTP & DuckDB `httpfs` | 64 MiB Store member **12.86 GiB/s** (8w, 256 MiB cache; **1.01×** direct object) and **3.34 GiB/s** uncached (**0.90×**); 16 MiB Zstd (method 93) **2.75 GiB/s** (**1.8–2.0×** Deflate); 10k × 4 KiB parallel retrieval **35.8k GET/s** (Store), **37.3k GET/s** (Zstd) and **40.5k HEAD/s** at 1.000 PG lookup/req; 10k-member `delimiter=/` listing **1.11 ms**; DuckDB 1M-row Parquet inside `.zip` within **0–1.2 ms** of standalone. |
 
 Two benchmark harnesses are included in the repository:
 
@@ -340,6 +341,149 @@ bound parameters and less server-side branching, benchmarked at 16 and 64
 workers against the current 33.3k req/s. It will be kept only if it beats that
 result. Small GET is at its query/transport ceiling, warm cache GET matches
 native, and large reads are at the syscall ceiling.
+
+## Archive virtual folders (ZIP / ZIP64)
+
+Archive members are served as virtual S3 keys, so these runs measure the cost of
+resolving `<archive>/<member>` through the cached central-directory index and
+then streaming the member's bytes. Host: 16-core Intel Core Ultra X7 358H,
+PostgreSQL 18 on loopback with `shared_buffers=1GB`, gateway `--pool-max 64`,
+Go 1.27. Measured 2026-11-11.
+
+Method and fixtures:
+
+- **Whole-member and range GET:** 16 MiB and 64 MiB archive members, whole and
+  1 MiB range reads, compared against the same payload stored as a direct
+  unarchived object on the same gateway and database, at 1 and 8 workers, with
+  `--read-cache-bytes 0` and `256 MiB`. Ratios are paired within one session;
+  the direct object is the denominator.
+- **Small files:** a 10,000-member (~42.5 MiB) ZIP64 archive whose members are
+  4 KiB each and laid out in folders (`10k.zip/sample_042/…`). A Go HTTP
+  keep-alive driver fetched random members at `c = 1, 8, 32, 64, 128` workers
+  with `--s3-concurrency 128`, plus the same workload as standalone 4 KiB
+  inline objects. `pg/req` counts `s.pool` acquires per request; `chunk/req`
+  counts requests that touched chunk rows.
+- **Listing and indexing:** cold first `ListObjectsV2` over the 10,000-member
+  archive, then warm root (`delimiter=/`) and leaf-subfolder listings.
+- **DuckDB:** 2.0.0 `read_parquet` on a 1,000,000-row, 40.8 MiB Zstd Parquet
+  member inside a `.zip` against the identical standalone `.parquet`, with
+  `enable_external_file_cache=false` and `parquet_metadata_cache=false`, median
+  of 5 runs. Each client cache is disabled so the measured time is the gateway
+  path, not a DuckDB-side reuse.
+
+**Caveats.** These are loopback runs: they measure gateway and PostgreSQL
+overhead and ratios within one session, not a network ceiling, an origin, or a
+fleet capacity claim. Whole-member throughput at 8 workers is bounded by this
+host's socket and PostgreSQL read path, which is exactly why the cached columns
+are compared against the direct object rather than quoted alone.
+
+### Whole-member and 1 MiB range GET
+
+Store members cut through to one exact range request, so their cost is the
+object GET plus one index lookup. A cached member adds no PostgreSQL chunk work.
+
+| Case | Workers | Read cache | Throughput | vs direct object |
+| --- | ---: | ---: | ---: | ---: |
+| 64 MiB Store member, whole GET | 8 | 256 MiB | **12.86 GiB/s** | **1.01×** |
+| 64 MiB Store member, whole GET | 8 | 0 | **3.34 GiB/s** | **0.90×** |
+| 16 MiB Zstd member (method 93), whole GET | 8 | 256 MiB | **2.75 GiB/s** | decompression-bound |
+
+The 256 MiB gateway block cache closes the gap entirely: 1.01× of the direct
+object. Without it, a Store member still reaches 0.90× of a direct 64 MiB
+object, so index resolution and member-offset mapping cost about 10%.
+
+Compressed members pay decompression on the gateway CPU. On 16 MiB TSV members, a
+Zstd (method 93) member at a 3.76× ratio decompressed faster than a Deflate
+(method 8) member at a 4.00× ratio, at both concurrency levels:
+
+| Member encoding | Workers | Decompression throughput |
+| --- | ---: | ---: |
+| Zstd (method 93, 3.76×) | 1 | **444–456 MiB/s** |
+| Deflate (method 8, 4.00×) | 1 | **217–228 MiB/s** |
+| Zstd (method 93, 3.76×) | 8 | **2,506–2,753 MiB/s** |
+| Deflate (method 8, 4.00×) | 8 | **1,392–1,547 MiB/s** |
+
+That is **1.8–2.0×** Deflate at equal worker counts, and it is why the current
+16 MiB Zstd whole GET reaches **2.75 GiB/s**. SIMD Deflate cannot close that
+gap by tuning; the codec choice does.
+
+Compressed members up to 16 MiB are decompressed once, CRC-checked and retained
+in the bounded 64 MiB decompressed-member cache. Paired ABBA runs with the
+member cache off and then on:
+
+| Path | Member cache off → on | Change |
+| --- | ---: | ---: |
+| 16 MiB Zstd whole GET | 12.37 → 5.80 ms | 2.1× faster |
+| 1 MiB Range GET from the same member | 6.91 → 1.07 ms | 6.5× faster |
+
+Ranged reads gain most: a middle range of a compressed member no longer
+decompresses from byte zero, and a cached member serves the range from memory.
+
+### Parallel small-file retrieval (10,000 × 4 KiB)
+
+Random whole-member requests against `store10k.zip` (10,000 stored members of
+4 KiB each, ~42.5 MiB total), driven by a Go HTTP keep-alive client with
+`--s3-concurrency 128`. The sweep covered `c = 1, 8, 32, 64, 128` workers; the
+`c = 64` cell is the retained sample and the basis for the headline rate.
+
+At `c = 64` every request needed exactly one `s.pool` acquire (`1.000` pg/req):
+the archive lookup and the member body resolve in a single metadata round trip
+through `MetaPair` (`WHERE key IN ($1, $2)`), which tests the literal key and
+the archive-member key in one statement instead of paying a second lookup for
+the index.
+
+| Fixture | Op | Read cache | Throughput | p50 | p99 | pg/req | chunk/req |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `store10k.zip` | GET | 0 B | **18.1k req/s** | 3.20 ms | 8.00 ms | 1.000 | 1.000 |
+| `store10k.zip` | GET | 256 MiB | **35.8k req/s** | 1.56 ms | 4.84 ms | 1.000 | 0.000 |
+| `zstd10k.zip` (method 93) | GET | 256 MiB | **37.3k req/s** | 1.49 ms | 5.03 ms | 1.000 | 0.000 |
+| `store10k.zip` | HEAD | 256 MiB | **40.5k req/s** | 1.35 ms | 4.18 ms | 1.000 | 0.000 |
+| Standalone 4 KiB inline objects | GET | 256 MiB | 37.1k req/s | 1.50 ms | 5.67 ms | 1.000 | 0.000 |
+
+Two results stand out. First, the 256 MiB block cache roughly doubles Store
+member throughput (18.1k → 35.8k req/s) and removes all chunk-row work
+(`1.000` → `0.000` chunk/req): the member body comes from gateway memory while
+the metadata round trip stays. Second, that metadata round trip is the same one
+a standalone inline object pays, so a Zstd member (37.3k req/s) and a Store
+member (35.8k req/s) land at parity with standalone 4 KiB objects (37.1k req/s).
+`HEAD` avoids the body path entirely and reaches 40.5k req/s.
+
+### Indexing and `ListObjectsV2` over 10,000 members
+
+The first archive read builds the index once: tail read, the 970 KB central
+directory, and a single-pass `zipIndex` build. Every later listing and member
+lookup reads that cached index.
+
+| Case | Median |
+| --- | ---: |
+| Cold first `ListObjectsV2` (tail + 970 KB central directory + `zipIndex` build) | **24.1 ms** |
+| Warm root `delimiter=/` (100 `CommonPrefixes`, binary-search delimiter jump) | **1.11 ms** |
+| Warm leaf subfolder (`prefix=10k.zip/sample_042/`, 100 keys), `c=1` | **0.51 ms** p50 (**1,545 req/s**) |
+| Warm leaf subfolder, `c=8` | **1.74 ms** p50 (**4,221 req/s**) |
+
+Delimiter pagination binary-searches past a common prefix already emitted
+instead of scanning its members, so the warm root listing of 100 prefixes costs
+**1.11 ms** against **10.45 ms** for linear paging, **9.4× faster**. Leaf
+listings stay sub-millisecond at one client and scale to 4.2k req/s at eight.
+
+### DuckDB `read_parquet` inside `.zip` vs standalone
+
+DuckDB 2.0.0 on a 1,000,000-row, 40.8 MiB Zstd Parquet file, first as a member
+of a `.zip` and then as a standalone `.parquet`, with
+`enable_external_file_cache=false` and `parquet_metadata_cache=false` so each
+query reads through the gateway. Median of 5 runs:
+
+| Query | Inside `.zip` | Standalone | Difference |
+| --- | ---: | ---: | ---: |
+| Point lookup (`WHERE id = 777777`) | **25.63 ms** | 30.76 ms | −5.13 ms |
+| 1% range (`WHERE id BETWEEN 500000 AND 509999`) | **7.99 ms** | 7.75 ms | +0.24 ms |
+| Full group-by projection (1,000 groups) | **13.13 ms** | 11.95 ms | +1.18 ms |
+
+Every query is within **0–1.2 ms** of the standalone file, and the point lookup
+is faster inside the archive in this run: DuckDB's footer and row-group ranges
+land on member ranges that resolve to the same cut-through GETs. Archive
+membership is not a throughput tax for analytic reads; it costs one cached index
+build and one `MetaPair` lookup per request.
 
 ## DuckDB 2.0 `httpfs` (`just bench s3`)
 

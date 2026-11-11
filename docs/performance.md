@@ -196,6 +196,36 @@ Measured above: warm whole-object reads 2.3–2.6× faster for one client and ab
 row groups, shared lake files) and does nothing for one-pass scans. Watch
 `pgvs3_read_cache_hit_bytes_total` against total read volume before sizing it up.
 
+## Archive virtual folders
+
+An archive member is a normal `GET`/`HEAD` target that resolves through the
+cached central-directory index, not a separate data plane. Two mechanisms keep
+it at parity with standalone objects:
+
+- **`Store` cut-through:** a stored member maps to one exact byte range of the
+  archive, so the read is a single range GET with no inflate step and no
+  whole-archive download. The index supplies the member offset; the chunk path
+  is unchanged.
+- **`MetaPair`, one round trip:** `WHERE key IN ($1, $2)` tests the literal key
+  and the archive-member key in one statement, so resolving `<archive>/<member>`
+  costs the same `s.pool` acquire a plain object pays. A second lookup for the
+  archive index is not needed on the request path.
+
+That is why archive members reach 1-RTT parity: at `c = 64` on the 16-core host,
+parallel 4 KiB retrieval measured **35.8k req/s** for `Store` members, **37.3k
+req/s** for Zstd members and **40.5k `HEAD`/s**, all at **1.000** `s.pool`
+acquire per request, against **37.1k req/s** for standalone 4 KiB inline
+objects. Cached streaming scales the same way: a 64 MiB `Store` member served
+**12.86 GiB/s** at 8 workers with a 256 MiB cache (**1.01×** the same bytes as a
+direct object) and **3.34 GiB/s** uncached (**0.90×**). A 10,000-member
+`delimiter=/` listing costs **1.11 ms** warm because pagination binary-searches
+past common prefixes. Full tables, fixtures and caveats are in the
+[archive virtual-folder benchmarks](benchmarks.md#archive-virtual-folders-zip--zip64).
+
+Compressed members add gateway CPU rather than PostgreSQL work: a Zstd member
+decompresses **1.8–2.0×** faster than SIMD Deflate, and ≤16 MiB hot members are
+served from the bounded 64 MiB decompressed cache.
+
 ## Write path
 
 A streaming writer acquires one slot from a per-gateway gate of

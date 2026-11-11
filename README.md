@@ -103,8 +103,9 @@ directory once, and caches the index automatically; no sidecar is needed. It
 then serves each member with one cut-through range request when it is stored,
 or a sequential range when it is compressed. `Store` (0) members
 are zero-copy; `Deflate` (8) and `Zstd` (method 93, which decompresses
-about 4–6× faster than Deflate and is recommended for new archives) are
-decompressed natively.
+about 1.8–2.0× faster than Deflate and is recommended for new archives) are
+decompressed natively. Measured member, listing and DuckDB numbers are in the
+[archive virtual-folder benchmarks](docs/benchmarks.md#archive-virtual-folders-zip--zip64).
 
 TAR indexing walks 512-byte headers only, so a 512 MiB uncompressed `.tar`
 costs a few hundred KiB of header ranges rather than its full size. A
