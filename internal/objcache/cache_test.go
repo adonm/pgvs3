@@ -118,6 +118,41 @@ func TestSpoolWithBudget(t *testing.T) {
 	}
 }
 
+func TestConditionalHeadRevalidation(t *testing.T) {
+	var etag = `"v1"`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/b/k" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Length", "10")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	o, err := NewS3Origin(S3Config{Endpoint: srv.URL, Region: "us-east-1", PathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	_, notMod, err := o.AttributesIfNoneMatch(context.Background(), "b", "k", "v1")
+	if err != nil || !notMod {
+		t.Fatalf("matching ETag: notMod=%v err=%v, want true nil", notMod, err)
+	}
+
+	etag = `"v2"`
+	attrs, notMod, err := o.AttributesIfNoneMatch(context.Background(), "b", "k", "v1")
+	if err != nil || notMod || attrs.ETag != "v2" {
+		t.Fatalf("changed ETag: attrs=%+v notMod=%v err=%v", attrs, notMod, err)
+	}
+}
+
 func TestPlanCacheRead(t *testing.T) {
 	if p := planCacheRead(cacheResolution{}, 0, false, readView{Size: 0}); p.action != cacheActionZero {
 		t.Fatalf("zero size action = %v", p.action)

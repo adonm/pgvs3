@@ -80,26 +80,40 @@ func putMultipartBuf(bp *[]byte) {
 }
 
 func (b *Bucket) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	info, _, err := b.StatIfNoneMatch(ctx, key, "")
+	return info, err
+}
+
+// StatIfNoneMatch issues a HEAD request, optionally with If-None-Match.
+// When the origin returns 304 Not Modified, notModified is true.
+func (b *Bucket) StatIfNoneMatch(ctx context.Context, key, ifNoneMatch string) (info ObjectInfo, notModified bool, err error) {
 	c := b.client
 	if c == nil {
-		return ObjectInfo{}, errors.New("s3: nil bucket")
+		return ObjectInfo{}, false, errors.New("s3: nil bucket")
 	}
 	object, err := c.objectKey(key)
 	if err != nil {
-		return ObjectInfo{}, err
+		return ObjectInfo{}, false, err
 	}
-	resp, err := c.do(ctx, http.MethodHead, object, nil, nil, -1)
+	var extra [][2]string
+	if ifNoneMatch != "" {
+		extra = append(extra, [2]string{"If-None-Match", `"` + strings.Trim(ifNoneMatch, `"`) + `"`})
+	}
+	resp, err := c.do(ctx, http.MethodHead, object, nil, nil, -1, extra...)
 	if err != nil {
-		return ObjectInfo{}, err
+		return ObjectInfo{}, false, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		return ObjectInfo{}, true, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		return ObjectInfo{}, statusError("HEAD", key, resp)
+		return ObjectInfo{}, false, statusError("HEAD", key, resp)
 	}
 	if resp.ContentLength < 0 {
-		return ObjectInfo{}, fmt.Errorf("s3: HEAD %s returned no Content-Length", key)
+		return ObjectInfo{}, false, fmt.Errorf("s3: HEAD %s returned no Content-Length", key)
 	}
-	return objectInfoFromHeader(strings.TrimLeft(key, "/"), resp.Header, resp.ContentLength), nil
+	return objectInfoFromHeader(strings.TrimLeft(key, "/"), resp.Header, resp.ContentLength), false, nil
 }
 
 func (b *Bucket) Walk(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error] {

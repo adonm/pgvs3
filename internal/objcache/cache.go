@@ -340,30 +340,54 @@ func (t *Tier) resolveCache(ctx context.Context, bucket, key, ck string, deleteS
 		return res, nil
 	}
 
+	type headResult struct {
+		attrs       originAttrs
+		notModified bool
+	}
+	ifNoneMatch := ""
+	if m != nil {
+		ifNoneMatch = m.OriginETag
+	}
 	validated := time.Now()
-	ch := t.group.DoChan("head:"+ck, func() (any, error) {
+	ch := t.group.DoChan("head:"+ck+":"+ifNoneMatch, func() (any, error) {
 		headCtx, cancel := context.WithTimeout(t.baseContext(), 30*time.Second)
 		defer cancel()
-		return t.origin.Attributes(headCtx, bucket, key)
+		attrs, notMod, err := t.origin.AttributesIfNoneMatch(headCtx, bucket, key, ifNoneMatch)
+		if err != nil {
+			return nil, err
+		}
+		return headResult{attrs: attrs, notModified: notMod}, nil
 	})
-	var a originAttrs
+	var hr headResult
 	var aerr error
 	select {
 	case r := <-ch:
 		if r.Err != nil {
 			aerr = r.Err
 		} else {
-			a = r.Val.(originAttrs)
+			hr = r.Val.(headResult)
 		}
 	case <-ctx.Done():
 		return res, ctx.Err()
 	}
 	if aerr != nil {
 		if isObjectNotFound(aerr) {
+			if m != nil && !t.readOnly && deleteStale {
+				_, _ = t.store.DeleteExpected(context.WithoutCancel(ctx), res.ref, m.OriginETag)
+			}
 			return res, store.ErrNotFound
 		}
 		return res, aerr
 	}
+	if hr.notModified && m != nil {
+		if !t.readOnly {
+			_ = t.store.Cache(t.namespace).MarkRevalidated(t.baseContext(), ck, m.OriginETag, t.retention)
+		}
+		res.info = cachedInfo(m)
+		res.valid = true
+		return res, nil
+	}
+	a := hr.attrs
 	res.attrs, res.info = a, a.objectInfo()
 	if m == nil && t.rangeSize > 0 && a.Size > t.rangeSize && !t.readOnly {
 		ttl := t.ttl
@@ -376,7 +400,9 @@ func (t *Tier) resolveCache(ctx context.Context, bucket, key, ck string, deleteS
 	}
 	if m != nil {
 		if m.Size == res.info.Size && m.OriginETag == res.info.OriginETag {
-			t.touch(ck)
+			if !t.readOnly {
+				_ = t.store.Cache(t.namespace).MarkRevalidated(t.baseContext(), ck, m.OriginETag, t.retention)
+			}
 			res.info = cachedInfo(m)
 			res.valid = true
 		} else if !t.readOnly && deleteStale {

@@ -531,32 +531,28 @@ func (r *metaOriginRow) Scan(dest ...any) error {
 // range cache. Both lookups share one round trip so a warm range read does not
 // pay for a second query.
 func (c Cache) MetadataOrOrigin(ctx context.Context, key string, withInline bool, originMaxAge time.Duration) (*Meta, ns.Ref, *ObjectInfo, error) {
-	if originMaxAge <= 0 {
-		m, ref, err := c.Metadata(ctx, key, withInline)
-		return m, ref, nil, err
-	}
-	write, err := nsSQLIdent(ns.WriteBack, c.name)
+	read, err := nsSQLIdent(ns.Cache, c.name)
 	if err != nil {
 		return nil, ns.Ref{}, nil, err
 	}
-	read, _ := nsSQLIdent(ns.Cache, c.name)
 	body := metadataHeader
 	if withInline {
 		body = metadataDecoded
 	}
 	cols := metadataColumns(body)
+	omFilter := "expires_at > now()"
+	var args []any
+	args = append(args, key)
+	if originMaxAge > 0 {
+		omFilter += " AND validated_at > now() - make_interval(secs => $2)"
+		args = append(args, originMaxAge.Seconds())
+	}
 	row := &metaOriginRow{Row: c.s.pool.QueryRow(ctx, `WITH obj AS (
-		SELECT * FROM (
-			SELECT `+cols+`, 'writeback'::text AS kind, 0 AS source_priority FROM `+write+`.objects
-			 WHERE key=$1 AND (expires_at IS NULL OR expires_at > now())
-			UNION ALL
-			SELECT `+cols+`, 'cache'::text AS kind, 1 FROM `+read+`.objects
-			 WHERE key=$1 AND (expires_at IS NULL OR expires_at > now())
-			) c ORDER BY source_priority LIMIT 1
+		SELECT `+cols+`, 'cache'::text AS kind FROM `+read+`.objects
+		 WHERE key=$1 AND (expires_at IS NULL OR expires_at > now())
 		), om AS (
 		SELECT info FROM `+read+`.origin_metadata
-		 WHERE key = $1 AND expires_at > now()
-		   AND validated_at > now() - make_interval(secs => $2)
+		 WHERE key = $1 AND `+omFilter+`
 		   AND NOT EXISTS (SELECT 1 FROM obj)
 		)
 		SELECT * FROM (
@@ -565,16 +561,11 @@ func (c Cache) MetadataOrOrigin(ctx context.Context, key string, withInline bool
 			SELECT 0::int8, 0::int8, ''::bytea, 'epoch'::timestamptz, NULL::int8[], NULL::int8[],
 				''::text, '{}'::text[], ''::text, ''::text, NULL::timestamptz,
 				''::text, ''::text, ''::text, NULL::bytea, false, NULL::timestamptz, ''::text, 0::oid,
-				NULL::text, 0, (SELECT info FROM om)
-		) rows ORDER BY kind IS NULL LIMIT 1`, key, originMaxAge.Seconds())}
+				NULL::text, (SELECT info FROM om)
+		) rows ORDER BY kind IS NULL LIMIT 1`, args...)}
 	m, err := scanMetadata(row, body)
-	if missingNamespace(ctx, c.s.pool, write, row.err) || missingNamespace(ctx, c.s.pool, read, row.err) {
-		m, ref, err := c.Metadata(ctx, key, withInline)
-		if !errors.Is(err, ErrNotFound) {
-			return m, ref, nil, err
-		}
-		info, err := c.OriginMetadata(ctx, key, originMaxAge)
-		return nil, ns.Ref{}, info, err
+	if missingNamespace(ctx, c.s.pool, read, row.err) {
+		return nil, ns.Ref{}, nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, ns.Ref{}, nil, err

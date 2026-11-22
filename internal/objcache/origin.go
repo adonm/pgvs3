@@ -62,6 +62,7 @@ func (a originAttrs) writeOptions() store.WriteOptions {
 type originHandle interface {
 	BucketAllowed(bucket string) bool
 	Attributes(ctx context.Context, bucket, key string) (originAttrs, error)
+	AttributesIfNoneMatch(ctx context.Context, bucket, key, ifNoneMatch string) (originAttrs, bool, error)
 	GetWithAttrs(ctx context.Context, bucket, key string) (io.ReadCloser, originAttrs, error)
 	GetRange(ctx context.Context, bucket, key string, offset, length int64, ifMatch string) (io.ReadCloser, error)
 	Proxy(ctx context.Context, bucket, key, method string, query url.Values, body io.Reader, size int64, extra ...[2]string) (*http.Response, error)
@@ -155,15 +156,23 @@ func (o *S3Origin) bucket(name string) (*s3client.Bucket, error) {
 }
 
 func (o *S3Origin) Attributes(ctx context.Context, bucket, key string) (originAttrs, error) {
+	attrs, _, err := o.AttributesIfNoneMatch(ctx, bucket, key, "")
+	return attrs, err
+}
+
+func (o *S3Origin) AttributesIfNoneMatch(ctx context.Context, bucket, key, ifNoneMatch string) (originAttrs, bool, error) {
 	b, err := o.bucket(bucket)
 	if err != nil {
-		return originAttrs{}, err
+		return originAttrs{}, false, err
 	}
-	meta, err := b.Stat(ctx, key)
+	meta, notModified, err := b.StatIfNoneMatch(ctx, key, ifNoneMatch)
 	if err != nil {
-		return originAttrs{}, mapOriginError(err)
+		return originAttrs{}, false, mapOriginError(err)
 	}
-	return attrsFromS3(meta, key), nil
+	if notModified {
+		return originAttrs{}, true, nil
+	}
+	return attrsFromS3(meta, key), false, nil
 }
 
 func (o *S3Origin) GetWithAttrs(ctx context.Context, bucket, key string) (io.ReadCloser, originAttrs, error) {

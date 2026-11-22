@@ -1239,6 +1239,18 @@ func (s *Store) CleanupFillLeases(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+func (c Cache) MarkRevalidated(ctx context.Context, key, originETag string, retention time.Duration) error {
+	_, err := withSchema(ctx, c.s, ns.CacheRef(c.name), nil, nil, func(sc string) (struct{}, error) {
+		_, err := c.s.pool.Exec(ctx, `UPDATE `+sc+`.objects
+			SET created_at = now(),
+			    expires_at = now() + make_interval(secs => $3)
+			WHERE key = $1 AND COALESCE(origin_etag, '') = $2`,
+			key, originETag, retention.Seconds())
+		return struct{}{}, err
+	})
+	return err
+}
+
 func (c Cache) OriginMetadata(ctx context.Context, key string, maxAge time.Duration) (*ObjectInfo, error) {
 	return withSchema(ctx, c.s, ns.CacheRef(c.name), nil, nil, func(sc string) (*ObjectInfo, error) {
 		var raw []byte
