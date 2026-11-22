@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -21,7 +20,6 @@ import (
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/adonm/pgvs3/internal/telemetry"
-	"github.com/adonm/pgvs3/internal/work"
 )
 
 var version = "dev"
@@ -35,14 +33,13 @@ type command struct {
 }
 
 var commandTable = []command{
-	{name: "serve", summary: "Run the S3/OJS/HTTP/RESP gateway (default when no command is given).", run: serve},
+	{name: "serve", summary: "Run the S3 cache gateway (default when no command is given).", run: serve},
 	{name: "health", summary: "Exit 0 when a gateway's readiness URL returns 200.", run: health},
 	{name: "reap", summary: "Run one bounded maintenance pass (or all passes) without a gateway.", run: reap},
-	{name: "doctor", summary: "Check the database, its settings and fleet connection capacity; print fixes.", run: doctor},
 	{name: "stat", summary: "Print namespace, object, chunk and storage-overhead counts.", run: stat},
 	{name: "clone", summary: "Copy a bucket or cache namespace inside PostgreSQL.", run: cloneNS},
 	{name: "drop", summary: "Delete a namespace and its schema.", run: dropNS},
-	{name: "adopt", summary: "Register existing s3b_/s3c_/s3w_/s3q_ schemas in the catalog.", run: adoptNS},
+	{name: "adopt", summary: "Register existing s3b_/s3c_/s3w_ schemas in the catalog.", run: adoptNS},
 	{name: "origin", summary: "Set, clear, list or print SQL for the origin a bucket (or every bucket) caches.", run: originCmd},
 	{name: "pending", summary: "List or retry write-back uploads that have not reached the origin.", run: pendingCmd},
 	{name: "version", summary: "Print the binary version.", run: func([]string) int { fmt.Println(version); return 0 }},
@@ -154,7 +151,6 @@ type serveConfig struct {
 	reapGrace               time.Duration
 	readOnly                bool
 	logLevel                string
-	pprofAddr               string
 	originConfig            string
 	s3Origin                string
 	autoBucket              string
@@ -164,23 +160,16 @@ type serveConfig struct {
 	fillConcurrency         int
 	rangeCacheChunk         int64
 	cacheMaxBytes           int64
-	readCacheBytes          int64
 	s3Concurrency           int
 	s3QueueWait             time.Duration
-	queueConcurrency        int
-	respConcurrency         int
-	jobRetention            time.Duration
-	simulateLatency         time.Duration
-	simulateRPS             int
-	simulateBandwidth       int64
 }
 
 func parseServeConfig(args []string) (serveConfig, error) {
 	var cfg serveConfig
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.StringVar(&cfg.url, "url", "postgres://localhost/pgvs3", "PostgreSQL URL: the writer endpoint, or a standby with --read-only (use sslmode for database TLS)")
-	fs.StringVar(&cfg.addr, "addr", "0.0.0.0:8014", "listen address for S3/HTTP/RESP2/OJS, /healthz, /readyz and /metrics")
-	fs.IntVar(&cfg.poolMax, "pool-max", 64, "main-pool PostgreSQL connections; the chunk pool adds up to min(pool-max, 64), so check the fleet with pgvs3 doctor --gateways N")
+	fs.StringVar(&cfg.addr, "addr", "0.0.0.0:8014", "listen address for S3/HTTP, /healthz, /readyz and /metrics")
+	fs.IntVar(&cfg.poolMax, "pool-max", 64, "main-pool PostgreSQL connections; the chunk pool adds up to min(pool-max, 64)")
 	fs.StringVar(&cfg.spoolDir, "spool-dir", "", "scratch directory for cache fills over 8 MiB; use local disk, not a small tmpfs (empty uses the system temp dir)")
 	fs.Int64Var(&cfg.spoolMaxBytes, "spool-max-bytes", 8<<30, "process-wide spool byte budget for fills, foreground writes and pending uploads; busy admission returns 503")
 	fs.BoolVar(&cfg.cacheWriteBack, "cache-write-back", true, "acknowledge large unconditional cache writes after the logged write-back commit; the origin upload follows (conditional writes stay synchronous)")
@@ -197,7 +186,6 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.DurationVar(&cfg.reapGrace, "reap-grace", 10*time.Minute, "how long overwritten or deleted files stay readable before garbage collection")
 	fs.BoolVar(&cfg.readOnly, "read-only", false, "reject writes and skip DDL, reaping, fills and origin retries (for standbys); pending write-back objects stay readable")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
-	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "optional loopback address for net/http/pprof, e.g. 127.0.0.1:6060")
 	fs.StringVar(&cfg.originConfig, "origin-config", "", "process-local fallback origin JSON; prefer pgvs3 origin set, which every gateway discovers")
 	fs.StringVar(&cfg.s3Origin, "s3-origin", "", "attach a bucket-scoped S3 origin on writable startup as [bucket=]s3://origin-bucket[/prefix][?region=...&endpoint=...&path_style=true&insecure=true]")
 	fs.StringVar(&cfg.autoBucket, "auto-bucket", "", "comma-separated native buckets to ensure on writable startup")
@@ -207,15 +195,8 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills and pending-upload workers")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
 	fs.Int64Var(&cfg.cacheMaxBytes, "cache-max-bytes", 0, "evict oldest cached objects when cache namespace exceeds this byte budget (0 disables)")
-	fs.Int64Var(&cfg.readCacheBytes, "read-cache-bytes", 0, "gateway-local memory for immutable chunk blocks of hot reads; metadata still comes from PostgreSQL on every request (0 disables)")
 	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown")
 	fs.DurationVar(&cfg.s3QueueWait, "s3-queue-wait", time.Second, "maximum S3 admission wait (0 rejects excess immediately)")
-	fs.IntVar(&cfg.queueConcurrency, "queue-concurrency", 16, "concurrent OJS queue requests")
-	fs.IntVar(&cfg.respConcurrency, "resp-concurrency", 32, "concurrent RESP batches")
-	fs.DurationVar(&cfg.jobRetention, "job-retention", store.DefaultJobRetention, "keep completed/cancelled/discarded OJS jobs this long (0 = forever)")
-	fs.DurationVar(&cfg.simulateLatency, "simulate-latency", 0, "benchmark-only one-way delay added to S3 requests and responses (20ms is about a 40ms RTT)")
-	fs.IntVar(&cfg.simulateRPS, "simulate-rps", 0, "benchmark-only maximum S3 requests per second; probes and metrics are exempt (0 disables)")
-	fs.Int64Var(&cfg.simulateBandwidth, "simulate-bandwidth", 0, "benchmark-only per-request bandwidth in bytes/sec (0 disables)")
 	if describeFlags != nil {
 		describeFlags("serve", fs)
 		return cfg, errDescribed
@@ -230,11 +211,8 @@ func parseServeConfig(args []string) (serveConfig, error) {
 		return serveConfig{}, fmt.Errorf("unexpected serve argument %q", fs.Arg(0))
 	}
 	if cfg.spoolMaxBytes <= 0 || cfg.poolMax <= 0 || cfg.maxConns <= 0 || cfg.fillConcurrency <= 0 ||
-		cfg.s3Concurrency <= 0 || cfg.queueConcurrency <= 0 || cfg.respConcurrency <= 0 {
+		cfg.s3Concurrency <= 0 {
 		return serveConfig{}, fmt.Errorf("pool/connection/concurrency limits must be positive")
-	}
-	if cfg.readCacheBytes < 0 {
-		return serveConfig{}, fmt.Errorf("--read-cache-bytes must be non-negative")
 	}
 	if cfg.cacheMaxBytes < 0 {
 		return serveConfig{}, fmt.Errorf("--cache-max-bytes must be non-negative")
@@ -251,7 +229,7 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	}
 	if cfg.dbStatementTimeout < 0 || cfg.dbLockTimeout < 0 || cfg.dbIdleTxTimeout < 0 ||
 		cfg.dbMaxConnLifetime < 0 || cfg.dbMaxConnLifetimeJitter < 0 ||
-		cfg.httpReadTimeout < 0 || cfg.httpWriteTimeout < 0 || cfg.s3QueueWait < 0 || cfg.simulateLatency < 0 || cfg.simulateRPS < 0 || cfg.simulateBandwidth < 0 {
+		cfg.httpReadTimeout < 0 || cfg.httpWriteTimeout < 0 || cfg.s3QueueWait < 0 {
 		return serveConfig{}, fmt.Errorf("timeouts must be non-negative")
 	}
 	return cfg, nil
@@ -286,7 +264,6 @@ func serve(args []string) int {
 	}
 	defer st.Close()
 	st.SetMaxDBBytes(cfg.maxDBBytes)
-	st.SetJobRetention(cfg.jobRetention)
 
 	stopMaintenance, err := prepareStore(ctx, st, cfg, log)
 	defer stopMaintenance()
@@ -311,7 +288,6 @@ func serve(args []string) int {
 	origins.Start(ctx)
 	g := newGateway(ctx, st, cfg, origins, log)
 	defer g.Close()
-	startPprof(cfg.pprofAddr, log)
 	return runGateway(ctx, g, cfg, log)
 }
 
@@ -337,7 +313,6 @@ func storeOpenOptions(cfg serveConfig) store.OpenOptions {
 		MaxConnLifetime:       cfg.dbMaxConnLifetime,
 		MaxConnLifetimeJitter: cfg.dbMaxConnLifetimeJitter,
 		Tracer:                telemetry.PGXTracer{},
-		ReadCacheBytes:        cfg.readCacheBytes,
 	}
 }
 
@@ -445,9 +420,8 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 
 func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, origins *objcache.Registry, log *slog.Logger) *gateway.Gateway {
 	g := gateway.New(st, log, cfg.readOnly, origins, gateway.Limits{
-		S3: cfg.s3Concurrency, S3QueueWait: cfg.s3QueueWait, OJS: cfg.queueConcurrency, RESP: cfg.respConcurrency,
+		S3: cfg.s3Concurrency, S3QueueWait: cfg.s3QueueWait,
 	})
-	g.SetVersion(version)
 	go func() {
 		<-ctx.Done()
 		g.SetDraining(true)
@@ -455,25 +429,8 @@ func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, origins *
 	return g
 }
 
-func startPprof(addr string, log *slog.Logger) {
-	if addr == "" {
-		return
-	}
-	go func() {
-		log.Info("pprof listening", "addr", addr)
-		if err := http.ListenAndServe(addr, http.DefaultServeMux); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("pprof server", "err", err)
-		}
-	}()
-}
-
 func serveHandler(g *gateway.Gateway, cfg serveConfig) http.Handler {
-	handler := telemetry.Middleware(g)
-	sim := gateway.Simulation{Latency: cfg.simulateLatency, RPS: cfg.simulateRPS, Bandwidth: cfg.simulateBandwidth}
-	if sim.Enabled() {
-		handler = gateway.Constrain(handler, sim)
-	}
-	return handler
+	return telemetry.Middleware(g)
 }
 
 func runGateway(ctx context.Context, g *gateway.Gateway, cfg serveConfig, log *slog.Logger) int {
@@ -698,20 +655,20 @@ func reap(args []string) int {
 }
 
 func maintain(ctx context.Context, st *store.Store, grace, interval time.Duration, log *slog.Logger) {
-	work.Periodic(ctx, work.PeriodicOptions{
-		Name:     "maintenance",
-		Interval: interval,
-		Timeout:  2 * time.Minute,
-		Drain:    true,
-		Log:      log,
-	}, func(ctx context.Context) (bool, error) {
-		beforeRows, beforeFiles := st.ReapedRows(), st.ReapedFiles()
-		if err := st.Maintain(ctx, grace); err != nil {
-			return false, err
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			if err := st.Maintain(runCtx, grace); err != nil && ctx.Err() == nil {
+				log.Warn("maintenance failed", "err", err)
+			}
+			cancel()
 		}
-		return st.ReapedRows()-beforeRows >= store.ReapRows ||
-			st.ReapedFiles()-beforeFiles >= store.ReapRows, nil
-	})
+	}
 }
 
 var logLevels = map[string]slog.Level{

@@ -10,12 +10,10 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/adonm/pgvs3/internal/store"
 )
 
 func TestCommandTable(t *testing.T) {
-	want := []string{"serve", "health", "reap", "doctor", "stat", "clone", "drop", "adopt", "origin", "pending", "version"}
+	want := []string{"serve", "health", "reap", "stat", "clone", "drop", "adopt", "origin", "pending", "version"}
 	if len(commandTable) != len(want) {
 		t.Fatalf("command table has %d entries, want %d", len(commandTable), len(want))
 	}
@@ -121,9 +119,6 @@ func TestParseServeConfigDefaults(t *testing.T) {
 		fillConcurrency:         8,
 		s3Concurrency:           32,
 		s3QueueWait:             time.Second,
-		queueConcurrency:        16,
-		respConcurrency:         32,
-		jobRetention:            store.DefaultJobRetention,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("config = %+v, want %+v", cfg, want)
@@ -140,16 +135,13 @@ func TestParseServeConfigFlags(t *testing.T) {
 		"--db-lock-timeout", "2s", "--db-idle-tx-timeout", "30s",
 		"--db-max-conn-lifetime", "30m", "--db-max-conn-lifetime-jitter", "2m",
 		"--reap-grace", "2m", "--read-only", "--log-level", "warn",
-		"--pprof-addr", "127.0.0.1:6060", "--origin-config", "/tmp/origin.json",
+		"--origin-config", "/tmp/origin.json",
 		"--s3-origin", "overture=s3://overturemaps-us-west-2?region=us-west-2",
 		"--auto-bucket", "lake, edge",
 		"--cache-ttl", "30s", "--cache-retention", "1h", "--cache-namespace", "cache",
 		"--fill-concurrency", "3", "--range-cache-chunk", "4096",
 		"--cache-max-bytes", "1048576",
 		"--s3-concurrency", "7", "--s3-queue-wait", "75ms",
-		"--queue-concurrency", "5", "--resp-concurrency", "6",
-		"--job-retention", "2h",
-		"--simulate-latency", "25ms", "--simulate-rps", "17", "--simulate-bandwidth", "52428800",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +164,6 @@ func TestParseServeConfigFlags(t *testing.T) {
 		reapGrace:               2 * time.Minute,
 		readOnly:                true,
 		logLevel:                "warn",
-		pprofAddr:               "127.0.0.1:6060",
 		originConfig:            "/tmp/origin.json",
 		s3Origin:                "overture=s3://overturemaps-us-west-2?region=us-west-2",
 		autoBucket:              "lake, edge",
@@ -185,12 +176,6 @@ func TestParseServeConfigFlags(t *testing.T) {
 		cacheMaxBytes:           1048576,
 		s3Concurrency:           7,
 		s3QueueWait:             75 * time.Millisecond,
-		queueConcurrency:        5,
-		respConcurrency:         6,
-		jobRetention:            2 * time.Hour,
-		simulateLatency:         25 * time.Millisecond,
-		simulateRPS:             17,
-		simulateBandwidth:       52428800,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("config = %+v, want %+v", cfg, want)
@@ -581,18 +566,18 @@ func TestServeEnvironmentUsesFlagParsers(t *testing.T) {
 	t.Setenv("PGVS3_DB_LOCK_TIMEOUT", "1250ms")
 	t.Setenv("PGVS3_READ_ONLY", "yes")
 	t.Setenv("PGVS3_CACHE_WRITE_BACK", "no")
-	t.Setenv("PGVS3_SIMULATE_RPS", "17")
+	t.Setenv("PGVS3_S3_CONCURRENCY", "17")
 	cfg, err := parseServeConfig([]string{"--pool-max=9", "--read-only=false"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.poolMax != 9 || cfg.readOnly || cfg.cacheWriteBack || cfg.dbLockTimeout != 1250*time.Millisecond || cfg.simulateRPS != 17 {
+	if cfg.poolMax != 9 || cfg.readOnly || cfg.cacheWriteBack || cfg.dbLockTimeout != 1250*time.Millisecond || cfg.s3Concurrency != 17 {
 		t.Fatalf("environment/flag precedence: %+v", cfg)
 	}
 	if fromEnv, err := parseServeConfig(nil); err != nil || fromEnv.poolMax != 12 {
 		t.Fatalf("zero-padded decimal environment: %+v %v", fromEnv, err)
 	}
-	for _, key := range []string{"PGVS3_SIMULATE_RPS", "PGVS3_DB_LOCK_TIMEOUT", "PGVS3_CACHE_WRITE_BACK"} {
+	for _, key := range []string{"PGVS3_S3_CONCURRENCY", "PGVS3_DB_LOCK_TIMEOUT", "PGVS3_CACHE_WRITE_BACK"} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, "invalid")
 			if _, err := parseServeConfig(nil); err == nil {

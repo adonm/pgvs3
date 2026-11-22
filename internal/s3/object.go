@@ -331,71 +331,14 @@ func (b localBackend) ListUploads(ctx context.Context, bucket, prefix, bound, ke
 
 func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	backend := s.backendFor(r.Context(), bucket)
-	var head readHead
-	var err error
-	zipResolved := false
 	part, hasPart, err := parsePartNumber(r.URL.Query())
 	if err != nil {
 		return err
 	}
-	if !strings.HasSuffix(key, "/") {
-		if archiveKey, _, _, isArchive := splitArchiveKey(key); isArchive {
-			switch b := backend.(type) {
-			case originBackend:
-				info, cached, cachedErr := b.HeadCached(r.Context(), bucket, key)
-				switch {
-				case cachedErr == nil && cached:
-					// A literal cached object shadows the archive member.
-					head = readHead{Info: info, Hit: true}
-					zipResolved = true
-				case cachedErr == nil:
-					// No literal object is cached. Resolve the archive index
-					// without ever HEADing the non-existent member at origin.
-					if idx, member, _, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
-						if hasPart {
-							return errNotImplemented()
-						}
-						return s.headZipMember(w, r, idx, member)
-					}
-				}
-			case localBackend:
-				if b.store != nil {
-					var primary, archiveMeta *store.Meta
-					primary, archiveMeta, err = b.store.MetaPair(r.Context(), store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, archiveKey, false)
-					zipResolved = true
-					switch {
-					case err != nil:
-					case primary != nil:
-						head = readHead{Info: primary.ObjectInfo, Parts: primary.Parts, PartEnds: primary.PartEnds}
-					case archiveMeta != nil:
-						if idx, member, ok := s.resolveZipMemberWithMeta(r.Context(), backend, bucket, key, archiveMeta); ok {
-							if hasPart {
-								return errNotImplemented()
-							}
-							return s.headZipMember(w, r, idx, member)
-						}
-						err = store.ErrNotFound
-					default:
-						err = store.ErrNotFound
-					}
-				}
-			}
-		}
-	}
-	if !zipResolved {
+	head, err := backend.Head(r.Context(), bucket, key)
+	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
+		key += "index.html"
 		head, err = backend.Head(r.Context(), bucket, key)
-		if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
-			key += "index.html"
-			head, err = backend.Head(r.Context(), bucket, key)
-		}
-	}
-	if errors.Is(err, store.ErrNotFound) && !zipResolved {
-		if idx, member, _, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
-			if hasPart {
-				return errNotImplemented()
-			}
-			return s.headZipMember(w, r, idx, member)
-		}
 	}
 	if err != nil {
 		return err
@@ -474,78 +417,10 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		partCount = partsCount(m)
 	}
 	cond := headerReadCondition(r)
-	var res *store.ReadResult
-	resolved := false
-	if !hasPart && !strings.HasSuffix(key, "/") {
-		if archiveKey, _, _, isArchive := splitArchiveKey(key); isArchive {
-			switch b := backend.(type) {
-			case localBackend:
-				if b.store != nil {
-					primary, archiveMeta, pairErr := b.store.MetaPair(r.Context(), store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, archiveKey, true)
-					resolved = true
-					switch {
-					case pairErr != nil && !errors.Is(pairErr, store.ErrNotFound):
-						err = pairErr
-					case primary != nil:
-						res = &store.ReadResult{ObjectInfo: primary.ObjectInfo}
-						if err = cond.Check(true, primary.ETag); err == nil {
-							sm, body, bodyErr := b.store.GetBodyFromMeta(r.Context(), store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, primary, rng)
-							switch {
-							case errors.Is(bodyErr, store.ErrInvalidRange):
-								w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(primary.Size, 10))
-								return errInvalidRange()
-							case bodyErr != nil:
-								err = bodyErr
-							default:
-								res = &store.ReadResult{ObjectInfo: sm.ObjectInfo, Body: body, Start: sm.Start, End: sm.End, Ranged: rng.Requested}
-							}
-						}
-					case archiveMeta != nil:
-						if idx, member, ok := s.resolveZipMemberWithMeta(r.Context(), backend, bucket, key, archiveMeta); ok {
-							return s.serveZipMember(w, r, backend, bucket, key, idx, member, archiveMeta, rng)
-						}
-						err = store.ErrNotFound
-					default:
-						err = store.ErrNotFound
-					}
-				}
-			case originBackend:
-				cached, ok, cachedErr := b.OpenCached(r.Context(), bucket, key, rng)
-				switch {
-				case cachedErr == nil && ok:
-					// A literal cached object shadows the archive member.
-					resolved = true
-					if condErr := cond.Check(true, cached.ETag); condErr != nil {
-						cached.Body.Close()
-						err = condErr
-					} else {
-						s.serveReadResult(w, r, key, cached, true)
-						return nil
-					}
-				case cachedErr == nil:
-					// No literal object is cached. Resolve the archive index
-					// without ever GETing or HEADing the member at origin.
-					if idx, member, archiveMeta, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
-						return s.serveZipMember(w, r, backend, bucket, key, idx, member, archiveMeta, rng)
-					}
-				}
-			}
-		}
-	}
-	if !resolved {
+	res, err := openObject(r.Context(), backend, bucket, key, rng, cond)
+	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
+		key += "index.html"
 		res, err = openObject(r.Context(), backend, bucket, key, rng, cond)
-		if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
-			key += "index.html"
-			res, err = openObject(r.Context(), backend, bucket, key, rng, cond)
-		}
-		if errors.Is(err, store.ErrNotFound) {
-			if idx, member, archiveMeta, ok := s.resolveZipMember(r.Context(), backend, bucket, key); ok {
-				if hasPart {
-					return errNotImplemented()
-				}
-				return s.serveZipMember(w, r, backend, bucket, key, idx, member, archiveMeta, rng)
-			}
-		}
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotModified) {

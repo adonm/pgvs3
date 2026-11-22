@@ -252,11 +252,6 @@ func (s *Store) expirePass(ctx context.Context, conn *pgxpool.Conn, infos []Name
 	var expiredUploads int
 	for _, n := range infos {
 		if n.Kind == ns.Queue {
-			removed, err := s.queue(n.Name).expire(ctx, rounds)
-			if err != nil {
-				return err
-			}
-			s.expiredObjects.Add(removed)
 			continue
 		}
 		q := quoteIdent(n.Schema)
@@ -276,51 +271,6 @@ func (s *Store) expirePass(ctx context.Context, conn *pgxpool.Conn, infos []Name
 		s.log.Info("expired multipart uploads", "count", expiredUploads)
 	}
 	return nil
-}
-
-func (q Queue) expire(ctx context.Context, rounds int) (int64, error) {
-	var total int64
-	for range rounds {
-		removed, err := q.ExpireMessages(ctx, ExpireBatch)
-		if err != nil {
-			return total, err
-		}
-		total += removed
-		if removed < ExpireBatch {
-			break
-		}
-	}
-	for range rounds {
-		discarded, err := q.DiscardExpiredLeases(ctx, ExpireBatch)
-		if err != nil {
-			return total, err
-		}
-		total += discarded
-		if discarded < ExpireBatch {
-			break
-		}
-	}
-	for range rounds {
-		moved, err := q.ProcessRetries(ctx, ExpireBatch)
-		if err != nil {
-			return total, err
-		}
-		total += moved
-		if moved < ExpireBatch {
-			break
-		}
-	}
-	if rotated, err := q.Rotate(ctx); err != nil {
-		return total, err
-	} else {
-		total += rotated
-	}
-	if pruned, err := q.PruneTicks(ctx, ExpireBatch); err != nil {
-		return total, err
-	} else {
-		total += pruned
-	}
-	return total, nil
 }
 
 func (s *Store) expireNamespace(ctx context.Context, conn *pgxpool.Conn, schema string, n NamespaceInfo, rounds int) (int, error) {
@@ -438,9 +388,6 @@ func (s *Store) evictCacheOverBudget(ctx context.Context, conn *pgxpool.Conn, sc
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
-	}
-	if evicted > 0 {
-		s.invalidateChunkNS(namespace)
 	}
 	return evicted, nil
 }

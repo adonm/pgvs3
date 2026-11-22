@@ -986,7 +986,7 @@ func (s *Store) startSingleStream(ctx context.Context, cancel context.CancelFunc
 		return nil, err
 	}
 	body := &Body{
-		reader: newChunkRowReader(rows, p, start, end, s.blocks.fill(table, p)),
+		reader: newChunkRowReader(rows, p, start, end),
 		conn:   conn, cancel: cancel,
 	}
 	chunk, err := body.reader.nextChunk()
@@ -1009,26 +1009,10 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, ref 
 		return nil, err
 	}
 	var table uint32
-	if s.blocks != nil {
-		table = m.table
-	}
 	var cached [][][]byte
-	var need []int
-	if table != 0 {
-		pieces = alignPieces(pieces)
-		cached, need = s.lookupPieces(table, pieces, start, end)
-		if len(need) == 0 {
-			var parts [][]byte
-			for _, c := range cached {
-				parts = append(parts, c...)
-			}
-			return &Body{parts: parts, cancel: cancel}, nil
-		}
-	} else {
-		need = make([]int, len(pieces))
-		for i := range need {
-			need[i] = i
-		}
+	need := make([]int, len(pieces))
+	for i := range need {
+		need[i] = i
 	}
 	if len(pieces) == 1 {
 		return s.startSingleStream(ctx, cancel, schema, table, pieces[0], start, end)
@@ -1047,21 +1031,6 @@ func (s *Store) startStream(ctx context.Context, cancel context.CancelFunc, ref 
 		return nil, io.ErrUnexpectedEOF
 	}
 	return &Body{ch: ch, errc: errc, cancel: cancel, chunk: first.b, cur: first.b, shared: first.shared}, nil
-}
-
-// lookupPieces checks the cache once per piece and reports which pieces still
-// need a query. It is the only place a multi-piece read counts cache hits.
-func (s *Store) lookupPieces(table uint32, pieces []piece, start, end int64) ([][][]byte, []int) {
-	cached := make([][][]byte, len(pieces))
-	var need []int
-	for i, p := range pieces {
-		if parts, ok := s.blocks.pieceParts(table, p, start, end); ok {
-			cached[i] = parts
-		} else {
-			need = append(need, i)
-		}
-	}
-	return cached, need
 }
 
 // readWorkers reserves one guard connection per in-flight read and shares the
@@ -1134,7 +1103,7 @@ func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema stri
 						return false
 					}
 				}
-				if err := streamRows(gctx, q, schema, pieces[i], start, end, s.blocks.fill(table, pieces[i]), send); err != nil {
+				if err := streamRows(gctx, q, schema, pieces[i], start, end, send); err != nil {
 					return err
 				}
 				close(ch)
@@ -1231,12 +1200,12 @@ func getRangeSQL(schema string) string {
 WHERE c.file_id = $1 AND c.no >= $2 AND c.no <= $3`
 }
 
-func streamRows(ctx context.Context, q querier, schema string, p piece, start, end int64, fill *blockFill, send func(result) bool) error {
+func streamRows(ctx context.Context, q querier, schema string, p piece, start, end int64, send func(result) bool) error {
 	rows, err := q.Query(ctx, getRangeSQL(schema), p.fileID, p.lo, p.hi)
 	if err != nil {
 		return err
 	}
-	r := newChunkRowReader(rows, p, start, end, fill)
+	r := newChunkRowReader(rows, p, start, end)
 	defer r.close()
 	for {
 		res, err := r.nextChunk()
@@ -1412,14 +1381,13 @@ type chunkRowReader struct {
 	pending   []byte
 	decomp    []byte
 	decompPtr *[]byte
-	fill      *blockFill
 }
 
-func newChunkRowReader(rows pgx.Rows, p piece, start, end int64, fill *blockFill) *chunkRowReader {
+func newChunkRowReader(rows pgx.Rows, p piece, start, end int64) *chunkRowReader {
 	scratch := decompPool.Get().(*[]byte)
 	return &chunkRowReader{
 		rows: rows, piece: p, spanStart: start, spanEnd: end,
-		nextNo: p.lo, decomp: *scratch, decompPtr: scratch, fill: fill,
+		nextNo: p.lo, decomp: *scratch, decompPtr: scratch,
 	}
 }
 
@@ -1501,20 +1469,6 @@ func (r *chunkRowReader) nextChunk() (result, error) {
 			}
 			putChunkBuf(out)
 			return result{}, err
-		}
-		blockBuf, inBlock := r.fill.add(no, data)
-		if inBlock {
-			if blockBuf != nil {
-				clipped := clipBlock(r.piece.base, no/blockRows, blockBuf, r.spanStart, r.spanEnd)
-				if len(clipped) > 0 {
-					if len(out) > 0 {
-						r.pending = clipped
-						return result{b: out, shared: false}, nil
-					}
-					return result{b: clipped, shared: true}, nil
-				}
-			}
-			continue
 		}
 		if out == nil {
 			if capHint >= chunkSize {

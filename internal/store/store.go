@@ -64,7 +64,6 @@ type Store struct {
 	// always keep part of the main pool free.
 	writeGate chan struct{}
 
-	blocks             *blockCache
 	forceSnapshotReads bool
 	pinnedReads        atomic.Int64
 	snapshotReads      atomic.Int64
@@ -88,9 +87,6 @@ type OpenOptions struct {
 	MaxConnLifetimeJitter time.Duration
 	MinIdleConns          int32
 	Tracer                pgx.QueryTracer
-	// ReadCacheBytes bounds the gateway-local cache of immutable chunk blocks
-	// (0 disables it).
-	ReadCacheBytes int64
 }
 
 func defaultOpenOptions(maxConns int32) OpenOptions {
@@ -139,7 +135,6 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 	return &Store{
 		pool: pool, chunkPool: chunkPool, log: log,
 		jobRetention: DefaultJobRetention,
-		blocks:       newBlockCache(opts.ReadCacheBytes),
 		writeGate:    make(chan struct{}, max(int(cfg.MaxConns)/2, 1)),
 	}, nil
 }
@@ -439,7 +434,6 @@ func (s *Store) WriteMetrics(w io.Writer) {
 	fmt.Fprintf(w, "pgvs3_read_pinned_total %d\n", s.pinnedReads.Load())
 	fmt.Fprintf(w, "pgvs3_read_snapshot_total %d\n", s.snapshotReads.Load())
 	fmt.Fprintf(w, "pgvs3_reap_pinned_skips_total %d\n", s.reapPinnedSkips.Load())
-	s.blocks.writeMetrics(w)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	if live, dead, pendingBytes, oldest, err := s.PendingUploadStats(ctx); err == nil {
 		fmt.Fprintf(w, "pgvs3_pending_uploads_live %d\n", live)
@@ -782,10 +776,6 @@ func (s *Store) CreateBucket(ctx context.Context, name string) error {
 	return s.EnsureNamespace(ctx, ns.Bucket, name, nil, nil)
 }
 
-func (q Queue) Ensure(ctx context.Context, attrs map[string]any) error {
-	return q.s.EnsureNamespace(ctx, ns.Queue, q.name, nil, attrs)
-}
-
 func (s *Store) NamespaceExists(ctx context.Context, kind ns.Kind, name string) (bool, error) {
 	sc, err := nsSQLIdent(kind, name)
 	if err != nil {
@@ -849,9 +839,6 @@ func (s *Store) DropNamespace(ctx context.Context, kind ns.Kind, name string, fo
 	switch outcome {
 	case "deleted":
 		s.forget(ref)
-		if kind == ns.Cache || kind == ns.WriteBack {
-			s.invalidateChunkNS(name)
-		}
 		return BucketDeleted, nil
 	case "not_empty":
 		return BucketNotEmpty, nil
