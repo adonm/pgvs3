@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/s3client"
 	"github.com/adonm/pgvs3/internal/store"
 )
@@ -111,7 +110,7 @@ func NewS3Origin(cfg S3Config) (*S3Origin, error) {
 }
 
 func (o *S3Origin) BucketAllowed(bucket string) bool {
-	if !ns.ValidName(bucket) {
+	if !validBucketName(bucket) {
 		return false
 	}
 	if len(o.allowed) == 0 {
@@ -119,6 +118,20 @@ func (o *S3Origin) BucketAllowed(bucket string) bool {
 	}
 	_, ok := o.allowed[bucket]
 	return ok
+}
+
+func validBucketName(name string) bool {
+	if len(name) < 1 || len(name) > 58 || strings.Contains(name, "..") {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (i > 0 && (c == '.' || c == '_' || c == '-'))
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *S3Origin) newBucketClient(bucket string) (*s3client.Bucket, error) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,7 +18,6 @@ import (
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/adonm/pgvs3/internal/telemetry"
-	"github.com/adonm/pgvs3/internal/testutil"
 )
 
 func TestCRC64NVMEAgainstBitwise(t *testing.T) {
@@ -51,7 +51,7 @@ func TestCRC64NVMEAgainstBitwise(t *testing.T) {
 }
 
 func TestSpoolAdmissionMapsToRetryableSlowDown(t *testing.T) {
-	s := &Server{log: testutil.DiscardLogger()}
+	s := &Server{log: slog.New(slog.DiscardHandler)}
 	err := fmt.Errorf("spool: %w", objcache.ErrSpoolBusy)
 	ae, ok := s.apiError(err).(*APIError)
 	if !ok || ae.Status != http.StatusServiceUnavailable || ae.Code != "SlowDown" {
@@ -66,7 +66,7 @@ func TestSpoolAdmissionMapsToRetryableSlowDown(t *testing.T) {
 
 func TestServerAdmissionBoundsWaitsAndCancels(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s := New(nil, testutil.DiscardLogger(), false, 1, time.Second, nil)
+		s := New(nil, slog.New(slog.DiscardHandler), false, 1, time.Second, nil)
 		defer s.Close()
 		release, ok := s.acquire(t.Context())
 		if !ok {
@@ -139,7 +139,7 @@ func TestServerAdmissionBoundsWaitsAndCancels(t *testing.T) {
 		}
 	})
 	for _, canceled := range []bool{false, true} {
-		s := New(nil, testutil.DiscardLogger(), false, 1, 0, nil)
+		s := New(nil, slog.New(slog.DiscardHandler), false, 1, 0, nil)
 		ctx, cancel := context.WithCancel(t.Context())
 		release, _ := s.acquire(ctx)
 		if canceled {
@@ -323,7 +323,7 @@ func TestAWSEncode(t *testing.T) {
 
 func TestPresignedRequestRejected(t *testing.T) {
 	s := &Server{
-		log:     testutil.DiscardLogger(),
+		log:     slog.New(slog.DiscardHandler),
 		metrics: telemetry.NewRequestMetrics(),
 	}
 	for _, target := range []string{

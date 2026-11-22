@@ -1,9 +1,6 @@
 package syncx
 
-import (
-	"context"
-	"sync"
-)
+import "sync"
 
 // Result holds the outcome of a singleflight call.
 type Result struct {
@@ -51,53 +48,6 @@ func (g *Group) DoChan(key string, fn func() (any, error)) <-chan Result {
 		c.res.Val, c.res.Err = fn()
 	}()
 	return out
-}
-
-// ErrGroup runs goroutines with context cancellation and optional concurrency limit.
-type ErrGroup struct {
-	cancel  func()
-	wg      sync.WaitGroup
-	sem     chan struct{}
-	errOnce sync.Once
-	err     error
-}
-
-func WithContext(ctx context.Context) (*ErrGroup, context.Context) {
-	ctx, cancel := context.WithCancel(ctx)
-	return &ErrGroup{cancel: cancel}, ctx
-}
-
-func (g *ErrGroup) SetLimit(n int) {
-	if n > 0 {
-		g.sem = make(chan struct{}, n)
-	}
-}
-
-func (g *ErrGroup) Go(fn func() error) {
-	if g.sem != nil {
-		g.sem <- struct{}{}
-	}
-	g.wg.Go(func() {
-		if g.sem != nil {
-			defer func() { <-g.sem }()
-		}
-		if err := fn(); err != nil {
-			g.errOnce.Do(func() {
-				g.err = err
-				if g.cancel != nil {
-					g.cancel()
-				}
-			})
-		}
-	})
-}
-
-func (g *ErrGroup) Wait() error {
-	g.wg.Wait()
-	if g.cancel != nil {
-		g.cancel()
-	}
-	return g.err
 }
 
 // Weighted is a non-blocking weighted semaphore.

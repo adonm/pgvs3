@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -100,8 +99,15 @@ func awsEncode(s string, encodeSlash bool) string {
 }
 
 func validateBucketName(name string) error {
-	if !ns.ValidName(name) {
+	if len(name) < 1 || len(name) > 58 || strings.Contains(name, "..") {
 		return errInvalidBucketName()
+	}
+	for i := range len(name) {
+		c := name[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (i > 0 && (c == '.' || c == '_' || c == '-'))
+		if !ok {
+			return errInvalidBucketName()
+		}
 	}
 	return nil
 }
@@ -125,8 +131,6 @@ func (s *Server) apiError(err error) error {
 		return errPreconditionFailed()
 	case errors.Is(err, store.ErrNotFound):
 		return errNoSuchKey()
-	case errors.Is(err, ns.ErrInvalidName):
-		return errInvalidBucketName()
 	case errors.Is(err, store.ErrInvalidRange):
 		return errInvalidRange()
 	default:

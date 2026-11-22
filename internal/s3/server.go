@@ -9,12 +9,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/objcache"
-	"github.com/adonm/pgvs3/internal/reqguard"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/adonm/pgvs3/internal/telemetry"
 )
@@ -157,14 +157,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	if reqguard.Presigned(r.URL.Query()) {
-		writeError(rw, r, apiErr("InvalidRequest", reqguard.PresignRejection, http.StatusBadRequest), s.log)
+	if isPresigned(r.URL.Query()) {
+		writeError(rw, r, apiErr("InvalidRequest", "presigned URLs are not supported: pgvs3 does not authenticate requests and must run behind network-level access control", http.StatusBadRequest), s.log)
 		return
 	}
 	s.log.Debug("request", "method", r.Method, "host", r.Host, "path", r.URL.Path, "query", r.URL.RawQuery)
 	if err := s.serve(rw, r); err != nil {
 		s.fail(rw, r, err)
 	}
+}
+
+func isPresigned(q url.Values) bool {
+	var sigv4Alg, sigv4Cred, sigv4Sig, legKey, legSig bool
+	for k := range q {
+		switch {
+		case strings.EqualFold(k, "X-Amz-Algorithm"):
+			sigv4Alg = true
+		case strings.EqualFold(k, "X-Amz-Credential"):
+			sigv4Cred = true
+		case strings.EqualFold(k, "X-Amz-Signature"):
+			sigv4Sig = true
+		case strings.EqualFold(k, "AWSAccessKeyId"):
+			legKey = true
+		case strings.EqualFold(k, "Signature"):
+			legSig = true
+		}
+	}
+	return sigv4Sig || sigv4Alg || sigv4Cred || (legKey && legSig)
 }
 
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
