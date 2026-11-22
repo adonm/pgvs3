@@ -18,6 +18,7 @@ import (
 	"github.com/adonm/pgvs3/internal/gateway"
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/objcache"
+	"github.com/adonm/pgvs3/internal/s3client"
 	"github.com/adonm/pgvs3/internal/store"
 	"github.com/adonm/pgvs3/internal/telemetry"
 )
@@ -364,14 +365,12 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 		region = firstEnv("AWS_REGION", "AWS_DEFAULT_REGION")
 	}
 	origin, err := objcache.NewS3Origin(objcache.S3Config{
-		Endpoint:     cfg.originEndpoint,
-		Region:       region,
-		AccessKey:    os.Getenv("AWS_ACCESS_KEY_ID"),
-		SecretKey:    os.Getenv("AWS_SECRET_ACCESS_KEY"),
-		SessionToken: os.Getenv("AWS_SESSION_TOKEN"),
-		Insecure:     cfg.originInsecure,
-		PathStyle:    cfg.originPathStyle,
-		Buckets:      splitCSV(cfg.buckets),
+		Endpoint:  cfg.originEndpoint,
+		Region:    region,
+		Creds:     s3client.NewChainProvider(s3client.ChainConfig{Region: region}),
+		Insecure:  cfg.originInsecure,
+		PathStyle: cfg.originPathStyle,
+		Buckets:   splitCSV(cfg.buckets),
 	})
 	if err != nil {
 		log.Error("configuring s3 origin", "err", err)

@@ -44,6 +44,7 @@ type Config struct {
 	AccessKey    string
 	SecretKey    string
 	SessionToken string
+	Creds        CredentialsProvider
 
 	Insecure bool
 
@@ -60,6 +61,10 @@ type Bucket struct {
 
 type client struct {
 	signer       *signer
+	creds        CredentialsProvider
+	region       string
+	signerMu     sync.Mutex
+	dynSigner    *signer
 	bucket       string
 	prefix       string
 	scheme       string
@@ -130,6 +135,8 @@ func prepareClient(cfg Config) (*client, error) {
 	}
 	return &client{
 		signer:       s,
+		creds:        cfg.Creds,
+		region:       region,
 		bucket:       cfg.Bucket,
 		prefix:       normalizePrefix(cfg.Prefix),
 		scheme:       scheme,
@@ -237,6 +244,28 @@ func normalizePrefix(prefix string) string {
 	return strings.Trim(strings.TrimSpace(prefix), "/")
 }
 
+func (c *client) activeSigner(ctx context.Context) (*signer, error) {
+	if c.signer != nil {
+		return c.signer, nil
+	}
+	if c.creds == nil {
+		return nil, nil
+	}
+	cred, err := c.creds.Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if cred.AccessKey == "" {
+		return nil, nil
+	}
+	c.signerMu.Lock()
+	defer c.signerMu.Unlock()
+	if c.dynSigner == nil || c.dynSigner.accessKey != cred.AccessKey || c.dynSigner.secret != cred.SecretKey || c.dynSigner.token != cred.SessionToken {
+		c.dynSigner = newSigner(c.region, cred.AccessKey, cred.SecretKey, cred.SessionToken)
+	}
+	return c.dynSigner, nil
+}
+
 func (c *client) newRequest(ctx context.Context, method, object string, query url.Values, body io.Reader, size int64, extra ...[2]string) (*http.Request, error) {
 	if c == nil {
 		return nil, errors.New("s3: nil client")
@@ -263,16 +292,20 @@ func (c *client) newRequest(ctx context.Context, method, object string, query ur
 	for _, h := range extra {
 		req.Header.Set(h[0], h[1])
 	}
-	if c.signer != nil {
+	s, err := c.activeSigner(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s != nil {
 		var marker []byte
 		if body != nil {
 			marker = []byte{}
 		}
-		date, payloadHash, auth := c.signer.signRequest(nil, []byte(method), []byte(escaped), []byte(rawQuery), []byte(c.host), marker, extra...)
+		date, payloadHash, auth := s.signRequest(nil, []byte(method), []byte(escaped), []byte(rawQuery), []byte(c.host), marker, extra...)
 		req.Header.Set("X-Amz-Date", string(date))
 		req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-		if c.signer.token != "" {
-			req.Header.Set("X-Amz-Security-Token", c.signer.token)
+		if s.token != "" {
+			req.Header.Set("X-Amz-Security-Token", s.token)
 		}
 		req.Header.Set("Authorization", string(auth))
 	}

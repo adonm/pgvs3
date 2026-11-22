@@ -29,6 +29,7 @@ type S3Config struct {
 	AccessKey    string
 	SecretKey    string
 	SessionToken string
+	Creds        s3client.CredentialsProvider
 	Insecure     bool
 	PathStyle    bool
 	Buckets      []string
@@ -129,6 +130,7 @@ func (o *S3Origin) newBucketClient(bucket string) (*s3client.Bucket, error) {
 		AccessKey:    o.cfg.AccessKey,
 		SecretKey:    o.cfg.SecretKey,
 		SessionToken: o.cfg.SessionToken,
+		Creds:        o.cfg.Creds,
 		Insecure:     o.cfg.Insecure,
 		PathStyle:    o.cfg.PathStyle,
 		HTTPClient:   o.cfg.HTTPClient,
