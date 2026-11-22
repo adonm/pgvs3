@@ -459,6 +459,8 @@ var (
 	ErrPrecondition = errors.New("s3: precondition failed")
 
 	ErrConflict = errors.New("s3: conditional request conflict")
+
+	ErrWrongRegion = errors.New("s3: wrong region (bucket redirect)")
 )
 
 type Error struct {
@@ -502,9 +504,19 @@ func Precondition(err error) bool { return errors.Is(err, ErrPrecondition) }
 
 func Conflict(err error) bool { return errors.Is(err, ErrConflict) }
 
+func WrongRegion(err error) bool { return errors.Is(err, ErrWrongRegion) }
+
 func statusError(op, key string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	return bodyError(op, key, resp.StatusCode, body)
+	err := bodyError(op, key, resp.StatusCode, body)
+	if resp.StatusCode == http.StatusMovedPermanently {
+		if region := resp.Header.Get("x-amz-bucket-region"); region != "" {
+			if se, ok := errors.AsType[*Error](err); ok && se.Message == "" {
+				se.Message = fmt.Sprintf("bucket is in region %s", region)
+			}
+		}
+	}
+	return err
 }
 
 func bodyError(op, key string, status int, body []byte) error {
@@ -531,6 +543,8 @@ func classify(status int, code string) error {
 		return ErrPrecondition
 	case "ConditionalRequestConflict":
 		return ErrConflict
+	case "PermanentRedirect":
+		return ErrWrongRegion
 	}
 	switch status {
 	case http.StatusNotFound:
@@ -539,6 +553,8 @@ func classify(status int, code string) error {
 		return ErrPrecondition
 	case http.StatusConflict:
 		return ErrConflict
+	case http.StatusMovedPermanently:
+		return ErrWrongRegion
 	default:
 		return nil
 	}

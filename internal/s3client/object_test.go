@@ -92,3 +92,22 @@ func TestStatGetRangeAndProxy(t *testing.T) {
 		t.Fatalf("Proxy PUT = %d", resp.StatusCode)
 	}
 }
+
+func TestStatWrongRegionMapsToErrWrongRegion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-amz-bucket-region", "us-west-2")
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	defer srv.Close()
+
+	b, err := New(Config{Bucket: "bkt", Endpoint: srv.URL, Region: "us-east-1", PathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	_, err = b.Stat(context.Background(), "key.txt")
+	if !WrongRegion(err) || !strings.Contains(err.Error(), "us-west-2") {
+		t.Fatalf("Stat 301 err = %v, want WrongRegion mentioning us-west-2", err)
+	}
+}

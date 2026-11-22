@@ -17,6 +17,7 @@ import (
 
 var (
 	ErrOriginConflict   = errors.New("origin conditional request conflict")
+	ErrWrongRegion      = errors.New("origin bucket is in a different region")
 	ErrBucketNotAllowed = errors.New("bucket is not in --buckets allowlist")
 )
 
@@ -195,6 +196,8 @@ func mapOriginError(err error) error {
 		return ErrOriginConflict
 	case s3client.Precondition(err):
 		return store.ErrPrecondition
+	case s3client.WrongRegion(err):
+		return fmt.Errorf("%w: %w", ErrWrongRegion, err)
 	default:
 		return err
 	}
