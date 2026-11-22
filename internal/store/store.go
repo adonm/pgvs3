@@ -260,7 +260,7 @@ func (s *Store) OpenChunkStream(ctx context.Context, objectID int64, lo, hi int3
 	}
 	sr := &chunkStreamReader{
 		conn: conn, rows: rows,
-		expectIdx: lo, hiIdx: hi,
+		expectIdx: lo,
 		firstSkip: firstSkip, remaining: totalLen,
 	}
 	// Eagerly fetch first chunk so missing chunk 0 is detected before 200 OK headers are sent.
@@ -275,7 +275,6 @@ type chunkStreamReader struct {
 	conn      *pgxpool.Conn
 	rows      pgx.Rows
 	expectIdx int32
-	hiIdx     int32
 	firstSkip int64
 	remaining int64
 	buf       []byte

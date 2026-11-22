@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -59,19 +58,17 @@ type Bucket struct {
 }
 
 type client struct {
-	signer       *signer
-	creds        CredentialsProvider
-	region       string
-	signerMu     sync.Mutex
-	dynSigner    *signer
-	bucket       string
-	prefix       string
-	scheme       string
-	host         string
-	pathStyle    bool
-	http         *http.Client
-	maxSinglePut int64
-	minPartSize  int64
+	signer    *signer
+	creds     CredentialsProvider
+	region    string
+	signerMu  sync.Mutex
+	dynSigner *signer
+	bucket    string
+	prefix    string
+	scheme    string
+	host      string
+	pathStyle bool
+	http      *http.Client
 }
 
 func New(cfg Config) (*Bucket, error) {
@@ -91,11 +88,6 @@ func newClient(cfg Config) (*client, error) {
 		c.http = newHTTPClient(cfg.Insecure)
 	}
 	return c, nil
-}
-
-func ValidateConfig(cfg Config) error {
-	_, err := prepareClient(cfg)
-	return err
 }
 
 func prepareClient(cfg Config) (*client, error) {
@@ -133,17 +125,15 @@ func prepareClient(cfg Config) (*client, error) {
 		s = newSigner(region, cfg.AccessKey, cfg.SecretKey, cfg.SessionToken)
 	}
 	return &client{
-		signer:       s,
-		creds:        cfg.Creds,
-		region:       region,
-		bucket:       cfg.Bucket,
-		prefix:       normalizePrefix(cfg.Prefix),
-		scheme:       scheme,
-		host:         host,
-		pathStyle:    pathStyle,
-		http:         cfg.HTTPClient,
-		maxSinglePut: defaultMaxSinglePut,
-		minPartSize:  defaultMinPartSize,
+		signer:    s,
+		creds:     cfg.Creds,
+		region:    region,
+		bucket:    cfg.Bucket,
+		prefix:    normalizePrefix(cfg.Prefix),
+		scheme:    scheme,
+		host:      host,
+		pathStyle: pathStyle,
+		http:      cfg.HTTPClient,
 	}, nil
 }
 
@@ -159,12 +149,6 @@ func resolveEndpoint(cfg Config, region string) (scheme, host string, pathStyle 
 	pathStyle = cfg.PathStyle || strings.Contains(cfg.Bucket, ".")
 	return "https", host, pathStyle, nil
 }
-
-const (
-	defaultMaxSinglePut = 5 << 30
-
-	defaultMinPartSize = 8 << 20
-)
 
 func newHTTPClient(insecure bool) *http.Client {
 	return &http.Client{Transport: NewTransport(TransportOptions{
@@ -394,18 +378,6 @@ func awsEscape(s string) string {
 	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
 }
 
-func pickScheme(raw string, insecure bool) string {
-	if strings.Contains(raw, "://") {
-		if i := strings.Index(raw, "://"); i > 0 {
-			return strings.ToLower(raw[:i])
-		}
-	}
-	if insecure {
-		return "http"
-	}
-	return "https"
-}
-
 func parseEndpoint(raw string, insecure bool) (scheme, host string, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -430,7 +402,10 @@ func parseEndpoint(raw string, insecure bool) (scheme, host string, err error) {
 	}
 	scheme = u.Scheme
 	if scheme == "" {
-		scheme = pickScheme(raw, insecure)
+		scheme = "https"
+		if insecure {
+			scheme = "http"
+		}
 	}
 	return scheme, u.Host, nil
 }
@@ -524,16 +499,12 @@ func (e *Error) Error() string {
 func (e *Error) Unwrap() error { return e.Err }
 
 func NotFound(err error) bool {
-	return errors.Is(err, ErrNotFound) || errors.Is(err, fs.ErrNotExist)
+	return errors.Is(err, ErrNotFound)
 }
 
 func Precondition(err error) bool { return errors.Is(err, ErrPrecondition) }
 
 func Conflict(err error) bool { return errors.Is(err, ErrConflict) }
-
-func Unsupported(err error) bool { return errors.Is(err, ErrUnsupported) }
-
-func InvalidRange(err error) bool { return errors.Is(err, ErrInvalidRange) }
 
 func statusError(op, key string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -553,10 +524,7 @@ func bodyError(op, key string, status int, body []byte) error {
 			msg = msg[:256] + "..."
 		}
 	}
-	return &Error{
-		Op: op, Key: key, StatusCode: status, Code: parsed.Code,
-		Message: msg, Err: classify(status, parsed.Code),
-	}
+	return &Error{Op: op, Key: key, StatusCode: status, Code: parsed.Code, Message: msg, Err: classify(status, parsed.Code)}
 }
 
 func classify(status int, code string) error {

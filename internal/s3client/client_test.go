@@ -16,7 +16,6 @@
 package s3client
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -290,34 +289,6 @@ func TestSignerBodyAndToken(t *testing.T) {
 	nextDay := s.pickKey(time.Date(2026, 1, 3, 0, 0, 1, 0, time.UTC))
 	if string(first) == string(nextDay) {
 		t.Fatal("derived key did not change on the next day")
-	}
-}
-
-func TestPublicSignerMatchesFastPath(t *testing.T) {
-	previous := signTime
-	signTime = func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) }
-	defer func() { signTime = previous }()
-
-	const region, access, secret = "eu-west-1", "AKID", "SECRET"
-	req, err := http.NewRequest(http.MethodPut,
-		"https://bucket.example.com/bucket/key?a=1", bytes.NewReader(nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := NewSigner(region, access, secret, "").Sign(req, []byte{}); err != nil {
-		t.Fatal(err)
-	}
-	date, payload, auth := newSigner(region, access, secret, "").signRequest(nil,
-		[]byte(http.MethodPut), []byte("/bucket/key"), []byte("a=1"),
-		[]byte("bucket.example.com"), []byte{})
-	if got := req.Header.Get("X-Amz-Date"); got != string(date) {
-		t.Fatalf("date = %q, want %q", got, date)
-	}
-	if got := req.Header.Get("X-Amz-Content-Sha256"); got != payload {
-		t.Fatalf("payload hash = %q, want %q", got, payload)
-	}
-	if got := req.Header.Get("Authorization"); got != string(auth) {
-		t.Fatalf("authorization = %q, want %q", got, auth)
 	}
 }
 

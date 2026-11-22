@@ -20,8 +20,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
-	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -240,46 +238,3 @@ func (s *signer) sign(src, dst []byte, when time.Time) {
 	h.Write(inner)
 	hex.Encode(dst, h.Sum(sum[:0]))
 }
-
-type Signer struct {
-	impl *signer
-}
-
-func NewSigner(region, accessKey, secret, token string) *Signer {
-	return &Signer{impl: newSigner(region, accessKey, secret, token)}
-}
-
-func (s *Signer) Sign(req *http.Request, body []byte) error {
-	if s == nil || s.impl == nil {
-		return errors.New("s3client: nil signer")
-	}
-	if req == nil || req.URL == nil {
-		return errNilRequest
-	}
-	path := req.URL.EscapedPath()
-	if path == "" {
-		path = "/"
-	}
-	query := canonicalQuery(req.URL.Query())
-	req.URL.RawQuery = query
-	host := req.Host
-	if host == "" {
-		host = req.URL.Host
-	}
-	var marker []byte
-	if body != nil {
-		marker = []byte{}
-	}
-	date, payloadHash, auth := s.impl.signRequest(
-		nil, []byte(req.Method), []byte(path), []byte(query), []byte(host), marker,
-	)
-	req.Header.Set("X-Amz-Date", string(date))
-	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-	if s.impl.token != "" {
-		req.Header.Set("X-Amz-Security-Token", s.impl.token)
-	}
-	req.Header.Set("Authorization", string(auth))
-	return nil
-}
-
-var errNilRequest = errors.New("s3client: nil request")

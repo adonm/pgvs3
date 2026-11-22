@@ -17,38 +17,7 @@ import (
 
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
-	"github.com/adonm/pgvs3/internal/telemetry"
 )
-
-func TestCRC64NVMEAgainstBitwise(t *testing.T) {
-	bitwise := func(data []byte) uint64 {
-		crc := ^uint64(0)
-		for _, b := range data {
-			crc ^= uint64(b)
-			for range 8 {
-				if crc&1 != 0 {
-					crc = (crc >> 1) ^ 0x9a6c9329ac4bc9b5
-				} else {
-					crc >>= 1
-				}
-			}
-		}
-		return ^crc
-	}
-	for size := range 129 {
-		data := make([]byte, size)
-		for i := range data {
-			data[i] = byte(i*31 + size)
-		}
-		hasher := newCRC64NVME()
-		if _, err := hasher.Write(data); err != nil {
-			t.Fatal(err)
-		}
-		if got, want := hasher.Sum64(), bitwise(data); got != want {
-			t.Fatalf("size %d: got %016x, want %016x", size, got, want)
-		}
-	}
-}
 
 func TestSpoolAdmissionMapsToRetryableSlowDown(t *testing.T) {
 	s := &Server{log: slog.New(slog.DiscardHandler)}
@@ -302,29 +271,10 @@ func TestSplitPathKeepsDoubleEncodedSlash(t *testing.T) {
 	}
 }
 
-func TestAWSEncode(t *testing.T) {
-	tests := []struct {
-		in          string
-		encodeSlash bool
-		want        string
-	}{
-		{"abc-._~09AZ", true, "abc-._~09AZ"},
-		{"a b", true, "a%20b"},
-		{"a/b", true, "a%2Fb"},
-		{"a/b", false, "a/b"},
-		{"a+b", true, "a%2Bb"},
-	}
-	for _, tt := range tests {
-		if got := awsEncode(tt.in, tt.encodeSlash); got != tt.want {
-			t.Errorf("awsEncode(%q, %v) = %q, want %q", tt.in, tt.encodeSlash, got, tt.want)
-		}
-	}
-}
-
 func TestPresignedRequestRejected(t *testing.T) {
 	s := &Server{
 		log:     slog.New(slog.DiscardHandler),
-		metrics: telemetry.NewRequestMetrics(),
+		metrics: &requestMetrics{},
 	}
 	for _, target := range []string{
 		"/bucket/key?X-Amz-Signature=abc",
@@ -493,16 +443,8 @@ func TestAwsChunkedContentEncodingWithoutStreaming(t *testing.T) {
 	}
 }
 
-func TestCRC64NVMEVector(t *testing.T) {
-	c := newCRC64NVME()
-	_, _ = c.Write([]byte("123456789"))
-	if got, want := c.Sum64(), uint64(0xAE8B14860A799888); got != want {
-		t.Fatalf("crc64nvme = %#x, want %#x", got, want)
-	}
-}
-
 func TestMetricsObserveAndWrite(t *testing.T) {
-	m := telemetry.NewRequestMetrics()
+	m := &requestMetrics{}
 	m.Observe("GET", 200, 3*time.Millisecond, 10)
 	m.Observe("GET", 200, 7*time.Millisecond, 20)
 	m.Observe("PUT", 403, 25*time.Millisecond, 0)
@@ -521,9 +463,6 @@ func TestMetricsObserveAndWrite(t *testing.T) {
 		`pgvs3_requests_total{method="PUT",code="403"} 1`,
 		"pgvs3_request_duration_seconds_count 3",
 		"pgvs3_response_bytes_total 30",
-		`pgvs3_request_duration_seconds_bucket{le="0.005"} 1`,
-		`pgvs3_request_duration_seconds_bucket{le="0.01"} 2`,
-		`pgvs3_request_duration_seconds_bucket{le="+Inf"} 3`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q:\n%s", want, body)
@@ -532,7 +471,7 @@ func TestMetricsObserveAndWrite(t *testing.T) {
 }
 
 func TestMetricsConcurrentObserve(t *testing.T) {
-	m := telemetry.NewRequestMetrics()
+	m := &requestMetrics{}
 	var wg sync.WaitGroup
 	for range 100 {
 		wg.Go(func() {

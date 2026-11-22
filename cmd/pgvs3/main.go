@@ -39,14 +39,6 @@ var commandTable = []command{
 	{name: "version", summary: "Print the binary version.", run: func([]string) int { fmt.Println(version); return 0 }},
 }
 
-// describeFlags, when set, receives each command's flags instead of running it.
-// The reference test uses it to generate docs/reference.md from the real flag sets.
-var describeFlags func(command string, fs *flag.FlagSet)
-
-var errDescribed = errors.New("flags described")
-
-// reportedFlagError marks a flag.Parse error whose output the flag package
-// already wrote, so callers do not print it twice.
 type reportedFlagError struct{ err error }
 
 func (e *reportedFlagError) Error() string { return e.err.Error() }
@@ -101,14 +93,6 @@ func selectCommand(args []string) (command, []string, bool) {
 	return command{}, args, false
 }
 
-func extractSubcommand(args []string) (string, []string) {
-	cmd, rest, ok := selectCommand(args)
-	if !ok {
-		return "", args
-	}
-	return cmd.name, rest
-}
-
 var booleanFlags = map[string]bool{
 	"read-only":         true,
 	"origin-path-style": true,
@@ -139,8 +123,6 @@ type serveConfig struct {
 	maxConns                int
 	httpReadTimeout         time.Duration
 	httpWriteTimeout        time.Duration
-	maxDBBytes              int64
-	reapGrace               time.Duration
 	readOnly                bool
 	logLevel                string
 	originEndpoint          string
@@ -150,7 +132,6 @@ type serveConfig struct {
 	buckets                 string
 	revalidateAfter         time.Duration
 	cacheRetention          time.Duration
-	cacheNamespace          string
 	fillConcurrency         int
 	rangeCacheChunk         int64
 	cacheMaxBytes           int64
@@ -175,8 +156,6 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.IntVar(&cfg.maxConns, "max-conns", 4096, "concurrent client connections before shedding load")
 	fs.DurationVar(&cfg.httpReadTimeout, "http-read-timeout", 30*time.Minute, "HTTP read deadline including request bodies (0 disables)")
 	fs.DurationVar(&cfg.httpWriteTimeout, "http-write-timeout", 30*time.Minute, "HTTP response write deadline (0 disables)")
-	fs.Int64Var(&cfg.maxDBBytes, "max-db-bytes", 0, "reject writes when pg_database_size exceeds this (0 = unlimited)")
-	fs.DurationVar(&cfg.reapGrace, "reap-grace", 10*time.Minute, "how long overwritten or deleted files stay readable before garbage collection")
 	fs.BoolVar(&cfg.readOnly, "read-only", false, "reject writes and skip DDL, reaping, and fills (for standbys)")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&cfg.originEndpoint, "origin-endpoint", "", "S3 origin endpoint URL (empty uses AWS S3 for --origin-region)")
@@ -186,16 +165,11 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.StringVar(&cfg.buckets, "buckets", "", "optional comma-separated bucket allowlist (empty allows all valid bucket names)")
 	fs.DurationVar(&cfg.revalidateAfter, "revalidate-after", 0, "origin revalidation interval (0 = immutable, never revalidate hits)")
 	fs.DurationVar(&cfg.cacheRetention, "cache-retention", 24*time.Hour, "evict cached objects after this idle period")
-	fs.StringVar(&cfg.cacheNamespace, "cache-namespace", "origin", "cache namespace for origin objects")
 	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
 	fs.Int64Var(&cfg.cacheMaxBytes, "cache-max-bytes", 0, "evict oldest cached objects when cache namespace exceeds this byte budget (0 disables)")
 	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown")
 	fs.DurationVar(&cfg.s3QueueWait, "s3-queue-wait", time.Second, "maximum S3 admission wait (0 rejects excess immediately)")
-	if describeFlags != nil {
-		describeFlags("serve", fs)
-		return cfg, errDescribed
-	}
 	if err := applyFlagEnv(fs, "PGVS3_"); err != nil {
 		return serveConfig{}, err
 	}
@@ -226,9 +200,6 @@ func parseServeConfig(args []string) (serveConfig, error) {
 func serve(args []string) int {
 	cfg, err := parseServeConfig(args)
 	if err != nil {
-		if errors.Is(err, errDescribed) {
-			return 0
-		}
 		if _, ok := errors.AsType[*reportedFlagError](err); ok {
 			return flagExitCode(err)
 		}
@@ -414,10 +385,6 @@ func withStore(name string, args []string, timeout time.Duration, checkLayout bo
 	if setup != nil {
 		setup(fs)
 	}
-	if describeFlags != nil {
-		describeFlags(name, fs)
-		return 0
-	}
 	if err := applyFlagEnv(fs, "PGVS3_"); err != nil {
 		return fail(err)
 	}
@@ -463,10 +430,6 @@ func stat(args []string) int {
 func health(args []string) int {
 	fs := flag.NewFlagSet("health", flag.ContinueOnError)
 	u := fs.String("url", env("PGVS3_HEALTH_URL", "http://127.0.0.1:8014/readyz"), "readiness URL")
-	if describeFlags != nil {
-		describeFlags("health", fs)
-		return 0
-	}
 	if err := fs.Parse(args); err != nil {
 		return flagExitCode(err)
 	}

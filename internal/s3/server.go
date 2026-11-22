@@ -16,7 +16,6 @@ import (
 
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
-	"github.com/adonm/pgvs3/internal/telemetry"
 )
 
 const ioChunk = 256 << 10
@@ -33,7 +32,7 @@ func putCopyBuf(b []byte) { copyBufPool.Put(&b) }
 type Server struct {
 	store       *store.Store
 	log         *slog.Logger
-	metrics     *telemetry.RequestMetrics
+	metrics     *requestMetrics
 	readOnly    bool
 	draining    atomic.Bool
 	tier        *objcache.Tier
@@ -60,7 +59,7 @@ func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, queueWai
 		queueSize = 2 * maxConc
 	}
 	return &Server{
-		store: st, log: log, metrics: telemetry.NewRequestMetrics(), readOnly: readOnly,
+		store: st, log: log, metrics: &requestMetrics{}, readOnly: readOnly,
 		tier:    tier,
 		sem:     make(chan struct{}, maxConc),
 		waiters: make(chan struct{}, queueSize), queueWait: queueWait,
@@ -266,11 +265,9 @@ func errMethodNotAllowed() *APIError {
 }
 
 func (s *Server) listBuckets(w http.ResponseWriter, _ *http.Request) error {
-	out := listAllMyBucketsResult{
-		Xmlns: s3Namespace,
-		Owner: ownerXML{ID: "pgvs3", DisplayName: "pgvs3"},
-	}
-	writeXML(w, http.StatusOK, out)
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>pgvs3</ID><DisplayName>pgvs3</DisplayName></Owner><Buckets/></ListAllMyBucketsResult>`)
 	return nil
 }
 
@@ -404,30 +401,22 @@ func apiErr(code, message string, status int) *APIError {
 	return &APIError{Code: code, Message: message, Status: status}
 }
 
-func errAccessDenied(msg string) *APIError {
-	return apiErr("AccessDenied", msg, http.StatusForbidden)
-}
-
+func errAccessDenied(msg string) *APIError { return apiErr("AccessDenied", msg, http.StatusForbidden) }
 func errNoSuchKey() *APIError {
 	return apiErr("NoSuchKey", "The specified key does not exist.", http.StatusNotFound)
 }
-
 func errNoSuchBucket() *APIError {
 	return apiErr("NoSuchBucket", "The specified bucket does not exist.", http.StatusNotFound)
 }
-
 func errInvalidBucketName() *APIError {
 	return apiErr("InvalidBucketName", "The specified bucket is not valid.", http.StatusBadRequest)
 }
-
 func errPreconditionFailed() *APIError {
 	return apiErr("PreconditionFailed", "At least one of the preconditions you specified did not hold.", http.StatusPreconditionFailed)
 }
-
 func errInvalidRange() *APIError {
 	return apiErr("InvalidRange", "The requested range is not satisfiable.", http.StatusRequestedRangeNotSatisfiable)
 }
-
 func errInvalidRequest(msg string) *APIError {
 	return apiErr("InvalidRequest", msg, http.StatusBadRequest)
 }

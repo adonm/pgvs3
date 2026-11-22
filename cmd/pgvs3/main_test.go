@@ -107,12 +107,10 @@ func TestParseServeConfigDefaults(t *testing.T) {
 		maxConns:                4096,
 		httpReadTimeout:         30 * time.Minute,
 		httpWriteTimeout:        30 * time.Minute,
-		reapGrace:               10 * time.Minute,
 		logLevel:                "info",
 		originRegion:            "us-east-1",
 		revalidateAfter:         0,
 		cacheRetention:          24 * time.Hour,
-		cacheNamespace:          "origin",
 		fillConcurrency:         8,
 		s3Concurrency:           32,
 		s3QueueWait:             time.Second,
@@ -126,15 +124,15 @@ func TestParseServeConfigFlags(t *testing.T) {
 	clearServeEnv(t)
 	cfg, err := parseServeConfig([]string{
 		"--url", "postgres://db/pgvs3", "--addr", "127.0.0.1:9000",
-		"--pool-max", "12", "--max-conns", "99", "--max-db-bytes", "1024",
+		"--pool-max", "12", "--max-conns", "99",
 		"--http-read-timeout", "10m", "--http-write-timeout", "20m",
 		"--db-work-mem", "32MB", "--db-statement-timeout", "2m",
 		"--db-lock-timeout", "2s", "--db-idle-tx-timeout", "30s",
 		"--db-max-conn-lifetime", "30m", "--db-max-conn-lifetime-jitter", "2m",
-		"--reap-grace", "2m", "--read-only", "--log-level", "warn",
+		"--read-only", "--log-level", "warn",
 		"--origin-endpoint", "http://127.0.0.1:9000", "--origin-region", "us-west-2",
 		"--origin-path-style", "--origin-insecure", "--buckets", "lake,edge",
-		"--revalidate-after", "30s", "--cache-retention", "1h", "--cache-namespace", "cache",
+		"--revalidate-after", "30s", "--cache-retention", "1h",
 		"--fill-concurrency", "3", "--range-cache-chunk", "4096",
 		"--cache-max-bytes", "1048576",
 		"--s3-concurrency", "7", "--s3-queue-wait", "75ms",
@@ -156,8 +154,6 @@ func TestParseServeConfigFlags(t *testing.T) {
 		maxConns:                99,
 		httpReadTimeout:         10 * time.Minute,
 		httpWriteTimeout:        20 * time.Minute,
-		maxDBBytes:              1024,
-		reapGrace:               2 * time.Minute,
 		readOnly:                true,
 		logLevel:                "warn",
 		originEndpoint:          "http://127.0.0.1:9000",
@@ -167,7 +163,6 @@ func TestParseServeConfigFlags(t *testing.T) {
 		buckets:                 "lake,edge",
 		revalidateAfter:         30 * time.Second,
 		cacheRetention:          time.Hour,
-		cacheNamespace:          "cache",
 		fillConcurrency:         3,
 		rangeCacheChunk:         4096,
 		cacheMaxBytes:           1048576,
@@ -176,41 +171,6 @@ func TestParseServeConfigFlags(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("config = %+v, want %+v", cfg, want)
-	}
-}
-
-func TestExtractSubcommand(t *testing.T) {
-	cases := []struct {
-		in       []string
-		wantCmd  string
-		wantRest []string
-	}{
-		{
-			in:       []string{"reap", "--all", "stat"},
-			wantCmd:  "reap",
-			wantRest: []string{"--all", "stat"},
-		},
-		{
-			in:       []string{"stat", "--json"},
-			wantCmd:  "stat",
-			wantRest: []string{"--json"},
-		},
-		{
-			in:       []string{"--url", "postgres://localhost/pgvs3", "serve", "--addr", "127.0.0.1:8014"},
-			wantCmd:  "serve",
-			wantRest: []string{"--url", "postgres://localhost/pgvs3", "--addr", "127.0.0.1:8014"},
-		},
-		{
-			in:       []string{"--addr", "127.0.0.1:8014"},
-			wantCmd:  "",
-			wantRest: []string{"--addr", "127.0.0.1:8014"},
-		},
-	}
-	for _, tc := range cases {
-		cmd, rest := extractSubcommand(tc.in)
-		if cmd != tc.wantCmd || !reflect.DeepEqual(rest, tc.wantRest) {
-			t.Fatalf("extractSubcommand(%v) = (%q, %v), want (%q, %v)", tc.in, cmd, rest, tc.wantCmd, tc.wantRest)
-		}
 	}
 }
 
@@ -223,8 +183,7 @@ func TestParseServeConfigRejectsInvalidLimits(t *testing.T) {
 		{"--s3-queue-wait", "-1s"},
 		{"--http-read-timeout", "-1s"},
 		{"--cache-max-bytes", "-1"},
-		{"--auto-bucket", "Bad Name"},
-		{"--s3-origin", "ftp://bucket"},
+		{"--revalidate-after", "-1s"},
 	} {
 		if _, err := parseServeConfig(args); err == nil {
 			t.Fatalf("parseServeConfig(%v) succeeded, want error", args)

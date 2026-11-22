@@ -2,7 +2,6 @@ package s3
 
 import (
 	"bufio"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -77,27 +76,6 @@ func splitPath(r *http.Request) (string, string, error) {
 	return bucket, key, nil
 }
 
-func awsEncode(s string, encodeSlash bool) string {
-	const hexChars = "0123456789ABCDEF"
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
-			c == '-', c == '.', c == '_', c == '~':
-			b.WriteByte(c)
-		case c == '/' && !encodeSlash:
-			b.WriteByte(c)
-		default:
-			b.WriteByte('%')
-			b.WriteByte(hexChars[c>>4])
-			b.WriteByte(hexChars[c&15])
-		}
-	}
-	return b.String()
-}
-
 func validateBucketName(name string) error {
 	if len(name) < 1 || len(name) > 58 || strings.Contains(name, "..") {
 		return errInvalidBucketName()
@@ -152,81 +130,6 @@ func readCondition(r *http.Request, etag string) error {
 	}
 	return err
 }
-
-var crc64NVMETables = func() [8][256]uint64 {
-	const poly = 0x9a6c9329ac4bc9b5
-	var tables [8][256]uint64
-	for i := range tables[0] {
-		crc := uint64(i)
-		for range 8 {
-			if crc&1 != 0 {
-				crc = (crc >> 1) ^ poly
-			} else {
-				crc >>= 1
-			}
-		}
-		tables[0][i] = crc
-	}
-	for k := 1; k < len(tables); k++ {
-		for i := range tables[k] {
-			crc := tables[k-1][i]
-			tables[k][i] = tables[0][byte(crc)] ^ (crc >> 8)
-		}
-	}
-	return tables
-}()
-
-type crc64NVME struct {
-	crc uint64
-}
-
-func newCRC64NVME() *crc64NVME { return &crc64NVME{crc: ^uint64(0)} }
-
-func (c *crc64NVME) Write(p []byte) (int, error) {
-	n := len(p)
-	crc := c.crc
-	t := &crc64NVMETables
-	for len(p) >= 32 {
-		crc ^= binary.LittleEndian.Uint64(p)
-		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
-			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
-		crc ^= binary.LittleEndian.Uint64(p[8:])
-		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
-			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
-		crc ^= binary.LittleEndian.Uint64(p[16:])
-		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
-			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
-		crc ^= binary.LittleEndian.Uint64(p[24:])
-		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
-			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
-		p = p[32:]
-	}
-	for len(p) >= 8 {
-		crc ^= binary.LittleEndian.Uint64(p)
-		crc = t[7][byte(crc)] ^ t[6][byte(crc>>8)] ^ t[5][byte(crc>>16)] ^ t[4][byte(crc>>24)] ^
-			t[3][byte(crc>>32)] ^ t[2][byte(crc>>40)] ^ t[1][byte(crc>>48)] ^ t[0][byte(crc>>56)]
-		p = p[8:]
-	}
-	for _, b := range p {
-		crc = crc64NVMETables[0][byte(crc)^b] ^ (crc >> 8)
-	}
-	c.crc = crc
-	return n, nil
-}
-
-func (c *crc64NVME) Sum64() uint64 { return c.crc ^ ^uint64(0) }
-
-func (c *crc64NVME) Sum(in []byte) []byte {
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], c.Sum64())
-	return append(in, b[:]...)
-}
-
-func (c *crc64NVME) Reset() { c.crc = ^uint64(0) }
-
-func (c *crc64NVME) Size() int { return 8 }
-
-func (c *crc64NVME) BlockSize() int { return 1 }
 
 var streamingPayloads = map[string]bool{
 	"STREAMING-UNSIGNED-PAYLOAD-TRAILER":               true,
