@@ -367,8 +367,10 @@ func (f *fakeS3Origin) handleListV2(w http.ResponseWriter, bucket string, q url.
 	_, _ = w.Write(buf.Bytes())
 }
 
-func openTestGateway(t *testing.T, dbURL, nsName, endpoint string, revalidateAfter time.Duration, maxBytes int64) (*store.Store, *s3.Server) {
+func openTestGateway(t *testing.T, dbURL, endpoint string, revalidateAfter time.Duration) (*store.Store, *s3.Server) {
 	t.Helper()
+	t.Setenv("AWS_ACCESS_KEY_ID", "TESTAK")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "TESTSK")
 	ctx := context.Background()
 	st, err := store.Open(ctx, dbURL, 16, nil)
 	if err != nil {
@@ -381,8 +383,7 @@ func openTestGateway(t *testing.T, dbURL, nsName, endpoint string, revalidateAft
 	origin, err := objcache.NewS3Origin(objcache.S3Config{
 		Endpoint:  endpoint,
 		Region:    "us-east-1",
-		AccessKey: "TESTAK",
-		SecretKey: "TESTSK",
+		Creds:     s3client.NewChainProvider(s3client.ChainConfig{Region: "us-east-1", IMDSDisabled: true}),
 		PathStyle: true,
 	})
 	if err != nil {
@@ -391,10 +392,7 @@ func openTestGateway(t *testing.T, dbURL, nsName, endpoint string, revalidateAft
 	rt := objcache.NewRuntime(objcache.RuntimeOptions{Fills: 8, SpoolDir: t.TempDir(), SpoolBytes: 64 << 20})
 	tier, err := objcache.New(nil, origin, st, rt, objcache.TierOptions{
 		TTL:        revalidateAfter,
-		Retention:  time.Hour,
-		MaxFills:   8,
 		RangeChunk: 64 << 10,
-		MaxBytes:   maxBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -428,13 +426,12 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	originSrv := httptest.NewServer(fake)
 	defer originSrv.Close()
 
-	nsName := fmt.Sprintf("itest-%d", time.Now().UnixNano())
-	stA, gwA := openTestGateway(t, dbURL, nsName, originSrv.URL, 0, 0)
+	stA, gwA := openTestGateway(t, dbURL, originSrv.URL, 0)
 	defer func() {
 		_, _ = stA.Evict(context.Background(), 0, 1)
 		_ = stA.Delete(context.Background(), "b1", "obj.bin")
 	}()
-	_, gwB := openTestGateway(t, dbURL, nsName, originSrv.URL, 0, 0)
+	_, gwB := openTestGateway(t, dbURL, originSrv.URL, 0)
 
 	// 1. Miss -> fill -> hit, ranges (suffix, open-ended), HEAD, 304/412/416.
 	payload := bytes.Repeat([]byte("0123456789abcdef"), 1024) // 16 KiB
@@ -557,7 +554,7 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	if rImm.Body.String() != "updated-via-A" {
 		t.Fatalf("immutable cache should not see direct origin change, got %q", rImm.Body.String())
 	}
-	_, gwTTL := openTestGateway(t, dbURL, nsName, originSrv.URL, time.Nanosecond, 0)
+	_, gwTTL := openTestGateway(t, dbURL, originSrv.URL, time.Nanosecond)
 	headsBefore := fake.count("HEAD", "b1", "obj.bin")
 	rTTL := doReq(t, gwTTL, http.MethodGet, "/b1/obj.bin", nil, nil)
 	if rTTL.Body.String() != "mutated-direct" {
@@ -567,7 +564,7 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 		t.Fatalf("stale GET issued %d HEADs, want 1", heads)
 	}
 	// HEAD-only revalidation persists refreshed metadata so subsequent HEAD within TTL is a hit.
-	_, gwTTL5s := openTestGateway(t, dbURL, nsName, originSrv.URL, 5*time.Second, 0)
+	_, gwTTL5s := openTestGateway(t, dbURL, originSrv.URL, 5*time.Second)
 	fake.putDirect("b1", "headonly.bin", []byte("v1"), "text/plain")
 	if r := doReq(t, gwTTL5s, http.MethodHead, "/b1/headonly.bin", nil, nil); r.Code != 200 {
 		t.Fatalf("cold HEAD = %d", r.Code)
@@ -582,7 +579,7 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 
 	// 5. Restart persistence: new gateway instance on same PG still hits with zero origin GETs.
 	beforeRestart := fake.count("GET", "b1", "obj.bin")
-	_, gwRestarted := openTestGateway(t, dbURL, nsName, originSrv.URL, 0, 0)
+	_, gwRestarted := openTestGateway(t, dbURL, originSrv.URL, 0)
 	rRestart := doReq(t, gwRestarted, http.MethodGet, "/b1/obj.bin", nil, nil)
 	if rRestart.Code != 200 || rRestart.Header().Get("X-Cache") != "HIT" || fake.count("GET", "b1", "obj.bin") != beforeRestart {
 		t.Fatalf("restart persistence failed: code=%d cache=%q gets=%d->%d",
@@ -611,8 +608,7 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	fake.setOutage(false)
 
 	// 8. Eviction honours budget.
-	evictNS := fmt.Sprintf("evict-%d", time.Now().UnixNano())
-	stEv, gwEv := openTestGateway(t, dbURL, evictNS, originSrv.URL, 0, 5000)
+	stEv, gwEv := openTestGateway(t, dbURL, originSrv.URL, 0)
 	fake.putDirect("evb", "big1.bin", bytes.Repeat([]byte("a"), 4000), "application/octet-stream")
 	fake.putDirect("evb", "big2.bin", bytes.Repeat([]byte("b"), 4000), "application/octet-stream")
 	_ = doReq(t, gwEv, http.MethodGet, "/evb/big1.bin", nil, nil)

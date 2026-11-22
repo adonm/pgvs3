@@ -12,7 +12,6 @@ import (
 
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func metadataHeader(pairs []string) http.Header {
@@ -93,10 +92,6 @@ func validateBucketName(name string) error {
 func (s *Server) apiError(err error) error {
 	if ae, ok := errors.AsType[*APIError](err); ok {
 		return ae
-	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "objects_bucket_fkey" {
-		return errNoSuchBucket()
 	}
 	switch {
 	case errors.Is(err, objcache.ErrSpoolBusy):

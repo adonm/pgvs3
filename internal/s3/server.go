@@ -30,22 +30,19 @@ func copyBuf() []byte { return *(copyBufPool.Get().(*[]byte)) }
 func putCopyBuf(b []byte) { copyBufPool.Put(&b) }
 
 type Server struct {
-	store       *store.Store
-	log         *slog.Logger
-	metrics     *requestMetrics
-	readOnly    bool
-	draining    atomic.Bool
-	tier        *objcache.Tier
-	metricsHook func(io.Writer)
-	sem         chan struct{}
-	waiters     chan struct{}
-	queueWait   time.Duration
-	queued      atomic.Uint64
-	rejected    atomic.Uint64
-	waitNanos   atomic.Uint64
+	store     *store.Store
+	log       *slog.Logger
+	metrics   *requestMetrics
+	readOnly  bool
+	draining  atomic.Bool
+	tier      *objcache.Tier
+	sem       chan struct{}
+	waiters   chan struct{}
+	queueWait time.Duration
+	queued    atomic.Uint64
+	rejected  atomic.Uint64
+	waitNanos atomic.Uint64
 }
-
-func (s *Server) SetMetricsHook(f func(io.Writer)) { s.metricsHook = f }
 
 func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, queueWait time.Duration, tier *objcache.Tier) *Server {
 	if maxConc <= 0 {
@@ -138,9 +135,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/metrics" {
 		s.writeMetrics(w, s.store)
-		if s.metricsHook != nil {
-			s.metricsHook(w)
-		}
 		return
 	}
 	defer func() { s.metrics.Observe(r.Method, rw.status, time.Since(start), rw.n) }()

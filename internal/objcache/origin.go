@@ -21,46 +21,19 @@ var (
 )
 
 type S3Config struct {
-	Endpoint     string
-	Region       string
-	AccessKey    string
-	SecretKey    string
-	SessionToken string
-	Creds        s3client.CredentialsProvider
-	Insecure     bool
-	PathStyle    bool
-	Buckets      []string
-	HTTPClient   *http.Client
-}
-
-type originAttrs struct {
-	Key             string
-	Size            int64
-	ETag            string
-	LastModified    time.Time
-	ContentType     string
-	ContentEncoding string
-	UserMetadata    []string
-}
-
-func (a originAttrs) objectMeta(bucket, key string) store.ObjectMeta {
-	return store.ObjectMeta{
-		Bucket:          bucket,
-		Key:             key,
-		ETag:            a.ETag,
-		Size:            a.Size,
-		ContentType:     a.ContentType,
-		ContentEncoding: a.ContentEncoding,
-		LastModified:    a.LastModified,
-		UserMeta:        a.UserMetadata,
-	}
+	Endpoint   string
+	Region     string
+	Creds      s3client.CredentialsProvider
+	Insecure   bool
+	PathStyle  bool
+	Buckets    []string
+	HTTPClient *http.Client
 }
 
 type originHandle interface {
 	BucketAllowed(bucket string) bool
-	Attributes(ctx context.Context, bucket, key string) (originAttrs, error)
-	AttributesIfNoneMatch(ctx context.Context, bucket, key, ifNoneMatch string) (originAttrs, bool, error)
-	GetWithAttrs(ctx context.Context, bucket, key string) (io.ReadCloser, originAttrs, error)
+	Attributes(ctx context.Context, bucket, key string) (store.ObjectMeta, error)
+	AttributesIfNoneMatch(ctx context.Context, bucket, key, ifNoneMatch string) (store.ObjectMeta, bool, error)
 	GetRange(ctx context.Context, bucket, key string, offset, length int64, ifMatch string) (io.ReadCloser, error)
 	Proxy(ctx context.Context, bucket, key, method string, query url.Values, body io.Reader, size int64, extra ...[2]string) (*http.Response, error)
 	Close() error
@@ -74,12 +47,6 @@ type S3Origin struct {
 }
 
 func NewS3Origin(cfg S3Config) (*S3Origin, error) {
-	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
-		return nil, errors.New("s3 origin: access key and secret key must both be set or both be empty")
-	}
-	if cfg.AccessKey == "" && cfg.SessionToken != "" {
-		return nil, errors.New("s3 origin: session token requires access key and secret key")
-	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{
 			Transport: s3client.NewTransport(s3client.TransportOptions{
@@ -134,16 +101,13 @@ func validBucketName(name string) bool {
 
 func (o *S3Origin) newBucketClient(bucket string) (*s3client.Bucket, error) {
 	return s3client.New(s3client.Config{
-		Bucket:       bucket,
-		Endpoint:     o.cfg.Endpoint,
-		Region:       o.cfg.Region,
-		AccessKey:    o.cfg.AccessKey,
-		SecretKey:    o.cfg.SecretKey,
-		SessionToken: o.cfg.SessionToken,
-		Creds:        o.cfg.Creds,
-		Insecure:     o.cfg.Insecure,
-		PathStyle:    o.cfg.PathStyle,
-		HTTPClient:   o.cfg.HTTPClient,
+		Bucket:     bucket,
+		Endpoint:   o.cfg.Endpoint,
+		Region:     o.cfg.Region,
+		Creds:      o.cfg.Creds,
+		Insecure:   o.cfg.Insecure,
+		PathStyle:  o.cfg.PathStyle,
+		HTTPClient: o.cfg.HTTPClient,
 	})
 }
 
@@ -167,36 +131,24 @@ func (o *S3Origin) bucket(name string) (*s3client.Bucket, error) {
 	return b, nil
 }
 
-func (o *S3Origin) Attributes(ctx context.Context, bucket, key string) (originAttrs, error) {
+func (o *S3Origin) Attributes(ctx context.Context, bucket, key string) (store.ObjectMeta, error) {
 	attrs, _, err := o.AttributesIfNoneMatch(ctx, bucket, key, "")
 	return attrs, err
 }
 
-func (o *S3Origin) AttributesIfNoneMatch(ctx context.Context, bucket, key, ifNoneMatch string) (originAttrs, bool, error) {
+func (o *S3Origin) AttributesIfNoneMatch(ctx context.Context, bucket, key, ifNoneMatch string) (store.ObjectMeta, bool, error) {
 	b, err := o.bucket(bucket)
 	if err != nil {
-		return originAttrs{}, false, err
+		return store.ObjectMeta{}, false, err
 	}
 	meta, notModified, err := b.StatIfNoneMatch(ctx, key, ifNoneMatch)
 	if err != nil {
-		return originAttrs{}, false, mapOriginError(err)
+		return store.ObjectMeta{}, false, mapOriginError(err)
 	}
 	if notModified {
-		return originAttrs{}, true, nil
+		return store.ObjectMeta{}, true, nil
 	}
-	return attrsFromS3(meta, key), false, nil
-}
-
-func (o *S3Origin) GetWithAttrs(ctx context.Context, bucket, key string) (io.ReadCloser, originAttrs, error) {
-	b, err := o.bucket(bucket)
-	if err != nil {
-		return nil, originAttrs{}, err
-	}
-	rc, info, err := b.GetWithInfo(ctx, key, 0, -1, "")
-	if err != nil {
-		return nil, originAttrs{}, mapOriginError(err)
-	}
-	return rc, attrsFromS3(info, key), nil
+	return attrsFromS3(meta, bucket, key), false, nil
 }
 
 func (o *S3Origin) GetRange(ctx context.Context, bucket, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
@@ -226,15 +178,16 @@ func (o *S3Origin) Close() error {
 	return nil
 }
 
-func attrsFromS3(meta s3client.ObjectInfo, key string) originAttrs {
-	return originAttrs{
+func attrsFromS3(meta s3client.ObjectInfo, bucket, key string) store.ObjectMeta {
+	return store.ObjectMeta{
+		Bucket:          bucket,
 		Key:             key,
 		Size:            meta.Size,
 		ETag:            strings.Trim(meta.ETag, `"`),
 		LastModified:    meta.LastModified.UTC(),
 		ContentType:     meta.ContentType,
 		ContentEncoding: meta.ContentEncoding,
-		UserMetadata:    meta.UserMetadata,
+		UserMeta:        meta.UserMetadata,
 	}
 }
 

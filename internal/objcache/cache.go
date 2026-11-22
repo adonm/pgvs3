@@ -61,10 +61,7 @@ func (r *Runtime) WriteMetrics(w io.Writer) {
 
 type TierOptions struct {
 	TTL        time.Duration
-	Retention  time.Duration
-	MaxFills   int
 	RangeChunk int64
-	MaxBytes   int64
 	ReadOnly   bool
 }
 
@@ -73,11 +70,8 @@ type Tier struct {
 	store     *store.Store
 	runtime   *Runtime
 	ttl       time.Duration
-	retention time.Duration
 	chunkSize int64
-	maxBytes  int64
 	readOnly  bool
-	fills     chan struct{}
 	group     syncx.Group
 	log       *slog.Logger
 	ctx       context.Context
@@ -109,12 +103,6 @@ func New(log *slog.Logger, origin originHandle, st *store.Store, runtime *Runtim
 	if opts.TTL < 0 {
 		opts.TTL = 0
 	}
-	if opts.Retention <= 0 {
-		opts.Retention = 24 * time.Hour
-	}
-	if opts.MaxFills <= 0 {
-		opts.MaxFills = 8
-	}
 	cs := opts.RangeChunk
 	if cs <= 0 {
 		cs = defaultChunkSize
@@ -127,11 +115,8 @@ func New(log *slog.Logger, origin originHandle, st *store.Store, runtime *Runtim
 		store:     st,
 		runtime:   runtime,
 		ttl:       opts.TTL,
-		retention: opts.Retention,
 		chunkSize: cs,
-		maxBytes:  max(opts.MaxBytes, 0),
 		readOnly:  opts.ReadOnly,
-		fills:     make(chan struct{}, opts.MaxFills),
 		log:       log,
 		ctx:       ctx,
 		cancel:    cancel,
@@ -205,15 +190,14 @@ func (t *Tier) resolveMeta(ctx context.Context, bucket, key string, m *store.Obj
 	if attrs.ContentType == "" {
 		attrs.ContentType = contentTypeFor(key)
 	}
-	fresh := attrs.objectMeta(bucket, key)
 	if !t.readOnly {
-		id, uerr := t.store.UpsertObject(ctx, fresh)
+		id, uerr := t.store.UpsertObject(ctx, attrs)
 		if uerr != nil {
 			return nil, false, false, uerr
 		}
-		fresh.ID = id
+		attrs.ID = id
 	}
-	return &fresh, false, true, nil
+	return &attrs, false, true, nil
 }
 
 func (t *Tier) Head(ctx context.Context, bucket, key string) (*store.ReadResult, error) {
@@ -381,9 +365,9 @@ func (t *Tier) chunkLen(size int64, idx int32) int64 {
 	return min(t.chunkSize, size-off)
 }
 
-func (t *Tier) headOrigin(ctx context.Context, bucket, key, ifNoneMatch string) (originAttrs, bool, error) {
+func (t *Tier) headOrigin(ctx context.Context, bucket, key, ifNoneMatch string) (store.ObjectMeta, bool, error) {
 	type headRes struct {
-		attrs       originAttrs
+		attrs       store.ObjectMeta
 		notModified bool
 	}
 	ch := t.group.DoChan("head:"+bucket+"/"+key+":"+ifNoneMatch, func() (any, error) {
@@ -398,12 +382,12 @@ func (t *Tier) headOrigin(ctx context.Context, bucket, key, ifNoneMatch string) 
 	select {
 	case res := <-ch:
 		if res.Err != nil {
-			return originAttrs{}, false, res.Err
+			return store.ObjectMeta{}, false, res.Err
 		}
 		hr := res.Val.(headRes)
 		return hr.attrs, hr.notModified, nil
 	case <-ctx.Done():
-		return originAttrs{}, false, ctx.Err()
+		return store.ObjectMeta{}, false, ctx.Err()
 	}
 }
 
@@ -441,10 +425,6 @@ func (t *Tier) fillChunkRun(ctx context.Context, m *store.ObjectMeta, firstIdx, 
 			return nil, fctx.Err()
 		}
 		defer func() { <-t.runtime.fills }()
-		if !acquireSem(t.fills, fctx) {
-			return nil, fctx.Err()
-		}
-		defer func() { <-t.fills }()
 
 		rc, err := t.origin.GetRange(fctx, m.Bucket, m.Key, firstOff, totalLen, m.ETag)
 		if err != nil {

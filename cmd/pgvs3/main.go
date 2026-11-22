@@ -323,10 +323,7 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 	}
 	tier, err := objcache.New(log, origin, st, runtime, objcache.TierOptions{
 		TTL:        cfg.revalidateAfter,
-		Retention:  cfg.cacheRetention,
-		MaxFills:   cfg.fillConcurrency,
 		RangeChunk: cfg.rangeCacheChunk,
-		MaxBytes:   cfg.cacheMaxBytes,
 		ReadOnly:   cfg.readOnly,
 	})
 	if err != nil {

@@ -459,10 +459,6 @@ var (
 	ErrPrecondition = errors.New("s3: precondition failed")
 
 	ErrConflict = errors.New("s3: conditional request conflict")
-
-	ErrUnsupported = errors.New("s3: operation unsupported by origin")
-
-	ErrInvalidRange = errors.New("s3: invalid range")
 )
 
 type Error struct {
@@ -535,10 +531,6 @@ func classify(status int, code string) error {
 		return ErrPrecondition
 	case "ConditionalRequestConflict":
 		return ErrConflict
-	case "InvalidRange":
-		return ErrInvalidRange
-	case "NotImplemented", "UnsupportedOperation":
-		return ErrUnsupported
 	}
 	switch status {
 	case http.StatusNotFound:
@@ -547,10 +539,6 @@ func classify(status int, code string) error {
 		return ErrPrecondition
 	case http.StatusConflict:
 		return ErrConflict
-	case http.StatusRequestedRangeNotSatisfiable:
-		return ErrInvalidRange
-	case http.StatusNotImplemented:
-		return ErrUnsupported
 	default:
 		return nil
 	}
