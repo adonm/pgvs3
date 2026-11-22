@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/adonm/pgvs3/internal/ns"
+	"github.com/adonm/pgvs3/internal/syncx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"golang.org/x/sync/errgroup"
 )
 
 var ErrNotInteger = errors.New("value is not an integer or out of range")
@@ -403,7 +403,7 @@ func (c Cache) fetchFiles(ctx context.Context, files []*readManyFile) error {
 		return nil
 	}
 	workers := min(c.s.readWorkers(), len(files))
-	g, gctx := errgroup.WithContext(ctx)
+	g, gctx := syncx.WithContext(ctx)
 	for w := range workers {
 		var mine []*readManyFile
 		var ids []int64

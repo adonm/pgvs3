@@ -20,7 +20,6 @@ import (
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/s3client"
 	"github.com/adonm/pgvs3/internal/store"
-	"github.com/adonm/pgvs3/internal/telemetry"
 )
 
 var version = "dev"
@@ -238,12 +237,6 @@ func serve(args []string) int {
 		return 2
 	}
 	log := newLogger(cfg.logLevel)
-	shutdownTracing, err := setupTracing(log)
-	if err != nil {
-		log.Error("initializing tracing", "err", err)
-		return 1
-	}
-	defer shutdownTracing()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -274,18 +267,6 @@ func serve(args []string) int {
 	return runGateway(ctx, g, cfg, log)
 }
 
-func setupTracing(log *slog.Logger) (func(), error) {
-	shutdown, err := telemetry.Setup(context.Background(), version, log)
-	if err != nil {
-		return nil, err
-	}
-	return func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = shutdown(ctx)
-	}, nil
-}
-
 func storeOpenOptions(cfg serveConfig) store.OpenOptions {
 	return store.OpenOptions{
 		MaxConns:              int32(cfg.poolMax),
@@ -295,7 +276,6 @@ func storeOpenOptions(cfg serveConfig) store.OpenOptions {
 		IdleTxTimeout:         cfg.dbIdleTxTimeout,
 		MaxConnLifetime:       cfg.dbMaxConnLifetime,
 		MaxConnLifetimeJitter: cfg.dbMaxConnLifetimeJitter,
-		Tracer:                telemetry.PGXTracer{},
 	}
 }
 
@@ -415,7 +395,7 @@ func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, tier *obj
 }
 
 func serveHandler(g *gateway.Gateway, cfg serveConfig) http.Handler {
-	return telemetry.Middleware(g)
+	return g
 }
 
 func runGateway(ctx context.Context, g *gateway.Gateway, cfg serveConfig, log *slog.Logger) int {

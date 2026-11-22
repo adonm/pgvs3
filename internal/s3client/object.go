@@ -34,7 +34,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
+	"github.com/adonm/pgvs3/internal/syncx"
 )
 
 type ObjectInfo struct {
@@ -508,7 +508,7 @@ func (b *Bucket) putMultipartStream(ctx context.Context, key string, r io.Reader
 		}
 	}()
 	if partSize <= 16<<20 {
-		g, gctx := errgroup.WithContext(ctx)
+		g, gctx := syncx.WithContext(ctx)
 		g.SetLimit(4)
 		for number, remaining := int64(1), size; remaining > 0; number++ {
 			want := min(partSize, remaining)

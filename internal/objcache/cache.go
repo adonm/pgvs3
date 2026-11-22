@@ -20,9 +20,7 @@ import (
 
 	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/store"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
-	"golang.org/x/sync/singleflight"
+	"github.com/adonm/pgvs3/internal/syncx"
 )
 
 type Tier struct {
@@ -33,7 +31,7 @@ type Tier struct {
 	ttl       time.Duration
 	retention time.Duration
 	fills     chan struct{}
-	group     singleflight.Group
+	group     syncx.Group
 	log       *slog.Logger
 	readOnly  bool
 	workerID  string
@@ -43,6 +41,14 @@ type Tier struct {
 	cancel    context.CancelFunc
 	closeOnce sync.Once
 	fillTTL   time.Duration
+
+	hits              atomic.Uint64
+	misses            atomic.Uint64
+	hitBytes          atomic.Uint64
+	missBytes         atomic.Uint64
+	fillCount         atomic.Uint64
+	fillDurationNanos atomic.Uint64
+	originErrors      atomic.Uint64
 }
 
 const (
@@ -176,6 +182,9 @@ func (t *Tier) Name() string { return t.namespace }
 func (t *Tier) BucketAllowed(bucket string) bool { return t.origin.BucketAllowed(bucket) }
 
 func (t *Tier) WriteMetrics(w io.Writer) {
+	fmt.Fprintf(w, "pgvs3_cache_hits_total %d\npgvs3_cache_misses_total %d\npgvs3_cache_hit_bytes_total %d\npgvs3_cache_miss_bytes_total %d\npgvs3_cache_fill_duration_seconds_sum %.6f\npgvs3_cache_fill_duration_seconds_count %d\npgvs3_origin_errors_total %d\n",
+		t.hits.Load(), t.misses.Load(), t.hitBytes.Load(), t.missBytes.Load(),
+		float64(t.fillDurationNanos.Load())/float64(time.Second), t.fillCount.Load(), t.originErrors.Load())
 	if t.runtime != nil {
 		t.runtime.WriteMetrics(w)
 	}
@@ -449,6 +458,24 @@ func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 }
 
 func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange) (*Object, error) {
+	obj, err := t.open(ctx, bucket, key, rng)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) && !errors.Is(err, store.ErrInvalidRange) && !errors.Is(err, context.Canceled) {
+			t.originErrors.Add(1)
+		}
+		return nil, err
+	}
+	if obj.Hit {
+		t.hits.Add(1)
+		t.hitBytes.Add(uint64(obj.ContentLength()))
+	} else {
+		t.misses.Add(1)
+		t.missBytes.Add(uint64(obj.ContentLength()))
+	}
+	return obj, nil
+}
+
+func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange) (*Object, error) {
 	ck := t.key(bucket, key)
 	skipAttributes := !rng.Requested
 	res, err := t.resolveCache(ctx, bucket, key, ck, true, true, skipAttributes)
@@ -651,6 +678,11 @@ func (t *Tier) openRange(ctx context.Context, bucket, key, ck string, v readView
 }
 
 func (t *Tier) fillRangeRun(ctx context.Context, bucket, key, ck string, v readView, first, last int64) ([][]byte, error) {
+	start := time.Now()
+	defer func() {
+		t.fillCount.Add(1)
+		t.fillDurationNanos.Add(uint64(time.Since(start)))
+	}()
 	version := v.ETag
 	length := last + t.rangeChunkLen(v, last) - first
 	ch := t.group.DoChan(fmt.Sprintf("range:%s:%x:%x:%s", ck, first, length, version), func() (any, error) {
@@ -682,7 +714,7 @@ func (t *Tier) fillRangeRun(ctx context.Context, bucket, key, ck string, v readV
 			return nil, fmt.Errorf("origin range %s at %d: %w", key, first, err)
 		}
 		var chunks [][]byte
-		g, gctx := errgroup.WithContext(fillCtx)
+		g, gctx := syncx.WithContext(fillCtx)
 		g.SetLimit(4)
 		for off := first; off <= last; off += t.rangeSize {
 			chunk := buf[off-first : off-first+t.rangeChunkLen(v, off)]
@@ -835,6 +867,11 @@ func (t *Tier) renewFill(ctx context.Context, lease store.FillLease) (context.Co
 }
 
 func (t *Tier) fill(ctx context.Context, bucket, key, ck string) (*store.Meta, error) {
+	start := time.Now()
+	defer func() {
+		t.fillCount.Add(1)
+		t.fillDurationNanos.Add(uint64(time.Since(start)))
+	}()
 	return t.coalesceFill(ctx, ck, 10*time.Minute, func(fillCtx context.Context) (*store.Meta, error) {
 		rc, attrs, err := t.origin.GetWithAttrs(fillCtx, bucket, key)
 		if err != nil {
@@ -918,7 +955,7 @@ type spooled struct {
 }
 
 type spoolBudget struct {
-	sem      *semaphore.Weighted
+	sem      *syncx.Weighted
 	limit    int64
 	dir      string
 	used     atomic.Int64
@@ -927,7 +964,7 @@ type spoolBudget struct {
 }
 
 func newSpoolBudget(limit int64, dir string) *spoolBudget {
-	return &spoolBudget{sem: semaphore.NewWeighted(limit), limit: limit, dir: dir}
+	return &spoolBudget{sem: syncx.NewWeighted(limit), limit: limit, dir: dir}
 }
 
 func (r *Runtime) WriteMetrics(w io.Writer) {

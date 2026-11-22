@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/adonm/pgvs3/internal/ns"
+	"github.com/adonm/pgvs3/internal/syncx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/sync/errgroup"
 )
 
 type ObjectRef struct {
@@ -1057,7 +1057,7 @@ func (s *Store) streamWindow(ctx context.Context, out chan<- result, schema stri
 	for _, i := range need {
 		chans[i] = make(chan result, 2)
 	}
-	g, gctx := errgroup.WithContext(runCtx)
+	g, gctx := syncx.WithContext(runCtx)
 	if workers := min(s.readWorkers(), len(need)); workers > 0 {
 		guarded := make([]piece, len(need))
 		for j, i := range need {
