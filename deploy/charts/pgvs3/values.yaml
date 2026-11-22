@@ -18,15 +18,19 @@ s3Concurrency: 32
 fillConcurrency: 8
 # Cache aligned ranges of large objects at this byte size (0 disables).
 rangeCacheChunk: 1048576
-# Evict oldest cached objects when a cache namespace exceeds this byte budget
-# (0 disables).
+# Origin S3 settings (empty endpoint uses AWS S3 for originRegion).
+originEndpoint: ""
+originRegion: "us-east-1"
+originPathStyle: false
+originInsecure: false
+# Optional comma-separated bucket allowlist (empty allows any valid bucket).
+buckets: ""
+# Freshness: 0 = immutable (zero origin calls on cache hit); e.g. "5m" for conditional HEAD revalidation.
+revalidateAfter: "0"
+# Evict cached objects after this idle period.
+cacheRetention: "24h"
+# Evict oldest cached objects when cache exceeds this byte budget (0 disables).
 cacheMaxBytes: 0
-# Acknowledge large unconditional cache writes after the logged write-back
-# commit; the origin upload follows. Conditional writes stay synchronous.
-cacheWriteBack: true
-# Gateway-local memory for hot immutable chunk blocks (0 disables). Count it
-# inside gomemlimit; PostgreSQL stays the shared cache across replicas.
-readCacheBytes: 0
 # Spread stateless gateway replicas across zones.
 topologySpread:
   enabled: true

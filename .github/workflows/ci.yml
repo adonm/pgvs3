@@ -9,25 +9,27 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pgvs3_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      PGVS3_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/pgvs3_test?sslmode=disable
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
       - run: mise install
-      - run: mise exec -- just docs
       - run: mise exec -- just ci
-      - name: Upload verification logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: verification-logs
-          path: |
-            .tmp/verify/**/*.log
-            .tmp/verify/**/analytics.json
-            .tmp/verify/**/replication.json
-            .tmp/verify/**/guides.json
-            .tmp/verify/**/canary/**
-          include-hidden-files: true
 
   publish:
     runs-on: ubuntu-latest
@@ -61,8 +63,6 @@ jobs:
             tags="latest,${ver}"
           fi
           mise exec helm -- helm lint deploy/charts/pgvs3
-          # Main builds publish only container tags. Validate and package a
-          # release chart before building an image; push it only after success.
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             mkdir -p .tmp/pgvs3
             mise exec helm -- helm package deploy/charts/pgvs3 \
@@ -73,16 +73,6 @@ jobs:
             --tags "${tags}" \
             --ldflags "-s -w -X main.version=${ver}" \
             ./cmd/pgvs3
-          # amd64 Hardcharger/ChargeWire compute image from the pinned official base.
-          duckdb_image="ghcr.io/${GITHUB_REPOSITORY}-duckdb:2.0.0"
-          mise exec python -- python deploy/duckdb/fetch_artifacts.py
-          docker build --platform linux/amd64 -t "${duckdb_image}" deploy/duckdb
-          mise exec python -- python deploy/duckdb/image_tools.py check "${duckdb_image}"
-          docker tag "${duckdb_image}" "ghcr.io/${GITHUB_REPOSITORY}-duckdb:latest"
-          docker tag "${duckdb_image}" "ghcr.io/${GITHUB_REPOSITORY}-duckdb:${ver}"
-          docker push "${duckdb_image}"
-          docker push "ghcr.io/${GITHUB_REPOSITORY}-duckdb:latest"
-          docker push "ghcr.io/${GITHUB_REPOSITORY}-duckdb:${ver}"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             mise exec helm -- helm push ".tmp/pgvs3/pgvs3-${semver}.tgz" "${CHART_REPO}"
             if gh release view "${ver}" >/dev/null 2>&1; then
@@ -92,32 +82,3 @@ jobs:
                 --title "${ver}" --generate-notes --verify-tag
             fi
           fi
-
-  pages:
-    runs-on: ubuntu-latest
-    needs: check
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    concurrency:
-      group: pages
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-      - run: mise install
-      - run: mise exec -- just docs
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v6
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: docs/_site
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5

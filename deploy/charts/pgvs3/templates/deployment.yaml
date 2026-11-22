@@ -59,8 +59,13 @@ spec:
             - { name: PGVS3_FILL_CONCURRENCY, value: {{ .Values.fillConcurrency | quote }} }
             - { name: PGVS3_RANGE_CACHE_CHUNK, value: {{ .Values.rangeCacheChunk | int64 | quote }} }
             - { name: PGVS3_CACHE_MAX_BYTES, value: {{ .Values.cacheMaxBytes | int64 | quote }} }
-            - { name: PGVS3_CACHE_WRITE_BACK, value: {{ .Values.cacheWriteBack | quote }} }
-            - { name: PGVS3_READ_CACHE_BYTES, value: {{ .Values.readCacheBytes | int64 | quote }} }
+            - { name: PGVS3_ORIGIN_ENDPOINT, value: {{ .Values.originEndpoint | quote }} }
+            - { name: PGVS3_ORIGIN_REGION, value: {{ .Values.originRegion | quote }} }
+            - { name: PGVS3_ORIGIN_PATH_STYLE, value: {{ .Values.originPathStyle | quote }} }
+            - { name: PGVS3_ORIGIN_INSECURE, value: {{ .Values.originInsecure | quote }} }
+            - { name: PGVS3_BUCKETS, value: {{ .Values.buckets | quote }} }
+            - { name: PGVS3_REVALIDATE_AFTER, value: {{ .Values.revalidateAfter | quote }} }
+            - { name: PGVS3_CACHE_RETENTION, value: {{ .Values.cacheRetention | quote }} }
             - { name: GOMEMLIMIT, value: {{ .Values.gomemlimit | quote }} }
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
