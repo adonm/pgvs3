@@ -607,10 +607,66 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 		t.Fatal("expected cache eviction under budget")
 	}
 
-	// Verify /metrics includes cache counters.
+	// 9. Partial fills, concurrent coalesce, odd-tail multi-chunk, zero-byte object.
+	fake.putDirect("b1", "empty.bin", []byte{}, "application/octet-stream")
+	rz := doReq(t, gwA, http.MethodGet, "/b1/empty.bin", nil, nil)
+	if rz.Code != 200 || rz.Body.Len() != 0 {
+		t.Fatalf("zero-byte GET = %d len=%d", rz.Code, rz.Body.Len())
+	}
+	if rzr := doReq(t, gwA, http.MethodGet, "/b1/empty.bin", nil, map[string]string{"Range": "bytes=0-0"}); rzr.Code != 416 {
+		t.Fatalf("zero-byte range = %d, want 416", rzr.Code)
+	}
+
+	// 5 chunks of 64 KiB + 137 byte tail
+	odd := make([]byte, 5*(64<<10)+137)
+	for i := range odd {
+		odd[i] = byte(i * 31)
+	}
+	fake.putDirect("b1", "odd.bin", odd, "application/octet-stream")
+	// Fill chunk 0 and chunk 4 (non-contiguous), then read full object -> should only fetch missing chunks 1..3.
+	rP0 := doReq(t, gwA, http.MethodGet, "/b1/odd.bin", nil, map[string]string{"Range": "bytes=0-100"})
+	if rP0.Code != 206 || !bytes.Equal(rP0.Body.Bytes(), odd[:101]) {
+		t.Fatalf("partial chunk 0 = %d", rP0.Code)
+	}
+	rP4 := doReq(t, gwA, http.MethodGet, "/b1/odd.bin", nil, map[string]string{"Range": fmt.Sprintf("bytes=%d-", len(odd)-50)})
+	if rP4.Code != 206 || !bytes.Equal(rP4.Body.Bytes(), odd[len(odd)-50:]) {
+		t.Fatalf("partial tail = %d", rP4.Code)
+	}
+	getsBeforeFull := fake.count("GET", "b1", "odd.bin")
+	rFull := doReq(t, gwA, http.MethodGet, "/b1/odd.bin", nil, nil)
+	if rFull.Code != 200 || !bytes.Equal(rFull.Body.Bytes(), odd) {
+		t.Fatalf("full odd.bin = %d len=%d", rFull.Code, rFull.Body.Len())
+	}
+	if got := fake.count("GET", "b1", "odd.bin"); got != getsBeforeFull+1 {
+		t.Fatalf("expected 1 origin GET for contiguous missing chunks 1..3, got %d->%d", getsBeforeFull, got)
+	}
+	// Warm hit on full odd.bin -> zero origin GETs.
+	rFullHit := doReq(t, gwB, http.MethodGet, "/b1/odd.bin", nil, nil)
+	if rFullHit.Code != 200 || rFullHit.Header().Get("X-Cache") != "HIT" || fake.count("GET", "b1", "odd.bin") != getsBeforeFull+1 {
+		t.Fatalf("odd.bin warm hit failed")
+	}
+
+	// Concurrent fills of same key coalesce to 1 origin GET.
+	coalData := bytes.Repeat([]byte("coalesce"), 1024)
+	fake.putDirect("b1", "coal.bin", coalData, "application/octet-stream")
+	var cwg sync.WaitGroup
+	for range 16 {
+		cwg.Go(func() {
+			rc := doReq(t, gwA, http.MethodGet, "/b1/coal.bin", nil, nil)
+			if rc.Code != 200 || !bytes.Equal(rc.Body.Bytes(), coalData) {
+				t.Errorf("concurrent GET = %d len=%d", rc.Code, rc.Body.Len())
+			}
+		})
+	}
+	cwg.Wait()
+	if got := fake.count("GET", "b1", "coal.bin"); got != 1 {
+		t.Fatalf("concurrent coalesce origin GETs = %d, want 1", got)
+	}
+
+	// Verify /metrics includes cache counters and latency buckets.
 	rm := doReq(t, gwA, http.MethodGet, "/metrics", nil, nil)
-	if rm.Code != 200 || !strings.Contains(rm.Body.String(), "pgvs3_cache_hits_total") {
-		t.Fatalf("/metrics missing cache counters: %d", rm.Code)
+	if rm.Code != 200 || !strings.Contains(rm.Body.String(), "pgvs3_cache_hits_total") || !strings.Contains(rm.Body.String(), "pgvs3_request_duration_seconds_bucket") {
+		t.Fatalf("/metrics missing expected counters/buckets: %d", rm.Code)
 	}
 	_ = s3client.Config{}
 }

@@ -443,6 +443,21 @@ func (t *Tier) fillChunkRun(ctx context.Context, m *store.ObjectMeta, firstIdx, 
 	ch := t.group.DoChan(sfKey, func() (any, error) {
 		fctx, cancel := context.WithTimeout(t.ctx, 2*time.Minute)
 		defer cancel()
+		if existing, err := t.store.GetChunks(fctx, m.ID, firstIdx, lastIdx); err == nil {
+			allPresent := true
+			out := make([][]byte, 0, lastIdx-firstIdx+1)
+			for idx := firstIdx; idx <= lastIdx; idx++ {
+				c := existing[idx]
+				if c == nil || int64(len(c)) != t.chunkLen(m.Size, idx) {
+					allPresent = false
+					break
+				}
+				out = append(out, c)
+			}
+			if allPresent {
+				return out, nil
+			}
+		}
 		if !acquireSem(t.runtime.fills, fctx) {
 			return nil, fctx.Err()
 		}

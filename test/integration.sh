@@ -45,7 +45,7 @@ if [ -z "${PGVS3_TEST_DATABASE_URL:-}" ]; then
 fi
 
 echo "=== Tier 1: Go integration tests (in-process fake S3 + PostgreSQL 18) ==="
-mise exec go -- go test -tags=integration -v -count=1 ./internal/s3 -run TestReadThroughCacheIntegration
+mise exec go -- go test -tags=integration -p 1 -v -count=1 ./internal/store ./internal/s3
 
 echo "=== Tier 2: versitygw + two pgvs3 gateways + boto3/DuckDB smoke ==="
 BIN="$SCRATCH/pgvs3"

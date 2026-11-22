@@ -253,17 +253,17 @@ func (s *Store) OpenChunkStream(ctx context.Context, objectID int64, lo, hi int3
 	if err != nil {
 		return nil, err
 	}
-	rows, err := conn.Query(ctx, `SELECT idx, data FROM cache_chunks WHERE object_id = $1 AND idx BETWEEN $2 AND $3 ORDER BY idx`, objectID, lo, hi)
+	rows, err := conn.Query(ctx, `SELECT idx, data, count(*) OVER () FROM cache_chunks WHERE object_id = $1 AND idx BETWEEN $2 AND $3 ORDER BY idx`, objectID, lo, hi)
 	if err != nil {
 		conn.Release()
 		return nil, err
 	}
 	sr := &chunkStreamReader{
 		conn: conn, rows: rows,
-		expectIdx: lo,
+		expectIdx: lo, wantRows: int64(hi - lo + 1),
 		firstSkip: firstSkip, remaining: totalLen,
 	}
-	// Eagerly fetch first chunk so missing chunk 0 is detected before 200 OK headers are sent.
+	// Eagerly fetch first chunk so missing chunks are detected before 200 OK headers are sent.
 	if err := sr.fill(); err != nil {
 		_ = sr.Close()
 		return nil, err
@@ -275,6 +275,8 @@ type chunkStreamReader struct {
 	conn      *pgxpool.Conn
 	rows      pgx.Rows
 	expectIdx int32
+	wantRows  int64
+	checked   bool
 	firstSkip int64
 	remaining int64
 	buf       []byte
@@ -291,8 +293,15 @@ func (r *chunkStreamReader) fill() error {
 		}
 		var idx int32
 		var data []byte
-		if err := r.rows.Scan(&idx, &data); err != nil {
+		var totalRows int64
+		if err := r.rows.Scan(&idx, &data, &totalRows); err != nil {
 			return err
+		}
+		if !r.checked {
+			r.checked = true
+			if totalRows != r.wantRows {
+				return ErrNotFound
+			}
 		}
 		if idx != r.expectIdx {
 			return ErrNotFound
@@ -439,9 +448,14 @@ func (s *Store) Evict(ctx context.Context, retention time.Duration, maxBytes int
 			if cur <= maxBytes {
 				break
 			}
-			tag, err := s.pool.Exec(ctx, `DELETE FROM cache_objects WHERE id IN (
-				SELECT id FROM cache_objects ORDER BY last_access, id LIMIT 128
-			)`)
+			excess := cur - maxBytes
+			tag, err := s.pool.Exec(ctx, `WITH ranked AS (
+				SELECT id, size, sum(size) OVER (ORDER BY last_access, id) AS cum
+				FROM cache_objects
+			)
+			DELETE FROM cache_objects WHERE id IN (
+				SELECT id FROM ranked WHERE cum - size < $1 LIMIT 128
+			)`, excess)
 			if err != nil {
 				return totalEvicted, err
 			}
