@@ -201,7 +201,7 @@ func forwardHeaders(h http.Header) [][2]string {
 			"expect", "accept-encoding":
 			continue
 		}
-		out = append(out, [2]string{name, vals[0]})
+		out = append(out, [2]string{lower, vals[0]})
 	}
 	return out
 }

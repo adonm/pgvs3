@@ -884,8 +884,6 @@ func (s *Store) cacheMSet(ctx context.Context, sc string, batch cacheBatch) erro
 	if _, err := tx.Exec(ctx, `WITH old_objs AS (
 		SELECT key, file_id, parts FROM `+sc+`.objects
 		WHERE key = ANY($1::text[]) AND file_id IS NOT NULL
-	), cleared AS (
-		DELETE FROM `+sc+`.object_part_checksums WHERE key = ANY($1::text[])
 	), upserted AS (
 		INSERT INTO `+sc+`.objects (key, file_id, size, sha256, etag, expires_at, parts, part_ends, inline_data)
 		SELECT k, NULL, sz, sha, et, NULL, NULL, NULL, dat
@@ -914,7 +912,6 @@ func (s *Store) cacheMSet(ctx context.Context, sc string, batch cacheBatch) erro
 	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
 	    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
 	      AND NOT (o.key = ANY($1::text[])))
-	  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
 	ON CONFLICT DO NOTHING`, batch.keys, batch.sizes, batch.shas, batch.etags, batch.stored); err != nil {
 		return err
 	}

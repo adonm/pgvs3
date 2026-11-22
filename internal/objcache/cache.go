@@ -566,7 +566,11 @@ func (t *Tier) openZero(ctx context.Context, bucket, key, ck string, res cacheRe
 }
 
 func (t *Tier) openCached(ctx context.Context, ref store.ObjectRef, m *store.Meta, v readView) (*Object, error) {
-	sm, body, err := t.store.GetBodyFromMeta(ctx, ref, m, store.ByteRange{First: v.start, Last: v.end, Requested: v.ranged})
+	rng := store.WholeObjectRange()
+	if v.ranged {
+		rng = store.Range(v.start, v.end, -1)
+	}
+	sm, body, err := t.store.GetBodyFromMeta(ctx, ref, m, rng)
 	if err != nil {
 		return nil, err
 	}

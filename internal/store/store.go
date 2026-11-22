@@ -380,12 +380,6 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := checkLayout(ctx, tx); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, "SELECT s3p.reconcile_namespaces()"); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, "SELECT s3p.upgrade_queue_schemas()"); err != nil {
-		return err
-	}
 	return tx.Commit(ctx)
 }
 
@@ -1170,9 +1164,6 @@ var queueRelations = []relationRequirement{
 var bucketRelations = []relationRequirement{
 	{relation: "objects"}, {relation: "origin_metadata"},
 	{relation: "origin_metadata_expiry"}, {relation: "objects_file_id_idx"},
-	{relation: "objects_parts_idx"},
-	{relation: "upload_parts", cacheSkip: true},
-	{relation: "upload_parts_file_id_idx", cacheSkip: true},
 	{relation: "garbage"},
 }
 

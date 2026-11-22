@@ -220,9 +220,6 @@ func (s *Store) Maintain(ctx context.Context, grace time.Duration) error {
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", lock)
 
-	if _, err := conn.Exec(ctx, "SELECT s3p.reconcile_namespaces()"); err != nil {
-		return err
-	}
 	infos, err := s.Namespaces(ctx, "")
 	if err != nil {
 		return err
@@ -469,8 +466,7 @@ func (s *Store) reapOne(ctx context.Context, conn *pgx.Conn, schema string, grac
 	}
 	var referenced bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM `+schema+`.objects WHERE file_id IS NOT NULL AND file_id = $1)
-		OR EXISTS (SELECT 1 FROM `+schema+`.objects WHERE parts IS NOT NULL AND parts @> ARRAY[$1::int8])
-		OR EXISTS (SELECT 1 FROM `+schema+`.upload_parts WHERE file_id = $1)`, fileID).Scan(&referenced); err != nil {
+		OR EXISTS (SELECT 1 FROM `+schema+`.objects WHERE parts IS NOT NULL AND parts @> ARRAY[$1::int8])`, fileID).Scan(&referenced); err != nil {
 		return 0, false, err
 	}
 	if referenced {
@@ -693,10 +689,7 @@ func (s *Store) diagnoseNamespace(ctx context.Context, n NamespaceInfo, d *Diagn
 }
 
 func garbageUploadCheck(q string, kind ns.Kind) string {
-	if kind != ns.Bucket {
-		return ""
-	}
-	return " OR EXISTS (SELECT 1 FROM " + q + ".upload_parts p WHERE p.file_id = g.file_id)"
+	return ""
 }
 
 func (s *Store) diagnoseSchemas(ctx context.Context, d *Diagnosis) error {
@@ -724,8 +717,6 @@ var objectFunctions = []functionContract{
 	{signature: "publish_object(text,bigint,bigint,bytea,text,text[],text,text,text,timestamp with time zone,boolean,text,text,boolean,jsonb)", result: "text"},
 	{signature: "put_inline(text,bytea,bigint,bytea,text,text[],text,text,text,text,timestamp with time zone,boolean,text,text,boolean,jsonb)", result: "text"},
 	{signature: "expire_objects(integer)", result: "integer"},
-	{signature: "commit_part(text,integer,bigint,bigint,bytea,bytea,text)", result: "void"},
-	{signature: "expire_uploads(interval,integer)", result: "integer"},
 }
 
 var streamFunctions = []functionContract{

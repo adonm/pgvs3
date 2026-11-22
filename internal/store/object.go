@@ -514,14 +514,13 @@ func (r *cacheMetadataRow) Scan(dest ...any) error {
 
 type metaOriginRow struct {
 	pgx.Row
-	kind     pgtype.Text
-	priority pgtype.Int4
-	info     []byte
-	err      error
+	kind pgtype.Text
+	info []byte
+	err  error
 }
 
 func (r *metaOriginRow) Scan(dest ...any) error {
-	r.err = r.Row.Scan(append(dest, &r.kind, &r.priority, &r.info)...)
+	r.err = r.Row.Scan(append(dest, &r.kind, &r.info)...)
 	return r.err
 }
 
@@ -1285,7 +1284,6 @@ func (s *Store) deleteMany(ctx context.Context, ref ns.Ref, keys []string, locke
 				  AND NOT EXISTS (SELECT 1 FROM `+sc+`.objects o
 				    WHERE o.parts IS NOT NULL AND o.parts @> ARRAY[d.file_id]
 				      AND NOT (o.key = ANY($1::text[])))
-				  AND NOT EXISTS (SELECT 1 FROM `+sc+`.upload_parts p WHERE p.file_id = d.file_id)
 				ON CONFLICT DO NOTHING
 			)
 			SELECT count(*) FILTER (WHERE live) FROM doomed`, keys).Scan(&deleted)

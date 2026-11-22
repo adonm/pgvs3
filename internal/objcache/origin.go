@@ -48,7 +48,7 @@ type originAttrs struct {
 
 func (a originAttrs) objectInfo() store.ObjectInfo {
 	return store.ObjectInfo{
-		Size: a.Size, OriginETag: a.ETag, OriginModified: a.LastModified, CreatedAt: a.LastModified,
+		Size: a.Size, ETag: a.ETag, OriginETag: a.ETag, OriginModified: a.LastModified, CreatedAt: a.LastModified,
 		ContentType: a.ContentType, ContentEncoding: a.ContentEncoding, UserMetadata: a.UserMetadata,
 	}
 }
