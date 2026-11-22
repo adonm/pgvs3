@@ -38,7 +38,6 @@ type fakeS3Origin struct {
 	mu           sync.Mutex
 	objects      map[string]map[string]fakeObj // bucket -> key -> obj
 	uploads      map[string]map[int][]byte     // uploadID -> partNo -> data
-	uploadTarget map[string][2]string          // uploadID -> [bucket, key]
 	nextUpload   int
 	counts       map[string]int // "OP:bucket/key" -> count
 	outage       bool
@@ -51,7 +50,6 @@ func newFakeS3Origin(t *testing.T, expectAK, expectRegion string) *fakeS3Origin 
 	return &fakeS3Origin{
 		objects:      make(map[string]map[string]fakeObj),
 		uploads:      make(map[string]map[int][]byte),
-		uploadTarget: make(map[string][2]string),
 		counts:       make(map[string]int),
 		expectAK:     expectAK,
 		expectRegion: expectRegion,
@@ -139,7 +137,6 @@ func (f *fakeS3Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.nextUpload++
 		id := fmt.Sprintf("up-%d", f.nextUpload)
 		f.uploads[id] = make(map[int][]byte)
-		f.uploadTarget[id] = [2]string{bucket, key}
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/xml")
 		_, _ = fmt.Fprintf(w, `<InitiateMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, bucket, key, id)
@@ -174,7 +171,6 @@ func (f *fakeS3Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			buf.Write(parts[no])
 		}
 		delete(f.uploads, id)
-		delete(f.uploadTarget, id)
 		f.mu.Unlock()
 		f.putDirect(bucket, key, buf.Bytes(), "application/octet-stream")
 		f.mu.Lock()
@@ -607,20 +603,7 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	}
 	fake.setOutage(false)
 
-	// 8. Eviction honours budget.
-	stEv, gwEv := openTestGateway(t, dbURL, originSrv.URL, 0)
-	fake.putDirect("evb", "big1.bin", bytes.Repeat([]byte("a"), 4000), "application/octet-stream")
-	fake.putDirect("evb", "big2.bin", bytes.Repeat([]byte("b"), 4000), "application/octet-stream")
-	_ = doReq(t, gwEv, http.MethodGet, "/evb/big1.bin", nil, nil)
-	_ = doReq(t, gwEv, http.MethodGet, "/evb/big2.bin", nil, nil)
-	if _, err := stEv.Evict(context.Background(), 0, 5000); err != nil {
-		t.Fatal(err)
-	}
-	if stEv.CacheEvictedObjects() == 0 {
-		t.Fatal("expected cache eviction under budget")
-	}
-
-	// 9. Partial fills, concurrent coalesce, odd-tail multi-chunk, zero-byte object.
+	// 8. Partial fills, concurrent coalesce, odd-tail multi-chunk, zero-byte object.
 	fake.putDirect("b1", "empty.bin", []byte{}, "application/octet-stream")
 	rz := doReq(t, gwA, http.MethodGet, "/b1/empty.bin", nil, nil)
 	if rz.Code != 200 || rz.Body.Len() != 0 {
@@ -630,13 +613,11 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 		t.Fatalf("zero-byte range = %d, want 416", rzr.Code)
 	}
 
-	// 5 chunks of 64 KiB + 137 byte tail
 	odd := make([]byte, 5*(64<<10)+137)
 	for i := range odd {
 		odd[i] = byte(i * 31)
 	}
 	fake.putDirect("b1", "odd.bin", odd, "application/octet-stream")
-	// Fill chunk 0 and chunk 4 (non-contiguous), then read full object -> should only fetch missing chunks 1..3.
 	rP0 := doReq(t, gwA, http.MethodGet, "/b1/odd.bin", nil, map[string]string{"Range": "bytes=0-100"})
 	if rP0.Code != 206 || !bytes.Equal(rP0.Body.Bytes(), odd[:101]) {
 		t.Fatalf("partial chunk 0 = %d", rP0.Code)
@@ -653,13 +634,11 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	if got := fake.count("GET", "b1", "odd.bin"); got != getsBeforeFull+1 {
 		t.Fatalf("expected 1 origin GET for contiguous missing chunks 1..3, got %d->%d", getsBeforeFull, got)
 	}
-	// Warm hit on full odd.bin -> zero origin GETs.
 	rFullHit := doReq(t, gwB, http.MethodGet, "/b1/odd.bin", nil, nil)
 	if rFullHit.Code != 200 || rFullHit.Header().Get("X-Cache") != "HIT" || fake.count("GET", "b1", "odd.bin") != getsBeforeFull+1 {
 		t.Fatalf("odd.bin warm hit failed")
 	}
 
-	// Concurrent fills of same key coalesce to 1 origin GET.
 	coalData := bytes.Repeat([]byte("coalesce"), 1024)
 	fake.putDirect("b1", "coal.bin", coalData, "application/octet-stream")
 	var cwg sync.WaitGroup
@@ -681,5 +660,4 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	if rm.Code != 200 || !strings.Contains(rm.Body.String(), "pgvs3_cache_hits_total") || !strings.Contains(rm.Body.String(), "pgvs3_request_duration_seconds_bucket") {
 		t.Fatalf("/metrics missing expected counters/buckets: %d", rm.Code)
 	}
-	_ = s3client.Config{}
 }

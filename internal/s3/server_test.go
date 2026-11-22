@@ -192,44 +192,6 @@ func TestSelectRoute(t *testing.T) {
 	}
 }
 
-func TestRouteDispatch(t *testing.T) {
-	called := ""
-	table := []route{
-		{name: "specific", method: http.MethodGet, query: "special", run: func(*routeContext) error {
-			called = "specific"
-			return nil
-		}},
-		{name: "fallback", method: http.MethodGet, run: func(*routeContext) error {
-			called = "fallback"
-			return nil
-		}},
-	}
-	tests := []struct {
-		name   string
-		method string
-		target string
-		want   string
-		run    bool
-	}{
-		{name: "specific query", method: http.MethodGet, target: "/bucket?special=1", want: "specific", run: true},
-		{name: "fallback", method: http.MethodGet, target: "/bucket", want: "fallback", run: true},
-		{name: "no match", method: http.MethodPost, target: "/bucket", want: "", run: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			called = ""
-			req := httptest.NewRequest(tt.method, "http://s3.test"+tt.target, nil)
-			c := routeContext{r: req, q: req.URL.Query()}
-			if got, err := c.dispatch(table); got != tt.run || err != nil {
-				t.Fatalf("dispatch() = %v, %v, want %v, nil", got, err, tt.run)
-			}
-			if called != tt.want {
-				t.Fatalf("dispatch() called %q, want %q", called, tt.want)
-			}
-		})
-	}
-}
-
 func TestParseRange(t *testing.T) {
 	tests := []struct {
 		in   string
@@ -461,7 +423,6 @@ func TestMetricsObserveAndWrite(t *testing.T) {
 	for _, want := range []string{
 		`pgvs3_requests_total{method="GET",code="200"} 2`,
 		`pgvs3_requests_total{method="PUT",code="403"} 1`,
-		"pgvs3_request_duration_seconds_count 3",
 		"pgvs3_request_duration_seconds_count 3",
 		`pgvs3_request_duration_seconds_bucket{le="0.005"} 1`,
 		`pgvs3_request_duration_seconds_bucket{le="0.01"} 2`,

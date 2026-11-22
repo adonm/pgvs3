@@ -9,58 +9,17 @@ import (
 	"time"
 )
 
-func TestCommandTable(t *testing.T) {
-	want := []string{"serve", "health", "reap", "stat", "version"}
-	if len(commandTable) != len(want) {
-		t.Fatalf("command table has %d entries, want %d", len(commandTable), len(want))
-	}
-	for _, name := range want {
-		cmd, ok := commandByName[name]
-		if !ok || cmd.name != name || cmd.run == nil {
-			t.Fatalf("command %q = %+v ok=%v", name, cmd, ok)
-		}
-	}
-}
-
-func TestSelectCommand(t *testing.T) {
-	cases := []struct {
-		in      []string
-		wantCmd string
-		wantOK  bool
-	}{
-		{in: []string{"version"}, wantCmd: "version", wantOK: true},
-		{in: []string{"--addr=127.0.0.1:8014", "serve"}, wantCmd: "serve", wantOK: true},
-		{in: []string{"--url", "postgres://localhost/pgvs3", "stat"}, wantCmd: "stat", wantOK: true},
-		{in: []string{"--read-only", "serve", "--addr", "127.0.0.1:8014"}, wantCmd: "serve", wantOK: true},
-		{in: []string{"serve", "--url", "postgres://localhost/pgvs3"}, wantCmd: "serve", wantOK: true},
-		{in: []string{"unknown", "serve"}, wantOK: false},
-		{in: []string{"--", "serve"}, wantOK: false},
-	}
-	for _, tc := range cases {
-		cmd, _, ok := selectCommand(tc.in)
-		if ok != tc.wantOK || cmd.name != tc.wantCmd {
-			t.Fatalf("selectCommand(%v) = (%q, %v), want (%q, %v)", tc.in, cmd.name, ok, tc.wantCmd, tc.wantOK)
-		}
-	}
-}
-
 func clearServeEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
-		"PGVS3_URL", "PGVS3_ADDR", "PGVS3_POOL_MAX", "PGVS3_MAX_CONNS",
-		"PGVS3_MAX_DB_BYTES", "PGVS3_REAP_GRACE", "PGVS3_READ_ONLY",
-		"PGVS3_LOG_LEVEL", "PGVS3_PPROF_ADDR", "PGVS3_ORIGIN_CONFIG",
-		"PGVS3_S3_ORIGIN", "PGVS3_AUTO_BUCKET",
-		"PGVS3_CACHE_TTL", "PGVS3_CACHE_RETENTION", "PGVS3_CACHE_NAMESPACE",
+		"AWS_REGION",
+		"PGVS3_URL", "PGVS3_ADDR", "PGVS3_POOL_MAX", "PGVS3_SPOOL_DIR",
+		"PGVS3_SPOOL_MAX_BYTES", "PGVS3_MAX_CONNS", "PGVS3_READ_ONLY",
+		"PGVS3_LOG_LEVEL", "PGVS3_ORIGIN_ENDPOINT", "PGVS3_ORIGIN_REGION",
+		"PGVS3_ORIGIN_PATH_STYLE", "PGVS3_ORIGIN_INSECURE", "PGVS3_BUCKETS",
+		"PGVS3_REVALIDATE_AFTER", "PGVS3_CACHE_RETENTION",
 		"PGVS3_FILL_CONCURRENCY", "PGVS3_RANGE_CACHE_CHUNK",
-		"PGVS3_CACHE_MAX_BYTES",
-		"PGVS3_S3_ENDPOINT", "PGVS3_S3_BUCKET", "PGVS3_S3_REGION",
-		"PGVS3_S3_ACCESS_KEY", "PGVS3_S3_SECRET_KEY",
-		"PGVS3_S3_PATH_STYLE", "PGVS3_S3_INSECURE",
-		"PGVS3_QUEUE_CONCURRENCY", "PGVS3_RESP_CONCURRENCY",
-		"PGVS3_JOB_RETENTION",
-		"PGVS3_SPOOL_MAX_BYTES",
-		"PGVS3_S3_QUEUE_WAIT",
+		"PGVS3_CACHE_MAX_BYTES", "PGVS3_S3_CONCURRENCY", "PGVS3_S3_QUEUE_WAIT",
 	} {
 		t.Setenv(key, "")
 	}
@@ -242,23 +201,22 @@ func TestHelpSucceeds(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("run(%v) = %d, want 0; stderr=%q", args, code, stderr)
 			}
-			if !strings.Contains(stderr, "Usage of ") {
+			if !strings.Contains(stderr, "Usage of ") && !strings.Contains(stderr, "usage: pgvs3 ") {
 				t.Fatalf("run(%v) did not print usage; stderr=%q", args, stderr)
 			}
 		})
 	}
 }
 
-func TestRunRejectsUnexpectedServeArgs(t *testing.T) {
+func TestRunRejectsUnknownCommandAndExtraServeArgs(t *testing.T) {
 	cases := []struct {
 		name string
 		args []string
 		want string
 	}{
-		{"typo before flags", []string{"nonsense", "--url", "postgres://localhost/pgvs3"}, `unexpected serve argument "nonsense"`},
-		{"typo after flags", []string{"--url", "postgres://localhost/pgvs3", "nonsense"}, `unexpected serve argument "nonsense"`},
+		{"unknown command", []string{"nonsense", "--url", "postgres://localhost/pgvs3"}, `unknown command "nonsense"`},
+		{"flag before command", []string{"--url", "postgres://localhost/pgvs3", "serve"}, `unknown command "--url"`},
 		{"extra serve arg", []string{"serve", "extra"}, `unexpected serve argument "extra"`},
-		{"arg after terminator", []string{"--", "serve"}, `unexpected serve argument "serve"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -299,6 +257,17 @@ func TestServeEnvironmentUsesFlagParsers(t *testing.T) {
 			}
 		})
 	}
+	t.Setenv("AWS_REGION", "eu-central-1")
+	if cfgRegion, err := parseServeConfig(nil); err != nil || cfgRegion.originRegion != "eu-central-1" {
+		t.Fatalf("AWS_REGION default = %q err=%v", cfgRegion.originRegion, err)
+	}
+	t.Setenv("PGVS3_ORIGIN_REGION", "ap-southeast-2")
+	if cfgRegion, err := parseServeConfig(nil); err != nil || cfgRegion.originRegion != "ap-southeast-2" {
+		t.Fatalf("PGVS3_ORIGIN_REGION override = %q err=%v", cfgRegion.originRegion, err)
+	}
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("PGVS3_ORIGIN_REGION", "")
+
 	t.Setenv("PGVS3_ORIGIN_PATH_STYLE", "")
 	cfg, err = parseServeConfig(nil)
 	if err != nil || cfg.originPathStyle {

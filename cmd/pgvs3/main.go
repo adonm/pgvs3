@@ -25,20 +25,6 @@ var version = "dev"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
-type command struct {
-	name    string
-	summary string
-	run     func([]string) int
-}
-
-var commandTable = []command{
-	{name: "serve", summary: "Run the S3 cache gateway (default when no command is given).", run: serve},
-	{name: "health", summary: "Exit 0 when a gateway's readiness URL returns 200.", run: health},
-	{name: "reap", summary: "Run one bounded maintenance pass (or all passes) without a gateway.", run: reap},
-	{name: "stat", summary: "Print namespace, object, chunk and storage-overhead counts.", run: stat},
-	{name: "version", summary: "Print the binary version.", run: func([]string) int { fmt.Println(version); return 0 }},
-}
-
 type reportedFlagError struct{ err error }
 
 func (e *reportedFlagError) Error() string { return e.err.Error() }
@@ -51,61 +37,29 @@ func flagExitCode(err error) int {
 	return 2
 }
 
-var commandByName = indexCommands(commandTable)
-
-func indexCommands(table []command) map[string]command {
-	index := make(map[string]command, len(table))
-	for _, cmd := range table {
-		index[cmd.name] = cmd
-	}
-	return index
-}
-
 func run(args []string) int {
-	cmd, rest, ok := selectCommand(args)
-	if !ok {
-		return serve(args)
+	if len(args) == 0 {
+		return serve(nil)
 	}
-	return cmd.run(rest)
-}
-
-func selectCommand(args []string) (command, []string, bool) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "--" {
-			return command{}, args, false
-		}
-		if strings.HasPrefix(a, "-") {
-			if !strings.Contains(a, "=") && flagTakesValue(strings.TrimLeft(a, "-")) && i+1 < len(args) {
-				i++
-			}
-			continue
-		}
-		cmd, ok := commandByName[a]
-		if !ok {
-			return command{}, args, false
-		}
-		out := make([]string, 0, len(args)-1)
-		out = append(out, args[:i]...)
-		out = append(out, args[i+1:]...)
-		return cmd, out, true
+	switch args[0] {
+	case "serve":
+		return serve(args[1:])
+	case "health":
+		return health(args[1:])
+	case "reap":
+		return reap(args[1:])
+	case "stat":
+		return stat(args[1:])
+	case "version":
+		fmt.Println(version)
+		return 0
+	case "-h", "--help", "help":
+		fmt.Fprintln(os.Stderr, "usage: pgvs3 <serve|health|reap|stat|version> [flags]")
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "pgvs3: unknown command %q\nusage: pgvs3 <serve|health|reap|stat|version> [flags]\n", args[0])
+		return 2
 	}
-	return command{}, args, false
-}
-
-var booleanFlags = map[string]bool{
-	"read-only":         true,
-	"origin-path-style": true,
-	"origin-insecure":   true,
-	"force":             true,
-	"all":               true,
-	"json":              true,
-	"h":                 true,
-	"help":              true,
-}
-
-func flagTakesValue(name string) bool {
-	return !booleanFlags[name]
 }
 
 type serveConfig struct {
@@ -158,8 +112,12 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.DurationVar(&cfg.httpWriteTimeout, "http-write-timeout", 30*time.Minute, "HTTP response write deadline (0 disables)")
 	fs.BoolVar(&cfg.readOnly, "read-only", false, "reject writes and skip DDL, reaping, and fills (for standbys)")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
+	defaultRegion := os.Getenv("AWS_REGION")
+	if defaultRegion == "" {
+		defaultRegion = "us-east-1"
+	}
 	fs.StringVar(&cfg.originEndpoint, "origin-endpoint", "", "S3 origin endpoint URL (empty uses AWS S3 for --origin-region)")
-	fs.StringVar(&cfg.originRegion, "origin-region", "us-east-1", "S3 origin region")
+	fs.StringVar(&cfg.originRegion, "origin-region", defaultRegion, "S3 origin region (defaults to AWS_REGION, or us-east-1)")
 	fs.BoolVar(&cfg.originPathStyle, "origin-path-style", false, "use path-style S3 origin addressing")
 	fs.BoolVar(&cfg.originInsecure, "origin-insecure", false, "skip TLS certificate verification for origin")
 	fs.StringVar(&cfg.buckets, "buckets", "", "optional comma-separated bucket allowlist (empty allows all valid bucket names)")
@@ -255,12 +213,11 @@ func prepareStore(ctx context.Context, st *store.Store, cfg serveConfig, log *sl
 			log.Error("checking storage layout", "err", err)
 			return noop, err
 		}
-	} else if err := st.Init(ctx); err != nil {
+		return noop, nil
+	}
+	if err := st.Init(ctx); err != nil {
 		log.Error("initializing schema", "err", err)
 		return noop, err
-	}
-	if cfg.readOnly {
-		return noop, nil
 	}
 	return startMaintenance(ctx, st, cfg.cacheRetention, cfg.cacheMaxBytes, log), nil
 }
@@ -306,9 +263,6 @@ func cacheRuntime(cfg serveConfig) (*objcache.Runtime, error) {
 
 func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log *slog.Logger) (*objcache.Tier, error) {
 	region := cfg.originRegion
-	if region == "" {
-		region = firstEnv("AWS_REGION", "AWS_DEFAULT_REGION")
-	}
 	origin, err := objcache.NewS3Origin(objcache.S3Config{
 		Endpoint:  cfg.originEndpoint,
 		Region:    region,
@@ -333,15 +287,6 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 	}
 	log.Info("origin cache enabled", "endpoint", cfg.originEndpoint, "region", region)
 	return tier, nil
-}
-
-func firstEnv(keys ...string) string {
-	for _, k := range keys {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, tier *objcache.Tier, log *slog.Logger) *s3.Server {
