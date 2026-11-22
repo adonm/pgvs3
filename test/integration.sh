@@ -44,10 +44,6 @@ if [ -z "${PGVS3_TEST_DATABASE_URL:-}" ]; then
   export PGVS3_TEST_DATABASE_URL="postgres://postgres:postgres@127.0.0.1:15432/pgvs3_test?sslmode=disable"
 fi
 
-if [ -z "${CGO_ENABLED:-}" ] && ! printf '%s\n' '#include <stdio.h>' | cc -x c - -o /dev/null 2>/dev/null; then
-  export CGO_ENABLED=0
-fi
-
 echo "=== Tier 1: Go integration tests (in-process fake S3 + PostgreSQL 18) ==="
 mise exec go -- go test -tags=integration -v -count=1 ./internal/s3 -run TestReadThroughCacheIntegration
 
