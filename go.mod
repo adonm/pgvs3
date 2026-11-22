@@ -4,7 +4,6 @@ go 1.27.4
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/klauspost/compress v1.20.3
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0

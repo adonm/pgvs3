@@ -23,7 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const LayoutVersion = 25
+const LayoutVersion = 26
 
 const (
 	chunkSize = 256 << 10
@@ -545,21 +545,13 @@ var layoutManifest = struct {
 	functions []functionContract
 }{
 	relations: []string{
-		"s3p.layout", "s3p.namespaces", "s3p.file_ids", "s3p.job_index",
-		"s3p.pending_uploads", "s3p.cache_fill_leases",
+		"s3p.layout", "s3p.namespaces", "s3p.file_ids", "s3p.cache_fill_leases",
 	},
 	functions: []functionContract{
 		{signature: "namespace_schema(text,text)", result: "text"},
 		{signature: "ensure_namespace(text,text,bigint,jsonb)", result: "text"},
 		{signature: "ensure_object_schema(text,text)", result: "void"},
-		{signature: "ensure_queue_schema(text)", result: "void"},
-		{signature: "tune_queue_schema(text)", result: "void"},
 		{signature: "drop_namespace(text,text,boolean)", result: "text"},
-		{signature: "clone_namespace(text,text,text)", result: "text"},
-		{signature: "adopt_namespace(text,text)", result: "text"},
-		{signature: "adopt_namespaces(text)", result: "integer"},
-		{signature: "reconcile_namespaces()", result: "integer"},
-		{signature: "upgrade_queue_schemas()", result: "integer"},
 	},
 }
 

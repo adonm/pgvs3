@@ -249,26 +249,14 @@ func (s *Store) maintenancePasses(conn *pgxpool.Conn, infos []NamespaceInfo, gra
 }
 
 func (s *Store) expirePass(ctx context.Context, conn *pgxpool.Conn, infos []NamespaceInfo, rounds int) error {
-	var expiredUploads int
 	for _, n := range infos {
 		if n.Kind == ns.Queue {
 			continue
 		}
 		q := quoteIdent(n.Schema)
-		var uploads int
-		if err := conn.QueryRow(ctx, "SELECT "+q+".expire_uploads(interval '24 hours', 64)").Scan(&uploads); err != nil {
-			if missingNamespace(ctx, conn, q, err) {
-				continue
-			}
-			return err
-		}
-		expiredUploads += uploads
 		if _, err := s.expireNamespace(ctx, conn, q, n, rounds); err != nil {
 			return err
 		}
-	}
-	if expiredUploads > 0 {
-		s.log.Info("expired multipart uploads", "count", expiredUploads)
 	}
 	return nil
 }

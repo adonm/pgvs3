@@ -16,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -1479,98 +1478,22 @@ func (r *chunkRowReader) appendRow(out *[]byte, no int32, data []byte) {
 	appendRow(out, r.piece.base, no, data, r.spanStart, r.spanEnd)
 }
 
-const (
-	zstdWindow             = 64 << 10
-	zstdEncoderConcurrency = 4
-	zstdDecoderConcurrency = 8
-)
-
-var (
-	zstdEncoder = mustZstdEncoder()
-	zstdDecoder = mustZstdDecoder()
-)
-
-func mustZstdEncoder() *zstd.Encoder {
-	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedFastest),
-		zstd.WithEncoderCRC(false),
-		zstd.WithEncoderConcurrency(zstdEncoderConcurrency),
-		zstd.WithWindowSize(zstdWindow),
-	)
-	if err != nil {
-		panic("initializing zstd encoder: " + err.Error())
-	}
-	return enc
-}
-
-func mustZstdDecoder() *zstd.Decoder {
-	dec, err := zstd.NewReader(nil,
-		zstd.WithDecoderConcurrency(zstdDecoderConcurrency),
-		zstd.WithDecoderLowmem(true),
-		zstd.WithDecoderMaxWindow(zstdWindow),
-		zstd.WithDecoderMaxMemory(1<<20),
-	)
-	if err != nil {
-		panic("initializing zstd decoder: " + err.Error())
-	}
-	return dec
-}
-
 func compressBlock(dst, src []byte) []byte {
-	n := len(src)
-	if n < 16 || n > MaxInlineBytes {
+	if dst == nil {
 		return src
 	}
-	if likelyIncompressible(src) {
-		return src
-	}
-	if cap(dst) < n {
-		dst = make([]byte, 0, n)
-	} else {
-		dst = dst[:0]
-	}
-	dst = zstdEncoder.EncodeAll(src, dst)
-	if len(dst) >= n {
-		return src
-	}
-	return dst
-}
-
-func likelyIncompressible(src []byte) bool {
-	const sample = 512
-	n := min(len(src), sample)
-	var seen [256]bool
-	distinct := 0
-	for _, b := range src[:n] {
-		if !seen[b] {
-			seen[b] = true
-			distinct++
-		}
-	}
-	return distinct > 200
+	return append(dst[:0], src...)
 }
 
 func decompressBlock(dst, src []byte, wantLen int) ([]byte, error) {
 	if wantLen == 0 {
 		return []byte{}, nil
 	}
-	if len(src) == wantLen {
-		return src, nil
+	if len(src) != wantLen {
+		return nil, fmt.Errorf("corrupt block: stored %d bytes, want %d", len(src), wantLen)
 	}
-	if len(src) > wantLen {
-		return nil, fmt.Errorf("corrupt block: stored %d > logical %d", len(src), wantLen)
+	if dst != nil {
+		return append(dst[:0], src...), nil
 	}
-	if cap(dst) < wantLen {
-		dst = make([]byte, 0, wantLen)
-	} else {
-		dst = dst[:0]
-	}
-	out, err := zstdDecoder.DecodeAll(src, dst)
-	if err != nil {
-		return nil, fmt.Errorf("corrupt zstd block: %w", err)
-	}
-	if len(out) != wantLen {
-		return nil, fmt.Errorf("corrupt block: decoded %d bytes, want %d", len(out), wantLen)
-	}
-	return out, nil
+	return src, nil
 }

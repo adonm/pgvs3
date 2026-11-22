@@ -13,7 +13,6 @@ import (
 	"io"
 	"math"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -391,68 +390,11 @@ func TestPreconditionAllows(t *testing.T) {
 	}
 }
 
-func TestCompressibleBlocksShrink(t *testing.T) {
-	src := bytes.Repeat([]byte("abcdefgh"), 1015)
+func TestBlockCodecRawRoundTrip(t *testing.T) {
+	src := bytes.Repeat([]byte("raw-block-"), 500)
 	enc := compressBlock(nil, src)
-	if len(enc) >= len(src)/4 {
-		t.Fatalf("expected >4x compression, got %d -> %d", len(src), len(enc))
-	}
-	dec, err := decompressBlock(nil, enc, len(src))
-	if err != nil || !bytes.Equal(dec, src) {
-		t.Fatalf("round trip failed: %v", err)
-	}
-}
-
-func TestIncompressibleBlocksStayRaw(t *testing.T) {
-	src := make([]byte, 8120)
-	if _, err := rand.Read(src); err != nil {
-		t.Fatal(err)
-	}
-	enc := compressBlock(nil, src)
-	if len(enc) != len(src) {
-		t.Fatalf("random block should stay raw, got %d -> %d", len(src), len(enc))
-	}
-}
-
-func TestMaxInlineBlockRoundTrip(t *testing.T) {
-	src := bytes.Repeat([]byte("maximum-inline-block-"), (MaxInlineBytes+20)/21)[:MaxInlineBytes]
-	enc := compressBlock(nil, src)
-	if len(enc) >= len(src) {
-		t.Fatalf("expected compression, got %d -> %d", len(src), len(enc))
-	}
-	dec, err := decompressBlock(nil, enc, len(src))
-	if err != nil || !bytes.Equal(dec, src) {
-		t.Fatalf("round trip failed: %v", err)
-	}
-}
-
-func TestBlockCodecConcurrent(t *testing.T) {
-	src := bytes.Repeat([]byte("concurrent-zstd-block-"), 400)
-	var wg sync.WaitGroup
-	for range 16 {
-		wg.Go(func() {
-			enc := compressBlock(nil, src)
-			dec, err := decompressBlock(nil, enc, len(src))
-			if err != nil {
-				t.Errorf("decompress failed: %v", err)
-				return
-			}
-			if !bytes.Equal(dec, src) {
-				t.Error("round-trip mismatch")
-			}
-		})
-	}
-	wg.Wait()
-}
-
-func TestCompressedBlocksAreZstdFrames(t *testing.T) {
-	src := bytes.Repeat([]byte("postgres-zstd-block-"), 500)
-	enc := compressBlock(nil, src)
-	if len(enc) >= len(src) {
-		t.Fatalf("expected compression, got %d -> %d", len(src), len(enc))
-	}
-	if !bytes.HasPrefix(enc, []byte{0x28, 0xb5, 0x2f, 0xfd}) {
-		t.Fatalf("missing Zstd frame magic: %x", enc[:min(4, len(enc))])
+	if !bytes.Equal(enc, src) {
+		t.Fatalf("compressBlock altered bytes: got %d, want %d", len(enc), len(src))
 	}
 	dec, err := decompressBlock(nil, enc, len(src))
 	if err != nil || !bytes.Equal(dec, src) {
@@ -772,8 +714,8 @@ func TestRowFramerSplitsAtRowBoundary(t *testing.T) {
 	}
 	bc := fc.finish()
 	defer putFramerBuf(bc)
-	if len(bc.Bytes()) >= 200 {
-		t.Fatalf("expected compressed frame < 200 bytes, got %d", len(bc.Bytes()))
+	if want := len(copyHeader) + RowBytes + RowBytes/2 + 2*26 + 2; len(bc.Bytes()) != want {
+		t.Fatalf("raw frame length %d, want %d", len(bc.Bytes()), want)
 	}
 	r0Len := int(binary.BigEndian.Uint32(bc.Bytes()[19+22 : 19+26]))
 	r0 := bc.Bytes()[19+26 : 19+26+r0Len]
