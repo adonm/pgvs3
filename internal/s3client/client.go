@@ -151,9 +151,6 @@ func resolveEndpoint(cfg Config, region string) (scheme, host string, pathStyle 
 	}
 	host = "s3." + region + ".amazonaws.com"
 	pathStyle = cfg.PathStyle || strings.Contains(cfg.Bucket, ".")
-	if !pathStyle {
-		host = cfg.Bucket + "." + host
-	}
 	return "https", host, pathStyle, nil
 }
 
@@ -176,6 +173,20 @@ func (b *Bucket) Close() error {
 		b.client.http.CloseIdleConnections()
 	}
 	return nil
+}
+
+// Proxy forwards a signed S3 request to the origin and returns the raw HTTP response.
+// Callers are responsible for closing resp.Body.
+func (b *Bucket) Proxy(ctx context.Context, method, key string, query url.Values, body io.Reader, size int64, extra ...[2]string) (*http.Response, error) {
+	object := ""
+	if key != "" {
+		var err error
+		object, err = b.client.objectKey(key)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return b.client.do(ctx, method, object, query, body, size, extra...)
 }
 
 func (c *client) target(object string) (decoded, escaped string) {

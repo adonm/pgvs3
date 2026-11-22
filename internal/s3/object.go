@@ -1,527 +1,169 @@
 package s3
 
 import (
-	"context"
-	"crypto/md5"
-	"encoding/base64"
+	"bytes"
 	"encoding/xml"
 	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
-	"net/url"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/adonm/pgvs3/internal/ns"
-	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/store"
 )
 
-type readHead struct {
-	Info     store.ObjectInfo
-	Parts    []int64
-	PartEnds []int64
-	Hit      bool
-}
-
-type objectBackend interface {
-	readBackend
-	writeBackend
-	multipartBackend
-}
-
-type requestBackendsKey struct{}
-
-type bucketBackend struct {
-	bucket  string
-	origin  *objcache.Tier
-	backend objectBackend
-	release func()
-}
-
-type requestBackends struct {
-	context context.Context
-	entries []bucketBackend
-}
-
-func (s *Server) bindBackends(r *http.Request) (*http.Request, func()) {
-	backends := &requestBackends{context: r.Context()}
-	r = r.WithContext(context.WithValue(r.Context(), requestBackendsKey{}, backends))
-	return r, func() {
-		for _, entry := range backends.entries {
-			if entry.release != nil {
-				entry.release()
-			}
-		}
-	}
-}
-
-func (s *Server) selectedBackend(ctx context.Context, bucket string) bucketBackend {
-	backends, ok := ctx.Value(requestBackendsKey{}).(*requestBackends)
-	if !ok {
-		return bucketBackend{bucket: bucket, backend: localBackend{store: s.store}}
-	}
-	for _, entry := range backends.entries {
-		if entry.bucket == bucket {
-			return entry
-		}
-	}
-	tier, release := s.origins.Acquire(backends.context, bucket)
-	entry := bucketBackend{bucket: bucket, origin: tier, backend: localBackend{store: s.store}, release: release}
-	if tier != nil {
-		entry.backend = originBackend{Tier: tier}
-	}
-	backends.entries = append(backends.entries, entry)
-	return entry
-}
-
-type readBackend interface {
-	Head(ctx context.Context, bucket, key string) (readHead, error)
-	Open(ctx context.Context, bucket, key string, rng store.ByteRange) (*store.ReadResult, error)
-	List(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error)
-}
-
-// conditionalReadBackend lets a backend reject a conditional GET before it
-// opens a body. Backends that do not implement it are checked after Open.
-type conditionalReadBackend interface {
-	OpenConditional(ctx context.Context, bucket, key string, rng store.ByteRange, cond store.ReadCondition) (*store.ReadResult, error)
-}
-
-func openObject(ctx context.Context, backend readBackend, bucket, key string, rng store.ByteRange, cond store.ReadCondition) (*store.ReadResult, error) {
-	if cb, ok := backend.(conditionalReadBackend); ok {
-		return cb.OpenConditional(ctx, bucket, key, rng, cond)
-	}
-	return backend.Open(ctx, bucket, key, rng)
-}
-
-func (s *Server) backendFor(ctx context.Context, bucket string) readBackend {
-	if s.readOverride != nil {
-		return s.readOverride
-	}
-	return s.objectBackendFor(ctx, bucket)
-}
-
-func (s *Server) objectBackendFor(ctx context.Context, bucket string) objectBackend {
-	return s.selectedBackend(ctx, bucket).backend
-}
-
-type localBackend struct {
-	store *store.Store
-}
-
-func (b localBackend) Head(ctx context.Context, bucket, key string) (readHead, error) {
-	m, err := b.store.MetaHeader(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key})
-	if err != nil {
-		return readHead{}, err
-	}
-	return readHead{Info: m.ObjectInfo, Parts: m.Parts, PartEnds: m.PartEnds}, nil
-}
-
-func (b localBackend) Open(ctx context.Context, bucket, key string, rng store.ByteRange) (*store.ReadResult, error) {
-	return b.open(ctx, bucket, key, rng, nil)
-}
-
-// OpenConditional checks the read condition before any stream starts, so a
-// 304 or 412 costs only the metadata query.
-func (b localBackend) OpenConditional(ctx context.Context, bucket, key string, rng store.ByteRange, cond store.ReadCondition) (*store.ReadResult, error) {
-	return b.open(ctx, bucket, key, rng, &cond)
-}
-
-func (b localBackend) open(ctx context.Context, bucket, key string, rng store.ByteRange, cond *store.ReadCondition) (*store.ReadResult, error) {
-	sm, body, err := b.store.GetBody(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, rng, cond)
-	if err != nil {
-		if sm != nil {
-			return &store.ReadResult{ObjectInfo: sm.ObjectInfo, Start: sm.Start, End: sm.End, Ranged: rng.Requested}, err
-		}
-		return nil, err
-	}
-	return &store.ReadResult{
-		ObjectInfo: sm.ObjectInfo,
-		Body:       body,
-		Start:      sm.Start,
-		End:        sm.End,
-		Ranged:     rng.Requested,
-	}, nil
-}
-
-func (b localBackend) List(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error) {
-	return b.store.List(ctx, ns.BucketRef(bucket), prefix, prefixEnd(prefix), after, limit)
-}
-
-type originBackend struct {
-	*objcache.Tier
-}
-
-func (b originBackend) Head(ctx context.Context, bucket, key string) (readHead, error) {
-	obj, err := b.Tier.Head(ctx, bucket, key)
-	if err != nil {
-		return readHead{}, err
-	}
-	return readHead{Info: obj.ObjectInfo, Hit: obj.Hit}, nil
-}
-
-func (s *Server) SetOrigin(t *objcache.Tier) { s.origins.SetDefault(t) }
-
-func (s *Server) originFor(ctx context.Context, bucket string) *objcache.Tier {
-	return s.selectedBackend(ctx, bucket).origin
-}
-
-func (s *Server) serveOriginBucket(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) error {
-	c := routeContext{s: s, w: w, r: r, bucket: bucket, q: q}
-	found, err := c.dispatch(originBucketRoutes)
-	if !found {
-		return errMethodNotAllowed()
-	}
-	return err
-}
-
-type writeBackend interface {
-	Put(ctx context.Context, bucket, key string, body io.Reader, contentLength int64, opts store.WriteOptions, validate func() ([]store.Checksum, error)) (string, error)
-	Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, opts store.CopyOptions) (*store.Meta, error)
-	Delete(ctx context.Context, bucket, key string) error
-	DeleteMany(ctx context.Context, bucket string, keys []string) ([]deleteOutcome, error)
-}
-
-type deleteOutcome = objcache.DeleteResult
-
-func (s *Server) writeBackendFor(ctx context.Context, bucket string) writeBackend {
-	if s.writeOverride != nil {
-		return s.writeOverride
-	}
-	return s.objectBackendFor(ctx, bucket)
-}
-
-func (b localBackend) Put(ctx context.Context, bucket, key string, body io.Reader, contentLength int64, opts store.WriteOptions, validate func() ([]store.Checksum, error)) (string, error) {
-	if contentLength >= 0 {
-		opts.ExpectedSize = contentLength
-	}
-	if contentLength >= 0 && contentLength <= store.MaxInlineBytes {
-		inline, err := readInlineBody(contentLength, body, store.MaxInlineBytes)
-		if err != nil {
-			return "", err
-		}
-		defer inline.release()
-		checks, err := validate()
-		if err != nil {
-			return "", err
-		}
-		if opts.Checksum == nil {
-			if c := store.FirstObjectChecksum(checks); c != nil {
-				opts.Checksum = c
-				opts.ChecksumType = "FULL_OBJECT"
-			}
-		}
-		obj, err := b.store.PutInline(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, inline.data, opts)
-		if err != nil {
-			return "", err
-		}
-		return obj.ETag, nil
-	}
-	writer, err := b.store.StartObject(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, opts)
-	if err != nil {
-		return "", err
-	}
-	buf := copyBuf()
-	defer putCopyBuf(buf)
-	if _, err := io.CopyBuffer(writer, body, buf); err != nil {
-		writer.Abort()
-		return "", err
-	}
-	checks, err := validate()
-	if err != nil {
-		writer.Abort()
-		return "", err
-	}
-	pub, err := writer.Finish(checks)
-	if err != nil {
-		return "", err
-	}
-	return pub.ETag, nil
-}
-
-func (b localBackend) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, opts store.CopyOptions) (*store.Meta, error) {
-	return b.store.Copy(ctx,
-		store.ObjectRef{NS: ns.BucketRef(srcBucket), Key: srcKey},
-		store.ObjectRef{NS: ns.BucketRef(dstBucket), Key: dstKey}, opts)
-}
-
-func (b localBackend) Delete(ctx context.Context, bucket, key string) error {
-	_, err := b.store.Delete(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key})
-	return err
-}
-
-func (b localBackend) DeleteMany(ctx context.Context, bucket string, keys []string) ([]deleteOutcome, error) {
-	if _, err := b.store.DeleteMany(ctx, ns.BucketRef(bucket), keys); err != nil {
-		return nil, err
-	}
-	out := make([]deleteOutcome, 0, len(keys))
-	for _, key := range keys {
-		out = append(out, deleteOutcome{Key: key})
-	}
-	return out, nil
-}
-
-func (b originBackend) Put(ctx context.Context, bucket, key string, body io.Reader, size int64, opts store.WriteOptions, validate func() ([]store.Checksum, error)) (string, error) {
-	m, err := b.Tier.UploadWithOptions(ctx, bucket, key, body, objcache.UploadOptions{
-		ExpectedSize:    size,
-		UserMetadata:    opts.UserMetadata,
-		ContentType:     opts.ContentType,
-		ContentEncoding: opts.ContentEncoding,
-		Checksum:        opts.Checksum,
-		ChecksumType:    opts.ChecksumType,
-		Precondition:    opts.Precondition,
-		Validate: func() error {
-			_, err := validate()
-			return err
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-	return m.ETag, nil
-}
-
-func (b originBackend) DeleteMany(ctx context.Context, bucket string, keys []string) ([]deleteOutcome, error) {
-	return b.Tier.DeleteMany(ctx, bucket, keys), nil
-}
-
-type multipartBackend interface {
-	CreateUpload(ctx context.Context, bucket, key string, userMeta []string, contentType, contentEncoding string, checksumAlg *string) (string, error)
-	StartPart(ctx context.Context, uploadID, bucket, key string, partNo int32, expectedSize int64) (*store.ChunkWriter, error)
-	ListParts(ctx context.Context, uploadID, bucket, key string, max int, marker int32) ([]store.UploadPartInfo, bool, int32, error)
-	CompleteUpload(ctx context.Context, uploadID, bucket, key string, listed []store.ListedPart, opts store.WriteOptions) (*store.Completed, error)
-	AbortUpload(ctx context.Context, uploadID, bucket, key string) (bool, error)
-	ListUploads(ctx context.Context, bucket, prefix, bound, keyMarker, uploadMarker string, max int) ([]store.UploadInfo, bool, error)
-}
-
-func (s *Server) multipartBackendFor(ctx context.Context, bucket string) multipartBackend {
-	if s.multipartOverride != nil {
-		return s.multipartOverride
-	}
-	return s.objectBackendFor(ctx, bucket)
-}
-
-func (b localBackend) CreateUpload(ctx context.Context, bucket, key string, userMeta []string, contentType, contentEncoding string, checksumAlg *string) (string, error) {
-	return b.store.CreateUpload(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, store.UploadOptions{UserMetadata: userMeta, ContentType: contentType, ContentEncoding: contentEncoding, ChecksumAlgorithm: checksumAlg})
-}
-
-func (b localBackend) StartPart(ctx context.Context, uploadID, bucket, key string, partNo int32, expectedSize int64) (*store.ChunkWriter, error) {
-	return b.store.StartPart(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, uploadID, partNo, expectedSize)
-}
-
-func (b localBackend) ListParts(ctx context.Context, uploadID, bucket, key string, max int, marker int32) ([]store.UploadPartInfo, bool, int32, error) {
-	return b.store.ListParts(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, uploadID, max, marker)
-}
-
-func (b localBackend) CompleteUpload(ctx context.Context, uploadID, bucket, key string, listed []store.ListedPart, opts store.WriteOptions) (*store.Completed, error) {
-	return b.store.CompleteUpload(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, uploadID, listed, opts)
-}
-
-func (b localBackend) AbortUpload(ctx context.Context, uploadID, bucket, key string) (bool, error) {
-	return b.store.AbortUpload(ctx, store.ObjectRef{NS: ns.BucketRef(bucket), Key: key}, uploadID)
-}
-
-func (b localBackend) ListUploads(ctx context.Context, bucket, prefix, bound, keyMarker, uploadMarker string, max int) ([]store.UploadInfo, bool, error) {
-	return b.store.ListUploads(ctx, store.ObjectRef{NS: ns.BucketRef(bucket)}, prefix, bound, keyMarker, uploadMarker, max)
-}
-
 func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	backend := s.backendFor(r.Context(), bucket)
-	part, hasPart, err := parsePartNumber(r.URL.Query())
+	if s.tier == nil {
+		return errNoSuchBucket()
+	}
+	obj, err := s.tier.Head(r.Context(), bucket, key)
 	if err != nil {
 		return err
 	}
-	head, err := backend.Head(r.Context(), bucket, key)
-	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
-		key += "index.html"
-		head, err = backend.Head(r.Context(), bucket, key)
-	}
-	if err != nil {
-		return err
-	}
-	length := head.Info.Size
-	if hasPart {
-		if head.Parts == nil && backendIsOrigin(backend) {
-			return errNotImplemented()
-		}
-		m := &store.Meta{Size: head.Info.Size, Parts: head.Parts, PartEnds: head.PartEnds}
-		start, end, ok := partBounds(m, part)
-		if !ok {
-			return errInvalidPartNumber()
-		}
-		length = max(end-start+1, 0)
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, head.Info.Size))
-	}
-	if err := readCondition(r, head.Info.ETag); err != nil {
+	if err := checkReadPreconditions(r, obj.ETag, obj.LastModified()); err != nil {
 		if errors.Is(err, store.ErrNotModified) {
-			w.Header().Set("ETag", quoteETag(head.Info.ETag))
+			w.Header().Set("ETag", quoteETag(obj.ETag))
 			w.WriteHeader(http.StatusNotModified)
 			return nil
 		}
 		return err
 	}
-	setObjectInfoHeaders(w, head.Info, key)
-	if head.Parts != nil {
-		w.Header().Set("x-amz-mp-parts-count", strconv.Itoa(len(head.Parts)))
+	setObjectInfoHeaders(w, obj.ObjectInfo, key)
+	if obj.Hit {
+		w.Header().Set("X-Cache", "HIT")
+	} else {
+		w.Header().Set("X-Cache", "MISS")
 	}
-	if backendIsOrigin(backend) {
-		if head.Hit {
-			w.Header().Set("X-Cache", "HIT")
-		} else {
-			w.Header().Set("X-Cache", "MISS")
-		}
-	}
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.WriteHeader(http.StatusOK)
 	return nil
 }
 
-func backendIsOrigin(b readBackend) bool {
-	_, ok := b.(originBackend)
-	return ok
-}
-
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	backend := s.backendFor(r.Context(), bucket)
-	isOrigin := backendIsOrigin(backend)
-	part, hasPart, err := parsePartNumber(r.URL.Query())
-	if err != nil {
-		return err
+	if s.tier == nil {
+		return errNoSuchBucket()
 	}
 	rng, err := parseRange(r.Header.Get("Range"))
 	if err != nil {
 		return errInvalidRange()
 	}
-	var partCount int
-	if hasPart {
-		if isOrigin {
-			return errNotImplemented()
-		}
-		if rng.Requested {
-			return errInvalidRequest("partNumber and Range are mutually exclusive")
-		}
-		head, err := backend.Head(r.Context(), bucket, key)
-		if err != nil {
-			return err
-		}
-		m := &store.Meta{Size: head.Info.Size, Parts: head.Parts, PartEnds: head.PartEnds}
-		start, end, ok := partBounds(m, part)
-		if !ok {
-			return errInvalidPartNumber()
-		}
-		rng = store.Range(start, end, -1)
-		partCount = partsCount(m)
-	}
-	cond := headerReadCondition(r)
-	res, err := openObject(r.Context(), backend, bucket, key, rng, cond)
-	if errors.Is(err, store.ErrNotFound) && strings.HasSuffix(key, "/") {
-		key += "index.html"
-		res, err = openObject(r.Context(), backend, bucket, key, rng, cond)
-	}
+	obj, err := s.tier.Open(r.Context(), bucket, key, rng)
 	if err != nil {
-		if errors.Is(err, store.ErrNotModified) {
-			etag := ""
-			if res != nil {
-				etag = res.ETag
-			}
-			w.Header().Set("ETag", quoteETag(etag))
-			w.WriteHeader(http.StatusNotModified)
-			return nil
-		}
-		if errors.Is(err, store.ErrPrecondition) {
-			return errPreconditionFailed()
-		}
 		if errors.Is(err, store.ErrInvalidRange) {
-			var size int64
-			if head, herr := backend.Head(r.Context(), bucket, key); herr == nil {
-				size = head.Info.Size
+			if head, herr := s.tier.Head(r.Context(), bucket, key); herr == nil {
+				w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(head.Size, 10))
 			}
-			w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
 			return errInvalidRange()
 		}
 		return err
 	}
-	defer res.Body.Close()
-	if rng.Requested && res.Size == 0 {
+	defer obj.Close()
+
+	if rng.Requested && obj.Size == 0 {
 		w.Header().Set("Content-Range", "bytes */0")
 		return errInvalidRange()
 	}
-	if _, conditional := backend.(conditionalReadBackend); !conditional {
-		if err := readCondition(r, res.ETag); err != nil {
-			if errors.Is(err, store.ErrNotModified) {
-				w.Header().Set("ETag", quoteETag(res.ETag))
-				w.WriteHeader(http.StatusNotModified)
-				return nil
+	if err := checkReadPreconditions(r, obj.ETag, obj.LastModified()); err != nil {
+		if errors.Is(err, store.ErrNotModified) {
+			w.Header().Set("ETag", quoteETag(obj.ETag))
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+		return err
+	}
+
+	res := &store.ReadResult{
+		ObjectInfo: obj.ObjectInfo,
+		Body:       obj.Body,
+		Start:      obj.Start,
+		End:        obj.End,
+		Ranged:     obj.Ranged,
+		Hit:        obj.Hit,
+	}
+	s.serveReadResult(w, r, key, res, true)
+	return nil
+}
+
+func checkReadPreconditions(r *http.Request, etag string, lastModified time.Time) error {
+	if err := readCondition(r, etag); err != nil {
+		return err
+	}
+	if r.Header.Get("If-Match") == "" {
+		if raw := r.Header.Get("If-Unmodified-Since"); raw != "" && !lastModified.IsZero() {
+			if t, err := http.ParseTime(raw); err == nil {
+				if lastModified.UTC().Truncate(time.Second).After(t.UTC().Truncate(time.Second)) {
+					return errPreconditionFailed()
+				}
 			}
-			return err
 		}
 	}
-	if partCount > 0 {
-		w.Header().Set("x-amz-mp-parts-count", strconv.Itoa(partCount))
-	}
-	s.serveReadResult(w, r, key, res, isOrigin)
-	return nil
-}
-
-func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	ing, err := prepareIngest(r)
-	if err != nil {
-		return err
-	}
-	var checks []store.Checksum
-	etag, err := s.writeBackendFor(r.Context(), bucket).Put(r.Context(), bucket, key, ing.body.reader, ing.body.size, ing.opts,
-		func() ([]store.Checksum, error) {
-			got, err := ing.body.verify()
-			if err == nil {
-				checks = got
+	if r.Header.Get("If-None-Match") == "" {
+		if raw := r.Header.Get("If-Modified-Since"); raw != "" && !lastModified.IsZero() {
+			if t, err := http.ParseTime(raw); err == nil {
+				if !lastModified.UTC().Truncate(time.Second).After(t.UTC().Truncate(time.Second)) {
+					return store.ErrNotModified
+				}
 			}
-			return got, err
-		})
-	if err != nil {
-		return err
+		}
 	}
-	w.Header().Set("ETag", quoteETag(etag))
-	setChecksumHeaders(w, checks)
-	w.WriteHeader(http.StatusOK)
 	return nil
 }
 
-func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	if r.URL.Query().Has("versionId") || r.Header.Get("If-Match") != "" ||
-		r.Header.Get("x-amz-if-match-size") != "" || r.Header.Get("x-amz-if-match-last-modified-time") != "" {
-		return errNotImplemented()
+func (s *Server) proxyToOrigin(w http.ResponseWriter, r *http.Request, bucket, key string, invalidateOnSuccess bool) error {
+	if s.tier == nil {
+		return errNoSuchBucket()
 	}
-	if err := s.writeBackendFor(r.Context(), bucket).Delete(r.Context(), bucket, key); err != nil {
+	var body io.Reader
+	var size int64
+	if r.Method == http.MethodPut || r.Method == http.MethodPost {
+		size = r.ContentLength
+		if decoded, ok := r.Body.(*chunkedBody); ok {
+			size = decoded.decodedLen
+		}
+		if size < 0 && r.Body != nil {
+			spBody, spSize, clean, err := s.tier.SpoolStream(r.Context(), r.Body, -1)
+			if err != nil {
+				return err
+			}
+			defer clean()
+			body, size = spBody, spSize
+		} else if size > 0 {
+			body = r.Body
+		}
+	}
+	extra := forwardHeaders(r.Header)
+	resp, err := s.tier.Proxy(r.Context(), bucket, key, r.Method, r.URL.Query(), body, size, extra...)
+	if err != nil {
 		return err
 	}
-	w.WriteHeader(http.StatusNoContent)
+	defer resp.Body.Close()
+
+	if invalidateOnSuccess && key != "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := s.tier.Invalidate(r.Context(), bucket, key); err != nil {
+			s.log.Warn("cache invalidation failed", "bucket", bucket, "key", key, "err", err)
+		}
+	}
+	copyResponse(w, resp)
 	return nil
 }
 
 func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket string) error {
-	if r.Header.Get("x-amz-bypass-governance-retention") != "" {
-		return errNotImplemented()
+	if s.tier == nil {
+		return errNoSuchBucket()
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	if err != nil {
-		return bodyError(err)
-	}
-	if want := r.Header.Get("Content-MD5"); want != "" {
-		sum := md5.Sum(body)
-		if base64.StdEncoding.EncodeToString(sum[:]) != want {
-			return apiErr("BadDigest", "The Content-MD5 you specified did not match the request body.", http.StatusBadRequest)
-		}
+		return errInvalidRequest("unable to read delete request body")
 	}
 	var req deleteRequest
-	if err := xml.Unmarshal(body, &req); err != nil {
-		return errInvalidRequest("malformed Delete XML")
+	if err := xml.Unmarshal(raw, &req); err != nil {
+		return apiErr("MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.", http.StatusBadRequest)
 	}
 	if len(req.Objects) == 0 || len(req.Objects) > 1000 {
-		return errInvalidRequest("Delete must contain between 1 and 1000 objects")
+		return apiErr("MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.", http.StatusBadRequest)
 	}
 	keys := make([]string, 0, len(req.Objects))
 	for _, o := range req.Objects {
@@ -530,26 +172,53 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket st
 		}
 		keys = append(keys, o.Key)
 	}
-	out := deleteResult{Xmlns: s3Namespace}
-	outcomes, err := s.writeBackendFor(r.Context(), bucket).DeleteMany(r.Context(), bucket, keys)
+	extra := forwardHeaders(r.Header)
+	resp, err := s.tier.Proxy(r.Context(), bucket, "", r.Method, r.URL.Query(), bytes.NewReader(raw), int64(len(raw)), extra...)
 	if err != nil {
 		return err
 	}
-	for _, res := range outcomes {
-		if res.Err != nil {
-			s.log.Warn("delete failed", "bucket", bucket, "key", res.Key, "err", res.Err)
-			out.Errors = append(out.Errors, deleteErrXML{
-				Key: res.Key, Code: "InternalError",
-				Message: "The object could not be deleted.",
-			})
-			continue
-		}
-		if !req.Quiet {
-			out.Deleted = append(out.Deleted, deletedXML{Key: res.Key})
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := s.tier.InvalidateMany(r.Context(), bucket, keys); err != nil {
+			s.log.Warn("batch cache invalidation failed", "bucket", bucket, "count", len(keys), "err", err)
 		}
 	}
-	writeXML(w, http.StatusOK, out)
+	copyResponse(w, resp)
 	return nil
+}
+
+func forwardHeaders(h http.Header) [][2]string {
+	var out [][2]string
+	for name, vals := range h {
+		if len(vals) == 0 {
+			continue
+		}
+		lower := strings.ToLower(name)
+		switch lower {
+		case "host", "authorization", "connection", "transfer-encoding", "content-length",
+			"x-amz-date", "x-amz-content-sha256", "x-amz-security-token", "x-amz-decoded-content-length",
+			"expect", "accept-encoding":
+			continue
+		}
+		out = append(out, [2]string{name, vals[0]})
+	}
+	return out
+}
+
+func copyResponse(w http.ResponseWriter, resp *http.Response) {
+	for name, vals := range resp.Header {
+		if strings.EqualFold(name, "Connection") || strings.EqualFold(name, "Transfer-Encoding") {
+			continue
+		}
+		for _, v := range vals {
+			w.Header().Add(name, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	buf := copyBuf()
+	defer putCopyBuf(buf)
+	_, _ = io.CopyBuffer(w, resp.Body, buf)
 }
 
 func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectInfo, key string) {
@@ -584,7 +253,6 @@ func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectInfo, key stri
 func setReadHeaders(w http.ResponseWriter, res *store.ReadResult, key string, cacheHeader bool) {
 	info := res.ObjectInfo
 	if res.Ranged {
-
 		info.ChecksumName, info.ChecksumValue, info.ChecksumType = "", "", ""
 	}
 	setObjectInfoHeaders(w, info, key)
@@ -632,234 +300,4 @@ func checksumHeaderName(name string) string {
 		return lower
 	}
 	return "x-amz-checksum-" + lower
-}
-
-func storedChecksumXML(name, value, typ string) *checksumXML {
-	if name == "" || value == "" {
-		return nil
-	}
-	out := &checksumXML{Type: typ}
-	if out.Type == "" {
-		out.Type = "FULL_OBJECT"
-	}
-	switch strings.TrimPrefix(strings.ToLower(name), "x-amz-checksum-") {
-	case "crc32":
-		out.CRC32 = value
-	case "crc32c":
-		out.CRC32C = value
-	case "crc64nvme":
-		out.CRC64NVME = value
-	case "sha1":
-		out.SHA1 = value
-	case "sha256":
-		out.SHA256 = value
-	case "sha512":
-		out.SHA512 = value
-	default:
-		return nil
-	}
-	return out
-}
-
-type copyObjectResult struct {
-	XMLName      xml.Name `xml:"CopyObjectResult"`
-	Xmlns        string   `xml:"xmlns,attr"`
-	ETag         string   `xml:"ETag"`
-	LastModified string   `xml:"LastModified"`
-}
-
-func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	if err := validateWriteHeaders(r); err != nil {
-		return err
-	}
-	srcBucket, srcKey, err := parseCopySource(r.Header.Get("x-amz-copy-source"), bucket)
-	if err != nil {
-		return err
-	}
-	if srcBucket != bucket {
-		if err := s.requireOriginBucket(r.Context(), srcBucket); err != nil {
-			return err
-		}
-	}
-	replace := strings.EqualFold(r.Header.Get("x-amz-metadata-directive"), "REPLACE")
-	contentEncoding := r.Header.Get("Content-Encoding")
-	var meta []string
-	var ct string
-	if replace {
-		meta, err = parseMetadata(r.Header)
-		if err != nil {
-			return err
-		}
-		ct, err = contentType(r.Header.Get("Content-Type"))
-		if err != nil {
-			return err
-		}
-	}
-	dest, err := putCondition(r)
-	if err != nil {
-		return err
-	}
-	copyOpts := store.CopyOptions{
-		ReplaceMetadata: replace, UserMetadata: meta, ContentType: ct, ContentEncoding: contentEncoding,
-		Source: copySourceCondition(r), Dest: dest,
-	}
-	srcTier := s.originFor(r.Context(), srcBucket)
-	dstTier := s.originFor(r.Context(), bucket)
-	if srcTier == nil && dstTier == nil {
-		out, err := s.writeBackendFor(r.Context(), bucket).Copy(r.Context(), srcBucket, srcKey, bucket, key, copyOpts)
-		if err != nil {
-			return err
-		}
-		writeCopyObject(w, out)
-		return nil
-	}
-	if srcTier != nil && srcTier == dstTier {
-		out, err := dstTier.Copy(r.Context(), srcBucket, srcKey, bucket, key, copyOpts)
-		if err != nil {
-			return err
-		}
-		writeCopyObject(w, out)
-		return nil
-	}
-	src, err := s.backendFor(r.Context(), srcBucket).Open(r.Context(), srcBucket, srcKey, store.WholeObjectRange())
-	if err != nil {
-		return err
-	}
-	defer src.Body.Close()
-	if !copySourceCondition(r).Allows(true, src.ETag) {
-		return errPreconditionFailed()
-	}
-	if !replace {
-		meta, ct, contentEncoding = src.UserMetadata, src.ContentType, src.ContentEncoding
-	}
-	etag, err := s.writeBackendFor(r.Context(), bucket).Put(r.Context(), bucket, key, src.Body,
-		src.ContentLength(), store.WriteOptions{Precondition: dest, UserMetadata: meta, ContentType: ct, ContentEncoding: contentEncoding},
-		func() ([]store.Checksum, error) { return nil, nil })
-	if err != nil {
-		return err
-	}
-	writeXML(w, http.StatusOK, copyObjectResult{
-		Xmlns: s3Namespace, ETag: quoteETag(etag), LastModified: isoTime(time.Now()),
-	})
-	return nil
-}
-
-func writeCopyObject(w http.ResponseWriter, out *store.Meta) {
-	writeXML(w, http.StatusOK, copyObjectResult{
-		Xmlns: s3Namespace, ETag: quoteETag(out.ETag), LastModified: isoTime(out.LastModified()),
-	})
-}
-
-func parseCopySource(v, defaultBucket string) (string, string, error) {
-	if v == "" {
-		return "", "", errInvalidRequest("missing x-amz-copy-source")
-	}
-	decoded, err := url.PathUnescape(v)
-	if err != nil {
-		return "", "", errInvalidRequest("invalid x-amz-copy-source")
-	}
-	if i := strings.IndexByte(decoded, '?'); i >= 0 {
-		decoded = decoded[:i]
-	}
-	decoded = strings.TrimPrefix(decoded, "/")
-	bucket, key, ok := strings.Cut(decoded, "/")
-	if !ok || key == "" {
-		bucket, key = defaultBucket, decoded
-	}
-	if err := validateBucketName(bucket); err != nil {
-		return "", "", err
-	}
-	return bucket, key, nil
-}
-
-func (s *Server) getObjectAttributes(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	requested := map[string]bool{}
-	for a := range strings.SplitSeq(r.Header.Get("x-amz-object-attributes"), ",") {
-		a = strings.TrimSpace(a)
-		if a != "" {
-			requested[a] = true
-		}
-	}
-	if len(requested) == 0 {
-		return errInvalidRequest("x-amz-object-attributes is required")
-	}
-	backend := s.backendFor(r.Context(), bucket)
-	if backendIsOrigin(backend) {
-		head, err := backend.Head(r.Context(), bucket, key)
-		if err != nil {
-			return err
-		}
-		if requested["Checksum"] || (requested["ObjectParts"] && head.Parts != nil) {
-			return errNotImplemented()
-		}
-		out := getObjectAttributesResponse{Xmlns: s3Namespace}
-		if requested["ETag"] {
-			out.ETag = quoteETag(head.Info.ETag)
-		}
-		if requested["ObjectSize"] {
-			size := head.Info.Size
-			out.ObjectSize = &size
-		}
-		if requested["StorageClass"] {
-			out.StorageClass = "STANDARD"
-		}
-		w.Header().Set("Last-Modified", head.Info.LastModified().UTC().Format(http.TimeFormat))
-		writeXML(w, http.StatusOK, out)
-		return nil
-	}
-	meta, parts, err := s.store.Attributes(r.Context(), store.ObjectRef{NS: ns.BucketRef(bucket), Key: key})
-	if err != nil {
-		return err
-	}
-	maxParts := 1000
-	if v := r.Header.Get("x-amz-max-parts"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			return errInvalidRequest("invalid x-amz-max-parts")
-		}
-		maxParts = min(max(n, 1), 1000)
-	}
-	marker := 0
-	if v := r.Header.Get("x-amz-part-number-marker"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			return errInvalidRequest("invalid x-amz-part-number-marker")
-		}
-		marker = n
-	}
-	out := getObjectAttributesResponse{Xmlns: s3Namespace}
-	if requested["ETag"] {
-		out.ETag = quoteETag(meta.ETag)
-	}
-	if requested["ObjectSize"] {
-		size := meta.Size
-		out.ObjectSize = &size
-	}
-	if requested["StorageClass"] {
-		out.StorageClass = "STANDARD"
-	}
-	if requested["Checksum"] {
-
-		out.Checksum = storedChecksumXML(meta.ChecksumName, meta.ChecksumValue, meta.ChecksumType)
-	}
-	if requested["ObjectParts"] && meta.Parts != nil {
-		op := &objectPartsXML{MaxParts: maxParts, PartNumberMarker: marker, PartsCount: len(parts)}
-		for _, p := range parts {
-			if int(p.Number) <= marker {
-				continue
-			}
-			if len(op.Parts) >= maxParts {
-				op.IsTruncated = true
-				op.NextPartNumberMarker = int(op.Parts[len(op.Parts)-1].PartNumber)
-				break
-			}
-			part := partXML{PartNumber: int(p.Number), Size: p.Size}
-			setPartChecksum(&part, p.Checksum)
-			op.Parts = append(op.Parts, part)
-		}
-		out.ObjectParts = op
-	}
-	w.Header().Set("Last-Modified", meta.LastModified().UTC().Format(http.TimeFormat))
-	writeXML(w, http.StatusOK, out)
-	return nil
 }

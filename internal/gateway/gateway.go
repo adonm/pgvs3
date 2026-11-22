@@ -23,9 +23,9 @@ type Limits struct {
 	S3QueueWait time.Duration
 }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool, origins *objcache.Registry, lim Limits) *Gateway {
+func New(st *store.Store, log *slog.Logger, readOnly bool, tier *objcache.Tier, lim Limits) *Gateway {
 	return &Gateway{
-		s3: s3.New(st, log, readOnly, lim.S3, lim.S3QueueWait, origins),
+		s3: s3.New(st, log, readOnly, lim.S3, lim.S3QueueWait, tier),
 	}
 }
 

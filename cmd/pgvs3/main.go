@@ -37,11 +37,6 @@ var commandTable = []command{
 	{name: "health", summary: "Exit 0 when a gateway's readiness URL returns 200.", run: health},
 	{name: "reap", summary: "Run one bounded maintenance pass (or all passes) without a gateway.", run: reap},
 	{name: "stat", summary: "Print namespace, object, chunk and storage-overhead counts.", run: stat},
-	{name: "clone", summary: "Copy a bucket or cache namespace inside PostgreSQL.", run: cloneNS},
-	{name: "drop", summary: "Delete a namespace and its schema.", run: dropNS},
-	{name: "adopt", summary: "Register existing s3b_/s3c_/s3w_ schemas in the catalog.", run: adoptNS},
-	{name: "origin", summary: "Set, clear, list or print SQL for the origin a bucket (or every bucket) caches.", run: originCmd},
-	{name: "pending", summary: "List or retry write-back uploads that have not reached the origin.", run: pendingCmd},
 	{name: "version", summary: "Print the binary version.", run: func([]string) int { fmt.Println(version); return 0 }},
 }
 
@@ -116,15 +111,14 @@ func extractSubcommand(args []string) (string, []string) {
 }
 
 var booleanFlags = map[string]bool{
-	"read-only":        true,
-	"cache-write-back": true,
-	"force":            true,
-	"all":              true,
-	"json":             true,
-	"h":                true,
-	"help":             true,
-	"s3-path-style":    true,
-	"s3-insecure":      true,
+	"read-only":         true,
+	"origin-path-style": true,
+	"origin-insecure":   true,
+	"force":             true,
+	"all":               true,
+	"json":              true,
+	"h":                 true,
+	"help":              true,
 }
 
 func flagTakesValue(name string) bool {
@@ -137,7 +131,6 @@ type serveConfig struct {
 	poolMax                 int
 	spoolDir                string
 	spoolMaxBytes           int64
-	cacheWriteBack          bool
 	dbWorkMem               string
 	dbStatementTimeout      time.Duration
 	dbLockTimeout           time.Duration
@@ -151,10 +144,12 @@ type serveConfig struct {
 	reapGrace               time.Duration
 	readOnly                bool
 	logLevel                string
-	originConfig            string
-	s3Origin                string
-	autoBucket              string
-	cacheTTL                time.Duration
+	originEndpoint          string
+	originRegion            string
+	originPathStyle         bool
+	originInsecure          bool
+	buckets                 string
+	revalidateAfter         time.Duration
 	cacheRetention          time.Duration
 	cacheNamespace          string
 	fillConcurrency         int
@@ -171,8 +166,7 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.StringVar(&cfg.addr, "addr", "0.0.0.0:8014", "listen address for S3/HTTP, /healthz, /readyz and /metrics")
 	fs.IntVar(&cfg.poolMax, "pool-max", 64, "main-pool PostgreSQL connections; the chunk pool adds up to min(pool-max, 64)")
 	fs.StringVar(&cfg.spoolDir, "spool-dir", "", "scratch directory for cache fills over 8 MiB; use local disk, not a small tmpfs (empty uses the system temp dir)")
-	fs.Int64Var(&cfg.spoolMaxBytes, "spool-max-bytes", 8<<30, "process-wide spool byte budget for fills, foreground writes and pending uploads; busy admission returns 503")
-	fs.BoolVar(&cfg.cacheWriteBack, "cache-write-back", true, "acknowledge large unconditional cache writes after the logged write-back commit; the origin upload follows (conditional writes stay synchronous)")
+	fs.Int64Var(&cfg.spoolMaxBytes, "spool-max-bytes", 8<<30, "process-wide spool byte budget for fills; busy admission returns 503")
 	fs.StringVar(&cfg.dbWorkMem, "db-work-mem", "16MB", "session work_mem per sort/hash operation (not a per-connection ceiling)")
 	fs.DurationVar(&cfg.dbStatementTimeout, "db-statement-timeout", 5*time.Minute, "PostgreSQL statement timeout (0 disables)")
 	fs.DurationVar(&cfg.dbLockTimeout, "db-lock-timeout", 5*time.Second, "PostgreSQL lock timeout (0 disables)")
@@ -184,15 +178,17 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.DurationVar(&cfg.httpWriteTimeout, "http-write-timeout", 30*time.Minute, "HTTP response write deadline (0 disables)")
 	fs.Int64Var(&cfg.maxDBBytes, "max-db-bytes", 0, "reject writes when pg_database_size exceeds this (0 = unlimited)")
 	fs.DurationVar(&cfg.reapGrace, "reap-grace", 10*time.Minute, "how long overwritten or deleted files stay readable before garbage collection")
-	fs.BoolVar(&cfg.readOnly, "read-only", false, "reject writes and skip DDL, reaping, fills and origin retries (for standbys); pending write-back objects stay readable")
+	fs.BoolVar(&cfg.readOnly, "read-only", false, "reject writes and skip DDL, reaping, and fills (for standbys)")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
-	fs.StringVar(&cfg.originConfig, "origin-config", "", "process-local fallback origin JSON; prefer pgvs3 origin set, which every gateway discovers")
-	fs.StringVar(&cfg.s3Origin, "s3-origin", "", "attach a bucket-scoped S3 origin on writable startup as [bucket=]s3://origin-bucket[/prefix][?region=...&endpoint=...&path_style=true&insecure=true]")
-	fs.StringVar(&cfg.autoBucket, "auto-bucket", "", "comma-separated native buckets to ensure on writable startup")
-	fs.DurationVar(&cfg.cacheTTL, "cache-ttl", time.Minute, "origin revalidation interval (0 always revalidates)")
+	fs.StringVar(&cfg.originEndpoint, "origin-endpoint", "", "S3 origin endpoint URL (empty uses AWS S3 for --origin-region)")
+	fs.StringVar(&cfg.originRegion, "origin-region", "us-east-1", "S3 origin region")
+	fs.BoolVar(&cfg.originPathStyle, "origin-path-style", false, "use path-style S3 origin addressing")
+	fs.BoolVar(&cfg.originInsecure, "origin-insecure", false, "skip TLS certificate verification for origin")
+	fs.StringVar(&cfg.buckets, "buckets", "", "optional comma-separated bucket allowlist (empty allows all valid bucket names)")
+	fs.DurationVar(&cfg.revalidateAfter, "revalidate-after", 0, "origin revalidation interval (0 = immutable, never revalidate hits)")
 	fs.DurationVar(&cfg.cacheRetention, "cache-retention", 24*time.Hour, "evict cached objects after this idle period")
 	fs.StringVar(&cfg.cacheNamespace, "cache-namespace", "origin", "cache namespace for origin objects")
-	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills and pending-upload workers")
+	fs.IntVar(&cfg.fillConcurrency, "fill-concurrency", 8, "process-wide concurrent origin fills")
 	fs.Int64Var(&cfg.rangeCacheChunk, "range-cache-chunk", 0, "cache aligned ranges of large objects at this byte size (0 disables)")
 	fs.Int64Var(&cfg.cacheMaxBytes, "cache-max-bytes", 0, "evict oldest cached objects when cache namespace exceeds this byte budget (0 disables)")
 	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown")
@@ -217,15 +213,8 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	if cfg.cacheMaxBytes < 0 {
 		return serveConfig{}, fmt.Errorf("--cache-max-bytes must be non-negative")
 	}
-	if cfg.s3Origin != "" {
-		if _, _, err := parseS3OriginFlag(cfg.s3Origin, cfg); err != nil {
-			return serveConfig{}, err
-		}
-	}
-	for _, name := range autoBucketNames(cfg.autoBucket) {
-		if !ns.ValidName(name) {
-			return serveConfig{}, fmt.Errorf("invalid --auto-bucket name %q", name)
-		}
+	if cfg.revalidateAfter < 0 {
+		return serveConfig{}, fmt.Errorf("--revalidate-after must be non-negative")
 	}
 	if cfg.dbStatementTimeout < 0 || cfg.dbLockTimeout < 0 || cfg.dbIdleTxTimeout < 0 ||
 		cfg.dbMaxConnLifetime < 0 || cfg.dbMaxConnLifetimeJitter < 0 ||
@@ -275,18 +264,11 @@ func serve(args []string) int {
 		log.Error("configuring origin cache", "err", err)
 		return 1
 	}
-	origin, err := openOrigin(st, runtime, cfg, log)
+	tier, err := openOrigin(st, runtime, cfg, log)
 	if err != nil {
 		return 1
 	}
-	origins := objcache.NewRegistry(st, log, runtime, objcache.TierOptions{
-		ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack,
-		TTL: cfg.cacheTTL, Retention: cfg.cacheRetention, MaxFills: cfg.fillConcurrency,
-		RangeChunk: cfg.rangeCacheChunk, MaxBytes: cfg.cacheMaxBytes,
-	})
-	origins.SetDefault(origin)
-	origins.Start(ctx)
-	g := newGateway(ctx, st, cfg, origins, log)
+	g := newGateway(ctx, st, cfg, tier, log)
 	defer g.Close()
 	return runGateway(ctx, g, cfg, log)
 }
@@ -334,36 +316,17 @@ func prepareStore(ctx context.Context, st *store.Store, cfg serveConfig, log *sl
 	if cfg.readOnly {
 		return noop, nil
 	}
-	for _, name := range autoBucketNames(cfg.autoBucket) {
-		if err := st.CreateBucket(ctx, name); err != nil {
-			log.Error("creating startup bucket", "bucket", name, "err", err)
-			return noop, err
-		}
-	}
-	if cfg.s3Origin != "" {
-		localBucket, spec, err := parseS3OriginFlag(cfg.s3Origin, cfg)
-		if err != nil {
-			log.Error("parsing s3 origin", "err", err)
-			return noop, err
-		}
-		if err := objcache.SaveSpec(ctx, st, localBucket, spec); err != nil {
-			log.Error("saving s3 origin", "bucket", localBucket, "err", err)
-			return noop, err
-		}
-		log.Info("attached s3 origin", "bucket", localBucket, "s3_bucket", s3OriginBucket(spec),
-			"range_chunk", spec.RangeChunk, "duckdb_path", "s3://"+localBucket+"/")
-	}
 	return startMaintenance(ctx, st, cfg.reapGrace, log), nil
 }
 
-func autoBucketNames(raw string) []string {
-	var names []string
-	for name := range strings.SplitSeq(raw, ",") {
-		if name = strings.TrimSpace(name); name != "" {
-			names = append(names, name)
+func splitCSV(raw string) []string {
+	var out []string
+	for item := range strings.SplitSeq(raw, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
 		}
 	}
-	return names
+	return out
 }
 
 func startMaintenance(ctx context.Context, st *store.Store, reapGrace time.Duration, log *slog.Logger) func() {
@@ -391,35 +354,58 @@ func cacheRuntime(cfg serveConfig) (*objcache.Runtime, error) {
 		}
 	}
 	return objcache.NewRuntime(objcache.RuntimeOptions{
-		Fills: cfg.fillConcurrency, Pending: min(cfg.fillConcurrency, 8),
-		SpoolDir: cfg.spoolDir, SpoolBytes: cfg.spoolMaxBytes,
+		Fills: cfg.fillConcurrency, SpoolDir: cfg.spoolDir, SpoolBytes: cfg.spoolMaxBytes,
 	}), nil
 }
 
 func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log *slog.Logger) (*objcache.Tier, error) {
-	if cfg.originConfig == "" {
-		return nil, nil
+	region := cfg.originRegion
+	if region == "" {
+		region = firstEnv("AWS_REGION", "AWS_DEFAULT_REGION")
 	}
-	raw, err := os.ReadFile(cfg.originConfig)
-	if err != nil {
-		log.Error("reading origin config", "err", err)
-		return nil, err
-	}
-	origin, err := objcache.New(log, raw, st, runtime, objcache.TierOptions{
-		Namespace: cfg.cacheNamespace, TTL: cfg.cacheTTL, Retention: cfg.cacheRetention,
-		MaxFills: cfg.fillConcurrency, RangeChunk: cfg.rangeCacheChunk, MaxBytes: cfg.cacheMaxBytes,
-		ReadOnly: cfg.readOnly, WriteBack: cfg.cacheWriteBack,
+	origin, err := objcache.NewS3Origin(objcache.S3Config{
+		Endpoint:     cfg.originEndpoint,
+		Region:       region,
+		AccessKey:    os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretKey:    os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		SessionToken: os.Getenv("AWS_SESSION_TOKEN"),
+		Insecure:     cfg.originInsecure,
+		PathStyle:    cfg.originPathStyle,
+		Buckets:      splitCSV(cfg.buckets),
 	})
 	if err != nil {
-		log.Error("opening origin", "err", err)
+		log.Error("configuring s3 origin", "err", err)
 		return nil, err
 	}
-	log.Info("origin cache enabled", "namespace", origin.Name(), "capabilities", origin.Capabilities())
-	return origin, nil
+	tier, err := objcache.New(log, origin, st, runtime, objcache.TierOptions{
+		Namespace:  cfg.cacheNamespace,
+		TTL:        cfg.revalidateAfter,
+		Retention:  cfg.cacheRetention,
+		MaxFills:   cfg.fillConcurrency,
+		RangeChunk: cfg.rangeCacheChunk,
+		MaxBytes:   cfg.cacheMaxBytes,
+		ReadOnly:   cfg.readOnly,
+	})
+	if err != nil {
+		_ = origin.Close()
+		log.Error("opening origin cache", "err", err)
+		return nil, err
+	}
+	log.Info("origin cache enabled", "namespace", tier.Name(), "endpoint", cfg.originEndpoint, "region", region)
+	return tier, nil
 }
 
-func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, origins *objcache.Registry, log *slog.Logger) *gateway.Gateway {
-	g := gateway.New(st, log, cfg.readOnly, origins, gateway.Limits{
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, tier *objcache.Tier, log *slog.Logger) *gateway.Gateway {
+	g := gateway.New(st, log, cfg.readOnly, tier, gateway.Limits{
 		S3: cfg.s3Concurrency, S3QueueWait: cfg.s3QueueWait,
 	})
 	go func() {
@@ -519,88 +505,6 @@ func stat(args []string) int {
 		fmt.Println()
 		return 0
 	})
-}
-
-func cloneNS(args []string) int {
-	var kind *string
-	return withStore("clone", args, 30*time.Minute, true, func(fs *flag.FlagSet) {
-		kind = fs.String("kind", "bucket", "bucket or cache")
-	}, func(ctx context.Context, st *store.Store, rest []string) int {
-		if len(rest) != 2 {
-			fmt.Fprintln(os.Stderr, "usage: pgvs3 clone [--kind bucket|cache] <src> <dst>")
-			return 2
-		}
-		if err := st.CloneNamespace(ctx, ns.Kind(*kind), rest[0], rest[1]); err != nil {
-			return fail(err)
-		}
-		fmt.Printf("cloned=%s->%s kind=%s\n", rest[0], rest[1], *kind)
-		return 0
-	})
-}
-
-func dropNS(args []string) int {
-	var kind *string
-	var force *bool
-	return withStore("drop", args, 5*time.Minute, true, func(fs *flag.FlagSet) {
-		kind = fs.String("kind", "bucket", "bucket, cache or queue")
-		force = fs.Bool("force", false, "drop non-empty namespaces and reclaim their schema immediately")
-	}, func(ctx context.Context, st *store.Store, rest []string) int {
-		if len(rest) != 1 {
-			fmt.Fprintln(os.Stderr, "usage: pgvs3 drop [--kind bucket|cache|queue] [--force] <name>")
-			return 2
-		}
-		res, err := st.DropNamespace(ctx, ns.Kind(*kind), rest[0], *force)
-		if err != nil {
-			return fail(err)
-		}
-		switch res {
-		case store.BucketDeleted:
-			if *kind == string(ns.Cache) {
-				_, _ = st.DropNamespace(ctx, ns.WriteBack, rest[0], true)
-			}
-			fmt.Printf("dropped=%s kind=%s\n", rest[0], *kind)
-			return 0
-		case store.BucketNotEmpty:
-			fmt.Fprintf(os.Stderr, "namespace %s is not empty (pass --force)\n", rest[0])
-			return 1
-		default:
-			fmt.Fprintf(os.Stderr, "namespace %s does not exist\n", rest[0])
-			return 1
-		}
-	})
-}
-
-func adoptNS(args []string) int {
-	var kind *string
-	var all *bool
-	return withStore("adopt", args, 30*time.Minute, true, func(fs *flag.FlagSet) {
-		kind = fs.String("kind", "", "bucket, cache or queue (default: all)")
-		all = fs.Bool("all", false, "adopt every matching schema")
-	}, func(ctx context.Context, st *store.Store, rest []string) int {
-		if *all || len(rest) == 0 {
-			n, err := st.AdoptAll(ctx, ns.Kind(*kind))
-			if err != nil {
-				return fail(err)
-			}
-			fmt.Printf("adopted=%d kind=%s\n", n, orAll(*kind))
-			return 0
-		}
-		for _, name := range rest {
-			outcome, err := st.Adopt(ctx, ns.Kind(*kind), name)
-			if err != nil {
-				return fail(err)
-			}
-			fmt.Printf("%s=%s kind=%s\n", name, outcome, orAll(*kind))
-		}
-		return 0
-	})
-}
-
-func orAll(kind string) string {
-	if kind == "" {
-		return "all"
-	}
-	return kind
 }
 
 func health(args []string) int {

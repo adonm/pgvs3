@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,35 +31,29 @@ func copyBuf() []byte { return *(copyBufPool.Get().(*[]byte)) }
 func putCopyBuf(b []byte) { copyBufPool.Put(&b) }
 
 type Server struct {
-	store             *store.Store
-	log               *slog.Logger
-	metrics           *telemetry.RequestMetrics
-	readOnly          bool
-	draining          atomic.Bool
-	origins           *objcache.Registry
-	readOverride      readBackend
-	writeOverride     writeBackend
-	multipartOverride multipartBackend
-	metricsHook       func(io.Writer)
-	sem               chan struct{}
-	waiters           chan struct{}
-	queueWait         time.Duration
-	queued            atomic.Uint64
-	rejected          atomic.Uint64
-	waitNanos         atomic.Uint64
+	store       *store.Store
+	log         *slog.Logger
+	metrics     *telemetry.RequestMetrics
+	readOnly    bool
+	draining    atomic.Bool
+	tier        *objcache.Tier
+	metricsHook func(io.Writer)
+	sem         chan struct{}
+	waiters     chan struct{}
+	queueWait   time.Duration
+	queued      atomic.Uint64
+	rejected    atomic.Uint64
+	waitNanos   atomic.Uint64
 }
 
 func (s *Server) SetMetricsHook(f func(io.Writer)) { s.metricsHook = f }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, queueWait time.Duration, origins *objcache.Registry) *Server {
+func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, queueWait time.Duration, tier *objcache.Tier) *Server {
 	if maxConc <= 0 {
 		maxConc = 32
 	}
 	if log == nil {
 		log = slog.Default()
-	}
-	if origins == nil {
-		origins = objcache.NewRegistry(st, log, objcache.NewRuntime(objcache.RuntimeOptions{}), objcache.TierOptions{ReadOnly: readOnly})
 	}
 	queueSize := 0
 	if queueWait > 0 {
@@ -68,7 +61,7 @@ func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, queueWai
 	}
 	return &Server{
 		store: st, log: log, metrics: telemetry.NewRequestMetrics(), readOnly: readOnly,
-		origins: origins,
+		tier:    tier,
 		sem:     make(chan struct{}, maxConc),
 		waiters: make(chan struct{}, queueSize), queueWait: queueWait,
 	}
@@ -185,14 +178,15 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 
 func (s *Server) SetDraining(v bool) { s.draining.Store(v) }
 
-func (s *Server) Close() { s.origins.Close() }
+func (s *Server) Close() {
+	if s.tier != nil {
+		_ = s.tier.Close()
+	}
+}
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
 	if err := prepareBody(r); err != nil {
 		return err
-	}
-	if strings.HasPrefix(r.URL.EscapedPath(), CachePrefix) {
-		return s.serveCacheHTTP(w, r)
 	}
 	bucket, key, err := splitPath(r)
 	if err != nil {
@@ -202,12 +196,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
 		if err := validateBucketName(bucket); err != nil {
 			return err
 		}
+		if s.tier != nil && !s.tier.BucketAllowed(bucket) {
+			return errNoSuchBucket()
+		}
 	}
 	if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return errAccessDenied("gateway is read-only")
 	}
-	r, release := s.bindBackends(r)
-	defer release()
 	q := r.URL.Query()
 	switch {
 	case bucket == "":
@@ -216,9 +211,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
 		}
 		return errMethodNotAllowed()
 	case key == "":
-		if s.originFor(r.Context(), bucket) != nil {
-			return s.serveOriginBucket(w, r, bucket, q)
-		}
 		return s.bucketRequest(w, r, bucket, q)
 	default:
 		return s.objectRequest(w, r, bucket, key, q)
@@ -247,9 +239,6 @@ func (s *Server) objectRequest(w http.ResponseWriter, r *http.Request, bucket, k
 	if rt == nil {
 		return errMethodNotAllowed()
 	}
-	if err := s.requireOriginBucket(r.Context(), bucket); err != nil {
-		return err
-	}
 	return rt.run(&c)
 }
 
@@ -257,86 +246,12 @@ func errMethodNotAllowed() *APIError {
 	return apiErr("MethodNotAllowed", "The specified method is not allowed against this resource.", http.StatusMethodNotAllowed)
 }
 
-func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
-	if err := s.requireNativeBucket(r.Context(), bucket); err != nil {
-		return err
-	}
-	w.Header().Set("x-amz-bucket-region", "us-east-1")
-	w.WriteHeader(http.StatusOK)
-	return nil
-}
-
-func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
-	if strings.EqualFold(strings.TrimSpace(r.Header.Get("x-amz-bucket-object-lock-enabled")), "true") {
-		return errNotImplemented()
-	}
-	if err := validateWriteHeaders(r); err != nil {
-		return err
-	}
-	src := strings.TrimPrefix(strings.TrimSpace(r.Header.Get("x-amz-copy-source")), "/")
-	if src == "" {
-		src = strings.TrimPrefix(strings.TrimSpace(r.URL.Query().Get("clone")), "/")
-	}
-	if src != "" {
-		if err := validateBucketName(src); err != nil {
-			return err
-		}
-		if s.originFor(r.Context(), src) != nil {
-			return errNotImplemented()
-		}
-		if err := s.store.CloneBucket(r.Context(), src, bucket); err != nil {
-			return err
-		}
-		w.Header().Set("Location", "/"+bucket)
-		w.WriteHeader(http.StatusOK)
-		return nil
-	}
-	s.log.Debug("create bucket", "bucket", bucket, "content_length", r.ContentLength)
-	if err := s.store.CreateBucket(r.Context(), bucket); err != nil {
-		return err
-	}
-	w.Header().Set("Location", "/"+bucket)
-	w.WriteHeader(http.StatusOK)
-	return nil
-}
-
-func (s *Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
-	q := r.URL.Query()
-	force := q.Get("force") == "true" || q.Get("force") == "1" ||
-		strings.EqualFold(r.Header.Get("x-amz-force-delete"), "true")
-	res, err := s.store.DropBucket(r.Context(), bucket, force)
-	if err != nil {
-		return err
-	}
-	switch res {
-	case store.BucketDeleted:
-		w.WriteHeader(http.StatusNoContent)
-		return nil
-	case store.BucketNotEmpty:
-		return apiErr("BucketNotEmpty", "The bucket you tried to delete is not empty.", http.StatusConflict)
-	default:
-		return errNoSuchBucket()
-	}
-}
-
-func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) error {
-	buckets, err := s.store.Buckets(r.Context())
-	if err != nil {
-		return err
-	}
+func (s *Server) listBuckets(w http.ResponseWriter, _ *http.Request) error {
 	out := listAllMyBucketsResult{
 		Xmlns: s3Namespace,
 		Owner: ownerXML{ID: "pgvs3", DisplayName: "pgvs3"},
 	}
-	for _, b := range buckets {
-		out.Buckets = append(out.Buckets, bucketXML{Name: b.Name, CreationDate: isoTime(b.Created)})
-	}
 	writeXML(w, http.StatusOK, out)
-	return nil
-}
-
-func (s *Server) getBucketLocation(w http.ResponseWriter, _ *http.Request, _ string) error {
-	writeXML(w, http.StatusOK, locationConstraint{Xmlns: s3Namespace, Value: "us-east-1"})
 	return nil
 }
 
@@ -393,38 +308,29 @@ func (c *routeContext) dispatch(table []route) (bool, error) {
 
 var bucketRoutes = []route{
 	{name: "bucket-put", method: http.MethodPut, run: func(c *routeContext) error {
-		return c.s.createBucket(c.w, c.r, c.bucket)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
 	{name: "bucket-delete", method: http.MethodDelete, run: func(c *routeContext) error {
-		return c.s.deleteBucket(c.w, c.r, c.bucket)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
 	{name: "bucket-head", method: http.MethodHead, run: func(c *routeContext) error {
-		return c.s.headBucket(c.w, c.r, c.bucket)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
 	{name: "bucket-location", method: http.MethodGet, query: "location", run: func(c *routeContext) error {
-		return c.s.getBucketLocation(c.w, c.r, c.bucket)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
 	{name: "bucket-versions", method: http.MethodGet, query: "versions", run: func(c *routeContext) error {
-		return c.s.listObjectVersions(c.w, c.r, c.bucket, c.q)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
 	{name: "bucket-uploads", method: http.MethodGet, query: "uploads", run: func(c *routeContext) error {
-		return c.s.listMultipartUploads(c.w, c.r, c.bucket, c.q)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
 	{name: "bucket-delete-objects", method: http.MethodPost, query: "delete", run: func(c *routeContext) error {
 		return c.s.deleteObjects(c.w, c.r, c.bucket)
 	}},
 	{name: "bucket-get", method: http.MethodGet, run: func(c *routeContext) error {
-		return c.s.getOrListBucket(c.w, c.r, c.bucket, c.q)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
-}
-
-func (s *Server) getOrListBucket(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) error {
-	if r.URL.RawQuery == "" && r.Header.Get("Authorization") == "" && r.Header.Get("x-amz-date") == "" {
-		if _, err := s.backendFor(r.Context(), bucket).Head(r.Context(), bucket, "index.html"); err == nil {
-			return s.getObject(w, r, bucket, "index.html")
-		}
-	}
-	return s.listObjectsV2(w, r, bucket, q)
 }
 
 var objectRoutes = []route{
@@ -432,86 +338,40 @@ var objectRoutes = []route{
 		return c.s.headObject(c.w, c.r, c.bucket, c.key)
 	}},
 	{name: "object-attributes", method: http.MethodGet, query: "attributes", run: func(c *routeContext) error {
-		return c.s.getObjectAttributes(c.w, c.r, c.bucket, c.key)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
 	{name: "object-list-parts", method: http.MethodGet, query: "uploadId", run: func(c *routeContext) error {
-		return c.s.listParts(c.w, c.r, c.bucket, c.key, c.q)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
 	{name: "object-get", method: http.MethodGet, run: func(c *routeContext) error {
 		return c.s.getObject(c.w, c.r, c.bucket, c.key)
 	}},
 	{name: "object-upload-part-copy", method: http.MethodPut, query: "partNumber", query2: "uploadId",
 		header: "x-amz-copy-source", run: func(c *routeContext) error {
-			return c.s.uploadPartCopy(c.w, c.r, c.bucket, c.key, c.q)
+			return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 		}},
 	{name: "object-upload-part", method: http.MethodPut, query: "partNumber", query2: "uploadId", run: func(c *routeContext) error {
-		return c.s.uploadPart(c.w, c.r, c.bucket, c.key, c.q)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
 	{name: "object-copy", method: http.MethodPut, header: "x-amz-copy-source", run: func(c *routeContext) error {
-		return c.s.copyObject(c.w, c.r, c.bucket, c.key)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, true)
 	}},
 	{name: "object-put", method: http.MethodPut, run: func(c *routeContext) error {
-		return c.s.putObject(c.w, c.r, c.bucket, c.key)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, true)
 	}},
 	{name: "object-create-multipart", method: http.MethodPost, query: "uploads", run: func(c *routeContext) error {
-		return c.s.createMultipartUpload(c.w, c.r, c.bucket, c.key)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
 	{name: "object-complete-multipart", method: http.MethodPost, query: "uploadId", run: func(c *routeContext) error {
-		return c.s.completeMultipartUpload(c.w, c.r, c.bucket, c.key, c.q)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, true)
 	}},
 	{name: "object-abort-multipart", method: http.MethodDelete, query: "uploadId", run: func(c *routeContext) error {
-		return c.s.abortMultipartUpload(c.w, c.r, c.bucket, c.key, c.q)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
 	{name: "object-delete", method: http.MethodDelete, run: func(c *routeContext) error {
-		return c.s.deleteObject(c.w, c.r, c.bucket, c.key)
+		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, true)
 	}},
 }
-
-var originBucketRoutes = []route{
-	{name: "origin-bucket-head", method: http.MethodHead, run: catalogRoute(func(c *routeContext) error {
-		return c.s.headBucket(c.w, c.r, c.bucket)
-	})},
-	{name: "origin-bucket-location", method: http.MethodGet, query: "location", run: func(c *routeContext) error {
-		c.s.getBucketLocation(c.w, c.r, c.bucket)
-		return nil
-	}},
-	{name: "origin-bucket-versions", method: http.MethodGet, query: "versions", run: catalogRoute(func(c *routeContext) error {
-		return c.s.listOriginObjectVersions(c.w, c.r, c.bucket, c.q)
-	})},
-	{name: "origin-bucket-uploads", method: http.MethodGet, query: "uploads", run: catalogRoute(func(c *routeContext) error {
-		return c.s.listMultipartUploads(c.w, c.r, c.bucket, c.q)
-	})},
-	{name: "origin-bucket-list", method: http.MethodGet, run: catalogRoute(func(c *routeContext) error {
-		return c.s.listObjectsV2(c.w, c.r, c.bucket, c.q)
-	})},
-	{name: "origin-bucket-copy", method: http.MethodPut, header: "x-amz-copy-source", run: routeNotImplemented},
-	{name: "origin-bucket-put", method: http.MethodPut, run: func(c *routeContext) error {
-		if c.s.store == nil {
-			return routeStatusOK(c)
-		}
-		return c.s.createBucket(c.w, c.r, c.bucket)
-	}},
-	{name: "origin-bucket-delete", method: http.MethodDelete, run: routeNotImplemented},
-	{name: "origin-bucket-delete-objects", method: http.MethodPost, query: "delete", run: catalogRoute(func(c *routeContext) error {
-		return c.s.deleteObjects(c.w, c.r, c.bucket)
-	})},
-}
-
-func catalogRoute(run func(*routeContext) error) func(*routeContext) error {
-	return func(c *routeContext) error {
-		if err := c.s.requireOriginBucket(c.r.Context(), c.bucket); err != nil {
-			return err
-		}
-		return run(c)
-	}
-}
-
-func routeStatusOK(c *routeContext) error {
-	c.w.WriteHeader(http.StatusOK)
-	return nil
-}
-
-func routeNotImplemented(c *routeContext) error { return errNotImplemented() }
 
 type APIError struct {
 	Code    string
@@ -551,14 +411,6 @@ func errPreconditionFailed() *APIError {
 
 func errInvalidRange() *APIError {
 	return apiErr("InvalidRange", "The requested range is not satisfiable.", http.StatusRequestedRangeNotSatisfiable)
-}
-
-func errInvalidPart() *APIError {
-	return apiErr("InvalidPart", "One or more of the specified parts could not be found or did not match the supplied ETag.", http.StatusBadRequest)
-}
-
-func errInvalidPartNumber() *APIError {
-	return apiErr("InvalidPartNumber", "The requested part number is not satisfiable.", http.StatusRequestedRangeNotSatisfiable)
 }
 
 func errInvalidRequest(msg string) *APIError {
@@ -626,7 +478,9 @@ func (s *Server) writeMetrics(w http.ResponseWriter, st *store.Store) {
 	if st != nil {
 		st.WriteMetrics(w)
 	}
-	s.origins.WriteMetrics(w)
+	if s.tier != nil {
+		s.tier.WriteMetrics(w)
+	}
 }
 
 type recWriter struct {

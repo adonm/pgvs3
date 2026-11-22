@@ -10,9 +10,10 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,75 +26,60 @@ import (
 )
 
 type Tier struct {
-	origin         originHandle
-	store          *store.Store
-	runtime        *Runtime
-	namespace      string
-	ttl            time.Duration
-	retention      time.Duration
-	fills          chan struct{}
-	completes      chan struct{}
-	group          singleflight.Group
-	log            *slog.Logger
-	readOnly       bool
-	writeBack      bool
-	workerID       string
-	keyLocks       [64]sync.Mutex
-	rangeSize      int64
-	maxBytes       int64
-	pendingWorkers int
-	pendingWake    chan struct{}
-	ctx            context.Context
-	cancel         context.CancelFunc
-	done           chan struct{}
-	workerStarted  bool
-	closeOnce      sync.Once
-	closeErr       error
-	fillTTL        time.Duration
+	origin    originHandle
+	store     *store.Store
+	runtime   *Runtime
+	namespace string
+	ttl       time.Duration
+	retention time.Duration
+	fills     chan struct{}
+	group     singleflight.Group
+	log       *slog.Logger
+	readOnly  bool
+	workerID  string
+	rangeSize int64
+	maxBytes  int64
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	fillTTL   time.Duration
 }
 
 const (
-	memFillMax         = 8 << 20
-	fullCacheMax       = 8 << 20
-	maxRangeChunk      = 8 << 20
-	maxRangeCacheSpan  = 64 << 20
-	writeBackMin       = 8 << 20
-	originTombstoneTTL = 30 * time.Minute
-	fillLeaseTTL       = 2 * time.Minute
-	fillLeaseWait      = 45 * time.Second
+	memFillMax        = 8 << 20
+	fullCacheMax      = 8 << 20
+	maxRangeChunk     = 8 << 20
+	maxRangeCacheSpan = 64 << 20
+	fillLeaseTTL      = 2 * time.Minute
+	fillLeaseWait     = 45 * time.Second
 )
 
 var (
-	errPendingOrigin = errors.New("cache object is pending origin upload")
-	errFillBusy      = errors.New("origin fill owned by another worker")
-	ErrReadOnly      = errors.New("cache tier is read-only")
+	errFillBusy  = errors.New("origin fill owned by another worker")
+	ErrReadOnly  = errors.New("cache tier is read-only")
+	ErrSpoolBusy = errors.New("cache spool byte budget exhausted")
 )
 
 type RuntimeOptions struct {
 	Fills      int
-	Pending    int
 	SpoolDir   string
 	SpoolBytes int64
 }
 
 type Runtime struct {
-	fills   chan struct{}
-	pending chan struct{}
-	spool   *spoolBudget
+	fills chan struct{}
+	spool *spoolBudget
 }
 
 func NewRuntime(opts RuntimeOptions) *Runtime {
 	if opts.Fills <= 0 {
 		opts.Fills = 64
 	}
-	if opts.Pending <= 0 {
-		opts.Pending = opts.Fills
-	}
 	if opts.SpoolBytes <= 0 {
 		opts.SpoolBytes = 8 << 30
 	}
 	return &Runtime{
-		fills: make(chan struct{}, opts.Fills), pending: make(chan struct{}, opts.Pending),
+		fills: make(chan struct{}, opts.Fills),
 		spool: newSpoolBudget(opts.SpoolBytes, opts.SpoolDir),
 	}
 }
@@ -106,7 +92,6 @@ type TierOptions struct {
 	RangeChunk int64
 	MaxBytes   int64
 	ReadOnly   bool
-	WriteBack  bool
 }
 
 func acquireProcess(sem chan struct{}, ctx context.Context) bool {
@@ -118,7 +103,10 @@ func acquireProcess(sem chan struct{}, ctx context.Context) bool {
 	}
 }
 
-func New(log *slog.Logger, config []byte, st *store.Store, runtime *Runtime, opts TierOptions) (*Tier, error) {
+func New(log *slog.Logger, origin originHandle, st *store.Store, runtime *Runtime, opts TierOptions) (*Tier, error) {
+	if origin == nil {
+		return nil, errors.New("origin is required")
+	}
 	if runtime == nil {
 		return nil, errors.New("cache runtime is required")
 	}
@@ -128,23 +116,14 @@ func New(log *slog.Logger, config []byte, st *store.Store, runtime *Runtime, opt
 	if log == nil {
 		log = slog.Default()
 	}
-	c, err := parseConfig(config)
-	if err != nil {
-		return nil, fmt.Errorf("parse origin config: %w", err)
-	}
-	b, err := newOrigin(c)
-	if err != nil {
-		return nil, err
-	}
 	if opts.Namespace == "" {
 		opts.Namespace = "origin"
 	}
 	if !ns.ValidName(opts.Namespace) {
-		_ = b.Close()
 		return nil, fmt.Errorf("invalid cache namespace %q", opts.Namespace)
 	}
 	if opts.TTL < 0 {
-		opts.TTL = time.Minute
+		opts.TTL = 0
 	}
 	if opts.Retention <= 0 {
 		opts.Retention = 24 * time.Hour
@@ -157,28 +136,29 @@ func New(log *slog.Logger, config []byte, st *store.Store, runtime *Runtime, opt
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Tier{
-		origin: b, store: st, runtime: runtime, namespace: opts.Namespace, ttl: opts.TTL, retention: opts.Retention,
-		fills: make(chan struct{}, opts.MaxFills), completes: make(chan struct{}, opts.MaxFills),
-		log: log, readOnly: opts.ReadOnly, writeBack: opts.WriteBack,
-		rangeSize: max(opts.RangeChunk, 0), maxBytes: max(opts.MaxBytes, 0),
-		workerID: randomID(), pendingWorkers: min(opts.MaxFills, 8),
-		pendingWake: make(chan struct{}, 1),
-		ctx:         ctx, cancel: cancel, done: make(chan struct{}),
+		origin:    origin,
+		store:     st,
+		runtime:   runtime,
+		namespace: opts.Namespace,
+		ttl:       opts.TTL,
+		retention: opts.Retention,
+		fills:     make(chan struct{}, opts.MaxFills),
+		log:       log,
+		readOnly:  opts.ReadOnly,
+		rangeSize: max(opts.RangeChunk, 0),
+		maxBytes:  max(opts.MaxBytes, 0),
+		workerID:  randomID(),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	if st != nil {
 		st.SetCacheMaxBytes(opts.Namespace, t.maxBytes)
-	}
-	if !opts.ReadOnly {
-
-		for _, kind := range []ns.Kind{ns.Cache, ns.WriteBack} {
-			if err := st.EnsureNamespace(ctx, kind, opts.Namespace, nil, nil); err != nil {
+		if !opts.ReadOnly {
+			if err := st.EnsureNamespace(ctx, ns.Cache, opts.Namespace, nil, nil); err != nil {
 				cancel()
-				_ = b.Close()
-				return nil, fmt.Errorf("ensure %s namespace: %w", kind, err)
+				return nil, fmt.Errorf("ensure cache namespace: %w", err)
 			}
 		}
-		t.workerStarted = true
-		go t.runPending(ctx)
 	}
 	return t, nil
 }
@@ -193,12 +173,11 @@ func randomID() string {
 
 func (t *Tier) Name() string { return t.namespace }
 
-func (t *Tier) Capabilities() string { return t.origin.Capabilities().String() }
+func (t *Tier) BucketAllowed(bucket string) bool { return t.origin.BucketAllowed(bucket) }
 
-func (t *Tier) wakePending() {
-	select {
-	case t.pendingWake <- struct{}{}:
-	default:
+func (t *Tier) WriteMetrics(w io.Writer) {
+	if t.runtime != nil {
+		t.runtime.WriteMetrics(w)
 	}
 }
 
@@ -207,12 +186,11 @@ func (t *Tier) Close() error {
 		if t.cancel != nil {
 			t.cancel()
 		}
-		if t.workerStarted {
-			<-t.done
+		if t.origin != nil {
+			_ = t.origin.Close()
 		}
-		t.closeErr = t.origin.Close()
 	})
-	return t.closeErr
+	return nil
 }
 
 func (t *Tier) baseContext() context.Context {
@@ -224,127 +202,138 @@ func (t *Tier) baseContext() context.Context {
 
 func (t *Tier) key(bucket, key string) string { return bucket + "/" + key }
 
-func (t *Tier) durableRetention() time.Duration { return max(t.retention, originTombstoneTTL) }
-
 func (t *Tier) cacheRef(ck string) store.ObjectRef {
 	return store.ObjectRef{NS: ns.CacheRef(t.namespace), Key: ck}
 }
 
-func (t *Tier) writeRef(ck string) store.ObjectRef {
-	return store.ObjectRef{NS: ns.WriteBackRef(t.namespace), Key: ck}
+type Object struct {
+	store.ObjectInfo
+	Body   io.ReadCloser
+	Start  int64
+	End    int64
+	Ranged bool
+	Hit    bool
 }
 
-func (t *Tier) keyLockIndex(ck string) uint32 {
-	const (
-		offset = 2166136261
-		prime  = 16777619
-	)
-	h := uint32(offset)
-	for i := 0; i < len(ck); i++ {
-		h = (h ^ uint32(ck[i])) * prime
+func (o *Object) ContentLength() int64 {
+	if o == nil {
+		return 0
 	}
-	return h % uint32(len(t.keyLocks))
+	if o.Ranged {
+		return o.End - o.Start + 1
+	}
+	return o.Size
 }
 
-func (t *Tier) lockKey(ck string) func() {
-	mu := &t.keyLocks[t.keyLockIndex(ck)]
-	mu.Lock()
-	return mu.Unlock
+func (o *Object) Close() error {
+	if o == nil || o.Body == nil {
+		return nil
+	}
+	return o.Body.Close()
+}
+
+type readView struct {
+	store.ObjectInfo
+	start  int64
+	end    int64
+	ranged bool
+	hit    bool
+}
+
+func newObject(v readView, body io.ReadCloser) *Object {
+	info := v.ObjectInfo
+	return &Object{
+		ObjectInfo: info,
+		Body:       body,
+		Start:      v.start,
+		End:        v.end,
+		Ranged:     v.ranged,
+		Hit:        v.hit,
+	}
 }
 
 type cacheAction uint8
 
 const (
-	cacheActionZero cacheAction = iota
+	cacheActionRead cacheAction = iota
+	cacheActionZero
 	cacheActionPassThrough
 	cacheActionRange
-	cacheActionCached
 )
 
 type cachePlan struct {
 	action cacheAction
-	length int64
 }
 
 func planCacheRead(res cacheResolution, rangeSize int64, readOnly bool, v readView) cachePlan {
-	size := v.Size
-	var plan cachePlan
-	if size == 0 {
-		plan.action = cacheActionZero
-		return plan
+	if v.Size == 0 {
+		return cachePlan{action: cacheActionZero}
 	}
-	plan.length = v.end - v.start + 1
-	switch {
-	case readOnly && !res.valid && !res.attrsValid:
-		plan.action = cacheActionPassThrough
-	case rangeSize > 0 && !res.valid && size > rangeSize &&
-		plan.length < size && plan.length <= maxRangeCacheSpan:
-		plan.action = cacheActionRange
-	case res.valid || plan.length == size || size <= fullCacheMax:
-		plan.action = cacheActionCached
-	default:
-		plan.action = cacheActionPassThrough
+	if res.meta != nil && (res.meta.Size == 0 || res.meta.Inline != nil || res.meta.FileID > 0) {
+		return cachePlan{action: cacheActionRead}
 	}
-	return plan
-}
-
-type Object = store.ReadResult
-
-type readView struct {
-	store.ObjectInfo
-	start, end int64
-	ranged     bool
-	hit        bool
-}
-
-func newObject(v readView, body io.ReadCloser) *Object {
-	return &Object{ObjectInfo: v.ObjectInfo, Body: body, Start: v.start, End: v.end, Ranged: v.ranged, Hit: v.hit}
+	if rangeSize > 0 && v.Size > rangeSize {
+		span := v.end - v.start + 1
+		if v.ranged && (span <= maxRangeCacheSpan || v.Size > fullCacheMax) {
+			return cachePlan{action: cacheActionRange}
+		}
+		if v.Size > fullCacheMax {
+			return cachePlan{action: cacheActionPassThrough}
+		}
+	}
+	if v.Size > fullCacheMax && v.ranged {
+		return cachePlan{action: cacheActionPassThrough}
+	}
+	if readOnly && res.meta == nil {
+		return cachePlan{action: cacheActionPassThrough}
+	}
+	return cachePlan{action: cacheActionRead}
 }
 
 type cacheResolution struct {
 	meta       *store.Meta
 	ref        store.ObjectRef
-	state      store.CacheState
-	attrs      originAttrs
 	info       store.ObjectInfo
+	attrs      originAttrs
 	valid      bool
 	attrsValid bool
 }
 
-func (t *Tier) resolveCache(ctx context.Context, ck string, deleteStale, withInline, skipAttributesOnMiss bool) (cacheResolution, error) {
-	res := cacheResolution{ref: t.cacheRef(ck), state: store.CacheLive}
+func (t *Tier) isFresh(createdAt time.Time) bool {
+	return t.ttl == 0 || time.Since(createdAt) < t.ttl
+}
+
+func (t *Tier) resolveCache(ctx context.Context, bucket, key, ck string, deleteStale, withInline, skipAttributesOnMiss bool) (cacheResolution, error) {
+	res := cacheResolution{ref: t.cacheRef(ck)}
 	var m *store.Meta
-	var ref store.ObjectRef
 	var info *store.ObjectInfo
 	var err error
-	if !skipAttributesOnMiss && t.rangeSize > 0 && t.ttl > 0 {
-		// One query resolves both the mutable cache row and the warm parent
-		// origin metadata that a range cache writes before its first chunk.
+	if !skipAttributesOnMiss && t.rangeSize > 0 {
 		var cref ns.Ref
 		m, cref, info, err = t.store.Cache(t.namespace).MetadataOrOrigin(ctx, ck, withInline, t.ttl)
-		ref = store.ObjectRef{NS: cref, Key: ck}
+		res.ref = store.ObjectRef{NS: cref, Key: ck}
+	} else if withInline {
+		m, err = t.store.Meta(ctx, res.ref)
 	} else {
-		m, ref, err = t.lookupCached(ctx, ck, withInline)
+		m, err = t.store.MetaHeader(ctx, res.ref)
 	}
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return res, err
 	}
 	if m != nil {
-		res.meta, res.ref = m, ref
-		res.state = store.ParseCacheVersion(m.OriginETag).State
-		if res.state == store.CacheDeleted {
-			return res, store.ErrNotFound
-		}
-		if res.state == store.CachePending || (t.ttl > 0 && time.Since(m.CreatedAt) < t.ttl) {
-			res.info = cachedInfo(res.ref, m)
+		res.meta = m
+		if t.isFresh(m.CreatedAt) {
+			res.info = cachedInfo(m)
 			res.valid = true
 			return res, nil
 		}
 	} else if info != nil {
 		res.info = *info
-		res.attrs = originAttrs{Size: info.Size, ETag: info.OriginETag,
+		res.attrs = originAttrs{
+			Size: info.Size, ETag: info.OriginETag,
 			LastModified: info.LastModified(), ContentType: info.ContentType,
-			ContentEncoding: info.ContentEncoding, UserMetadata: info.UserMetadata}
+			ContentEncoding: info.ContentEncoding, UserMetadata: info.UserMetadata,
+		}
 		res.attrsValid = true
 		return res, nil
 	} else if skipAttributesOnMiss {
@@ -352,125 +341,77 @@ func (t *Tier) resolveCache(ctx context.Context, ck string, deleteStale, withInl
 	}
 
 	validated := time.Now()
-	// A cold Parquet range read heads the parent object before any chunk is
-	// fetched. DuckDB opens many column ranges on the same file at once, so
-	// coalesce that HEAD per key instead of issuing one per reader.
 	ch := t.group.DoChan("head:"+ck, func() (any, error) {
 		headCtx, cancel := context.WithTimeout(t.baseContext(), 30*time.Second)
 		defer cancel()
-		return t.origin.Attributes(headCtx, ck)
+		return t.origin.Attributes(headCtx, bucket, key)
 	})
 	var a originAttrs
 	var aerr error
 	select {
-	case res := <-ch:
-		if res.Err != nil {
-			aerr = res.Err
+	case r := <-ch:
+		if r.Err != nil {
+			aerr = r.Err
 		} else {
-			a = res.Val.(originAttrs)
+			a = r.Val.(originAttrs)
 		}
 	case <-ctx.Done():
 		return res, ctx.Err()
 	}
 	if aerr != nil {
-		if t.origin.IsObjNotFoundErr(aerr) {
-			if m != nil && res.ref.NS.Kind == ns.WriteBack && !t.readOnly {
-				_, _ = t.store.RetireOriginObject(ctx, res.ref, m)
-			}
+		if isObjectNotFound(aerr) {
 			return res, store.ErrNotFound
 		}
 		return res, aerr
 	}
 	res.attrs, res.info = a, a.objectInfo()
-	if m == nil && t.rangeSize > 0 && t.ttl > 0 && a.Size > t.rangeSize && !t.readOnly {
-		if err := t.store.Cache(t.namespace).RememberOriginMetadata(ctx, ck, res.info, validated, min(t.ttl, t.retention)); err != nil {
+	if m == nil && t.rangeSize > 0 && a.Size > t.rangeSize && !t.readOnly {
+		ttl := t.ttl
+		if ttl == 0 {
+			ttl = t.retention
+		}
+		if err := t.store.Cache(t.namespace).RememberOriginMetadata(ctx, ck, res.info, validated, min(ttl, t.retention)); err != nil {
 			return res, err
 		}
 	}
 	if m != nil {
 		if m.Size == res.info.Size && m.OriginETag == res.info.OriginETag {
-			t.touch(res.ref.NS.Kind, ck)
-			res.info = cachedInfo(res.ref, m)
+			t.touch(ck)
+			res.info = cachedInfo(m)
 			res.valid = true
-		} else {
-			if !t.readOnly && (deleteStale || res.ref.NS.Kind == ns.WriteBack) {
-				if res.ref.NS.Kind == ns.WriteBack {
-					if _, err := t.store.RetireOriginObject(ctx, res.ref, m); err != nil {
-						return res, err
-					}
-				} else {
-					_, _ = t.store.DeleteExpected(context.WithoutCancel(ctx), res.ref, m.OriginETag)
-				}
-			}
-			if res.ref.NS.Kind == ns.WriteBack {
-				res.meta = nil
-			}
+		} else if !t.readOnly && deleteStale {
+			_, _ = t.store.DeleteExpected(context.WithoutCancel(ctx), res.ref, m.OriginETag)
 		}
 	}
 	return res, nil
 }
 
-func cachedInfo(ref store.ObjectRef, m *store.Meta) store.ObjectInfo {
+func cachedInfo(m *store.Meta) store.ObjectInfo {
 	info := m.ObjectInfo
-	info.ETag, info.OriginETag = responseETag(m), originETag(m)
-	if ref.NS.Kind == ns.WriteBack {
-		info.ETag = m.ETag
-	}
+	info.ETag = responseETag(m)
+	info.OriginETag = originETag(m)
 	return info
 }
 
-// RangeChunkSize reports the aligned range size this tier fills, or zero when
-// range caching is disabled.
+func responseETag(m *store.Meta) string {
+	if v := m.OriginETag; v != "" {
+		return v
+	}
+	return m.ETag
+}
+
+func originETag(m *store.Meta) string {
+	if m.OriginETag != "" {
+		return m.OriginETag
+	}
+	return m.ETag
+}
+
 func (t *Tier) RangeChunkSize() int64 { return t.rangeSize }
-
-// HeadCached resolves metadata from the local cache only. It never contacts the
-// origin, so archive member lookups can check whether a literal object shadows
-// the member without a wasted origin HEAD.
-func (t *Tier) HeadCached(ctx context.Context, bucket, key string) (store.ObjectInfo, bool, error) {
-	m, ref, err := t.lookupCached(ctx, t.key(bucket, key), false)
-	if err != nil {
-		return store.ObjectInfo{}, false, err
-	}
-	if m == nil {
-		return store.ObjectInfo{}, false, nil
-	}
-	if store.ParseCacheVersion(m.OriginETag).State == store.CacheDeleted {
-		return store.ObjectInfo{}, false, store.ErrNotFound
-	}
-	return cachedInfo(ref, m), true, nil
-}
-
-// OpenCached opens a cached object without contacting the origin.
-func (t *Tier) OpenCached(ctx context.Context, bucket, key string, rng store.ByteRange) (*Object, bool, error) {
-	m, ref, err := t.lookupCached(ctx, t.key(bucket, key), true)
-	if err != nil {
-		return nil, false, err
-	}
-	if m == nil {
-		return nil, false, nil
-	}
-	if store.ParseCacheVersion(m.OriginETag).State == store.CacheDeleted {
-		return nil, false, store.ErrNotFound
-	}
-	span, err := rng.Resolve(m.Size)
-	if err != nil {
-		return nil, false, err
-	}
-	info := cachedInfo(ref, m)
-	if info.ContentType == "" {
-		info.ContentType = contentTypeFor(key)
-	}
-	view := readView{ObjectInfo: info, start: span.Start, end: span.End, ranged: span.Ranged, hit: true}
-	obj, err := t.openCached(ctx, ref, m, view)
-	if err != nil {
-		return nil, false, err
-	}
-	return obj, true, nil
-}
 
 func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 	ck := t.key(bucket, key)
-	res, err := t.resolveCache(ctx, ck, false, false, false)
+	res, err := t.resolveCache(ctx, bucket, key, ck, false, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -483,44 +424,35 @@ func (t *Tier) Head(ctx context.Context, bucket, key string) (*Object, error) {
 
 func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange) (*Object, error) {
 	ck := t.key(bucket, key)
-
 	skipAttributes := !rng.Requested
-	res, err := t.resolveCache(ctx, ck, true, true, skipAttributes)
+	res, err := t.resolveCache(ctx, bucket, key, ck, true, true, skipAttributes)
 	if err != nil {
 		return nil, err
 	}
 	if skipAttributes && res.meta == nil {
 		if t.readOnly {
-			return t.passThroughWhole(ctx, ck, key, rng)
+			return t.passThroughWhole(ctx, bucket, key, rng)
 		}
-		m, fillErr := t.fill(ctx, ck, key)
-		if errors.Is(fillErr, errPendingOrigin) || errors.Is(fillErr, errFillBusy) {
-			return t.openPending(ctx, ck, key, rng)
+		m, fillErr := t.fill(ctx, bucket, key, ck)
+		if errors.Is(fillErr, errFillBusy) {
+			return t.passThroughWhole(ctx, bucket, key, rng)
 		}
 		if errors.Is(fillErr, store.ErrStaleCache) {
-			return t.openPending(ctx, ck, key, rng)
+			return t.passThroughWhole(ctx, bucket, key, rng)
 		}
 		if fillErr != nil {
 			return nil, fillErr
-		}
-		readRef := t.cacheRef(ck)
-		if wm, werr := t.store.Meta(ctx, t.writeRef(ck)); werr == nil {
-			if store.ParseCacheVersion(wm.OriginETag).IsDeleted() {
-				return nil, store.ErrNotFound
-			}
-			m, readRef = wm, t.writeRef(ck)
 		}
 		span, spanErr := rng.Resolve(m.Size)
 		if spanErr != nil {
 			return nil, spanErr
 		}
-		return t.openCached(ctx, readRef, m, readView{start: span.Start, end: span.End, ranged: span.Ranged})
+		return t.openCached(ctx, t.cacheRef(ck), m, readView{start: span.Start, end: span.End, ranged: span.Ranged})
 	}
 	size, version, lastMod, ct := res.info.Size, res.info.OriginETag, res.info.CreatedAt, res.info.ContentType
 	if ct == "" {
 		ct = contentTypeFor(key)
 	}
-
 	span, err := rng.Resolve(size)
 	if err != nil {
 		return nil, err
@@ -529,167 +461,112 @@ func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange
 	plan := planCacheRead(res, t.rangeSize, t.readOnly, view)
 	switch plan.action {
 	case cacheActionZero:
-		return t.openZero(ctx, ck, key, res, rng)
+		return t.openZero(ctx, bucket, key, ck, res, rng)
 	case cacheActionPassThrough:
-		return t.passThrough(ctx, ck, view, res.attrs)
+		return t.passThrough(ctx, bucket, key, view, res.attrs)
 	case cacheActionRange:
 		view.ETag, view.ContentEncoding, view.UserMetadata = version, res.info.ContentEncoding, res.attrs.UserMetadata
-		obj, err := t.openRange(ctx, ck, key, view)
+		obj, err := t.openRange(ctx, bucket, key, ck, view)
 		if errors.Is(err, store.ErrStaleCache) || errors.Is(err, errFillBusy) {
-			return t.openPending(ctx, ck, key, rng)
+			return t.passThrough(ctx, bucket, key, view, res.attrs)
 		}
 		return obj, err
 	default:
 		readMeta, readRef := res.meta, res.ref
 		if !res.valid && t.readOnly {
-			return t.passThrough(ctx, ck, view, res.attrs)
+			return t.passThrough(ctx, bucket, key, view, res.attrs)
 		}
 		if !res.valid {
-			fm, err := t.fill(ctx, ck, key)
-			if errors.Is(err, errPendingOrigin) || errors.Is(err, errFillBusy) {
-				return t.passThrough(ctx, ck, view, res.attrs)
-			} else if errors.Is(err, store.ErrStaleCache) {
-				return t.openPending(ctx, ck, key, rng)
-			} else if err != nil {
+			fm, err := t.fill(ctx, bucket, key, ck)
+			if errors.Is(err, errFillBusy) || errors.Is(err, store.ErrStaleCache) {
+				return t.passThrough(ctx, bucket, key, view, res.attrs)
+			}
+			if err != nil {
 				return nil, err
 			}
 			if fm.Size != size {
-				return t.openPending(ctx, ck, key, rng)
+				return t.passThrough(ctx, bucket, key, view, res.attrs)
 			}
 			readMeta, readRef = fm, t.cacheRef(ck)
-			if wm, werr := t.store.Meta(ctx, t.writeRef(ck)); werr == nil {
-				if store.ParseCacheVersion(wm.OriginETag).IsDeleted() {
-					return nil, store.ErrNotFound
-				}
-				readMeta, readRef = wm, t.writeRef(ck)
-			}
 		}
-		view.hit = res.valid
 		return t.openCached(ctx, readRef, readMeta, view)
 	}
 }
 
-func (t *Tier) openZero(ctx context.Context, ck, key string, res cacheResolution, rng store.ByteRange) (*Object, error) {
-	info := res.info
-	if info.ContentType == "" {
-		info.ContentType = contentTypeFor(key)
+func (t *Tier) openZero(ctx context.Context, bucket, key, ck string, res cacheResolution, rng store.ByteRange) (*Object, error) {
+	if _, err := rng.Resolve(0); err != nil {
+		return nil, err
 	}
-	originZero := func() *Object {
-		info.Size = 0
-		return newObject(readView{ObjectInfo: info, ranged: rng.Requested}, io.NopCloser(bytes.NewReader(nil)))
-	}
-	if t.readOnly && !res.valid {
-		return originZero(), nil
-	}
-	if !res.valid {
-		m, err := t.fill(ctx, ck, key)
-		if errors.Is(err, errPendingOrigin) || errors.Is(err, errFillBusy) {
-			return originZero(), nil
-		}
-		if errors.Is(err, store.ErrStaleCache) {
-			return t.openPending(ctx, ck, key, rng)
-		}
-		if err != nil {
+	if res.meta == nil && !t.readOnly {
+		if _, err := t.fill(ctx, bucket, key, ck); err != nil && !errors.Is(err, errFillBusy) {
 			return nil, err
 		}
-		if m.Size != 0 {
-
-			return t.openPending(ctx, ck, key, rng)
-		}
-		info = m.ObjectInfo
-		info.ETag, info.OriginETag = responseETag(m), originETag(m)
+	} else if res.meta != nil && !res.valid {
+		t.touch(ck)
 	}
-	return newObject(readView{ObjectInfo: info, hit: res.valid}, io.NopCloser(bytes.NewReader(nil))), nil
+	info := res.info
+	info.ETag = res.info.OriginETag
+	if res.meta != nil {
+		info = cachedInfo(res.meta)
+	}
+	return newObject(readView{ObjectInfo: info, ranged: rng.Requested, hit: res.valid}, io.NopCloser(bytes.NewReader(nil))), nil
 }
 
 func (t *Tier) openCached(ctx context.Context, ref store.ObjectRef, m *store.Meta, v readView) (*Object, error) {
-	start, end := v.start, v.end
-	sm, body, err := t.store.GetBodyFromMeta(ctx, ref, m, store.Range(start, end, -1))
+	sm, body, err := t.store.GetBodyFromMeta(ctx, ref, m, store.ByteRange{First: v.start, Last: v.end, Requested: v.ranged})
 	if err != nil {
 		return nil, err
 	}
-	info := store.ObjectInfo{
-		Size: sm.Size, ETag: responseETagSliceFor(ref, sm), ContentType: sm.ContentType,
-		ContentEncoding: sm.ContentEncoding, ChecksumName: sm.ChecksumName,
-		ChecksumValue: sm.ChecksumValue, ChecksumType: sm.ChecksumType,
-		UserMetadata: sm.UserMetadata, CreatedAt: sm.CreatedAt, OriginModified: sm.OriginModified,
-	}
-	return newObject(readView{ObjectInfo: info, start: sm.Start, end: sm.End, ranged: v.ranged, hit: v.hit}, body), nil
+	info := sm.ObjectInfo
+	info.ETag, info.OriginETag = responseETag(m), originETag(m)
+	t.touch(ref.Key)
+	return newObject(readView{ObjectInfo: info, start: sm.Start, end: sm.End, ranged: v.ranged, hit: true}, body), nil
 }
 
-func (t *Tier) openPending(ctx context.Context, ck, key string, rng store.ByteRange) (*Object, error) {
-	a, err := t.origin.Attributes(ctx, ck)
+func (t *Tier) passThroughWhole(ctx context.Context, bucket, key string, rng store.ByteRange) (*Object, error) {
+	rc, attrs, err := t.origin.GetWithAttrs(ctx, bucket, key)
 	if err != nil {
-		if t.origin.IsObjNotFoundErr(err) {
+		if isObjectNotFound(err) {
 			return nil, store.ErrNotFound
 		}
 		return nil, err
-	}
-	ct := a.ContentType
-	if ct == "" {
-		ct = contentTypeFor(key)
-	}
-	size := a.Size
-	span, err := rng.Resolve(size)
-	if err != nil {
-		return nil, err
-	}
-	if size == 0 {
-		info := store.ObjectInfo{
-			Size: 0, ETag: etagForAttrs(a), ContentType: ct,
-			ContentEncoding: a.ContentEncoding,
-			UserMetadata:    a.UserMetadata, CreatedAt: a.LastModified,
-		}
-		return newObject(readView{ObjectInfo: info, ranged: rng.Requested}, io.NopCloser(bytes.NewReader(nil))), nil
-	}
-	view := readView{Size: size, ContentType: ct, CreatedAt: a.LastModified, start: span.Start, end: span.End, ranged: span.Ranged}
-	return t.passThrough(ctx, ck, view, a)
-}
-
-func (t *Tier) passThroughWhole(ctx context.Context, ck, key string, rng store.ByteRange) (*Object, error) {
-	rc, attrs, err := t.origin.GetWithAttrs(ctx, ck)
-	if err != nil {
-		if t.origin.IsObjNotFoundErr(err) {
-			return nil, store.ErrNotFound
-		}
-		return nil, err
-	}
-	ct := attrs.ContentType
-	if ct == "" {
-		ct = contentTypeFor(key)
 	}
 	span, err := rng.Resolve(attrs.Size)
 	if err != nil {
 		_ = rc.Close()
 		return nil, err
 	}
-	info := store.ObjectInfo{
-		Size: attrs.Size, ETag: etagForAttrs(attrs), ContentType: ct,
-		ContentEncoding: attrs.ContentEncoding,
-		UserMetadata:    attrs.UserMetadata, CreatedAt: attrs.LastModified,
+	if span.Ranged {
+		_ = rc.Close()
+		return t.passThrough(ctx, bucket, key, readView{
+			ObjectInfo: attrs.objectInfo(),
+			start:      span.Start, end: span.End, ranged: true,
+		}, attrs)
 	}
-	return newObject(readView{ObjectInfo: info, start: span.Start, end: span.End, ranged: span.Ranged}, rc), nil
+	info := attrs.objectInfo()
+	info.ETag = attrs.ETag
+	return newObject(readView{ObjectInfo: info, end: max(attrs.Size-1, 0)}, rc), nil
 }
 
-func (t *Tier) passThrough(ctx context.Context, ck string, v readView, a originAttrs) (*Object, error) {
-	rc, err := t.origin.GetRange(ctx, ck, v.start, v.end-v.start+1, "")
+func (t *Tier) passThrough(ctx context.Context, bucket, key string, v readView, a originAttrs) (*Object, error) {
+	rc, err := t.origin.GetRange(ctx, bucket, key, v.start, v.end-v.start+1, a.ETag)
 	if err != nil {
-		if t.origin.IsObjNotFoundErr(err) {
+		if isObjectNotFound(err) {
 			return nil, store.ErrNotFound
 		}
 		return nil, err
 	}
-	v.ETag, v.ContentEncoding, v.UserMetadata = etagForAttrs(a), a.ContentEncoding, a.UserMetadata
+	v.ETag, v.ContentEncoding, v.UserMetadata = a.ETag, a.ContentEncoding, a.UserMetadata
 	return newObject(v, rc), nil
 }
 
 func rangeChunkKey(ck string, offset int64, version string) string {
-	return fmt.Sprintf("%s.__range__.%016x.%s", ck, offset, version)
+	return fmt.Sprintf("%s#r#%016x#%s", ck, offset, version)
 }
 
 func (t *Tier) rangeChunkLen(v readView, off int64) int64 { return min(t.rangeSize, v.Size-off) }
 
-func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Object, error) {
+func (t *Tier) openRange(ctx context.Context, bucket, key, ck string, v readView) (*Object, error) {
 	start, end := v.start, v.end
 	var offsets []int64
 	for off := start - start%t.rangeSize; off <= end; off += t.rangeSize {
@@ -725,7 +602,7 @@ func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Obje
 			}
 			j = next
 		}
-		filled, err := t.fillRangeRun(ctx, ck, key, v, offsets[i], offsets[j])
+		filled, err := t.fillRangeRun(ctx, bucket, key, ck, v, offsets[i], offsets[j])
 		if err != nil {
 			return nil, err
 		}
@@ -747,13 +624,7 @@ func (t *Tier) openRange(ctx context.Context, ck, key string, v readView) (*Obje
 	return newObject(v, store.NewPartsBody(parts)), nil
 }
 
-// fillRangeRun fetches the aligned chunks first..last (offsets) with one
-// origin GET and stores each as its own cache object before returning. Store
-// failures remain best effort, but a successfully published fill is
-// immediately visible to other tiers sharing PostgreSQL. Chunk keys carry the
-// origin version, so a concurrent fill elsewhere writes identical bytes and
-// needs no fill lease.
-func (t *Tier) fillRangeRun(ctx context.Context, ck, key string, v readView, first, last int64) ([][]byte, error) {
+func (t *Tier) fillRangeRun(ctx context.Context, bucket, key, ck string, v readView, first, last int64) ([][]byte, error) {
 	version := v.ETag
 	length := last + t.rangeChunkLen(v, last) - first
 	ch := t.group.DoChan(fmt.Sprintf("range:%s:%x:%x:%s", ck, first, length, version), func() (any, error) {
@@ -767,13 +638,13 @@ func (t *Tier) fillRangeRun(ctx context.Context, ck, key string, v readView, fir
 			return nil, fillCtx.Err()
 		}
 		defer func() { <-t.fills }()
-		rc, err := t.origin.GetRange(fillCtx, ck, first, length, version)
+		rc, err := t.origin.GetRange(fillCtx, bucket, key, first, length, version)
 		if err != nil {
 			if errors.Is(err, errOriginPrecondition) {
 				_ = t.store.Cache(t.namespace).ForgetOriginMetadata(fillCtx, ck, version)
 				return nil, store.ErrStaleCache
 			}
-			if t.origin.IsObjNotFoundErr(err) {
+			if isObjectNotFound(err) {
 				return nil, store.ErrNotFound
 			}
 			return nil, err
@@ -814,196 +685,24 @@ func (t *Tier) fillRangeRun(ctx context.Context, ck, key string, v readView, fir
 	}
 }
 
-func (t *Tier) lookupCached(ctx context.Context, ck string, withInline bool) (*store.Meta, store.ObjectRef, error) {
-	m, ref, err := t.store.Cache(t.namespace).Metadata(ctx, ck, withInline)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, store.ObjectRef{}, nil
-	}
-	return m, store.ObjectRef{NS: ref, Key: ck}, err
-}
-
 func (t *Tier) currentMeta(ctx context.Context, ck string) (*store.Meta, error) {
-	m, _, err := t.lookupCached(ctx, ck, true)
-	if m != nil && store.ParseCacheVersion(m.OriginETag).IsDeleted() {
-		m = nil
+	m, err := t.store.Meta(ctx, t.cacheRef(ck))
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
 	}
 	return m, err
 }
 
-func (t *Tier) List(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error) {
-	if limit <= 0 {
-		return nil, nil
-	}
-	originRows, originErr := t.listDirect(ctx, bucket, prefix, after, limit)
-	writeRows, writeErr := t.listWriteBack(ctx, bucket, prefix, after, limit)
-	if writeErr != nil {
-		return nil, writeErr
-	}
-	if originErr != nil {
-		if !errors.Is(originErr, ErrOriginListingUnsupported) || len(writeRows) == 0 {
-			return nil, originErr
-		}
-	}
-	return mergeListed(originRows, writeRows, limit), nil
-}
-
-func (t *Tier) listWriteBack(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error) {
-	if t.store == nil {
-		return nil, nil
-	}
-	pfx := bucket + "/" + prefix
-	afterKey := bucket + "/" + after
-	rows, err := t.store.List(ctx, ns.WriteBackRef(t.namespace), pfx, pfx+"\U0010FFFF", afterKey, limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]store.Listed, 0, len(rows))
-	for _, row := range rows {
-		if store.IsDeletedOrigin(row.OriginETag) {
-			continue
-		}
-		row.Key = strings.TrimPrefix(row.Key, bucket+"/")
-		if row.Key == "" || !strings.HasPrefix(row.Key, prefix) {
-			continue
-		}
-		out = append(out, row)
-	}
-	return out, nil
-}
-
-func mergeListed(originRows, pendingRows []store.Listed, limit int) []store.Listed {
-	out := make([]store.Listed, 0, min(limit, len(originRows)+len(pendingRows)))
-	i, j := 0, 0
-	for len(out) < limit && (i < len(originRows) || j < len(pendingRows)) {
-		switch {
-		case i >= len(originRows):
-			out = append(out, pendingRows[j])
-			j++
-		case j >= len(pendingRows):
-			out = append(out, originRows[i])
-			i++
-		case originRows[i].Key < pendingRows[j].Key:
-			out = append(out, originRows[i])
-			i++
-		case originRows[i].Key > pendingRows[j].Key:
-			out = append(out, pendingRows[j])
-			j++
-		default:
-
-			out = append(out, pendingRows[j])
-			i++
-			j++
-		}
-	}
-	return out
-}
-
-func (t *Tier) listDirect(ctx context.Context, bucket, prefix, after string, limit int) ([]store.Listed, error) {
-	if limit <= 0 {
-		return nil, nil
-	}
-	if !t.origin.Supports(capList) {
-		return nil, ErrOriginListingUnsupported
-	}
-	pfx := bucket + "/" + prefix
-	dir := bucket + "/"
-	if i := strings.LastIndexByte(pfx, '/'); i >= 0 {
-		dir = pfx[:i+1]
-	}
-	out := make([]store.Listed, 0, limit)
-	afterKey := ""
-	if after != "" {
-		afterKey = bucket + "/" + after
-	}
-	for obj, err := range t.origin.IterAfter(ctx, dir, afterKey) {
-		if err != nil {
-			return nil, err
-		}
-		name := obj.Key
-		if strings.HasSuffix(name, "/") || !strings.HasPrefix(name, pfx) {
-			continue
-		}
-		rel := strings.TrimPrefix(name, bucket+"/")
-		if rel <= after {
-			continue
-		}
-		out = append(out, store.Listed{
-			Key: rel, Size: obj.Attrs.Size, ETag: etagForAttrs(obj.Attrs), CreatedAt: obj.Attrs.LastModified,
-		})
-		if len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-func orValue(value, fallback string) string {
-	if value != "" {
-		return value
-	}
-	return fallback
-}
-
-func versionFor(a originAttrs) string {
-	return orValue(a.ETag, fmt.Sprintf("%d-%d", a.Size, a.LastModified.UnixNano()))
-}
-
-func etagForAttrs(a originAttrs) string { return versionFor(a) }
-
-func originETag(m *store.Meta) string { return orValue(m.OriginETag, m.ETag) }
-
-func originETagSlice(m *store.SliceMeta) string { return orValue(m.OriginETag, m.ETag) }
-
-func responseETag(m *store.Meta) string {
-	if store.ParseCacheVersion(m.OriginETag).IsPending() {
-		return m.ETag
-	}
-	return originETag(m)
-}
-
-func responseETagSlice(m *store.SliceMeta) string {
-	if store.ParseCacheVersion(m.OriginETag).IsPending() {
-		return m.ETag
-	}
-	return originETagSlice(m)
-}
-
-func responseETagSliceFor(ref store.ObjectRef, m *store.SliceMeta) string {
-	if ref.NS.Kind == ns.WriteBack {
-		return m.ETag
-	}
-	return responseETagSlice(m)
-}
-
-func (t *Tier) touch(kind ns.Kind, ck string) {
+func (t *Tier) touch(ck string) {
 	if t.readOnly {
 		return
 	}
-	retention := t.retention
-	if kind == ns.WriteBack {
-		retention = t.durableRetention()
-	}
-	_ = t.store.TouchNamespaceObject(context.Background(), kind, t.namespace, ck, retention)
-}
-
-func contentTypeFor(key string) string {
-	if ct := mime.TypeByExtension(path.Ext(key)); ct != "" {
-		return ct
-	}
-	return "application/octet-stream"
-}
-
-type fillLeaseContextKey struct{}
-
-func fillPublication(ctx context.Context, origin, expected string) store.Publication {
-	lease, _ := ctx.Value(fillLeaseContextKey{}).(*store.FillLease)
-	return store.FillPublication(origin, expected, lease)
+	exp := time.Now().Add(t.retention)
+	_, _ = t.store.Cache(t.namespace).Expire(t.baseContext(), ck, &exp)
 }
 
 func (t *Tier) coalesceFill(ctx context.Context, ck string, timeout time.Duration, fetch func(context.Context) (*store.Meta, error)) (*store.Meta, error) {
 	ch := t.group.DoChan("fill:"+ck, func() (any, error) {
-		unlock := t.lockKey(ck)
-		defer unlock()
 		fillCtx, cancel := context.WithTimeout(t.baseContext(), timeout)
 		defer cancel()
 		if !acquireProcess(t.runtime.fills, fillCtx) {
@@ -1014,18 +713,20 @@ func (t *Tier) coalesceFill(ctx context.Context, ck string, timeout time.Duratio
 			return nil, fillCtx.Err()
 		}
 		defer func() { <-t.fills }()
-		wait := min(timeout-time.Second, max(fillLeaseWait, timeout/2))
-		lease, existing, err := t.acquireFill(fillCtx, ck, wait)
-		if err != nil || existing != nil {
-			return existing, err
+		lease, existing, err := t.acquireFill(fillCtx, ck, fillLeaseWait)
+		if err != nil {
+			return nil, err
 		}
-		leaseCtx, stop := t.renewFill(fillCtx, *lease)
-		defer stop()
-		m, err := fetch(leaseCtx)
-		if errors.Is(context.Cause(leaseCtx), store.ErrStaleCache) {
-			return nil, store.ErrStaleCache
+		if existing != nil {
+			return existing, nil
 		}
-		return m, err
+		if lease == nil {
+			return nil, errFillBusy
+		}
+		defer func() { t.store.Cache(t.namespace).ReleaseFillLease(context.Background(), ck, t.workerID) }()
+		leaseCtx, stopRenew := t.renewFill(fillCtx, *lease)
+		defer stopRenew()
+		return fetch(leaseCtx)
 	})
 	select {
 	case res := <-ch:
@@ -1040,42 +741,32 @@ func (t *Tier) coalesceFill(ctx context.Context, ck string, timeout time.Duratio
 
 func (t *Tier) acquireFill(ctx context.Context, ck string, wait time.Duration) (*store.FillLease, *store.Meta, error) {
 	deadline := time.Now().Add(wait)
-	probe := func() (*store.Meta, error) {
-		m, _, err := t.lookupCached(ctx, ck, true)
-		if err == nil && m != nil {
-			switch store.ParseCacheVersion(m.OriginETag).State {
-			case store.CacheDeleted:
-				return nil, store.ErrNotFound
-			case store.CachePending:
-				return nil, errPendingOrigin
-			}
-		}
-		return m, err
-	}
+	delay := 15 * time.Millisecond
 	for {
-		if m, err := probe(); err != nil || m != nil {
-			return nil, m, err
-		}
-		owner := t.workerID + "-" + randomID()
-		acquired, err := t.store.Cache(t.namespace).AcquireFillLease(ctx, ck, owner, t.leaseTTL())
+		acquired, err := t.store.Cache(t.namespace).AcquireFillLease(ctx, ck, t.workerID, t.leaseTTL())
 		if err != nil {
 			return nil, nil, err
 		}
 		if acquired {
-
-			if m, err := probe(); err != nil || m != nil {
-				t.store.Cache(t.namespace).ReleaseFillLease(context.WithoutCancel(ctx), ck, owner)
-				return nil, m, err
-			}
-			return &store.FillLease{Namespace: t.namespace, Key: ck, Owner: owner}, nil, nil
+			return &store.FillLease{Namespace: t.namespace, Key: ck, Owner: t.workerID}, nil, nil
 		}
-		pause := min(100*time.Millisecond, time.Until(deadline))
-		if pause <= 0 {
-			return nil, nil, errFillBusy
+		cur, err := t.currentMeta(ctx, ck)
+		if err != nil {
+			return nil, nil, err
 		}
-		if !sleepContext(ctx, pause) {
+		if cur != nil && t.isFresh(cur.CreatedAt) {
+			return nil, cur, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, nil, nil
+		}
+		select {
+		case <-time.After(min(delay, remaining)):
+		case <-ctx.Done():
 			return nil, nil, ctx.Err()
 		}
+		delay = min(delay*2, 200*time.Millisecond)
 	}
 }
 
@@ -1087,42 +778,41 @@ func (t *Tier) leaseTTL() time.Duration {
 }
 
 func (t *Tier) renewFill(ctx context.Context, lease store.FillLease) (context.Context, func()) {
-	ctx, cancel := context.WithCancelCause(ctx)
-	ctx = context.WithValue(ctx, fillLeaseContextKey{}, &lease)
+	leaseCtx, cancel := context.WithCancelCause(ctx)
+	interval := max(t.leaseTTL()/3, 20*time.Millisecond)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(t.leaseTTL() / 3)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-leaseCtx.Done():
 				return
 			case <-ticker.C:
-				renewCtx, stop := context.WithTimeout(ctx, t.leaseTTL()/3)
-				owned, err := t.store.RenewFillLease(renewCtx, lease, t.leaseTTL())
-				stop()
-				if err != nil || !owned {
-					cancel(store.ErrStaleCache)
+				ok, err := t.store.RenewFillLease(leaseCtx, lease, t.leaseTTL())
+				if err != nil && leaseCtx.Err() == nil {
+					cancel(err)
+					return
+				}
+				if err == nil && !ok {
+					cancel(errFillBusy)
 					return
 				}
 			}
 		}
 	}()
-	return ctx, func() {
+	return leaseCtx, func() {
 		cancel(nil)
 		<-done
-		releaseCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer stop()
-		t.store.Cache(lease.Namespace).ReleaseFillLease(releaseCtx, lease.Key, lease.Owner)
 	}
 }
 
-func (t *Tier) fill(ctx context.Context, ck, key string) (*store.Meta, error) {
+func (t *Tier) fill(ctx context.Context, bucket, key, ck string) (*store.Meta, error) {
 	return t.coalesceFill(ctx, ck, 10*time.Minute, func(fillCtx context.Context) (*store.Meta, error) {
-		rc, attrs, err := t.origin.GetWithAttrs(fillCtx, ck)
+		rc, attrs, err := t.origin.GetWithAttrs(fillCtx, bucket, key)
 		if err != nil {
-			if t.origin.IsObjNotFoundErr(err) {
+			if isObjectNotFound(err) {
 				return nil, store.ErrNotFound
 			}
 			return nil, err
@@ -1130,7 +820,7 @@ func (t *Tier) fill(ctx context.Context, ck, key string) (*store.Meta, error) {
 		sp, cleanup, err := t.runtime.spoolStream(fillCtx, rc, attrs.Size)
 		_ = rc.Close()
 		if err != nil {
-			if t.origin.IsObjNotFoundErr(err) {
+			if isObjectNotFound(err) {
 				return nil, store.ErrNotFound
 			}
 			return nil, err
@@ -1140,7 +830,7 @@ func (t *Tier) fill(ctx context.Context, ck, key string) (*store.Meta, error) {
 			return nil, fmt.Errorf("origin GET %s returned %d bytes, wanted %d", key, sp.size, attrs.Size)
 		}
 		opts := attrs.writeOptions()
-		opts.Publication = fillPublication(fillCtx, versionFor(attrs), versionFor(attrs))
+		opts.Publication = store.FillPublication(attrs.ETag, attrs.ETag, nil)
 		m, err := t.storeSpooled(fillCtx, t.cacheRef(ck), sp, opts, nil)
 		if errors.Is(err, store.ErrStaleCache) {
 			return t.currentFillResult(fillCtx, ck)
@@ -1157,13 +847,49 @@ func (t *Tier) currentFillResult(ctx context.Context, ck string) (*store.Meta, e
 	return nil, store.ErrStaleCache
 }
 
+// Proxy forwards a request straight to origin without caching.
+func (t *Tier) Proxy(ctx context.Context, bucket, key, method string, query url.Values, body io.Reader, size int64, extra ...[2]string) (*http.Response, error) {
+	return t.origin.Proxy(ctx, bucket, key, method, query, body, size, extra...)
+}
+
+// SpoolStream spools an unknown-length request body into memory (<=8 MiB) or a temp file.
+func (t *Tier) SpoolStream(ctx context.Context, body io.Reader, expected int64) (io.ReadSeeker, int64, func(), error) {
+	sp, clean, err := t.runtime.spoolStream(ctx, body, expected)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	return sp.r, sp.size, clean, nil
+}
+
+// Invalidate removes a cached object and its origin metadata from PostgreSQL.
+func (t *Tier) Invalidate(ctx context.Context, bucket, key string) error {
+	return t.InvalidateMany(ctx, bucket, []string{key})
+}
+
+// InvalidateMany removes multiple cached objects and their origin metadata from PostgreSQL.
+func (t *Tier) InvalidateMany(ctx context.Context, bucket string, keys []string) error {
+	if t.readOnly || len(keys) == 0 {
+		return nil
+	}
+	cks := make([]string, len(keys))
+	for i, k := range keys {
+		cks[i] = t.key(bucket, k)
+	}
+	c := t.store.Cache(t.namespace)
+	if _, err := c.Del(ctx, cks); err != nil {
+		return err
+	}
+	for _, ck := range cks {
+		_ = c.ForgetOriginMetadata(ctx, ck, "")
+	}
+	return nil
+}
+
 type spooled struct {
 	r    io.ReadSeeker
 	data []byte
 	size int64
 }
-
-var ErrSpoolBusy = errors.New("cache spool byte budget exhausted")
 
 type spoolBudget struct {
 	sem      *semaphore.Weighted
@@ -1248,7 +974,6 @@ func spoolWithBudget(ctx context.Context, r io.Reader, expected int64, budget *s
 	}
 	var n int64
 	if bounded != nil {
-
 		bounded.N = expected - int64(len(head))
 		n, err = io.Copy(tmp, bounded)
 		if err == nil {
@@ -1305,21 +1030,10 @@ func (t *Tier) storeSpooled(ctx context.Context, ref store.ObjectRef, sp spooled
 	if locked != nil && locked.Ref() != ref {
 		return nil, store.ErrInvalidPublication
 	}
-	retention := t.retention
-	if ref.NS.Kind == ns.WriteBack {
-		retention = t.durableRetention()
-	}
-	exp := time.Now().Add(retention)
+	exp := time.Now().Add(t.retention)
 	opts.ExpiresAt = &exp
-	if opts.Publication.IsPending() {
-
-		opts.ExpiresAt = nil
-	}
 	opts.ExpectedSize = sp.size
 	if sp.data != nil && int64(len(sp.data)) <= int64(ref.NS.Kind.InlineMax()) {
-		if opts.Publication.IsPending() {
-			return nil, errors.New("pending origin publication requires the chunked write path")
-		}
 		if locked != nil {
 			return locked.PutInline(ctx, sp.data, opts)
 		}
@@ -1358,525 +1072,9 @@ func (t *Tier) storeSpooled(ctx context.Context, ref store.ObjectRef, sp spooled
 	return m, nil
 }
 
-func (t *Tier) requireWrite(operation string) error {
-	if t.readOnly {
-		return ErrReadOnly
-	}
-	if !t.origin.Supports(capWrite) {
-		return fmt.Errorf("origin %s: %w", operation, ErrOriginUnsupported)
-	}
-	return nil
-}
-
-type lockedWrite struct {
-	object  *store.LockedObject
-	release func()
-}
-
-func (t *Tier) lockWrite(ctx context.Context, ck string, validate func() error) (*lockedWrite, error) {
-	unlock := t.lockKey(ck)
-	var locked *store.LockedObject
-	defer func() {
-		if locked == nil {
-			unlock()
-		}
-	}()
-	if validate != nil {
-		if err := validate(); err != nil {
-			return nil, err
-		}
-	}
-	var err error
-	locked, err = t.store.LockCacheKey(ctx, ns.WriteBack, t.namespace, ck)
-	if err != nil {
-		return nil, err
-	}
-	return &lockedWrite{object: locked, release: func() {
-		defer unlock()
-		locked.Release()
-	}}, nil
-}
-
-func (t *Tier) resolvePrecondition(ctx context.Context, ck string, p store.Precondition) (store.Precondition, error) {
-	if p.Mode == store.Unconditional {
-		return p, nil
-	}
-	cur, err := t.currentMeta(ctx, ck)
-	if err != nil || cur == nil {
-		return p, err
-	}
-	if p.Mode == store.IfAbsent {
-		return p, store.ErrPrecondition
-	}
-	if p.Mode == store.IfMatch && cur.ETag == p.ETag {
-		if store.ParseCacheVersion(cur.OriginETag).IsPending() || cur.OriginETag == "" {
-			return p, ErrOriginConflict
-		}
-		p.ETag = cur.OriginETag
-	}
-	return p, nil
-}
-
-type UploadOptions struct {
-	ExpectedSize    int64
-	UserMetadata    []string
-	ContentType     string
-	ContentEncoding string
-	Checksum        *store.Checksum
-	ChecksumType    string
-	Precondition    store.Precondition
-	Validate        func() error
-}
-
-func (o UploadOptions) writeOptions() store.WriteOptions {
-	return store.WriteOptions{
-		UserMetadata: o.UserMetadata, ContentType: o.ContentType, ContentEncoding: o.ContentEncoding,
-		Checksum: o.Checksum, ChecksumType: o.ChecksumType,
-	}
-}
-
-func (t *Tier) Upload(ctx context.Context, bucket, key string, body io.Reader, userMeta []string, contentType string) (*store.Meta, error) {
-	return t.UploadWithOptions(ctx, bucket, key, body, UploadOptions{UserMetadata: userMeta, ContentType: contentType})
-}
-
-func (t *Tier) UploadWithOptions(ctx context.Context, bucket, key string, body io.Reader, opts UploadOptions) (*store.Meta, error) {
-	if err := t.requireWrite("upload"); err != nil {
-		return nil, err
-	}
-	ck := t.key(bucket, key)
-	if err := t.origin.checkKey(ck); err != nil {
-		return nil, err
-	}
-	expected := opts.ExpectedSize
-	if expected <= 0 {
-		expected = -1
-	}
-	sp, cleanup, err := t.runtime.spoolStream(ctx, body, expected)
-	if err != nil {
-		switch {
-		case errors.Is(err, errOriginPrecondition):
-			return nil, store.ErrPrecondition
-		case t.origin.IsObjNotFoundErr(err):
-			return nil, store.ErrNotFound
-		default:
-			return nil, err
-		}
-	}
-	defer cleanup()
-	unlock, err := t.lockWrite(ctx, ck, opts.Validate)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock.release()
-	resolved, err := t.resolvePrecondition(ctx, ck, opts.Precondition)
-	if err != nil {
-		return nil, err
-	}
-	opts.Precondition = resolved
-	writeOpts := opts.writeOptions()
-	if t.writeBack && sp.size > writeBackMin && opts.Precondition.Mode == store.Unconditional {
-		token := store.PendingOriginToken("write-" + randomID())
-		writeOpts.Publication = store.WriteBackPublication(store.PendingOrigin{Token: token})
-		m, err := t.storeSpooled(ctx, t.writeRef(ck), sp, writeOpts, unlock.object)
-		if err == nil {
-			_ = t.fenceReadCache(ctx, ck)
-			t.wakePending()
-		}
-		return m, err
-	}
-	attrs, err := t.origin.Upload(ctx, ck, sp.r, sp.size, originUpload{
-		UserMetadata: opts.UserMetadata, ContentType: opts.ContentType,
-		ContentEncoding: opts.ContentEncoding, Checksum: opts.Checksum, Precondition: opts.Precondition,
-	})
-	if errors.Is(err, errOriginPrecondition) {
-		return nil, store.ErrPrecondition
-	}
-	if err != nil {
-		return nil, err
-	}
-	if !t.writeBack && sp.size > writeBackMin {
-		// Writing a second multi-MiB copy into s3w_ would double the durable
-		// cost of an object the origin already has. Retire any stale copies and
-		// answer reads from the origin instead. A tombstone would make the new
-		// object unreadable because no live write-back row shadows it.
-		cleanupCtx := context.WithoutCancel(ctx)
-		_, _ = unlock.object.Delete(cleanupCtx)
-		if _, err := t.store.Cache(t.namespace).Del(cleanupCtx, []string{ck}); err != nil {
-			t.log.Warn("clearing stale origin cache entry", "bucket", bucket, "key", key, "err", err)
-		}
-		_ = t.store.Cache(t.namespace).ClearPendingUploads(cleanupCtx, ck)
-		if t.rangeSize > 0 && t.ttl > 0 {
-			_ = t.store.Cache(t.namespace).RememberOriginMetadata(cleanupCtx, ck,
-				attrs.objectInfo(), time.Now(), min(t.ttl, t.retention))
-		}
-		return &store.Meta{ObjectInfo: attrs.objectInfo()}, nil
-	}
-	writeOpts.Publication, writeOpts.OriginModified = store.NormalPublication(versionFor(attrs)), attrs.LastModified
-	m, cacheErr := t.storeSpooled(ctx, t.writeRef(ck), sp, writeOpts, unlock.object)
-
-	_ = t.fenceReadCache(ctx, ck)
-	_ = t.store.Cache(t.namespace).ClearPendingUploads(context.WithoutCancel(ctx), ck)
-	if cacheErr != nil {
-		t.log.Warn("populating durable origin write cache", "bucket", bucket, "key", key, "err", cacheErr)
-		if errors.Is(cacheErr, store.ErrQuotaExceeded) {
-			return &store.Meta{ObjectInfo: attrs.objectInfo()}, nil
-		}
-		return nil, fmt.Errorf("populate durable origin write cache: %w", cacheErr)
-	}
-	return m, nil
-}
-
-func (t *Tier) fenceReadCache(ctx context.Context, ck string) error {
-	return t.store.CacheTombstone(context.WithoutCancel(ctx), ns.CacheRef(t.namespace), ck,
-		time.Now().Add(originTombstoneTTL))
-}
-
-func (t *Tier) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, opts store.CopyOptions) (*store.Meta, error) {
-	if err := t.requireWrite("copy"); err != nil {
-		return nil, err
-	}
-	if err := t.origin.checkKey(t.key(dstBucket, dstKey)); err != nil {
-		return nil, err
-	}
-	srcObj, err := t.Open(ctx, srcBucket, srcKey, store.WholeObjectRange())
-	if err != nil {
-		return nil, err
-	}
-	defer srcObj.Body.Close()
-	if !opts.Source.Allows(true, srcObj.ETag) {
-		return nil, store.ErrPrecondition
-	}
-	meta, ct, encoding := srcObj.UserMetadata, srcObj.ContentType, srcObj.ContentEncoding
-	if opts.ReplaceMetadata {
-		meta, ct, encoding = opts.UserMetadata, opts.ContentType, opts.ContentEncoding
-	}
-	return t.UploadWithOptions(ctx, dstBucket, dstKey, srcObj.Body, UploadOptions{
-		ExpectedSize: srcObj.Size,
-		UserMetadata: meta, ContentType: ct, ContentEncoding: encoding, Precondition: opts.Dest,
-	})
-}
-
-func (t *Tier) CreateUpload(ctx context.Context, bucket, key string, userMeta []string, contentType, contentEncoding string, checksumAlg *string) (string, error) {
-	if err := t.requireWrite("multipart upload"); err != nil {
-		return "", err
-	}
-	return t.store.CreateUpload(ctx, t.writeRef(t.key(bucket, key)), store.UploadOptions{UserMetadata: userMeta, ContentType: contentType, ContentEncoding: contentEncoding, ChecksumAlgorithm: checksumAlg})
-}
-
-func (t *Tier) StartPart(ctx context.Context, uploadID, bucket, key string, partNo int32, expectedSize int64) (*store.ChunkWriter, error) {
-	if err := t.requireWrite("multipart upload"); err != nil {
-		return nil, err
-	}
-	return t.store.StartPart(ctx, t.writeRef(t.key(bucket, key)), uploadID, partNo, expectedSize)
-}
-
-func (t *Tier) CompleteUpload(ctx context.Context, uploadID, bucket, key string, listed []store.ListedPart, opts store.WriteOptions) (*store.Completed, error) {
-	if err := t.requireWrite("multipart upload"); err != nil {
-		return nil, err
-	}
-	ck := t.key(bucket, key)
-	if err := t.origin.checkKey(ck); err != nil {
-		return nil, err
-	}
-	exp := time.Now().Add(t.durableRetention())
-	unlock, err := t.lockWrite(ctx, ck, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock.release()
-	if t.writeBack && opts.Precondition.Mode == store.Unconditional {
-		opts.ExpiresAt = nil
-		done, err := unlock.object.CompleteUploadPending(ctx, uploadID, listed, opts, store.PendingCompletion{})
-		if err != nil {
-			return nil, err
-		}
-		_ = t.fenceReadCache(ctx, ck)
-		t.wakePending()
-		done.Bucket, done.Key = bucket, key
-		return done, nil
-	}
-	if !acquireProcess(t.runtime.pending, ctx) {
-		return nil, ctx.Err()
-	}
-	defer func() { <-t.runtime.pending }()
-	if !acquireProcess(t.completes, ctx) {
-		return nil, ctx.Err()
-	}
-	defer func() { <-t.completes }()
-	base, baseErr := t.origin.Attributes(ctx, ck)
-	baseMissing := errors.Is(baseErr, store.ErrNotFound) || (baseErr != nil && t.origin.IsObjNotFoundErr(baseErr))
-	if baseErr != nil && !baseMissing {
-		return nil, baseErr
-	}
-	baseETag := ""
-	if !baseMissing {
-		baseETag = versionFor(base)
-	}
-	resolved, err := t.resolvePrecondition(ctx, ck, opts.Precondition)
-	if err != nil {
-		return nil, err
-	}
-	if !resolved.Allows(!baseMissing, baseETag) {
-		return nil, store.ErrPrecondition
-	}
-
-	opts.Precondition = store.Precondition{}
-	opts.ExpiresAt = &exp
-	done, err := unlock.object.CompleteUploadPending(ctx, uploadID, listed, opts, store.PendingCompletion{BaseETag: baseETag, BaseMissing: baseMissing, LeaseOwner: t.workerID})
-	if err != nil {
-		return nil, err
-	}
-	_ = t.fenceReadCache(ctx, ck)
-	pending := store.PendingUpload{
-		Key: ck, Token: store.PendingOriginToken(uploadID),
-		BaseETag: baseETag, BaseMissing: baseMissing, LeaseOwner: t.workerID,
-	}
-	localETag, err := t.flushOneNoLock(ctx, pending, t.workerID)
-	if err != nil {
-		if errors.Is(err, store.ErrPrecondition) {
-			_, _ = t.store.Delete(context.WithoutCancel(ctx), t.cacheRef(ck))
-		}
-		return nil, err
-	}
-	if localETag == "" {
-		return nil, store.ErrPrecondition
-	}
-	done.ETag, done.Bucket, done.Key = localETag, bucket, key
-	return done, nil
-}
-
-func (t *Tier) AbortUpload(ctx context.Context, uploadID, bucket, key string) (bool, error) {
-	if t.readOnly {
-		return false, ErrReadOnly
-	}
-	return t.store.AbortUpload(ctx, t.writeRef(t.key(bucket, key)), uploadID)
-}
-
-func (t *Tier) ListParts(ctx context.Context, uploadID, bucket, key string, max int, marker int32) ([]store.UploadPartInfo, bool, int32, error) {
-	return t.store.ListParts(ctx, t.writeRef(t.key(bucket, key)), uploadID, max, marker)
-}
-
-func (t *Tier) ListUploads(ctx context.Context, bucket, prefix, bound, keyMarker, uploadMarker string, max int) ([]store.UploadInfo, bool, error) {
-	rows, truncated, err := t.store.ListUploads(ctx, store.ObjectRef{NS: ns.WriteBackRef(t.namespace)},
-		t.key(bucket, prefix), t.key(bucket, bound), t.key(bucket, keyMarker), uploadMarker, max)
-	if err != nil {
-		return nil, false, err
-	}
-	for i := range rows {
-		rows[i].Key = strings.TrimPrefix(rows[i].Key, bucket+"/")
-	}
-	return rows, truncated, nil
-}
-
-func (t *Tier) Delete(ctx context.Context, bucket, key string) error {
-	if err := t.requireWrite("delete"); err != nil {
-		return err
-	}
-	ck := t.key(bucket, key)
-	unlock, err := t.lockWrite(ctx, ck, nil)
-	if err != nil {
-		return err
-	}
-	defer unlock.release()
-	if err := t.origin.Delete(ctx, ck); err != nil && !t.origin.IsObjNotFoundErr(err) {
-		return err
-	}
-	cleanupCtx := context.WithoutCancel(ctx)
-	if err := unlock.object.Tombstone(cleanupCtx, time.Now().Add(originTombstoneTTL)); err != nil {
-		return err
-	}
-	if err := t.fenceReadCache(ctx, ck); err != nil {
-		return err
-	}
-	_ = t.store.Cache(t.namespace).ClearPendingUploads(cleanupCtx, ck)
-	return nil
-}
-
-type DeleteResult struct {
-	Key string
-	Err error
-}
-
-func (t *Tier) DeleteMany(ctx context.Context, bucket string, keys []string) []DeleteResult {
-	results := make([]DeleteResult, len(keys))
-	for i, key := range keys {
-		results[i].Key = key
-	}
-	if len(keys) == 0 {
-		return results
-	}
-	if err := t.requireWrite("delete"); err != nil {
-		for i := range results {
-			results[i].Err = err
-		}
-		return results
-	}
-	fullKeys := make([]string, 0, len(keys))
-	positions := make([]int, 0, len(keys))
-	for i, key := range keys {
-		ck := t.key(bucket, key)
-		if err := t.origin.checkKey(ck); err != nil {
-			results[i].Err = err
-			continue
-		}
-		fullKeys = append(fullKeys, ck)
-		positions = append(positions, i)
-	}
-	if len(fullKeys) == 0 {
-		return results
-	}
-	// Hold every affected local write shard once, in ascending shard order.
-	locked := make([]bool, len(t.keyLocks))
-	for _, ck := range fullKeys {
-		locked[t.keyLockIndex(ck)] = true
-	}
-	for i := range locked {
-		if locked[i] {
-			t.keyLocks[i].Lock()
-		}
-	}
-	defer func() {
-		for i := len(locked) - 1; i >= 0; i-- {
-			if locked[i] {
-				t.keyLocks[i].Unlock()
-			}
-		}
-	}()
-	originErrs := t.origin.DeleteMany(ctx, fullKeys)
-	cleanupCtx := context.WithoutCancel(ctx)
-	expires := time.Now().Add(originTombstoneTTL)
-	for i, ck := range fullKeys {
-		if err := originErrs[i]; err != nil && !t.origin.IsObjNotFoundErr(err) {
-			results[positions[i]].Err = err
-			continue
-		}
-		if err := t.store.CacheTombstone(cleanupCtx, ns.WriteBackRef(t.namespace), ck, expires); err != nil {
-			results[positions[i]].Err = err
-			continue
-		}
-		if err := t.fenceReadCache(cleanupCtx, ck); err != nil {
-			results[positions[i]].Err = err
-			continue
-		}
-		_ = t.store.Cache(t.namespace).ClearPendingUploads(cleanupCtx, ck)
-	}
-	return results
-}
-
-func (t *Tier) flushOne(ctx context.Context, p store.PendingUpload, owner string) (string, error) {
-	unlock, err := t.lockWrite(ctx, p.Key, nil)
-	if err != nil {
-		return "", err
-	}
-	defer unlock.release()
-	return t.flushOneNoLock(ctx, p, owner)
-}
-
-func (t *Tier) flushOneNoLock(ctx context.Context, p store.PendingUpload, owner string) (string, error) {
-	sm, body, err := t.store.GetBody(ctx, t.writeRef(p.Key), store.WholeObjectRange(), nil)
-	if errors.Is(err, store.ErrNotFound) {
-		err = fmt.Errorf("durable pending body missing for %s: %w", p.Key, err)
-		_ = t.store.Cache(t.namespace).FailPendingUploadPermanent(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
-		return "", err
-	}
-	if err != nil {
-		return "", err
-	}
-	defer body.Close()
-	if sm.OriginETag != p.Token {
-		_ = t.store.Cache(t.namespace).ClearPendingUploadToken(context.WithoutCancel(ctx), p.Key, p.Token)
-		return "", nil
-	}
-	condition := store.IfMatch
-	switch {
-	case p.BaseMissing:
-		condition = store.IfAbsent
-	case p.BaseETag == "":
-
-		condition = store.Unconditional
-	}
-	attrs, err := t.origin.Upload(ctx, p.Key, body, sm.Size, originUpload{
-		UserMetadata: sm.UserMetadata, ContentType: sm.ContentType,
-		ContentEncoding: sm.ContentEncoding,
-		Precondition:    store.Precondition{Mode: condition, ETag: p.BaseETag},
-	})
-	if errors.Is(err, errOriginPrecondition) {
-		_ = t.store.Cache(t.namespace).AbandonPendingUpload(context.WithoutCancel(ctx), p.Key, p.Token)
-
-		_, _ = t.store.Delete(context.WithoutCancel(ctx), t.cacheRef(p.Key))
-		return "", store.ErrPrecondition
-	}
-	if err != nil {
-		cache := t.store.Cache(t.namespace)
-		fail := cache.FailPendingUpload
-		if errors.Is(err, ErrOriginUnsupported) {
-			fail = cache.FailPendingUploadPermanent
-		}
-		_ = fail(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
-		return "", err
-	}
-	expiresAt := time.Now().Add(t.durableRetention())
-	owned, err := t.store.Cache(t.namespace).MarkOriginCommitted(ctx, p.Key, p.Token, versionFor(attrs), attrs.LastModified, &expiresAt)
-	if err != nil {
-		_ = t.store.Cache(t.namespace).FailPendingUpload(context.WithoutCancel(ctx), p.Key, p.Token, owner, p.Attempts, err)
-		return "", err
-	}
-	if !owned {
-		return "", nil
-	}
-	return sm.ETag, nil
-}
-
-func (t *Tier) runPending(ctx context.Context) {
-	defer close(t.done)
-	var wg sync.WaitGroup
-	for i := range max(t.pendingWorkers, 1) {
-		owner := fmt.Sprintf("%s-%d", t.workerID, i)
-		wg.Go(func() { t.runPendingWorker(ctx, owner) })
-	}
-	wg.Wait()
-}
-
-func (t *Tier) runPendingWorker(ctx context.Context, owner string) {
-	for ctx.Err() == nil {
-		if !acquireProcess(t.runtime.pending, ctx) {
-			return
-		}
-		pending, err := t.store.Cache(t.namespace).ClaimPendingUploads(ctx, owner, 1, 5*time.Minute)
-		if err != nil || len(pending) == 0 {
-			<-t.runtime.pending
-			if err != nil && ctx.Err() == nil {
-				t.log.Warn("claiming pending origin uploads", "owner", owner, "err", err)
-			}
-			if !waitContext(ctx, time.Second, t.pendingWake) {
-				return
-			}
-			continue
-		}
-		p := pending[0]
-		flushCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-		_, err = t.flushOne(flushCtx, p, p.LeaseOwner)
-		cancel()
-		<-t.runtime.pending
-		if err != nil && ctx.Err() == nil {
-			t.log.Warn("pending origin upload failed", "key", p.Key, "attempt", p.Attempts+1, "err", err)
-		}
-	}
-}
-
-func sleepContext(ctx context.Context, d time.Duration) bool {
-	return waitContext(ctx, d, nil)
-}
-
-func waitContext(ctx context.Context, d time.Duration, wake <-chan struct{}) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	case <-wake:
-		return true
-	}
+func contentTypeFor(key string) string {
+	if ct := mime.TypeByExtension(path.Ext(key)); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
 }

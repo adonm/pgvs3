@@ -1,9 +1,6 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"flag"
 	"io"
 	"os"
 	"reflect"
@@ -13,7 +10,7 @@ import (
 )
 
 func TestCommandTable(t *testing.T) {
-	want := []string{"serve", "health", "reap", "stat", "clone", "drop", "adopt", "origin", "pending", "version"}
+	want := []string{"serve", "health", "reap", "stat", "version"}
 	if len(commandTable) != len(want) {
 		t.Fatalf("command table has %d entries, want %d", len(commandTable), len(want))
 	}
@@ -112,10 +109,10 @@ func TestParseServeConfigDefaults(t *testing.T) {
 		httpWriteTimeout:        30 * time.Minute,
 		reapGrace:               10 * time.Minute,
 		logLevel:                "info",
-		cacheTTL:                time.Minute,
+		originRegion:            "us-east-1",
+		revalidateAfter:         0,
 		cacheRetention:          24 * time.Hour,
 		cacheNamespace:          "origin",
-		cacheWriteBack:          true,
 		fillConcurrency:         8,
 		s3Concurrency:           32,
 		s3QueueWait:             time.Second,
@@ -135,10 +132,9 @@ func TestParseServeConfigFlags(t *testing.T) {
 		"--db-lock-timeout", "2s", "--db-idle-tx-timeout", "30s",
 		"--db-max-conn-lifetime", "30m", "--db-max-conn-lifetime-jitter", "2m",
 		"--reap-grace", "2m", "--read-only", "--log-level", "warn",
-		"--origin-config", "/tmp/origin.json",
-		"--s3-origin", "overture=s3://overturemaps-us-west-2?region=us-west-2",
-		"--auto-bucket", "lake, edge",
-		"--cache-ttl", "30s", "--cache-retention", "1h", "--cache-namespace", "cache",
+		"--origin-endpoint", "http://127.0.0.1:9000", "--origin-region", "us-west-2",
+		"--origin-path-style", "--origin-insecure", "--buckets", "lake,edge",
+		"--revalidate-after", "30s", "--cache-retention", "1h", "--cache-namespace", "cache",
 		"--fill-concurrency", "3", "--range-cache-chunk", "4096",
 		"--cache-max-bytes", "1048576",
 		"--s3-concurrency", "7", "--s3-queue-wait", "75ms",
@@ -164,13 +160,14 @@ func TestParseServeConfigFlags(t *testing.T) {
 		reapGrace:               2 * time.Minute,
 		readOnly:                true,
 		logLevel:                "warn",
-		originConfig:            "/tmp/origin.json",
-		s3Origin:                "overture=s3://overturemaps-us-west-2?region=us-west-2",
-		autoBucket:              "lake, edge",
-		cacheTTL:                30 * time.Second,
+		originEndpoint:          "http://127.0.0.1:9000",
+		originRegion:            "us-west-2",
+		originPathStyle:         true,
+		originInsecure:          true,
+		buckets:                 "lake,edge",
+		revalidateAfter:         30 * time.Second,
 		cacheRetention:          time.Hour,
 		cacheNamespace:          "cache",
-		cacheWriteBack:          true,
 		fillConcurrency:         3,
 		rangeCacheChunk:         4096,
 		cacheMaxBytes:           1048576,
@@ -182,248 +179,6 @@ func TestParseServeConfigFlags(t *testing.T) {
 	}
 }
 
-func TestParseS3OriginFlag(t *testing.T) {
-	clearServeEnv(t)
-	t.Setenv("AWS_REGION", "")
-	t.Setenv("AWS_DEFAULT_REGION", "")
-	t.Setenv("AWS_ACCESS_KEY_ID", "")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
-	cfg := serveConfig{
-		cacheNamespace: "origin", cacheTTL: time.Minute, cacheRetention: 24 * time.Hour,
-		fillConcurrency: 8, cacheMaxBytes: 1 << 30,
-	}
-	local, spec, err := parseS3OriginFlag("overture=s3://overturemaps-us-west-2?region=us-west-2", cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if local != "overture" || spec.Namespace != "origin-overture" || spec.TTL != "1m0s" ||
-		spec.Retention != "24h0m0s" || spec.MaxFills != 8 || spec.RangeChunk != 1<<20 || spec.MaxBytes != 1<<30 {
-		t.Fatalf("spec = %+v local=%q", spec, local)
-	}
-	var parsed struct {
-		Type   string `json:"type"`
-		Prefix string `json:"prefix"`
-		Config struct {
-			Bucket           string `json:"bucket"`
-			Endpoint         string `json:"endpoint"`
-			Region           string `json:"region"`
-			AccessKey        string `json:"access_key"`
-			SecretKey        string `json:"secret_key"`
-			Insecure         bool   `json:"insecure"`
-			BucketLookupType string `json:"bucket_lookup_type"`
-			StripBucket      bool   `json:"strip_bucket"`
-		} `json:"config"`
-	}
-	if err := json.Unmarshal([]byte(spec.Config), &parsed); err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Type != "s3" || parsed.Config.Bucket != "overturemaps-us-west-2" ||
-		parsed.Config.Region != "us-west-2" || parsed.Prefix != "" ||
-		parsed.Config.BucketLookupType != "auto" || !parsed.Config.StripBucket {
-		t.Fatalf("origin config = %+v (%s)", parsed, spec.Config)
-	}
-
-	t.Setenv("AWS_DEFAULT_REGION", "eu-west-1")
-	t.Setenv("PGVS3_S3_ACCESS_KEY", "key")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
-	cfg.cacheNamespace, cfg.rangeCacheChunk = "cache", 4096
-	local, spec, err = parseS3OriginFlag("s3://warehouse/data/?endpoint=http://127.0.0.1:9000&path_style=1&insecure=true", cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if local != "warehouse" || spec.Namespace != "cache" || spec.RangeChunk != 4096 {
-		t.Fatalf("local=%q namespace=%q range=%d", local, spec.Namespace, spec.RangeChunk)
-	}
-	if err := json.Unmarshal([]byte(spec.Config), &parsed); err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Prefix != "data" || parsed.Config.Endpoint != "http://127.0.0.1:9000" ||
-		parsed.Config.Region != "eu-west-1" || parsed.Config.AccessKey != "key" ||
-		parsed.Config.SecretKey != "secret" || !parsed.Config.Insecure || parsed.Config.BucketLookupType != "path" {
-		t.Fatalf("origin config = %+v (%s)", parsed, spec.Config)
-	}
-
-	if _, _, err := parseS3OriginFlag("Lake=s3://bucket", cfg); err == nil || !strings.Contains(err.Error(), "local=s3://bucket") {
-		t.Fatalf("uppercase local bucket error = %v", err)
-	}
-	if _, _, err := parseS3OriginFlag("s3://MyBucket", cfg); err == nil || !strings.Contains(err.Error(), "local=s3://MyBucket") {
-		t.Fatalf("uppercase origin bucket error = %v", err)
-	}
-	if _, _, err := parseS3OriginFlag("ftp://bucket", cfg); err == nil {
-		t.Fatal("non-s3 origin accepted")
-	}
-	if _, _, err := parseS3OriginFlag("s3://", cfg); err == nil {
-		t.Fatal("empty origin bucket accepted")
-	}
-}
-
-func TestOriginConfig(t *testing.T) {
-	cfg := originConfig{
-		cacheNamespace:  "cache",
-		ttl:             time.Minute,
-		retention:       24 * time.Hour,
-		fillConcurrency: 8,
-		rangeCacheChunk: 4096,
-		cacheMaxBytes:   1 << 30,
-	}
-	if got := cfg.scope(); got != "global" {
-		t.Fatalf("scope = %q", got)
-	}
-	cfg.bucket = "bucket"
-	if got := cfg.scope(); got != "bucket" {
-		t.Fatalf("scope = %q", got)
-	}
-	sp := cfg.spec([]byte(`{"endpoint":"origin"}`))
-	if sp.Namespace != "cache" || sp.TTL != "1m0s" || sp.Retention != "24h0m0s" ||
-		sp.MaxFills != 8 || sp.RangeChunk != 4096 || sp.MaxBytes != 1<<30 ||
-		sp.Config != `{"endpoint":"origin"}` {
-		t.Fatalf("spec = %+v", sp)
-	}
-	for _, action := range []string{"set", "clear", "list", "sql"} {
-		if originActions[action] == nil {
-			t.Fatalf("origin action %q is missing", action)
-		}
-	}
-}
-
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	old := os.Stdout
-	os.Stdout = w
-	fn()
-	os.Stdout = old
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(out)
-}
-
-func TestOriginSQL(t *testing.T) {
-	t.Setenv("PGVS3_ENDPOINT", "http://gateway.example:9000")
-	t.Setenv("PGVS3_URL", "postgres://alice:s%27cret@db.example:5544/lake_catalog?sslmode=disable")
-	code := -1
-	out := captureStdout(t, func() { code = originSQL(context.Background(), nil, nil, originConfig{bucket: "edge"}) })
-	if code != 0 {
-		t.Fatalf("exit code = %d", code)
-	}
-	for _, want := range []string{
-		"ENDPOINT 'gateway.example:9000'",
-		"HOST 'db.example'",
-		"PORT 5544",
-		"DATABASE 'lake_catalog'",
-		"USER 'alice'",
-		"PASSWORD 's''cret'",
-		"DATA_PATH 's3://edge/ducklake/'",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("output missing %q:\n%s", want, out)
-		}
-	}
-}
-
-func TestOriginSQLDefaults(t *testing.T) {
-	t.Setenv("PGVS3_ENDPOINT", "")
-	t.Setenv("PGVS3_URL", "")
-	host, port, user, password, database := ducklakePostgres()
-	if host != "127.0.0.1" || port != 5432 || user != "postgres" || password != "postgres" || database != "ducklake_catalog" {
-		t.Fatalf("defaults = %s %d %s %s %s", host, port, user, password, database)
-	}
-	code := -1
-	out := captureStdout(t, func() { code = originSQL(context.Background(), nil, nil, originConfig{}) })
-	if code != 0 {
-		t.Fatalf("exit code = %d", code)
-	}
-	for _, want := range []string{"ENDPOINT '127.0.0.1:8014'", "DATA_PATH 's3://lake/ducklake/'"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("output missing %q:\n%s", want, out)
-		}
-	}
-}
-
-func TestOriginS3ShorthandFlags(t *testing.T) {
-	clearServeEnv(t)
-	var cfg originConfig
-	fs := flag.NewFlagSet("origin", flag.ContinueOnError)
-	registerOriginFlags(fs, &cfg)
-	if err := fs.Parse([]string{
-		"--s3-endpoint", "s3.example.com", "--s3-bucket", "warehouse",
-		"--s3-region", "eu-west-1", "--s3-access-key", "key",
-		"--s3-secret-key", "secret", "--s3-path-style", "--s3-insecure",
-		"--cache-max-bytes", "2048",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := cfg.buildS3JSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got struct {
-		Type   string `json:"type"`
-		Config struct {
-			Bucket           string `json:"bucket"`
-			Endpoint         string `json:"endpoint"`
-			Region           string `json:"region"`
-			AccessKey        string `json:"access_key"`
-			SecretKey        string `json:"secret_key"`
-			Insecure         bool   `json:"insecure"`
-			BucketLookupType string `json:"bucket_lookup_type"`
-			StripBucket      bool   `json:"strip_bucket"`
-		} `json:"config"`
-	}
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Type != "s3" || got.Config.Bucket != "warehouse" || got.Config.Endpoint != "s3.example.com" ||
-		got.Config.Region != "eu-west-1" || got.Config.AccessKey != "key" || got.Config.SecretKey != "secret" ||
-		!got.Config.Insecure || got.Config.BucketLookupType != "path" || got.Config.StripBucket {
-		t.Fatalf("s3 config = %+v (%s)", got, raw)
-	}
-	if cfg.spec(raw).MaxBytes != 2048 {
-		t.Fatalf("max bytes = %d", cfg.spec(raw).MaxBytes)
-	}
-
-	t.Setenv("AWS_REGION", "")
-	t.Setenv("AWS_DEFAULT_REGION", "ap-south-1")
-	t.Setenv("AWS_ACCESS_KEY_ID", "env-key")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "env-secret")
-	cfg = originConfig{bucket: "edge", s3Endpoint: "minio:9000"}
-	raw, err = cfg.buildS3JSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Config.Bucket != "edge" || !got.Config.StripBucket || got.Config.BucketLookupType != "auto" ||
-		got.Config.Region != "ap-south-1" || got.Config.AccessKey != "env-key" || got.Config.SecretKey != "env-secret" {
-		t.Fatalf("environment fallback = %+v (%s)", got, raw)
-	}
-
-	var envCfg originConfig
-	fs = flag.NewFlagSet("origin", flag.ContinueOnError)
-	registerOriginFlags(fs, &envCfg)
-	t.Setenv("PGVS3_S3_ENDPOINT", "env-host:9000")
-	t.Setenv("PGVS3_S3_BUCKET", "env-bucket")
-	t.Setenv("PGVS3_S3_PATH_STYLE", "yes")
-	if err := applyFlagEnv(fs, "PGVS3_"); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.Parse(nil); err != nil {
-		t.Fatal(err)
-	}
-	if envCfg.s3Endpoint != "env-host:9000" || envCfg.s3Bucket != "env-bucket" || !envCfg.s3PathStyle {
-		t.Fatalf("environment flags = %+v", envCfg)
-	}
-}
-
 func TestExtractSubcommand(t *testing.T) {
 	cases := []struct {
 		in       []string
@@ -431,14 +186,14 @@ func TestExtractSubcommand(t *testing.T) {
 		wantRest []string
 	}{
 		{
-			in:       []string{"drop", "--force", "stat"},
-			wantCmd:  "drop",
-			wantRest: []string{"--force", "stat"},
+			in:       []string{"reap", "--all", "stat"},
+			wantCmd:  "reap",
+			wantRest: []string{"--all", "stat"},
 		},
 		{
-			in:       []string{"clone", "stat", "doctor"},
-			wantCmd:  "clone",
-			wantRest: []string{"stat", "doctor"},
+			in:       []string{"stat", "--json"},
+			wantCmd:  "stat",
+			wantRest: []string{"--json"},
 		},
 		{
 			in:       []string{"--url", "postgres://localhost/pgvs3", "serve", "--addr", "127.0.0.1:8014"},
@@ -565,19 +320,19 @@ func TestServeEnvironmentUsesFlagParsers(t *testing.T) {
 	t.Setenv("PGVS3_POOL_MAX", "0012")
 	t.Setenv("PGVS3_DB_LOCK_TIMEOUT", "1250ms")
 	t.Setenv("PGVS3_READ_ONLY", "yes")
-	t.Setenv("PGVS3_CACHE_WRITE_BACK", "no")
+	t.Setenv("PGVS3_ORIGIN_PATH_STYLE", "no")
 	t.Setenv("PGVS3_S3_CONCURRENCY", "17")
 	cfg, err := parseServeConfig([]string{"--pool-max=9", "--read-only=false"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.poolMax != 9 || cfg.readOnly || cfg.cacheWriteBack || cfg.dbLockTimeout != 1250*time.Millisecond || cfg.s3Concurrency != 17 {
+	if cfg.poolMax != 9 || cfg.readOnly || cfg.originPathStyle || cfg.dbLockTimeout != 1250*time.Millisecond || cfg.s3Concurrency != 17 {
 		t.Fatalf("environment/flag precedence: %+v", cfg)
 	}
 	if fromEnv, err := parseServeConfig(nil); err != nil || fromEnv.poolMax != 12 {
 		t.Fatalf("zero-padded decimal environment: %+v %v", fromEnv, err)
 	}
-	for _, key := range []string{"PGVS3_S3_CONCURRENCY", "PGVS3_DB_LOCK_TIMEOUT", "PGVS3_CACHE_WRITE_BACK"} {
+	for _, key := range []string{"PGVS3_S3_CONCURRENCY", "PGVS3_DB_LOCK_TIMEOUT", "PGVS3_ORIGIN_PATH_STYLE"} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, "invalid")
 			if _, err := parseServeConfig(nil); err == nil {
@@ -585,9 +340,9 @@ func TestServeEnvironmentUsesFlagParsers(t *testing.T) {
 			}
 		})
 	}
-	t.Setenv("PGVS3_CACHE_WRITE_BACK", "")
+	t.Setenv("PGVS3_ORIGIN_PATH_STYLE", "")
 	cfg, err = parseServeConfig(nil)
-	if err != nil || cfg.cacheWriteBack {
+	if err != nil || cfg.originPathStyle {
 		t.Fatalf("empty boolean environment: %+v %v", cfg, err)
 	}
 }
