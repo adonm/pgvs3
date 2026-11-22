@@ -117,8 +117,6 @@ func (s *Server) apiError(err error) error {
 	switch {
 	case errors.Is(err, objcache.ErrSpoolBusy):
 		return apiErr("SlowDown", "The cache scratch byte budget is busy; retry shortly.", http.StatusServiceUnavailable)
-	case errors.Is(err, objcache.ErrReadOnly):
-		return errAccessDenied("gateway is read-only")
 	case errors.Is(err, objcache.ErrOriginConflict):
 		return apiErr("OperationAborted", "A conflicting conditional operation is in progress. Retry the request.", http.StatusConflict)
 	case errors.Is(err, objcache.ErrOriginUnsupported):
@@ -127,22 +125,10 @@ func (s *Server) apiError(err error) error {
 		return errPreconditionFailed()
 	case errors.Is(err, store.ErrNotFound):
 		return errNoSuchKey()
-	case errors.Is(err, store.ErrNoBucket):
-		return errNoSuchBucket()
-	case errors.Is(err, store.ErrInvalidBucket), errors.Is(err, ns.ErrInvalidName):
+	case errors.Is(err, ns.ErrInvalidName):
 		return errInvalidBucketName()
-	case errors.Is(err, store.ErrNoUpload):
-		return errNoSuchUpload()
 	case errors.Is(err, store.ErrInvalidRange):
 		return errInvalidRange()
-	case errors.Is(err, store.ErrMissingChecksum):
-		return errInvalidRequest("part lacks the upload's checksum")
-	case errors.Is(err, store.ErrTooManyNamespaces):
-		return apiErr("TooManyBuckets", "The namespace limit has been reached.", http.StatusBadRequest)
-	case errors.Is(err, store.ErrBucketNotEmpty):
-		return apiErr("BucketNotEmpty", "The bucket you tried to delete is not empty.", http.StatusConflict)
-	case errors.Is(err, store.ErrQuotaExceeded):
-		return apiErr("InsufficientStorage", "The database or namespace is over its storage budget.", http.StatusInsufficientStorage)
 	default:
 		return errInternal(err, s.log)
 	}

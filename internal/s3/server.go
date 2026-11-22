@@ -401,10 +401,6 @@ func errInvalidBucketName() *APIError {
 	return apiErr("InvalidBucketName", "The specified bucket is not valid.", http.StatusBadRequest)
 }
 
-func errNoSuchUpload() *APIError {
-	return apiErr("NoSuchUpload", "The specified multipart upload does not exist.", http.StatusNotFound)
-}
-
 func errPreconditionFailed() *APIError {
 	return apiErr("PreconditionFailed", "At least one of the preconditions you specified did not hold.", http.StatusPreconditionFailed)
 }

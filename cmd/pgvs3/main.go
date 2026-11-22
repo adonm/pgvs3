@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/adonm/pgvs3/internal/gateway"
-	"github.com/adonm/pgvs3/internal/ns"
 	"github.com/adonm/pgvs3/internal/objcache"
 	"github.com/adonm/pgvs3/internal/s3client"
 	"github.com/adonm/pgvs3/internal/store"
@@ -246,7 +245,6 @@ func serve(args []string) int {
 		return 1
 	}
 	defer st.Close()
-	st.SetMaxDBBytes(cfg.maxDBBytes)
 
 	stopMaintenance, err := prepareStore(ctx, st, cfg, log)
 	defer stopMaintenance()
@@ -290,14 +288,10 @@ func prepareStore(ctx context.Context, st *store.Store, cfg serveConfig, log *sl
 		log.Error("initializing schema", "err", err)
 		return noop, err
 	}
-	if err := st.EnsureMaintenance(ctx); err != nil {
-		log.Error("verifying maintenance schema", "err", err)
-		return noop, err
-	}
 	if cfg.readOnly {
 		return noop, nil
 	}
-	return startMaintenance(ctx, st, cfg.reapGrace, log), nil
+	return startMaintenance(ctx, st, cfg.cacheRetention, cfg.cacheMaxBytes, log), nil
 }
 
 func splitCSV(raw string) []string {
@@ -310,12 +304,12 @@ func splitCSV(raw string) []string {
 	return out
 }
 
-func startMaintenance(ctx context.Context, st *store.Store, reapGrace time.Duration, log *slog.Logger) func() {
+func startMaintenance(ctx context.Context, st *store.Store, retention time.Duration, maxBytes int64, log *slog.Logger) func() {
 	maintainCtx, cancelMaintain := context.WithCancel(ctx)
 	maintainDone := make(chan struct{})
 	go func() {
 		defer close(maintainDone)
-		maintain(maintainCtx, st, reapGrace, time.Minute, log)
+		maintain(maintainCtx, st, retention, maxBytes, time.Minute, log)
 	}()
 	return func() {
 		cancelMaintain()
@@ -357,7 +351,6 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 		return nil, err
 	}
 	tier, err := objcache.New(log, origin, st, runtime, objcache.TierOptions{
-		Namespace:  cfg.cacheNamespace,
 		TTL:        cfg.revalidateAfter,
 		Retention:  cfg.cacheRetention,
 		MaxFills:   cfg.fillConcurrency,
@@ -370,7 +363,7 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 		log.Error("opening origin cache", "err", err)
 		return nil, err
 	}
-	log.Info("origin cache enabled", "namespace", tier.Name(), "endpoint", cfg.originEndpoint, "region", region)
+	log.Info("origin cache enabled", "endpoint", cfg.originEndpoint, "region", region)
 	return tier, nil
 }
 
@@ -447,24 +440,13 @@ func withStore(name string, args []string, timeout time.Duration, checkLayout bo
 }
 
 func stat(args []string) int {
-	var kind, name *string
 	var asJSON *bool
 	return withStore("stat", args, 30*time.Second, false, func(fs *flag.FlagSet) {
-		kind = fs.String("kind", "", "filter by namespace kind (bucket, cache, writeback or queue)")
-		name = fs.String("name", "", "namespace name")
 		asJSON = fs.Bool("json", false, "print JSON")
 	}, func(ctx context.Context, st *store.Store, _ []string) int {
-		s, err := st.StatNamespace(ctx, ns.Kind(*kind), *name)
+		s, err := st.Stat(ctx)
 		if err != nil {
 			return fail(err)
-		}
-		overhead := 0.0
-		if s.LogicalBytes > 0 {
-			overhead = (float64(s.PhysicalBytes)/float64(s.LogicalBytes) - 1) * 100
-		}
-		oldest := "none"
-		if s.OldestGarbage != nil {
-			oldest = s.OldestGarbage.Round(time.Second).String()
 		}
 		if *asJSON {
 			enc := json.NewEncoder(os.Stdout)
@@ -472,16 +454,8 @@ func stat(args []string) int {
 			_ = enc.Encode(s)
 			return 0
 		}
-		fmt.Printf("namespaces=%d buckets=%d objects=%d chunks=%d events=%d logical=%d MiB physical=%d MiB db=%d MiB overhead=%.2f%% garbage_files=%d oldest_garbage=%s",
-			s.Namespaces, s.Buckets, s.Objects, s.Chunks, s.Events, s.LogicalBytes>>20,
-			s.PhysicalBytes>>20, s.DatabaseBytes>>20, overhead, s.GarbageFiles, oldest)
-		if s.OriginMetadata > 0 {
-			fmt.Printf(" origin_metadata=%d", s.OriginMetadata)
-		}
-		if s.MaxBytes > 0 {
-			fmt.Printf(" max_bytes=%d", s.MaxBytes)
-		}
-		fmt.Println()
+		fmt.Printf("objects=%d logical=%d MiB db=%d MiB\n",
+			s.Objects, s.LogicalBytes>>20, s.DatabaseBytes>>20)
 		return 0
 	})
 }
@@ -509,35 +483,27 @@ func health(args []string) int {
 }
 
 func reap(args []string) int {
-	var grace *time.Duration
-	var all *bool
 	var retention *time.Duration
+	var maxBytes *int64
 	return withStore("reap", args, 30*time.Minute, true, func(fs *flag.FlagSet) {
-		grace = fs.Duration("grace", envDuration("PGVS3_REAP_GRACE", 10*time.Minute), "only reap files deleted at least this long ago")
-		all = fs.Bool("all", false, "repeat the bounded pass until no garbage remains")
-		retention = fs.Duration("job-retention", envDuration("PGVS3_JOB_RETENTION", store.DefaultJobRetention), "keep terminal OJS jobs this long (0 = forever)")
+		retention = fs.Duration("retention", envDuration("PGVS3_CACHE_RETENTION", 24*time.Hour), "evict cached objects idle longer than this")
+		maxBytes = fs.Int64("max-bytes", 0, "evict oldest cached objects above this byte budget (0 = unlimited)")
 	}, func(ctx context.Context, st *store.Store, _ []string) int {
-		st.SetJobRetention(*retention)
-		for i := 0; ; i++ {
-			beforeRows, beforeFiles := st.ReapedRows(), st.ReapedFiles()
-			if err := st.Maintain(ctx, *grace); err != nil {
-				return fail(err)
-			}
-			if !*all || (st.ReapedRows() == beforeRows && st.ReapedFiles() == beforeFiles) || i >= 1000 {
-				break
-			}
+		evicted, err := st.Evict(ctx, *retention, *maxBytes)
+		if err != nil {
+			return fail(err)
 		}
 		after, err := st.Stat(ctx)
 		if err != nil {
 			return fail(err)
 		}
-		fmt.Printf("garbage_files=%d reaped_rows=%d reaped_files=%d expired_objects=%d db=%d MiB\n",
-			after.GarbageFiles, st.ReapedRows(), st.ReapedFiles(), st.ExpiredObjects(), after.DatabaseBytes>>20)
+		fmt.Printf("evicted=%d objects=%d logical=%d MiB db=%d MiB\n",
+			evicted, after.Objects, after.LogicalBytes>>20, after.DatabaseBytes>>20)
 		return 0
 	})
 }
 
-func maintain(ctx context.Context, st *store.Store, grace, interval time.Duration, log *slog.Logger) {
+func maintain(ctx context.Context, st *store.Store, retention time.Duration, maxBytes int64, interval time.Duration, log *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -546,8 +512,8 @@ func maintain(ctx context.Context, st *store.Store, grace, interval time.Duratio
 			return
 		case <-ticker.C:
 			runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-			if err := st.Maintain(runCtx, grace); err != nil && ctx.Err() == nil {
-				log.Warn("maintenance failed", "err", err)
+			if _, err := st.Evict(runCtx, retention, maxBytes); err != nil && ctx.Err() == nil {
+				log.Warn("eviction failed", "err", err)
 			}
 			cancel()
 		}

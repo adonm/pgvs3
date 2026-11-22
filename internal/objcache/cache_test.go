@@ -63,16 +63,6 @@ func TestS3OriginAllowlistAndTransparentBucket(t *testing.T) {
 		t.Fatalf("attrs = %+v", attrs)
 	}
 
-	rc, gotAttrs, err := o.GetWithAttrs(context.Background(), "allowed-b", "hello.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, _ := io.ReadAll(rc)
-	_ = rc.Close()
-	if string(data) != "hello" || gotAttrs.ETag != "abc123" {
-		t.Fatalf("got %q %+v", string(data), gotAttrs)
-	}
-
 	resp, err := o.Proxy(context.Background(), "allowed-b", "up.txt", http.MethodPut, nil, strings.NewReader("world"), 5)
 	if err != nil {
 		t.Fatal(err)
@@ -87,39 +77,8 @@ func TestS3OriginAllowlistAndTransparentBucket(t *testing.T) {
 	}
 }
 
-func TestSpoolWithBudget(t *testing.T) {
-	budget := newSpoolBudget(10<<20, t.TempDir())
-	// Small payload stays in memory.
-	sp, clean, err := spoolWithBudget(context.Background(), bytes.NewReader([]byte("abc")), 3, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sp.size != 3 || string(sp.data) != "abc" {
-		t.Fatalf("small spool = %+v", sp)
-	}
-	clean()
-
-	// Unknown length payload > memFillMax spills to temp file and releases budget on clean.
-	big := bytes.Repeat([]byte("x"), memFillMax+1024)
-	sp2, clean2, err := spoolWithBudget(context.Background(), bytes.NewReader(big), -1, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sp2.size != int64(len(big)) || sp2.data != nil {
-		t.Fatalf("big spool size=%d dataNil=%v", sp2.size, sp2.data == nil)
-	}
-	got, err := io.ReadAll(sp2.r)
-	if err != nil || !bytes.Equal(got, big) {
-		t.Fatalf("spooled read mismatch: err=%v len=%d", err, len(got))
-	}
-	clean2()
-	if budget.used.Load() != 0 {
-		t.Fatalf("budget used after clean = %d, want 0", budget.used.Load())
-	}
-}
-
 func TestConditionalHeadRevalidation(t *testing.T) {
-	var etag = `"v1"`
+	etag := `"v1"`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodHead || r.URL.Path != "/b/k" {
 			w.WriteHeader(http.StatusNotFound)
@@ -153,14 +112,32 @@ func TestConditionalHeadRevalidation(t *testing.T) {
 	}
 }
 
-func TestPlanCacheRead(t *testing.T) {
-	if p := planCacheRead(cacheResolution{}, 0, false, readView{Size: 0}); p.action != cacheActionZero {
-		t.Fatalf("zero size action = %v", p.action)
+func TestSpoolWithBudget(t *testing.T) {
+	budget := newSpoolBudget(10<<20, t.TempDir())
+	r, sz, clean, err := spoolWithBudget(context.Background(), bytes.NewReader([]byte("abc")), 3, budget)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if p := planCacheRead(cacheResolution{}, 1<<20, false, readView{Size: 10 << 20, start: 0, end: 100, ranged: true}); p.action != cacheActionRange {
-		t.Fatalf("range action = %v", p.action)
+	if sz != 3 {
+		t.Fatalf("small spool size = %d", sz)
 	}
-	if p := planCacheRead(cacheResolution{}, 1<<20, false, readView{Size: 10 << 20, start: 0, end: 10<<20 - 1}); p.action != cacheActionPassThrough {
-		t.Fatalf("large whole action = %v", p.action)
+	_ = r
+	clean()
+
+	big := bytes.Repeat([]byte("x"), memSpoolMax+1024)
+	r2, sz2, clean2, err := spoolWithBudget(context.Background(), bytes.NewReader(big), -1, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sz2 != int64(len(big)) {
+		t.Fatalf("big spool size = %d", sz2)
+	}
+	got, err := io.ReadAll(r2)
+	if err != nil || !bytes.Equal(got, big) {
+		t.Fatalf("spooled read mismatch: err=%v len=%d", err, len(got))
+	}
+	clean2()
+	if budget.used.Load() != 0 {
+		t.Fatalf("budget used after clean = %d, want 0", budget.used.Load())
 	}
 }

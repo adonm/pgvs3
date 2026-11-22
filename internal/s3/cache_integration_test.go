@@ -390,7 +390,6 @@ func openTestGateway(t *testing.T, dbURL, nsName, endpoint string, revalidateAft
 	}
 	rt := objcache.NewRuntime(objcache.RuntimeOptions{Fills: 8, SpoolDir: t.TempDir(), SpoolBytes: 64 << 20})
 	tier, err := objcache.New(nil, origin, st, rt, objcache.TierOptions{
-		Namespace:  nsName,
 		TTL:        revalidateAfter,
 		Retention:  time.Hour,
 		MaxFills:   8,
@@ -432,7 +431,8 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	nsName := fmt.Sprintf("itest-%d", time.Now().UnixNano())
 	stA, gwA := openTestGateway(t, dbURL, nsName, originSrv.URL, 0, 0)
 	defer func() {
-		_, _ = stA.DropNamespace(context.Background(), "cache", nsName, true)
+		_, _ = stA.Evict(context.Background(), 0, 1)
+		_ = stA.Delete(context.Background(), "b1", "obj.bin")
 	}()
 	_, gwB := openTestGateway(t, dbURL, nsName, originSrv.URL, 0, 0)
 
@@ -584,14 +584,11 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	// 7. Eviction honours budget.
 	evictNS := fmt.Sprintf("evict-%d", time.Now().UnixNano())
 	stEv, gwEv := openTestGateway(t, dbURL, evictNS, originSrv.URL, 0, 5000)
-	defer func() {
-		_, _ = stEv.DropNamespace(context.Background(), "cache", evictNS, true)
-	}()
-	fake.putDirect("b1", "big1.bin", bytes.Repeat([]byte("a"), 4000), "application/octet-stream")
-	fake.putDirect("b1", "big2.bin", bytes.Repeat([]byte("b"), 4000), "application/octet-stream")
-	_ = doReq(t, gwEv, http.MethodGet, "/b1/big1.bin", nil, nil)
-	_ = doReq(t, gwEv, http.MethodGet, "/b1/big2.bin", nil, nil)
-	if err := stEv.Maintain(context.Background(), 0); err != nil {
+	fake.putDirect("evb", "big1.bin", bytes.Repeat([]byte("a"), 4000), "application/octet-stream")
+	fake.putDirect("evb", "big2.bin", bytes.Repeat([]byte("b"), 4000), "application/octet-stream")
+	_ = doReq(t, gwEv, http.MethodGet, "/evb/big1.bin", nil, nil)
+	_ = doReq(t, gwEv, http.MethodGet, "/evb/big2.bin", nil, nil)
+	if _, err := stEv.Evict(context.Background(), 0, 5000); err != nil {
 		t.Fatal(err)
 	}
 	if stEv.CacheEvictedObjects() == 0 {

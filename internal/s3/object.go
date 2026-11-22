@@ -23,7 +23,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	if err != nil {
 		return err
 	}
-	if err := checkReadPreconditions(r, obj.ETag, obj.LastModified()); err != nil {
+	if err := checkReadPreconditions(r, obj.ETag, obj.LastModified); err != nil {
 		if errors.Is(err, store.ErrNotModified) {
 			w.Header().Set("ETag", quoteETag(obj.ETag))
 			w.WriteHeader(http.StatusNotModified)
@@ -31,7 +31,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		}
 		return err
 	}
-	setObjectInfoHeaders(w, obj.ObjectInfo, key)
+	setObjectInfoHeaders(w, obj.ObjectMeta, key)
 	if obj.Hit {
 		w.Header().Set("X-Cache", "HIT")
 	} else {
@@ -60,13 +60,13 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		}
 		return err
 	}
-	defer obj.Close()
+	defer obj.Body.Close()
 
 	if rng.Requested && obj.Size == 0 {
 		w.Header().Set("Content-Range", "bytes */0")
 		return errInvalidRange()
 	}
-	if err := checkReadPreconditions(r, obj.ETag, obj.LastModified()); err != nil {
+	if err := checkReadPreconditions(r, obj.ETag, obj.LastModified); err != nil {
 		if errors.Is(err, store.ErrNotModified) {
 			w.Header().Set("ETag", quoteETag(obj.ETag))
 			w.WriteHeader(http.StatusNotModified)
@@ -75,15 +75,7 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		return err
 	}
 
-	res := &store.ReadResult{
-		ObjectInfo: obj.ObjectInfo,
-		Body:       obj.Body,
-		Start:      obj.Start,
-		End:        obj.End,
-		Ranged:     obj.Ranged,
-		Hit:        obj.Hit,
-	}
-	s.serveReadResult(w, r, key, res, true)
+	s.serveReadResult(w, r, key, obj, true)
 	return nil
 }
 
@@ -221,7 +213,7 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	_, _ = io.CopyBuffer(w, resp.Body, buf)
 }
 
-func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectInfo, key string) {
+func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectMeta, key string) {
 	ct := info.ContentType
 	if ct == "" || ct == "application/octet-stream" || ct == "application/x-www-form-urlencoded" {
 		if inferred := mime.TypeByExtension(path.Ext(key)); inferred != "" {
@@ -234,16 +226,13 @@ func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectInfo, key stri
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("ETag", quoteETag(info.ETag))
 	w.Header().Set("Content-Type", ct)
-	if info.ChecksumName != "" && info.ChecksumValue != "" {
-		w.Header().Set(checksumHeaderName(info.ChecksumName), info.ChecksumValue)
-	}
 	if info.ContentEncoding != "" {
 		w.Header().Set("Content-Encoding", info.ContentEncoding)
 	}
-	if !info.LastModified().IsZero() {
-		w.Header().Set("Last-Modified", info.LastModified().UTC().Format(http.TimeFormat))
+	if !info.LastModified.IsZero() {
+		w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
 	}
-	for k, vs := range metadataHeader(info.UserMetadata) {
+	for k, vs := range metadataHeader(info.UserMeta) {
 		for _, v := range vs {
 			w.Header().Set(k, v)
 		}
@@ -251,11 +240,7 @@ func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectInfo, key stri
 }
 
 func setReadHeaders(w http.ResponseWriter, res *store.ReadResult, key string, cacheHeader bool) {
-	info := res.ObjectInfo
-	if res.Ranged {
-		info.ChecksumName, info.ChecksumValue, info.ChecksumType = "", "", ""
-	}
-	setObjectInfoHeaders(w, info, key)
+	setObjectInfoHeaders(w, res.ObjectMeta, key)
 	if cacheHeader {
 		if res.Hit {
 			w.Header().Set("X-Cache", "HIT")
@@ -292,12 +277,4 @@ func (s *Server) serveReadResult(w http.ResponseWriter, r *http.Request, key str
 	if _, err := io.CopyBuffer(w, res.Body, buf); err != nil {
 		s.log.Debug("GET body interrupted", "key", key, "err", err)
 	}
-}
-
-func checksumHeaderName(name string) string {
-	lower := strings.ToLower(name)
-	if strings.HasPrefix(lower, "x-amz-checksum-") {
-		return lower
-	}
-	return "x-amz-checksum-" + lower
 }

@@ -46,17 +46,16 @@ type originAttrs struct {
 	UserMetadata    []string
 }
 
-func (a originAttrs) objectInfo() store.ObjectInfo {
-	return store.ObjectInfo{
-		Size: a.Size, ETag: a.ETag, OriginETag: a.ETag, OriginModified: a.LastModified, CreatedAt: a.LastModified,
-		ContentType: a.ContentType, ContentEncoding: a.ContentEncoding, UserMetadata: a.UserMetadata,
-	}
-}
-
-func (a originAttrs) writeOptions() store.WriteOptions {
-	return store.WriteOptions{
-		ContentType: a.ContentType, ContentEncoding: a.ContentEncoding,
-		UserMetadata: a.UserMetadata, OriginModified: a.LastModified,
+func (a originAttrs) objectMeta(bucket, key string) store.ObjectMeta {
+	return store.ObjectMeta{
+		Bucket:          bucket,
+		Key:             key,
+		ETag:            a.ETag,
+		Size:            a.Size,
+		ContentType:     a.ContentType,
+		ContentEncoding: a.ContentEncoding,
+		LastModified:    a.LastModified,
+		UserMeta:        a.UserMetadata,
 	}
 }
 

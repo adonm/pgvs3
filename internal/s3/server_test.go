@@ -50,25 +50,6 @@ func TestCRC64NVMEAgainstBitwise(t *testing.T) {
 	}
 }
 
-func TestRangeDoesNotAdvertiseWholeObjectChecksum(t *testing.T) {
-	res := &store.ReadResult{Size: 100, Start: 10, End: 19, Ranged: true,
-		ChecksumName: "crc32", ChecksumValue: "whole-object", ChecksumType: "FULL_OBJECT"}
-	w := httptest.NewRecorder()
-	setReadHeaders(w, res, "key", true)
-	if got := w.Header().Get("x-amz-checksum-crc32"); got != "" {
-		t.Fatalf("partial payload checksum = %q", got)
-	}
-	if res.ChecksumValue != "whole-object" {
-		t.Fatal("range response mutated shared metadata")
-	}
-	res.Ranged = false
-	w = httptest.NewRecorder()
-	setReadHeaders(w, res, "key", true)
-	if got := w.Header().Get("x-amz-checksum-crc32"); got != "whole-object" {
-		t.Fatalf("full payload lost checksum = %q", got)
-	}
-}
-
 func TestSpoolAdmissionMapsToRetryableSlowDown(t *testing.T) {
 	s := &Server{log: testutil.DiscardLogger()}
 	err := fmt.Errorf("spool: %w", objcache.ErrSpoolBusy)
