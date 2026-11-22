@@ -581,7 +581,19 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 		t.Fatalf("ListObjectsV2 = %d %s", rList.Code, rList.Body.String())
 	}
 
-	// 7. Eviction honours budget.
+	// 7. Origin outage: cached hits still served; misses return 5xx cleanly.
+	fake.setOutage(true)
+	rOutageHit := doReq(t, gwA, http.MethodGet, "/b1/obj.bin", nil, nil)
+	if rOutageHit.Code != 200 || rOutageHit.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("outage cached hit = %d", rOutageHit.Code)
+	}
+	rOutageMiss := doReq(t, gwA, http.MethodGet, "/b1/uncached.bin", nil, nil)
+	if rOutageMiss.Code < 500 || rOutageMiss.Code >= 600 {
+		t.Fatalf("outage miss = %d, want 5xx", rOutageMiss.Code)
+	}
+	fake.setOutage(false)
+
+	// 8. Eviction honours budget.
 	evictNS := fmt.Sprintf("evict-%d", time.Now().UnixNano())
 	stEv, gwEv := openTestGateway(t, dbURL, evictNS, originSrv.URL, 0, 5000)
 	fake.putDirect("evb", "big1.bin", bytes.Repeat([]byte("a"), 4000), "application/octet-stream")
@@ -593,17 +605,6 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	}
 	if stEv.CacheEvictedObjects() == 0 {
 		t.Fatal("expected cache eviction under budget")
-	}
-
-	// 8. Origin outage: cached hits still served; misses return 5xx cleanly.
-	fake.setOutage(true)
-	rOutageHit := doReq(t, gwA, http.MethodGet, "/b1/obj.bin", nil, nil)
-	if rOutageHit.Code != 200 || rOutageHit.Header().Get("X-Cache") != "HIT" {
-		t.Fatalf("outage cached hit = %d", rOutageHit.Code)
-	}
-	rOutageMiss := doReq(t, gwA, http.MethodGet, "/b1/uncached.bin", nil, nil)
-	if rOutageMiss.Code < 500 || rOutageMiss.Code >= 600 {
-		t.Fatalf("outage miss = %d, want 5xx", rOutageMiss.Code)
 	}
 
 	// Verify /metrics includes cache counters.

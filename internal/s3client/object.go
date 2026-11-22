@@ -37,7 +37,7 @@ func (b *Bucket) StatIfNoneMatch(ctx context.Context, key, ifNoneMatch string) (
 	}
 	var extra [][2]string
 	if ifNoneMatch != "" {
-		extra = append(extra, [2]string{"If-None-Match", `"` + strings.Trim(ifNoneMatch, `"`) + `"`})
+		extra = append(extra, [2]string{"if-none-match", `"` + strings.Trim(ifNoneMatch, `"`) + `"`})
 	}
 	resp, err := c.do(ctx, http.MethodHead, object, nil, nil, -1, extra...)
 	if err != nil {
@@ -86,10 +86,10 @@ func (b *Bucket) GetWithInfo(ctx context.Context, key string, offset, length int
 		} else {
 			rng = fmt.Sprintf("bytes=%d-", offset)
 		}
-		headers = append(headers, [2]string{"Range", rng})
+		headers = append(headers, [2]string{"range", rng})
 	}
 	if ifMatch != "" {
-		headers = append(headers, [2]string{"If-Match", `"` + strings.Trim(ifMatch, `"`) + `"`})
+		headers = append(headers, [2]string{"if-match", `"` + strings.Trim(ifMatch, `"`) + `"`})
 	}
 	resp, err := c.do(ctx, http.MethodGet, object, nil, nil, -1, headers...)
 	if err != nil {
