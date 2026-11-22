@@ -30,3 +30,7 @@ pgvs3 serve \
 
 - [Design](docs/design.md) — architecture, trust model, and consistency model
 - [Operations](docs/operations.md) — flags, metrics, Helm deployment, and upgrade path
+
+## Public S3 Smoke
+
+`just s3-public` (`test/s3-public.sh`) runs an optional, network-dependent smoke against real anonymous-access AWS S3 RODA buckets (`overturemaps-us-west-2`, `noaa-gsod-pds`, `tripdata`); it is excluded from `just ci` and runs weekly via `.github/workflows/s3-public.yml`.

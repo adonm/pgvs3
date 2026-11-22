@@ -72,6 +72,11 @@ vet:
 integration:
     bash test/integration.sh
 
+# Live smoke against real AWS S3 public RODA buckets (network-dependent; not in `just ci`).
+[group('test')]
+s3-public:
+    bash test/s3-public.sh
+
 [group('test')]
 fuzz:
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=10s ./internal/s3

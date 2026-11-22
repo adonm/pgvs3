@@ -60,3 +60,7 @@ helm lint deploy/charts/pgvs3
 ```
 
 See `deploy/charts/pgvs3/values.yaml` for EKS Pod Identity / IRSA (`extraEnv`, `podAnnotations`, `serviceMonitor`).
+
+## Public S3 Smoke
+
+`just s3-public` (`test/s3-public.sh`) exercises live anonymous AWS S3 buckets (`overturemaps-us-west-2`, `noaa-gsod-pds`, `tripdata`) and verifies region-mismatch `301 PermanentRedirect` handling. It is network-dependent and excluded from `just ci`.
