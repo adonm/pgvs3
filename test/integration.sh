@@ -105,7 +105,7 @@ done
 PGVS3_GW_A="http://127.0.0.1:18014" \
 PGVS3_GW_B="http://127.0.0.1:18015" \
 TMPDIR="$SCRATCH" \
-  mise exec uv -- uv run --quiet --no-project --with boto3 --with duckdb python test/smoke_versity.py || {
+  mise exec uv -- uv run --quiet --no-project --with boto3 --with "duckdb==${DUCKDB_PY:-2.0.0}" python test/smoke_versity.py || {
     echo "=== gwA.log ==="
     cat "$SCRATCH/gwA.log"
     echo "=== vgw.log ==="

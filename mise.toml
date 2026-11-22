@@ -7,11 +7,6 @@ ko = "0.19.1"
 uv = "0.13.5"
 python = "3.12.15"
 helm = "4.3.1"
-kind = "0.33.0"
-kubectl = "1.37.1"
-rclone = "1.75.2"
-restic = "0.19.1"
-"github:quarto-dev/quarto-cli" = "1.10.20"
 
 # Git hooks and Go quality tools. `mise install` provisions them for hk.
 hk = "2.8.1"
@@ -19,6 +14,6 @@ hk = "2.8.1"
 "go:honnef.co/go/tools/cmd/staticcheck" = "0.8.2"
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.9.0"
 
-# DuckDB for `just contract`, `just ducklake` and `just bench`.
+# DuckDB version for the integration smoke (test/smoke_versity.py).
 [env]
 DUCKDB_PY = "2.0.0"

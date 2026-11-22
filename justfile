@@ -86,7 +86,6 @@ s3-aws:
 fuzz:
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=10s ./internal/s3
     mise exec go -- go test -fuzz=FuzzChunkedBody -fuzztime=10s ./internal/s3
-    mise exec go -- go test -fuzz=FuzzRowFramer -fuzztime=10s ./internal/store
 
 IMAGE := env("KO_DOCKER_REPO", "ghcr.io/adonm/pgvs3")
 CHART_REPO := env("CHART_REPO", "oci://ghcr.io/adonm/charts")
