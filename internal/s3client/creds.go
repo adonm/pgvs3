@@ -62,9 +62,10 @@ type ChainProvider struct {
 	now    func() time.Time
 	buffer time.Duration
 
-	mu       sync.Mutex
-	cached   Credentials
-	inflight *credCall
+	mu            sync.Mutex
+	cached        Credentials
+	negativeUntil time.Time
+	inflight      *credCall
 }
 
 type credCall struct {
@@ -109,10 +110,15 @@ func NewChainProvider(cfg ChainConfig) *ChainProvider {
 
 func (p *ChainProvider) Get(ctx context.Context) (Credentials, error) {
 	p.mu.Lock()
-	if p.cached.valid(p.now(), p.buffer) {
+	now := p.now()
+	if p.cached.valid(now, p.buffer) {
 		c := p.cached
 		p.mu.Unlock()
 		return c, nil
+	}
+	if !p.negativeUntil.IsZero() && now.Before(p.negativeUntil) {
+		p.mu.Unlock()
+		return Credentials{}, nil
 	}
 	if p.inflight != nil {
 		call := p.inflight
@@ -131,8 +137,13 @@ func (p *ChainProvider) Get(ctx context.Context) (Credentials, error) {
 	cred, err := p.resolve(ctx)
 
 	p.mu.Lock()
-	if err == nil && cred.AccessKey != "" {
-		p.cached = cred
+	if err == nil {
+		if cred.AccessKey != "" {
+			p.cached = cred
+			p.negativeUntil = time.Time{}
+		} else {
+			p.negativeUntil = p.now().Add(time.Minute)
+		}
 	}
 	p.inflight = nil
 	call.cred, call.err = cred, err

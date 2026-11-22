@@ -16,7 +16,6 @@
 package s3client
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/xml"
@@ -222,24 +221,6 @@ func (c *client) objectKey(key string) (string, error) {
 	return c.prefix + "/" + key, nil
 }
 
-func (c *client) logicalKey(physical string) string {
-	if c.prefix == "" {
-		return physical
-	}
-	return strings.TrimPrefix(physical, c.prefix+"/")
-}
-
-func (c *client) listPrefix(prefix string) string {
-	prefix = strings.TrimLeft(prefix, "/")
-	if c.prefix == "" {
-		return prefix
-	}
-	if prefix == "" {
-		return c.prefix + "/"
-	}
-	return c.prefix + "/" + prefix
-}
-
 func normalizePrefix(prefix string) string {
 	return strings.Trim(strings.TrimSpace(prefix), "/")
 }
@@ -382,16 +363,6 @@ func (c *client) send(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	return resp, nil
-}
-
-func (c *client) doBytes(ctx context.Context, method, object string, query url.Values, body []byte, extra ...[2]string) (*http.Response, error) {
-	var r io.Reader
-	size := int64(-1)
-	if body != nil {
-		r = bytes.NewReader(body)
-		size = int64(len(body))
-	}
-	return c.do(ctx, method, object, query, r, size, extra...)
 }
 
 func canonicalQuery(q url.Values) string {

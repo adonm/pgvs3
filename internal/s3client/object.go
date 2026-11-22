@@ -1,40 +1,14 @@
-// Copyright 2023 Sneller, Inc.
-// Copyright 2025 Roman Atachiants
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//    http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-
 package s3client
 
 import (
-	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/base64"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
-	"iter"
-	"math"
 	"net/http"
-	"net/url"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/adonm/pgvs3/internal/syncx"
 )
 
 type ObjectInfo struct {
@@ -47,45 +21,11 @@ type ObjectInfo struct {
 	UserMetadata    []string
 }
 
-type PutOptions struct {
-	UserMetadata    []string
-	ContentType     string
-	ContentEncoding string
-
-	IfMatch string
-
-	IfNoneMatch string
-
-	ChecksumAlgorithm string
-	ChecksumValue     string
-}
-
-var multipartBufPool sync.Pool
-
-func getMultipartBuf(size int64) ([]byte, *[]byte) {
-	if v := multipartBufPool.Get(); v != nil {
-		bp := v.(*[]byte)
-		if int64(cap(*bp)) >= size {
-			return (*bp)[:size], bp
-		}
-	}
-	b := make([]byte, size, max(size, defaultMinPartSize))
-	return b, &b
-}
-
-func putMultipartBuf(bp *[]byte) {
-	if bp != nil && cap(*bp) <= 16<<20 {
-		multipartBufPool.Put(bp)
-	}
-}
-
 func (b *Bucket) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 	info, _, err := b.StatIfNoneMatch(ctx, key, "")
 	return info, err
 }
 
-// StatIfNoneMatch issues a HEAD request, optionally with If-None-Match.
-// When the origin returns 304 Not Modified, notModified is true.
 func (b *Bucket) StatIfNoneMatch(ctx context.Context, key, ifNoneMatch string) (info ObjectInfo, notModified bool, err error) {
 	c := b.client
 	if c == nil {
@@ -116,1009 +56,87 @@ func (b *Bucket) StatIfNoneMatch(ctx context.Context, key, ifNoneMatch string) (
 	return objectInfoFromHeader(strings.TrimLeft(key, "/"), resp.Header, resp.ContentLength), false, nil
 }
 
-func (b *Bucket) Walk(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error] {
-	return b.WalkAfter(ctx, prefix, "")
-}
-
-// WalkAfter lists objects under prefix, starting strictly after startAfter.
-// S3 serves the first page with start-after so deep pages do not rescan the
-// prefix client-side; later pages use the continuation token.
-func (b *Bucket) WalkAfter(ctx context.Context, prefix, startAfter string) iter.Seq2[ObjectInfo, error] {
-	return func(yield func(ObjectInfo, error) bool) {
-		if b.client == nil {
-			yield(ObjectInfo{}, errors.New("s3: nil bucket"))
-			return
-		}
-		if ctx == nil {
-			yield(ObjectInfo{}, errors.New("s3 request: nil context"))
-			return
-		}
-		if err := ctx.Err(); err != nil {
-			yield(ObjectInfo{}, err)
-			return
-		}
-		logical := strings.TrimLeft(prefix, "/")
-		if logical == "." {
-			logical = ""
-		}
-		physical := b.client.listPrefix(logical)
-		physicalAfter := ""
-		if startAfter != "" {
-			physicalAfter = b.client.listPrefix(strings.TrimLeft(startAfter, "/"))
-		}
-		token, previous := "", ""
-		for {
-			page, err := b.client.listPage(ctx, physical, token, physicalAfter)
-			if err != nil {
-				yield(ObjectInfo{}, err)
-				return
-			}
-			for _, object := range page.Contents {
-				key := object.Key
-				if page.EncodingType == "url" {
-					key, err = url.PathUnescape(key)
-					if err != nil {
-						yield(ObjectInfo{}, fmt.Errorf("s3: list %q: decoding key: %w", physical, err))
-						return
-					}
-				}
-				if strings.HasSuffix(key, "/") {
-					continue
-				}
-				if physical != "" && !strings.HasPrefix(key, physical) {
-					continue
-				}
-				logicalKey := b.client.logicalKey(key)
-				if b.client.prefix != "" && logicalKey == key {
-					continue
-				}
-				info := ObjectInfo{
-					Key:          logicalKey,
-					Size:         object.Size,
-					ETag:         normalizeETag(object.ETag),
-					LastModified: object.LastModified,
-					ContentType:  object.ContentType,
-				}
-				if !yield(info, nil) {
-					return
-				}
-			}
-			if !page.IsTruncated {
-				return
-			}
-			next := page.NextContinuationToken
-			if next == "" || next == token || next == previous {
-				yield(ObjectInfo{}, fmt.Errorf("s3: list %q: origin returned a non-advancing continuation token", physical))
-				return
-			}
-			previous, token = token, next
-		}
-	}
-}
-
 func (b *Bucket) Get(ctx context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, error) {
 	rc, _, err := b.GetWithInfo(ctx, key, offset, length, ifMatch)
 	return rc, err
 }
 
 func (b *Bucket) GetWithInfo(ctx context.Context, key string, offset, length int64, ifMatch string) (io.ReadCloser, ObjectInfo, error) {
-	if offset < 0 {
-		return nil, ObjectInfo{}, fmt.Errorf("s3: negative offset %d", offset)
-	}
-	if length < -1 {
-		return nil, ObjectInfo{}, fmt.Errorf("s3: invalid length %d", length)
-	}
 	c := b.client
 	if c == nil {
 		return nil, ObjectInfo{}, errors.New("s3: nil bucket")
 	}
+	if offset < 0 {
+		return nil, ObjectInfo{}, fmt.Errorf("s3: negative offset %d", offset)
+	}
+	if offset > 0 && length == 0 {
+		return nil, ObjectInfo{}, errors.New("s3: ranged read requires positive length")
+	}
 	object, err := c.objectKey(key)
 	if err != nil {
 		return nil, ObjectInfo{}, err
 	}
-	etag := normalizeETag(ifMatch)
-	if length == 0 {
-		meta, err := b.Stat(ctx, key)
-		if err != nil {
-			return nil, ObjectInfo{}, err
+	var headers [][2]string
+	wantStatus := http.StatusOK
+	if offset > 0 || length > 0 {
+		wantStatus = http.StatusPartialContent
+		var rng string
+		if length > 0 {
+			rng = fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+		} else {
+			rng = fmt.Sprintf("bytes=%d-", offset)
 		}
-		if etag != "" && etag != "*" && !etagEqual(etag, meta.ETag) {
-			return nil, ObjectInfo{}, fmt.Errorf("%w: GET %s If-Match %s", ErrPrecondition, key, etag)
-		}
-		return http.NoBody, meta, nil
+		headers = append(headers, [2]string{"Range", rng})
 	}
-	if length > 0 && offset > math.MaxInt64-(length-1) {
-		return nil, ObjectInfo{}, fmt.Errorf("s3: range %d+%d overflows", offset, length)
+	if ifMatch != "" {
+		headers = append(headers, [2]string{"If-Match", `"` + strings.Trim(ifMatch, `"`) + `"`})
 	}
-
-	headers := make([][2]string, 0, 2)
-	requested := ""
-	switch {
-	case length > 0:
-		requested = fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
-	case offset > 0:
-		requested = fmt.Sprintf("bytes=%d-", offset)
-	}
-	if requested != "" {
-		headers = append(headers, [2]string{"range", requested})
-	}
-	if etag != "" {
-		headers = append(headers, [2]string{"if-match", quoteETag(etag)})
-	}
-
 	resp, err := c.do(ctx, http.MethodGet, object, nil, nil, -1, headers...)
 	if err != nil {
 		return nil, ObjectInfo{}, err
 	}
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != wantStatus {
 		defer resp.Body.Close()
 		return nil, ObjectInfo{}, statusError("GET", key, resp)
 	}
-	if err := checkRangeResponse(resp, offset, length, requested); err != nil {
-		resp.Body.Close()
-		return nil, ObjectInfo{}, fmt.Errorf("s3: GET %s: %w", key, err)
-	}
 	size := resp.ContentLength
-	if total, ok := parseContentRangeSize(resp.Header.Get("Content-Range")); ok {
-		size = total
+	if wantStatus == http.StatusPartialContent {
+		if total, ok := parseContentRangeTotal(resp.Header.Get("Content-Range")); ok {
+			size = total
+		}
 	}
 	info := objectInfoFromHeader(strings.TrimLeft(key, "/"), resp.Header, size)
-	if length > 0 {
-		return &limitedReadCloser{r: io.LimitReader(resp.Body, length), c: resp.Body}, info, nil
-	}
 	return resp.Body, info, nil
 }
 
-func (b *Bucket) Delete(ctx context.Context, key string) error {
-	if b.client == nil {
-		return errors.New("s3: nil bucket")
+func parseContentRangeTotal(v string) (int64, bool) {
+	_, totalStr, ok := strings.Cut(v, "/")
+	if !ok || totalStr == "*" {
+		return 0, false
 	}
-	object, err := b.client.objectKey(key)
-	if err != nil {
-		return err
-	}
-	resp, err := b.client.do(ctx, http.MethodDelete, object, nil, nil, -1)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return statusError("DELETE", key, resp)
-	}
-	return nil
-}
-
-const (
-	deleteObjectsMax  = 1000
-	deleteObjectsNS   = "http://s3.amazonaws.com/doc/2006-03-01/"
-	deleteResultLimit = 1 << 20
-)
-
-type deleteObjectsRequest struct {
-	XMLName xml.Name              `xml:"Delete"`
-	Xmlns   string                `xml:"xmlns,attr"`
-	Objects []deleteObjectsObject `xml:"Object"`
-}
-
-type deleteObjectsObject struct {
-	Key string `xml:"Key"`
-}
-
-type deleteObjectsResult struct {
-	Deleted []deleteObjectsDeleted `xml:"Deleted"`
-	Errors  []deleteObjectsError   `xml:"Error"`
-}
-
-type deleteObjectsDeleted struct {
-	Key string `xml:"Key"`
-}
-
-type deleteObjectsError struct {
-	Key     string `xml:"Key"`
-	Code    string `xml:"Code"`
-	Message string `xml:"Message"`
-}
-
-// DeleteObjects deletes up to 1000 keys per POST /?delete request and returns
-// one error per input key. NoSuchKey is success, matching Delete. Origins that
-// do not implement the batch endpoint fall back to individual deletes.
-func (b *Bucket) DeleteObjects(ctx context.Context, keys []string) ([]error, error) {
-	errs := make([]error, len(keys))
-	if len(keys) == 0 {
-		return errs, nil
-	}
-	c := b.client
-	if c == nil {
-		return nil, errors.New("s3: nil bucket")
-	}
-	for start := 0; start < len(keys); start += deleteObjectsMax {
-		end := min(start+deleteObjectsMax, len(keys))
-		physical := make([]string, 0, end-start)
-		positions := make([]int, 0, end-start)
-		for i := start; i < end; i++ {
-			object, err := c.objectKey(keys[i])
-			if err != nil {
-				errs[i] = err
-				continue
-			}
-			physical = append(physical, object)
-			positions = append(positions, i)
-		}
-		if len(physical) == 0 {
-			continue
-		}
-		batchErrs, err := b.deleteObjectsBatch(ctx, physical)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return errs, ctxErr
-			}
-			for j := range physical {
-				errs[positions[j]] = b.Delete(ctx, keys[positions[j]])
-			}
-			continue
-		}
-		for j, err := range batchErrs {
-			errs[positions[j]] = err
-		}
-	}
-	return errs, nil
-}
-
-func (b *Bucket) deleteObjectsBatch(ctx context.Context, keys []string) ([]error, error) {
-	request := deleteObjectsRequest{Xmlns: deleteObjectsNS, Objects: make([]deleteObjectsObject, len(keys))}
-	for i, key := range keys {
-		request.Objects[i].Key = key
-	}
-	payload, err := xml.Marshal(request)
-	if err != nil {
-		return nil, err
-	}
-	sum := md5.Sum(payload)
-	resp, err := b.client.doBytes(ctx, http.MethodPost, "", url.Values{"delete": {""}}, payload,
-		[2]string{"content-type", "application/xml"},
-		[2]string{"content-md5", base64.StdEncoding.EncodeToString(sum[:])})
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, statusError("POST delete", "", resp)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, deleteResultLimit))
-	if err != nil {
-		return nil, fmt.Errorf("s3: POST delete: reading response: %w", err)
-	}
-	var result deleteObjectsResult
-	if err := xml.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("s3: POST delete: decoding response: %w", err)
-	}
-	out := make([]error, len(keys))
-	index := make(map[string][]int, len(keys))
-	for i, key := range keys {
-		index[key] = append(index[key], i)
-	}
-	for _, failure := range result.Errors {
-		if failure.Code == "NoSuchKey" {
-			continue
-		}
-		message := failure.Message
-		if message == "" {
-			message = failure.Code
-		}
-		for _, i := range index[failure.Key] {
-			out[i] = fmt.Errorf("s3: DELETE %s: %s: %s", failure.Key, failure.Code, message)
-		}
-	}
-	return out, nil
-}
-
-func (b *Bucket) CreateBucket(ctx context.Context) error {
-	if b.client == nil {
-		return errors.New("s3: nil bucket")
-	}
-	resp, err := b.client.do(ctx, http.MethodPut, "", nil, nil, -1)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusNoContent, http.StatusConflict:
-		return nil
-	default:
-		return statusError("PUT bucket", b.client.bucket, resp)
-	}
-}
-
-func (b *Bucket) DeleteBucket(ctx context.Context) error {
-	if b.client == nil {
-		return errors.New("s3: nil bucket")
-	}
-	resp, err := b.client.do(ctx, http.MethodDelete, "", nil, nil, -1)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
-		return nil
-	default:
-		return statusError("DELETE bucket", b.client.bucket, resp)
-	}
-}
-
-func (b *Bucket) WriteReader(ctx context.Context, key string, r io.Reader, size int64, opts PutOptions) (ObjectInfo, error) {
-	if size < 0 {
-		return ObjectInfo{}, fmt.Errorf("s3: PUT %s: negative size %d", key, size)
-	}
-	if r == nil && size > 0 {
-		return ObjectInfo{}, fmt.Errorf("s3: PUT %s: nil body for %d bytes", key, size)
-	}
-	c := b.client
-	if c == nil {
-		return ObjectInfo{}, errors.New("s3: nil bucket")
-	}
-	object, err := c.objectKey(key)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-	headers, userMeta, err := putHeaders(opts)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-	logical := strings.TrimLeft(key, "/")
-	if size > c.maxSinglePut {
-		return b.putMultipartStream(ctx, logical, r, size, headers, userMeta)
-	}
-	var body io.Reader
-	if size > 0 {
-		body = r
-	} else {
-		body = http.NoBody
-	}
-	resp, err := c.do(ctx, http.MethodPut, object, nil, body, size, headers...)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ObjectInfo{}, statusError("PUT", key, resp)
-	}
-	return putObjectInfo(logical, size, opts.ContentType, opts.ContentEncoding, userMeta, resp.Header), nil
-}
-
-func (b *Bucket) putMultipartStream(ctx context.Context, key string, r io.Reader, size int64, headers [][2]string, userMeta []string) (ObjectInfo, error) {
-	if r == nil {
-		return ObjectInfo{}, fmt.Errorf("s3: PUT %s: nil body", key)
-	}
-	c := b.client
-	partSize := calculatePartSize(size, c.minPartSize)
-	u := &uploader{
-		c:             c,
-		object:        key,
-		createHeaders: nonConditionalHeaders(headers),
-		conditions:    conditionalHeaders(headers),
-	}
-	if err := u.Start(ctx); err != nil {
-		return ObjectInfo{}, err
-	}
-	finished := false
-	defer func() {
-		if !finished {
-			_ = u.Abort(context.WithoutCancel(ctx))
-		}
-	}()
-	if partSize <= 16<<20 {
-		g, gctx := syncx.WithContext(ctx)
-		g.SetLimit(4)
-		for number, remaining := int64(1), size; remaining > 0; number++ {
-			want := min(partSize, remaining)
-			buf, bp := getMultipartBuf(want)
-			if _, err := io.ReadFull(r, buf); err != nil {
-				putMultipartBuf(bp)
-				_ = g.Wait()
-				return ObjectInfo{}, fmt.Errorf("s3: PUT %s: reading part %d: %w", key, number, err)
-			}
-			g.Go(func() error {
-				defer putMultipartBuf(bp)
-				return u.uploadPart(gctx, number, bytes.NewReader(buf), want)
-			})
-			remaining -= want
-		}
-		if err := g.Wait(); err != nil {
-			return ObjectInfo{}, err
-		}
-	} else {
-		for number, remaining := int64(1), size; remaining > 0; number++ {
-			want := min(partSize, remaining)
-			if err := u.uploadPart(ctx, number, io.LimitReader(r, want), want); err != nil {
-				return ObjectInfo{}, err
-			}
-			remaining -= want
-		}
-	}
-	if err := u.Close(ctx); err != nil {
-		if len(u.conditions) > 0 && Unsupported(err) {
-			return ObjectInfo{}, fmt.Errorf("%w: origin cannot apply conditions to CompleteMultipartUpload: %w", ErrUnsupported, err)
-		}
-		return ObjectInfo{}, err
-	}
-	finished = true
-	return ObjectInfo{
-		Key: key, Size: size, ETag: normalizeETag(u.ETag()),
-		ContentType: contentTypeHeader(headers), ContentEncoding: headerValue(headers, "content-encoding"),
-		UserMetadata: append([]string(nil), userMeta...),
-		LastModified: time.Now().UTC(),
-	}, nil
-}
-
-func putHeaders(opts PutOptions) ([][2]string, []string, error) {
-	userMeta, err := normalizeUserMetadata(opts.UserMetadata)
-	if err != nil {
-		return nil, nil, err
-	}
-	ifMatch := normalizeETag(opts.IfMatch)
-	ifNone := normalizeETag(opts.IfNoneMatch)
-	if ifMatch != "" && ifNone != "" {
-		return nil, nil, errors.New("s3: If-Match and If-None-Match are mutually exclusive")
-	}
-	if ifNone != "" && ifNone != "*" {
-		return nil, nil, fmt.Errorf("s3: If-None-Match supports only %q", "*")
-	}
-	headers := make([][2]string, 0, 1+len(userMeta)/2+2)
-	if opts.ContentType != "" {
-		if !validHeaderValue(opts.ContentType) {
-			return nil, nil, errors.New("s3: invalid content type")
-		}
-		headers = append(headers, [2]string{"content-type", opts.ContentType})
-	}
-	if opts.ContentEncoding != "" {
-		if !validHeaderValue(opts.ContentEncoding) {
-			return nil, nil, errors.New("s3: invalid content encoding")
-		}
-		headers = append(headers, [2]string{"content-encoding", opts.ContentEncoding})
-	}
-	for i := 0; i+1 < len(userMeta); i += 2 {
-		headers = append(headers, [2]string{"x-amz-meta-" + userMeta[i], userMeta[i+1]})
-	}
-	if ifMatch != "" {
-		headers = append(headers, [2]string{"if-match", quoteETag(ifMatch)})
-	}
-	if ifNone != "" {
-		headers = append(headers, [2]string{"if-none-match", "*"})
-	}
-	if opts.ChecksumAlgorithm != "" && opts.ChecksumValue != "" {
-		alg := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(opts.ChecksumAlgorithm), "x-amz-checksum-"))
-		switch alg {
-		case "crc32", "crc32c", "crc64nvme", "sha1", "sha256":
-		default:
-			return nil, nil, fmt.Errorf("s3: unsupported checksum algorithm %q", opts.ChecksumAlgorithm)
-		}
-		if !validHeaderValue(opts.ChecksumValue) {
-			return nil, nil, errors.New("s3: invalid checksum value")
-		}
-		headers = append(headers, [2]string{"x-amz-checksum-" + alg, opts.ChecksumValue})
-	}
-	return headers, userMeta, nil
-}
-
-func conditionalHeaders(headers [][2]string) [][2]string {
-	out := make([][2]string, 0, 2)
-	for _, h := range headers {
-		if h[0] == "if-match" || h[0] == "if-none-match" {
-			out = append(out, h)
-		}
-	}
-	return out
-}
-
-func nonConditionalHeaders(headers [][2]string) [][2]string {
-	out := make([][2]string, 0, len(headers))
-	for _, h := range headers {
-		if h[0] == "if-match" || h[0] == "if-none-match" || strings.HasPrefix(h[0], "x-amz-checksum-") {
-			continue
-		}
-		out = append(out, h)
-	}
-	return out
-}
-
-func headerValue(headers [][2]string, name string) string {
-	for _, h := range headers {
-		if h[0] == name {
-			return h[1]
-		}
-	}
-	return ""
-}
-
-func contentTypeHeader(headers [][2]string) string {
-	for _, h := range headers {
-		if h[0] == "content-type" {
-			return h[1]
-		}
-	}
-	return ""
-}
-
-func normalizeUserMetadata(pairs []string) ([]string, error) {
-	if len(pairs) == 0 {
-		return nil, nil
-	}
-	if len(pairs)%2 != 0 {
-		return nil, errors.New("s3: user metadata must be name/value pairs")
-	}
-	values := make(map[string]string, len(pairs)/2)
-	for i := 0; i < len(pairs); i += 2 {
-		name := strings.TrimSpace(strings.ToLower(pairs[i]))
-		name = strings.TrimPrefix(name, "x-amz-meta-")
-		if !validHeaderName(name) {
-			return nil, fmt.Errorf("s3: invalid user metadata name %q", pairs[i])
-		}
-		value := pairs[i+1]
-		if value == "" || !validHeaderValue(value) {
-			return nil, fmt.Errorf("s3: invalid user metadata value for %q", name)
-		}
-		values[name] = value
-	}
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	out := make([]string, 0, len(keys)*2)
-	for _, key := range keys {
-		out = append(out, key, values[key])
-	}
-	return out, nil
-}
-
-func validHeaderName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
-			c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
-			c == '^' || c == '_' || c == '`' || c == '|' || c == '~':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func validHeaderValue(value string) bool {
-	for i := 0; i < len(value); i++ {
-		c := value[i]
-		if c < 0x20 && c != '\t' || c == 0x7f {
-			return false
-		}
-	}
-	return true
-}
-
-func putObjectInfo(key string, size int64, contentType, contentEncoding string, userMeta []string, h http.Header) ObjectInfo {
-	info := ObjectInfo{
-		Key: key, Size: size, ETag: normalizeETag(h.Get("ETag")),
-		ContentType: contentType, ContentEncoding: contentEncoding,
-		UserMetadata: append([]string(nil), userMeta...),
-	}
-	if t, err := http.ParseTime(h.Get("Last-Modified")); err == nil {
-		info.LastModified = t
-	} else {
-		info.LastModified = time.Now().UTC()
-	}
-	return info
+	n, err := strconv.ParseInt(strings.TrimSpace(totalStr), 10, 64)
+	return n, err == nil && n >= 0
 }
 
 func objectInfoFromHeader(key string, h http.Header, size int64) ObjectInfo {
-	info := ObjectInfo{
-		Key: key, Size: size, ETag: normalizeETag(h.Get("ETag")),
-		ContentType: h.Get("Content-Type"), ContentEncoding: h.Get("Content-Encoding"),
+	var mod time.Time
+	if raw := h.Get("Last-Modified"); raw != "" {
+		mod, _ = http.ParseTime(raw)
 	}
-	if t, err := http.ParseTime(h.Get("Last-Modified")); err == nil {
-		info.LastModified = t
-	}
-	values := map[string]string{}
-	for name, list := range h {
+	var meta []string
+	for name, vals := range h {
 		lower := strings.ToLower(name)
-		if strings.HasPrefix(lower, "x-amz-meta-") && len(list) > 0 {
-			values[strings.TrimPrefix(lower, "x-amz-meta-")] = list[0]
+		if strings.HasPrefix(lower, "x-amz-meta-") && len(vals) > 0 {
+			meta = append(meta, lower, vals[0])
 		}
 	}
-	info.UserMetadata = pairMap(values)
-	return info
-}
-
-func normalizeETag(etag string) string {
-	etag = strings.TrimSpace(etag)
-	if etag == "*" {
-		return etag
+	return ObjectInfo{
+		Key:             key,
+		Size:            size,
+		ETag:            strings.Trim(h.Get("ETag"), `"`),
+		LastModified:    mod.UTC(),
+		ContentType:     h.Get("Content-Type"),
+		ContentEncoding: h.Get("Content-Encoding"),
+		UserMetadata:    meta,
 	}
-	return strings.Trim(etag, `"`)
-}
-
-func quoteETag(etag string) string {
-	if etag == "*" || etag == "" {
-		return etag
-	}
-	return `"` + etag + `"`
-}
-
-func etagEqual(a, b string) bool {
-	return normalizeETag(a) == normalizeETag(b)
-}
-
-func checkRangeResponse(resp *http.Response, offset, length int64, requested string) error {
-	if requested == "" {
-		if resp.StatusCode == http.StatusOK {
-			return nil
-		}
-		return errors.New("origin returned a partial response for a whole-object GET")
-	}
-	if resp.StatusCode == http.StatusOK {
-		if length > 0 {
-			if offset == 0 && resp.ContentLength == length {
-				return nil
-			}
-			return fmt.Errorf("origin ignored Range (wanted %d bytes at %d, got whole object)", length, offset)
-		}
-		if offset == 0 {
-			return nil
-		}
-		return fmt.Errorf("origin ignored Range (wanted offset %d, got whole object)", offset)
-	}
-	start, end, ok := parseContentRange(resp.Header.Get("Content-Range"))
-	if !ok {
-		if resp.ContentLength >= 0 && length > 0 && resp.ContentLength != length {
-			return fmt.Errorf("range returned %d bytes, wanted %d", resp.ContentLength, length)
-		}
-		return nil
-	}
-	if start != offset {
-		return fmt.Errorf("range starts at %d, wanted %d", start, offset)
-	}
-	if length > 0 && end < offset+length-1 {
-		return fmt.Errorf("range ended at %d, wanted %d", end, offset+length-1)
-	}
-	return nil
-}
-
-func parseContentRangeSize(value string) (int64, bool) {
-	value = strings.TrimSpace(value)
-	const prefix = "bytes "
-	if !strings.HasPrefix(value, prefix) {
-		return 0, false
-	}
-	_, total, ok := strings.Cut(value[len(prefix):], "/")
-	if !ok || total == "*" {
-		return 0, false
-	}
-	n, err := strconv.ParseInt(strings.TrimSpace(total), 10, 64)
-	if err != nil || n < 0 {
-		return 0, false
-	}
-	return n, true
-}
-
-func parseContentRange(value string) (start, end int64, ok bool) {
-	value = strings.TrimSpace(value)
-	const prefix = "bytes "
-	if !strings.HasPrefix(value, prefix) {
-		return 0, 0, false
-	}
-	spec, _, _ := strings.Cut(value[len(prefix):], "/")
-	left, right, ok := strings.Cut(spec, "-")
-	if !ok {
-		return 0, 0, false
-	}
-	start, err := strconv.ParseInt(strings.TrimSpace(left), 10, 64)
-	if err != nil {
-		return 0, 0, false
-	}
-	end, err = strconv.ParseInt(strings.TrimSpace(right), 10, 64)
-	if err != nil || end < start {
-		return 0, 0, false
-	}
-	return start, end, true
-}
-
-type limitedReadCloser struct {
-	r io.Reader
-	c io.Closer
-}
-
-func (r *limitedReadCloser) Read(p []byte) (int, error) { return r.r.Read(p) }
-func (r *limitedReadCloser) Close() error               { return r.c.Close() }
-
-func pairMap(m map[string]string) []string {
-	if len(m) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	out := make([]string, 0, len(keys)*2)
-	for _, key := range keys {
-		out = append(out, key, m[key])
-	}
-	return out
-}
-
-type listPage struct {
-	IsTruncated           bool         `xml:"IsTruncated"`
-	EncodingType          string       `xml:"EncodingType"`
-	NextContinuationToken string       `xml:"NextContinuationToken"`
-	Contents              []listObject `xml:"Contents"`
-}
-
-type listObject struct {
-	Key          string    `xml:"Key"`
-	LastModified time.Time `xml:"LastModified"`
-	ETag         string    `xml:"ETag"`
-	Size         int64     `xml:"Size"`
-	ContentType  string    `xml:"ContentType"`
-}
-
-func (c *client) listPage(ctx context.Context, prefix, token, startAfter string) (listPage, error) {
-	query := url.Values{
-		"list-type":     {"2"},
-		"encoding-type": {"url"},
-		"max-keys":      {"1000"},
-	}
-	if prefix != "" {
-		query.Set("prefix", prefix)
-	}
-	if token != "" {
-		query.Set("continuation-token", token)
-	} else if startAfter != "" {
-		query.Set("start-after", startAfter)
-	}
-	resp, err := c.do(ctx, http.MethodGet, "", query, nil, -1)
-	if err != nil {
-		return listPage{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return listPage{}, statusError("GET list", prefix, resp)
-	}
-	var page listPage
-	if err := xml.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&page); err != nil {
-		return listPage{}, fmt.Errorf("s3: list %q: decoding response: %w", prefix, err)
-	}
-	return page, nil
-}
-
-const (
-	minPartSize = 5 * 1024 * 1024
-
-	maxParts = 10000
-
-	abortTimeout = 15 * time.Second
-)
-
-type uploader struct {
-	c      *client
-	object string
-
-	createHeaders [][2]string
-
-	conditions [][2]string
-
-	id       string
-	etag     string
-	mu       sync.Mutex
-	parts    []tagpart
-	started  bool
-	finished bool
-}
-
-type tagpart struct {
-	Num  int64  `xml:"PartNumber"`
-	ETag string `xml:"ETag"`
-}
-
-type multipartResponse struct {
-	XMLName xml.Name
-	Bucket  string `xml:"Bucket"`
-	Key     string `xml:"Key"`
-	ID      string `xml:"UploadId"`
-	ETag    string `xml:"ETag"`
-	Code    string `xml:"Code"`
-	Message string `xml:"Message"`
-}
-
-func encodeCompleteMultipart(parts []tagpart) ([]byte, error) {
-	var body bytes.Buffer
-	body.Grow(110 + len(parts)*96)
-	body.WriteString(`<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
-	var digits [20]byte
-	for _, part := range parts {
-		body.WriteString("<Part><PartNumber>")
-		body.Write(strconv.AppendInt(digits[:0], part.Num, 10))
-		body.WriteString("</PartNumber><ETag>")
-		if err := xml.EscapeText(&body, []byte(part.ETag)); err != nil {
-			return nil, err
-		}
-		body.WriteString("</ETag></Part>")
-	}
-	body.WriteString("</CompleteMultipartUpload>")
-	return body.Bytes(), nil
-}
-
-func decodeMultipartResponse(r io.Reader) (multipartResponse, error) {
-	var response multipartResponse
-	err := xml.NewDecoder(io.LimitReader(r, 1<<20)).Decode(&response)
-	return response, err
-}
-
-func (u *uploader) Start(ctx context.Context) error {
-	if u.started {
-		return errors.New("s3: multipart upload already started")
-	}
-	if u.c == nil || u.object == "" {
-		return errors.New("s3: multipart upload requires a client and object")
-	}
-	object, err := u.c.objectKey(u.object)
-	if err != nil {
-		return err
-	}
-	res, err := u.c.doBytes(ctx, http.MethodPost, object, url.Values{"uploads": {""}}, nil, u.createHeaders...)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return statusError("POST create-multipart", u.object, res)
-	}
-	rt, err := decodeMultipartResponse(res.Body)
-	if err != nil {
-		return fmt.Errorf("s3: create-multipart: decoding response: %w", err)
-	}
-	switch {
-	case rt.ID == "":
-		return errors.New("s3: create-multipart: origin returned no upload id")
-	case rt.Bucket != "" && rt.Bucket != u.c.bucket:
-		return fmt.Errorf("s3: create-multipart: returned bucket %q, want %q", rt.Bucket, u.c.bucket)
-	case rt.Key != "" && rt.Key != object:
-		return fmt.Errorf("s3: create-multipart: returned key %q, want %q", rt.Key, object)
-	}
-	u.started = true
-	u.id = rt.ID
-	return nil
-}
-
-func (u *uploader) uploadPart(ctx context.Context, num int64, r io.Reader, size int64) error {
-	if !u.started || u.finished {
-		return errors.New("s3: multipart upload is not active")
-	}
-	object, err := u.c.objectKey(u.object)
-	if err != nil {
-		return err
-	}
-	query := url.Values{
-		"partNumber": {strconv.FormatInt(num, 10)},
-		"uploadId":   {u.id},
-	}
-	res, err := u.c.do(ctx, http.MethodPut, object, query, r, size)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return statusError("PUT upload-part", u.object, res)
-	}
-	etag := res.Header.Get("ETag")
-	if etag == "" {
-		return errors.New("s3: upload-part: response missing ETag")
-	}
-	u.addPart(num, etag)
-	return nil
-}
-
-func (u *uploader) addPart(num int64, etag string) {
-	u.mu.Lock()
-	u.parts = append(u.parts, tagpart{Num: num, ETag: etag})
-	u.mu.Unlock()
-}
-
-func (u *uploader) Close(ctx context.Context) error {
-	if !u.started {
-		return errors.New("s3: multipart upload is not active")
-	}
-	if u.finished {
-		return errors.New("s3: multipart upload already completed")
-	}
-
-	sort.Slice(u.parts, func(i, j int) bool { return u.parts[i].Num < u.parts[j].Num })
-	buf, err := encodeCompleteMultipart(u.parts)
-	if err != nil {
-		return err
-	}
-	object, err := u.c.objectKey(u.object)
-	if err != nil {
-		return err
-	}
-	headers := make([][2]string, 0, len(u.conditions)+1)
-	headers = append(headers, u.conditions...)
-	headers = append(headers, [2]string{"content-type", "application/xml"})
-	res, err := u.c.doBytes(ctx, http.MethodPost, object, url.Values{"uploadId": {u.id}}, buf, headers...)
-	if err != nil {
-		return fmt.Errorf("s3: complete-multipart: %w", err)
-	}
-	defer res.Body.Close()
-	payload, readErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return bodyError("POST complete-multipart", u.object, res.StatusCode, payload)
-	}
-	if readErr != nil {
-		return fmt.Errorf("s3: complete-multipart: reading response: %w", readErr)
-	}
-	if len(bytes.TrimSpace(payload)) == 0 {
-
-		u.finished = true
-		return nil
-	}
-	rt, err := decodeMultipartResponse(bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("s3: complete-multipart: decoding response: %w", err)
-	}
-	switch rt.XMLName.Local {
-	default:
-		return fmt.Errorf("s3: complete-multipart: unexpected response %s", rt.XMLName.Local)
-	case "Error":
-		return bodyError("POST complete-multipart", u.object, http.StatusOK, payload)
-	case "CompleteMultipartUploadResult":
-
-	}
-	u.etag = rt.ETag
-	u.finished = true
-	return nil
-}
-
-func (u *uploader) ETag() string { return u.etag }
-
-func (u *uploader) Abort(ctx context.Context) error {
-	if !u.started || u.finished {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(ctx, abortTimeout)
-	defer cancel()
-
-	object, err := u.c.objectKey(u.object)
-	if err != nil {
-		return err
-	}
-	res, err := u.c.doBytes(ctx, http.MethodDelete, object, url.Values{"uploadId": {u.id}}, nil)
-	if err != nil {
-		return fmt.Errorf("s3: abort-multipart: %w", err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return statusError("DELETE abort-multipart", u.object, res)
-	}
-	u.started = false
-	u.finished = false
-	u.id = ""
-	u.etag = ""
-	u.parts = nil
-	return nil
-}
-
-func calculatePartSize(totalSize, minPart int64) int64 {
-	partSize := minPart
-	if partSize <= 0 {
-		partSize = minPartSize
-	}
-	if totalSize > 0 {
-		for (totalSize-1)/partSize >= maxParts {
-			partSize *= 2
-		}
-	}
-	return partSize
 }
