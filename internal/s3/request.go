@@ -103,8 +103,6 @@ func (s *Server) apiError(err error) error {
 		return apiErr("SlowDown", "The cache scratch byte budget is busy; retry shortly.", http.StatusServiceUnavailable)
 	case errors.Is(err, objcache.ErrOriginConflict):
 		return apiErr("OperationAborted", "A conflicting conditional operation is in progress. Retry the request.", http.StatusConflict)
-	case errors.Is(err, objcache.ErrOriginUnsupported):
-		return apiErr("NotImplemented", "The configured origin does not support this operation.", http.StatusNotImplemented)
 	case errors.Is(err, store.ErrPrecondition):
 		return errPreconditionFailed()
 	case errors.Is(err, store.ErrNotFound):

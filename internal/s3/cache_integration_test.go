@@ -551,16 +551,33 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 		t.Fatalf("GET after DeleteObjects = %d, want 404", r.Code)
 	}
 
-	// 4. Immutable default vs TTL revalidation.
+	// 4. Immutable default vs TTL revalidation (single HEAD + HEAD persists metadata).
 	fake.putDirect("b1", "obj.bin", []byte("mutated-direct"), "text/plain")
 	rImm := doReq(t, gwA, http.MethodGet, "/b1/obj.bin", nil, nil)
 	if rImm.Body.String() != "updated-via-A" {
 		t.Fatalf("immutable cache should not see direct origin change, got %q", rImm.Body.String())
 	}
 	_, gwTTL := openTestGateway(t, dbURL, nsName, originSrv.URL, time.Nanosecond, 0)
+	headsBefore := fake.count("HEAD", "b1", "obj.bin")
 	rTTL := doReq(t, gwTTL, http.MethodGet, "/b1/obj.bin", nil, nil)
 	if rTTL.Body.String() != "mutated-direct" {
 		t.Fatalf("TTL gateway did not revalidate, got %q", rTTL.Body.String())
+	}
+	if heads := fake.count("HEAD", "b1", "obj.bin") - headsBefore; heads != 1 {
+		t.Fatalf("stale GET issued %d HEADs, want 1", heads)
+	}
+	// HEAD-only revalidation persists refreshed metadata so subsequent HEAD within TTL is a hit.
+	_, gwTTL5s := openTestGateway(t, dbURL, nsName, originSrv.URL, 5*time.Second, 0)
+	fake.putDirect("b1", "headonly.bin", []byte("v1"), "text/plain")
+	if r := doReq(t, gwTTL5s, http.MethodHead, "/b1/headonly.bin", nil, nil); r.Code != 200 {
+		t.Fatalf("cold HEAD = %d", r.Code)
+	}
+	headsBefore2 := fake.count("HEAD", "b1", "headonly.bin")
+	if r := doReq(t, gwTTL5s, http.MethodHead, "/b1/headonly.bin", nil, nil); r.Code != 200 || r.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("second HEAD = %d X-Cache=%q", r.Code, r.Header().Get("X-Cache"))
+	}
+	if fake.count("HEAD", "b1", "headonly.bin") != headsBefore2 {
+		t.Fatalf("second HEAD within TTL hit origin")
 	}
 
 	// 5. Restart persistence: new gateway instance on same PG still hits with zero origin GETs.

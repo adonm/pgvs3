@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/adonm/pgvs3/internal/store"
 )
 
 func TestS3OriginAllowlistAndTransparentBucket(t *testing.T) {
@@ -74,6 +76,20 @@ func TestS3OriginAllowlistAndTransparentBucket(t *testing.T) {
 
 	if _, err := o.Attributes(context.Background(), "other-b", "hello.txt"); !errors.Is(err, ErrBucketNotAllowed) {
 		t.Fatalf("disallowed bucket err = %v, want ErrBucketNotAllowed", err)
+	}
+
+	// Origin 412 maps to store.ErrPrecondition.
+	srv412 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPreconditionFailed)
+	}))
+	defer srv412.Close()
+	o412, err := NewS3Origin(S3Config{Endpoint: srv412.URL, Region: "us-east-1", PathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o412.Close()
+	if _, err := o412.GetRange(context.Background(), "b", "k", 0, 10, "stale"); !errors.Is(err, store.ErrPrecondition) {
+		t.Fatalf("412 range err = %v, want store.ErrPrecondition", err)
 	}
 }
 

@@ -174,41 +174,61 @@ func (t *Tier) maybeTouch(m *store.ObjectMeta) {
 	}
 }
 
-func (t *Tier) Head(ctx context.Context, bucket, key string) (*store.ReadResult, error) {
-	m, err := t.store.GetObject(ctx, bucket, key)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
+// resolveMeta validates m against t.ttl and origin if needed, persisting
+// refreshed or updated metadata when writable. It issues at most one origin HEAD.
+func (t *Tier) resolveMeta(ctx context.Context, bucket, key string, m *store.ObjectMeta) (meta *store.ObjectMeta, hit bool, changed bool, err error) {
 	if m != nil && t.isFresh(m.FilledAt) {
 		t.maybeTouch(m)
-		return &store.ReadResult{ObjectMeta: *m, End: max(m.Size-1, 0), Hit: true}, nil
+		return m, true, false, nil
 	}
 
 	ifNoneMatch := ""
 	if m != nil {
 		ifNoneMatch = m.ETag
 	}
-	attrs, notMod, err := t.headOrigin(ctx, bucket, key, ifNoneMatch)
-	if err != nil {
-		if isObjectNotFound(err) {
+	attrs, notMod, herr := t.headOrigin(ctx, bucket, key, ifNoneMatch)
+	if herr != nil {
+		if isObjectNotFound(herr) {
 			if m != nil && !t.readOnly {
 				_ = t.store.Delete(context.WithoutCancel(ctx), bucket, key)
 			}
-			return nil, store.ErrNotFound
+			return nil, false, false, store.ErrNotFound
 		}
-		t.originErrors.Add(1)
-		return nil, err
+		return nil, false, false, herr
 	}
-	if notMod && m != nil {
+	if m != nil && (notMod || (attrs.ETag == m.ETag && attrs.Size == m.Size)) {
 		if !t.readOnly {
 			_ = t.store.MarkRevalidated(t.ctx, bucket, key, m.ETag)
 		}
-		return &store.ReadResult{ObjectMeta: *m, End: max(m.Size-1, 0), Hit: true}, nil
+		return m, true, false, nil
 	}
 	if attrs.ContentType == "" {
 		attrs.ContentType = contentTypeFor(key)
 	}
-	return &store.ReadResult{ObjectMeta: attrs.objectMeta(bucket, key), End: max(attrs.Size-1, 0)}, nil
+	fresh := attrs.objectMeta(bucket, key)
+	if !t.readOnly {
+		id, uerr := t.store.UpsertObject(ctx, fresh)
+		if uerr != nil {
+			return nil, false, false, uerr
+		}
+		fresh.ID = id
+	}
+	return &fresh, false, true, nil
+}
+
+func (t *Tier) Head(ctx context.Context, bucket, key string) (*store.ReadResult, error) {
+	m, err := t.store.GetObject(ctx, bucket, key)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	meta, hit, _, err := t.resolveMeta(ctx, bucket, key, m)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) && !errors.Is(err, context.Canceled) {
+			t.originErrors.Add(1)
+		}
+		return nil, err
+	}
+	return &store.ReadResult{ObjectMeta: *meta, End: max(meta.Size-1, 0), Hit: hit}, nil
 }
 
 func (t *Tier) Open(ctx context.Context, bucket, key string, rng store.ByteRange) (*store.ReadResult, error) {
@@ -240,56 +260,15 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 		return nil, err
 	}
 
-	if m != nil && !t.isFresh(m.FilledAt) {
-		attrs, notMod, herr := t.headOrigin(ctx, bucket, key, m.ETag)
-		if herr != nil {
-			if isObjectNotFound(herr) {
-				if !t.readOnly {
-					_ = t.store.Delete(context.WithoutCancel(ctx), bucket, key)
-				}
-				return nil, store.ErrNotFound
-			}
-			return nil, herr
-		}
-		if notMod {
-			if !t.readOnly {
-				_ = t.store.MarkRevalidated(t.ctx, bucket, key, m.ETag)
-			}
-		} else if attrs.ETag != m.ETag || attrs.Size != m.Size {
-			m = nil
-			fastChunk = nil
-			if !t.readOnly {
-				_ = t.store.Delete(context.WithoutCancel(ctx), bucket, key)
-			}
-		} else {
-			if !t.readOnly {
-				_ = t.store.MarkRevalidated(t.ctx, bucket, key, m.ETag)
-			}
-		}
+	m, _, changed, err := t.resolveMeta(ctx, bucket, key, m)
+	if err != nil {
+		return nil, err
 	}
-
-	if m == nil {
-		if t.readOnly {
-			return t.passThrough(ctx, bucket, key, rng)
-		}
-		attrs, _, herr := t.headOrigin(ctx, bucket, key, "")
-		if herr != nil {
-			if isObjectNotFound(herr) {
-				return nil, store.ErrNotFound
-			}
-			return nil, herr
-		}
-		if attrs.ContentType == "" {
-			attrs.ContentType = contentTypeFor(key)
-		}
-		meta := attrs.objectMeta(bucket, key)
-		id, uerr := t.store.UpsertObject(ctx, meta)
-		if uerr != nil {
-			return nil, uerr
-		}
-		meta.ID = id
-		m = &meta
+	if changed {
 		fastChunk = nil
+	}
+	if t.readOnly && changed {
+		return t.passThroughMeta(ctx, m, rng)
 	}
 
 	span, err := rng.Resolve(m.Size)
@@ -351,7 +330,7 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 			continue
 		}
 		if t.readOnly {
-			return t.passThrough(ctx, bucket, key, rng)
+			return t.passThroughMeta(ctx, m, rng)
 		}
 		hit = false
 		runEnd := idx
@@ -504,30 +483,22 @@ func (t *Tier) fillChunkRun(ctx context.Context, m *store.ObjectMeta, firstIdx, 
 	}
 }
 
-func (t *Tier) passThrough(ctx context.Context, bucket, key string, rng store.ByteRange) (*store.ReadResult, error) {
-	attrs, _, err := t.headOrigin(ctx, bucket, key, "")
-	if err != nil {
-		if isObjectNotFound(err) {
-			return nil, store.ErrNotFound
-		}
-		return nil, err
-	}
-	span, err := rng.Resolve(attrs.Size)
+func (t *Tier) passThroughMeta(ctx context.Context, m *store.ObjectMeta, rng store.ByteRange) (*store.ReadResult, error) {
+	span, err := rng.Resolve(m.Size)
 	if err != nil {
 		return nil, err
 	}
 	var rc io.ReadCloser
-	if attrs.Size == 0 {
+	if m.Size == 0 {
 		rc = io.NopCloser(bytes.NewReader(nil))
 	} else {
-		rc, err = t.origin.GetRange(ctx, bucket, key, span.Start, span.End-span.Start+1, attrs.ETag)
+		rc, err = t.origin.GetRange(ctx, m.Bucket, m.Key, span.Start, span.End-span.Start+1, m.ETag)
 		if err != nil {
 			return nil, err
 		}
 	}
-	meta := attrs.objectMeta(bucket, key)
 	return &store.ReadResult{
-		ObjectMeta: meta,
+		ObjectMeta: *m,
 		Body:       rc,
 		Start:      span.Start, End: span.End, Ranged: span.Ranged,
 	}, nil

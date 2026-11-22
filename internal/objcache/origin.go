@@ -16,10 +16,8 @@ import (
 )
 
 var (
-	ErrOriginConflict     = errors.New("origin conditional request conflict")
-	ErrOriginUnsupported  = errors.New("origin operation unsupported")
-	ErrBucketNotAllowed   = errors.New("bucket is not in --buckets allowlist")
-	errOriginPrecondition = errors.New("origin precondition failed")
+	ErrOriginConflict   = errors.New("origin conditional request conflict")
+	ErrBucketNotAllowed = errors.New("bucket is not in --buckets allowlist")
 )
 
 type S3Config struct {
@@ -242,10 +240,10 @@ func attrsFromS3(meta s3client.ObjectInfo, key string) originAttrs {
 
 func mapOriginError(err error) error {
 	switch {
-	case errors.Is(err, ErrOriginConflict), s3client.Conflict(err):
+	case s3client.Conflict(err):
 		return ErrOriginConflict
-	case errors.Is(err, errOriginPrecondition), s3client.Precondition(err):
-		return errOriginPrecondition
+	case s3client.Precondition(err):
+		return store.ErrPrecondition
 	default:
 		return err
 	}
