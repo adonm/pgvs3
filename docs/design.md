@@ -2,34 +2,36 @@
 
 ## Architecture
 
-`pgvs3` is a stateless S3 HTTP gateway backed by PostgreSQL 18:
+`pgvs3` is a stateless S3 HTTP gateway that caches origin S3 objects in PostgreSQL 18:
 
-- **S3 HTTP frontend (`internal/s3`)**: parses S3 object/bucket requests, decodes `aws-chunked` streaming request bodies, and enforces admission concurrency (`--s3-concurrency`).
-- **Read-through cache (`internal/objcache`)**:
-  - Whole objects `<= 8 MiB` (and aligned range chunks via `--range-cache-chunk`) are cached in PostgreSQL.
-  - Cache fills use in-process `syncx.Group` singleflight, cross-gateway PostgreSQL fill leases (`s3p.cache_fill_leases`), and a bounded `--fill-concurrency` / `--spool-max-bytes` budget.
-  - Large fills (> 8 MiB) spool to `--spool-dir` outside any PostgreSQL transaction before streaming into `chunks`.
-- **Origin client & credential chain (`internal/s3client`)**: stdlib-only SigV4 signer with automatic credential resolution:
+- **S3 HTTP frontend (`internal/s3`)**: path-style S3 routing, `aws-chunked` request decoding, conditional/range handling and admission control (`--s3-concurrency`).
+- **Read-through cache (`internal/objcache`)**: objects are cached as fixed, aligned chunks (`--range-cache-chunk`, default 1 MiB). A read fills only the chunks it is missing, so partially cached objects are normal. Concurrent fills of the same chunk range coalesce in-process; fills are bounded by `--fill-concurrency` and `--spool-max-bytes` and never hold a PostgreSQL connection while waiting on origin.
+- **Origin client (`internal/s3client`)**: stdlib SigV4 signer, object `Stat`/`Get`, and a re-signing proxy for writes and listings. Credentials resolve in order:
   1. Static env (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`)
   2. EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`)
-  3. IRSA Web Identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` via STS `AssumeRoleWithWebIdentity`)
+  3. IRSA web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` via STS `AssumeRoleWithWebIdentity`)
   4. IMDSv2 (`169.254.169.254`)
-  5. Anonymous/unsigned fallback
-- **PostgreSQL store (`internal/store`)**:
-  - `s3p` catalog (`layout`, `namespaces`, `cache_fill_leases`, `file_ids`).
-  - `s3c_<namespace>` cache schema (`objects`, `origin_metadata`, `chunks` with `STORAGE EXTERNAL`, `garbage`, `meta`).
-  - Chunks are stored raw (uncompressed) because lake formats (Parquet, ORC, compressed tiles) are already compressed.
+  5. Anonymous/unsigned
+- **PostgreSQL store (`internal/store`)**: two tables (`internal/store/schema.sql`):
+  - `cache_objects`: one row per `(bucket, key)` with origin ETag, size and response metadata, plus `last_access` for LRU eviction.
+  - `cache_chunks`: `(object_id, idx)` → raw chunk bytes (`STORAGE EXTERNAL`), deleted with their object. Bytes are stored uncompressed because lake formats are already compressed.
 
 ## Trust Model
 
-`pgvs3` is designed to run inside a trusted cluster network (e.g., EKS VPC with `NetworkPolicy` restricting pod ingress):
+`pgvs3` runs inside a trusted cluster network (for example an EKS VPC with a `NetworkPolicy` restricting ingress):
 
-- **No client authentication**: incoming client requests are not authenticated; presigned URLs are rejected.
-- **Gateway-signed origin requests**: the gateway signs all upstream S3 requests using its own IAM credentials (Pod Identity / IRSA / IMDSv2 / static env).
+- **No client authentication**: client requests are not authenticated; presigned URLs are rejected.
+- **Gateway-signed origin requests**: the gateway signs every upstream request with its own credentials.
 
 ## Consistency Model
 
-- **Immutable by default (`--revalidate-after=0`)**: cache hits serve directly from PostgreSQL with zero origin calls.
-- **TTL revalidation (`--revalidate-after > 0`)**: once an entry's age exceeds `--revalidate-after`, the gateway issues a conditional `HEAD` (`If-None-Match: "<etag>"`) to origin. A `304 Not Modified` refreshes the entry without re-downloading bytes.
-- **Write invalidation**: writes (`PUT`, `CopyObject`, `DeleteObject`, `DeleteObjects`, `CompleteMultipartUpload`) proxy straight to origin and, on 2xx, delete the affected cache key in PostgreSQL so all gateway replicas immediately see the invalidation.
-- **Out-of-band origin writes**: writes that bypass `pgvs3` are not seen until `--revalidate-after` elapses (or `--cache-retention` / `--cache-max-bytes` evicts the key).
+- **Immutable by default (`--revalidate-after=0`)**: hits are served from PostgreSQL with zero origin calls.
+- **TTL revalidation (`--revalidate-after > 0`)**: a stale entry is revalidated with a conditional `HEAD` (`If-None-Match`). `304` refreshes it; a new ETag replaces it.
+- **Write invalidation**: `PUT`, `CopyObject`, `DeleteObject`, `DeleteObjects` and `CompleteMultipartUpload` go straight to origin and, on success, delete the cached key in PostgreSQL, so every replica sees the change.
+- **Out-of-band origin writes** are not seen until `--revalidate-after` elapses or the key is evicted.
+
+## Performance Model
+
+- **One connection per GET**: a GET streams its chunks sequentially over one PostgreSQL connection. Small reads fetch metadata and the first chunk in one round trip.
+- **Clients parallelise large reads**: the gateway does not fan one GET out over several connections. Engines that need throughput on large objects (DuckDB, Trino, Spark, AWS SDK transfer managers) already issue concurrent range GETs, and each lands on its own connection. Size `--pool-max` and `--s3-concurrency` for the client's total range concurrency.
+- **No in-process byte cache**: PostgreSQL is the shared tier; clients may keep their own local caches.
