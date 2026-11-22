@@ -462,6 +462,10 @@ func TestMetricsObserveAndWrite(t *testing.T) {
 		`pgvs3_requests_total{method="GET",code="200"} 2`,
 		`pgvs3_requests_total{method="PUT",code="403"} 1`,
 		"pgvs3_request_duration_seconds_count 3",
+		"pgvs3_request_duration_seconds_count 3",
+		`pgvs3_request_duration_seconds_bucket{le="0.005"} 1`,
+		`pgvs3_request_duration_seconds_bucket{le="0.01"} 2`,
+		`pgvs3_request_duration_seconds_bucket{le="+Inf"} 3`,
 		"pgvs3_response_bytes_total 30",
 	} {
 		if !strings.Contains(body, want) {
