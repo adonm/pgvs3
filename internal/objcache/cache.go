@@ -141,9 +141,7 @@ func (t *Tier) WriteMetrics(w io.Writer) {
 	fmt.Fprintf(w, "pgvs3_cache_hits_total %d\npgvs3_cache_misses_total %d\npgvs3_cache_hit_bytes_total %d\npgvs3_cache_miss_bytes_total %d\npgvs3_cache_fill_duration_seconds_sum %.6f\npgvs3_cache_fill_duration_seconds_count %d\npgvs3_origin_errors_total %d\n",
 		t.hits.Load(), t.misses.Load(), t.hitBytes.Load(), t.missBytes.Load(),
 		float64(t.fillDurationNanos.Load())/float64(time.Second), t.fillCount.Load(), t.originErrors.Load())
-	if t.runtime != nil {
-		t.runtime.WriteMetrics(w)
-	}
+	t.runtime.WriteMetrics(w)
 }
 
 func (t *Tier) isFresh(filledAt time.Time) bool {

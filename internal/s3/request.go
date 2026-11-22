@@ -14,14 +14,6 @@ import (
 	"github.com/adonm/pgvs3/internal/store"
 )
 
-func metadataHeader(pairs []string) http.Header {
-	h := http.Header{}
-	for i := 0; i+1 < len(pairs); i += 2 {
-		h.Set("x-amz-meta-"+pairs[i], pairs[i+1])
-	}
-	return h
-}
-
 func parseRange(h string) (store.ByteRange, error) {
 	if h == "" {
 		return store.WholeObjectRange(), nil
@@ -76,15 +68,8 @@ func splitPath(r *http.Request) (string, string, error) {
 }
 
 func validateBucketName(name string) error {
-	if len(name) < 1 || len(name) > 58 || strings.Contains(name, "..") {
+	if !objcache.ValidBucketName(name) {
 		return errInvalidBucketName()
-	}
-	for i := range len(name) {
-		c := name[i]
-		ok := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (i > 0 && (c == '.' || c == '_' || c == '-'))
-		if !ok {
-			return errInvalidBucketName()
-		}
 	}
 	return nil
 }

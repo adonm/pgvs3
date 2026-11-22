@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/adonm/pgvs3/internal/gateway"
 	"github.com/adonm/pgvs3/internal/objcache"
+	"github.com/adonm/pgvs3/internal/s3"
 	"github.com/adonm/pgvs3/internal/s3client"
 	"github.com/adonm/pgvs3/internal/store"
 )
@@ -344,27 +344,19 @@ func firstEnv(keys ...string) string {
 	return ""
 }
 
-func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, tier *objcache.Tier, log *slog.Logger) *gateway.Gateway {
-	g := gateway.New(st, log, cfg.readOnly, tier, gateway.Limits{
-		S3: cfg.s3Concurrency, S3QueueWait: cfg.s3QueueWait,
-	})
+func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, tier *objcache.Tier, log *slog.Logger) *s3.Server {
+	srv := s3.New(st, log, cfg.readOnly, cfg.s3Concurrency, cfg.s3QueueWait, tier)
 	go func() {
 		<-ctx.Done()
-		g.SetDraining(true)
+		srv.SetDraining(true)
 	}()
-	return g
+	return srv
 }
 
-func serveHandler(g *gateway.Gateway, cfg serveConfig) http.Handler {
-	return g
-}
-
-func runGateway(ctx context.Context, g *gateway.Gateway, cfg serveConfig, log *slog.Logger) int {
-	srv := gateway.NewHTTPServer(cfg.addr, serveHandler(g, cfg), log)
-	srv.ReadTimeout = cfg.httpReadTimeout
-	srv.WriteTimeout = cfg.httpWriteTimeout
+func runGateway(ctx context.Context, g *s3.Server, cfg serveConfig, log *slog.Logger) int {
+	srv := newHTTPServer(cfg.addr, g, cfg.httpReadTimeout, cfg.httpWriteTimeout, log)
 	log.Info("pgvs3 starting", "version", version, "addr", cfg.addr)
-	if err := gateway.Run(ctx, srv, g, 5*time.Second, cfg.maxConns, log); err != nil {
+	if err := runHTTP(ctx, srv, 5*time.Second, cfg.maxConns, log); err != nil {
 		log.Error("serving", "err", err)
 		return 1
 	}

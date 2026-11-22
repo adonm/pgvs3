@@ -75,7 +75,7 @@ func NewS3Origin(cfg S3Config) (*S3Origin, error) {
 }
 
 func (o *S3Origin) BucketAllowed(bucket string) bool {
-	if !validBucketName(bucket) {
+	if !ValidBucketName(bucket) {
 		return false
 	}
 	if len(o.allowed) == 0 {
@@ -85,7 +85,7 @@ func (o *S3Origin) BucketAllowed(bucket string) bool {
 	return ok
 }
 
-func validBucketName(name string) bool {
+func ValidBucketName(name string) bool {
 	if len(name) < 1 || len(name) > 58 || strings.Contains(name, "..") {
 		return false
 	}
@@ -172,9 +172,7 @@ func (o *S3Origin) Proxy(ctx context.Context, bucket, key, method string, query 
 }
 
 func (o *S3Origin) Close() error {
-	if o.cfg.HTTPClient != nil {
-		o.cfg.HTTPClient.CloseIdleConnections()
-	}
+	o.cfg.HTTPClient.CloseIdleConnections()
 	return nil
 }
 

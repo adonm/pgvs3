@@ -5,15 +5,22 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
-	"mime"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/store"
 )
+
+type deleteRequest struct {
+	Quiet   bool `xml:"Quiet"`
+	Objects []struct {
+		Key string `xml:"Key"`
+	} `xml:"Object"`
+}
+
+func quoteETag(etag string) string { return `"` + etag + `"` }
 
 func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	if s.tier == nil {
@@ -31,13 +38,7 @@ func (s *Server) headObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		}
 		return err
 	}
-	setObjectInfoHeaders(w, obj.ObjectMeta, key)
-	if obj.Hit {
-		w.Header().Set("X-Cache", "HIT")
-	} else {
-		w.Header().Set("X-Cache", "MISS")
-	}
-	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
+	setReadHeaders(w, obj, true)
 	w.WriteHeader(http.StatusOK)
 	return nil
 }
@@ -213,13 +214,8 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	_, _ = io.CopyBuffer(w, resp.Body, buf)
 }
 
-func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectMeta, key string) {
+func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectMeta) {
 	ct := info.ContentType
-	if ct == "" || ct == "application/octet-stream" || ct == "application/x-www-form-urlencoded" {
-		if inferred := mime.TypeByExtension(path.Ext(key)); inferred != "" {
-			ct = inferred
-		}
-	}
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
@@ -232,15 +228,17 @@ func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectMeta, key stri
 	if !info.LastModified.IsZero() {
 		w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
 	}
-	for k, vs := range metadataHeader(info.UserMeta) {
-		for _, v := range vs {
-			w.Header().Set(k, v)
+	for i := 0; i+1 < len(info.UserMeta); i += 2 {
+		k := info.UserMeta[i]
+		if !strings.HasPrefix(k, "x-amz-meta-") {
+			k = "x-amz-meta-" + k
 		}
+		w.Header().Set(k, info.UserMeta[i+1])
 	}
 }
 
-func setReadHeaders(w http.ResponseWriter, res *store.ReadResult, key string, cacheHeader bool) {
-	setObjectInfoHeaders(w, res.ObjectMeta, key)
+func setReadHeaders(w http.ResponseWriter, res *store.ReadResult, cacheHeader bool) {
+	setObjectInfoHeaders(w, res.ObjectMeta)
 	if cacheHeader {
 		if res.Hit {
 			w.Header().Set("X-Cache", "HIT")
@@ -252,7 +250,7 @@ func setReadHeaders(w http.ResponseWriter, res *store.ReadResult, key string, ca
 }
 
 func (s *Server) serveReadResult(w http.ResponseWriter, r *http.Request, key string, res *store.ReadResult, cacheHeader bool) {
-	setReadHeaders(w, res, key, cacheHeader)
+	setReadHeaders(w, res, cacheHeader)
 	if res.Ranged {
 		w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(res.Start, 10)+"-"+
 			strconv.FormatInt(res.End, 10)+"/"+strconv.FormatInt(res.Size, 10))
