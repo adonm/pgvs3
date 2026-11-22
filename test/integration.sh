@@ -9,7 +9,7 @@ if ! command -v docker >/dev/null 2>&1 && [ -x /run/host/usr/bin/docker ]; then
   export PATH="/run/host/usr/bin:$PATH"
 fi
 
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp/opencode}/pgvs3-int.XXXXXX")
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/pgvs3-int.XXXXXX")
 PG_CONTAINER=""
 VGW_PID=""
 GW_A_PID=""
