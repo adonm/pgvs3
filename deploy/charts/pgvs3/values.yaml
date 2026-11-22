@@ -14,9 +14,9 @@ poolMax: 64
 spoolMaxBytes: 8589934592
 # Active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown.
 s3Concurrency: 32
-# Process-wide concurrent origin fills and pending-upload workers.
+# Process-wide concurrent origin fills.
 fillConcurrency: 8
-# Cache aligned ranges of large objects at this byte size (0 disables).
+# Aligned chunk size in bytes (0 uses 1 MiB default).
 rangeCacheChunk: 1048576
 # Origin S3 settings (empty endpoint uses AWS S3 for originRegion).
 originEndpoint: ""
@@ -61,8 +61,8 @@ containerSecurityContext:
   readOnlyRootFilesystem: true
   capabilities:
     drop: ["ALL"]
-# Cache fills and origin uploads spool to /tmp; it must be writable even with
-# a read-only root filesystem. Raise sizeLimit if origin objects exceed it.
+# Unknown-length proxied uploads > 8 MiB spool to /tmp; it must be writable
+# even with a read-only root filesystem. Raise sizeLimit if uploads exceed it.
 tmpDir:
   sizeLimit: 10Gi
 # Ingress is default-deny. The default allows clients in the release namespace;

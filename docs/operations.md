@@ -1,5 +1,9 @@
 # pgvs3 Operations
 
+## CLI
+
+Invoke `pgvs3 <command> [flags]` (running `pgvs3` with no arguments runs `serve`). Commands: `serve`, `health`, `reap`, `stat`, `version`.
+
 ## Configuration
 
 Every `pgvs3 serve` flag can be set via `PGVS3_<FLAG_NAME>` environment variables (e.g. `--origin-endpoint` → `PGVS3_ORIGIN_ENDPOINT`).
@@ -21,7 +25,7 @@ Key flags:
 | `--pool-max` | `64` | PostgreSQL connections; each streaming GET holds one |
 | `--s3-concurrency` | `32` | Concurrent S3 requests per gateway before queueing (`--s3-queue-wait`) and `503 SlowDown` |
 | `--fill-concurrency` | `8` | Max concurrent origin fills per gateway |
-| `--spool-max-bytes` | `8GiB` | Spool byte budget for fills and unknown-length PUTs |
+| `--spool-max-bytes` | `8GiB` | Spool byte budget for unknown-length proxied uploads |
 
 ## Sizing
 
@@ -32,11 +36,8 @@ gateway, and keep `pool-max × replicas` within PostgreSQL `max_connections`.
 
 ## Upgrade Path
 
-The cache is rebuildable from S3, so there is no in-place migration. Point
-`pgvs3` at a fresh database, or drop the previous pgvs3 schemas (`s3p` and the
-`s3c_*`/`s3b_*` namespace schemas) and the `cache_*` tables. `pgvs3 serve`
-initializes the current layout on an empty database and refuses a mismatched
-`cache_layout` version.
+The cache is rebuildable from S3, so there is no in-place migration. Use a fresh
+database or drop the `cache_*` tables (`DROP TABLE IF EXISTS cache_chunks, cache_objects, cache_layout CASCADE;`). `pgvs3 serve` initializes the current layout on an empty database and refuses a mismatched `cache_layout` version.
 
 ## Monitoring
 

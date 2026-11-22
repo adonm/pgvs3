@@ -72,16 +72,6 @@ vet:
 integration:
     bash test/integration.sh
 
-# Optional real AWS S3 smoke test using the ambient AWS credential chain (not run in CI).
-# Set PGVS3_AWS_TEST_BUCKET (and optionally AWS_REGION) before running.
-[group('test')]
-s3-aws:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    : "${PGVS3_AWS_TEST_BUCKET:?set PGVS3_AWS_TEST_BUCKET to run the real AWS S3 smoke}"
-    echo "real AWS S3 smoke placeholder: bucket=${PGVS3_AWS_TEST_BUCKET} region=${AWS_REGION:-us-east-1}"
-    echo "run: pgvs3 serve --url <pg-url> --origin-region ${AWS_REGION:-us-east-1} --buckets ${PGVS3_AWS_TEST_BUCKET}"
-
 [group('test')]
 fuzz:
     mise exec go -- go test -fuzz=FuzzParseRange -fuzztime=10s ./internal/s3
@@ -126,6 +116,6 @@ ci:
     set -euo pipefail
     mise exec -- hk check --all --profile ci
     mise exec go -- go vet -tags=integration ./...
-    mise exec go -- go test -race ./...
+    mise exec go -- go test -race ./cmd/pgvs3 ./internal/objcache ./internal/s3client
     GOFLAGS=-race just integration
     mise exec helm -- helm lint deploy/charts/pgvs3

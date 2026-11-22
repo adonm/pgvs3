@@ -5,7 +5,7 @@
 `pgvs3` is a stateless S3 HTTP gateway that caches origin S3 objects in PostgreSQL 18:
 
 - **S3 HTTP frontend (`internal/s3`)**: path-style S3 routing, `aws-chunked` request decoding, conditional/range handling and admission control (`--s3-concurrency`).
-- **Read-through cache (`internal/objcache`)**: objects are cached as fixed, aligned chunks (`--range-cache-chunk`, default 1 MiB). A read fills only the chunks it is missing, so partially cached objects are normal. Concurrent fills of the same chunk range coalesce in-process; fills are bounded by `--fill-concurrency` and `--spool-max-bytes` and never hold a PostgreSQL connection while waiting on origin.
+- **Read-through cache (`internal/objcache`)**: objects are cached as fixed, aligned chunks (`--range-cache-chunk`, default 1 MiB). A read fills only the chunks it is missing, so partially cached objects are normal. Concurrent fills of the same chunk range coalesce in-process; fills are bounded by `--fill-concurrency` and never hold a PostgreSQL connection while waiting on origin. Unknown-length proxied uploads (> 8 MiB) spool to `--spool-dir` under `--spool-max-bytes`.
 - **Origin client (`internal/s3client`)**: stdlib SigV4 signer, object `Stat`/`Get`, and a re-signing proxy for writes and listings. Credentials resolve in order:
   1. Static env (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`)
   2. EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`)

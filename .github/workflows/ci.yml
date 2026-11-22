@@ -55,30 +55,18 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            export CHART_VERSION="${GITHUB_REF_NAME}"
+            just chart push=true
+            just image push=true
             ver="${GITHUB_REF_NAME}"
             semver="${ver#v}"
-            tags="${ver},${semver},latest"
-          else
-            ver="${GITHUB_SHA::7}"
-            tags="latest,${ver}"
-          fi
-          mise exec helm -- helm lint deploy/charts/pgvs3
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            mkdir -p .tmp/pgvs3
-            mise exec helm -- helm package deploy/charts/pgvs3 \
-              -d .tmp/pgvs3 --version "${semver}" --app-version "${ver}"
-          fi
-          mise exec go ko -- ko build --bare \
-            --platform=linux/amd64,linux/arm64 \
-            --tags "${tags}" \
-            --ldflags "-s -w -X main.version=${ver}" \
-            ./cmd/pgvs3
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            mise exec helm -- helm push ".tmp/pgvs3/pgvs3-${semver}.tgz" "${CHART_REPO}"
             if gh release view "${ver}" >/dev/null 2>&1; then
               gh release upload "${ver}" ".tmp/pgvs3/pgvs3-${semver}.tgz" --clobber
             else
               gh release create "${ver}" ".tmp/pgvs3/pgvs3-${semver}.tgz" \
                 --title "${ver}" --generate-notes --verify-tag
             fi
+          else
+            just chart push=false
+            just image push=true
           fi

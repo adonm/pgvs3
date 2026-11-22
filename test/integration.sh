@@ -4,11 +4,6 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT_DIR"
 
-export DOCKER_HOST="${DOCKER_HOST:-unix:///run/host/run/docker.sock}"
-if ! command -v docker >/dev/null 2>&1 && [ -x /run/host/usr/bin/docker ]; then
-  export PATH="/run/host/usr/bin:$PATH"
-fi
-
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/pgvs3-int.XXXXXX")
 PG_CONTAINER=""
 VGW_PID=""

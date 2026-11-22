@@ -6,6 +6,8 @@ Clients point their S3 endpoint at `pgvs3`. Cached object bytes and metadata liv
 
 ## Quick start
 
+Invoke `pgvs3 <command> [flags]` (running `pgvs3` with no arguments runs `serve`):
+
 ```bash
 # Start PostgreSQL 18 (e.g. `just dev-db`) and run pgvs3 against S3:
 pgvs3 serve \
@@ -13,7 +15,7 @@ pgvs3 serve \
   --origin-region us-east-1
 ```
 
-Point any S3 client (AWS SDK, boto3, DuckDB `httpfs`, Trino) at `http://127.0.0.1:8014` with path-style addressing (`s3://bucket/key` maps transparently to origin `s3://bucket/key`).
+`--origin-region` defaults to `AWS_REGION` when set, otherwise `us-east-1`. Point any S3 client (AWS SDK, boto3, DuckDB `httpfs`, Trino) at `http://127.0.0.1:8014` with path-style addressing (`s3://bucket/key` maps transparently to origin `s3://bucket/key`).
 
 ## Features
 
