@@ -126,8 +126,8 @@ func objectInfoFromHeader(key string, h http.Header, size int64) ObjectInfo {
 	var meta []string
 	for name, vals := range h {
 		lower := strings.ToLower(name)
-		if strings.HasPrefix(lower, "x-amz-meta-") && len(vals) > 0 {
-			meta = append(meta, lower, vals[0])
+		if suffix, ok := strings.CutPrefix(lower, "x-amz-meta-"); ok && len(vals) > 0 {
+			meta = append(meta, suffix, vals[0])
 		}
 	}
 	return ObjectInfo{

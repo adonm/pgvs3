@@ -33,6 +33,7 @@ type fakeObj struct {
 	etag        string
 	contentType string
 	modTime     time.Time
+	userMeta    map[string]string
 }
 
 type fakeS3Origin struct {
@@ -200,6 +201,9 @@ func (f *fakeS3Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(obj.data)))
 		w.Header().Set("Content-Type", obj.contentType)
 		w.Header().Set("Last-Modified", obj.modTime.Format(http.TimeFormat))
+		for k, v := range obj.userMeta {
+			w.Header().Set(k, v)
+		}
 		w.WriteHeader(http.StatusOK)
 	case http.MethodGet:
 		f.mu.Lock()
@@ -256,8 +260,17 @@ func (f *fakeS3Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ct = "application/octet-stream"
 		}
 		f.putDirect(bucket, key, data, ct)
+		meta := map[string]string{}
+		for name, vals := range r.Header {
+			if strings.HasPrefix(strings.ToLower(name), "x-amz-meta-") && len(vals) > 0 {
+				meta[strings.ToLower(name)] = vals[0]
+			}
+		}
 		f.mu.Lock()
-		etag := f.objects[bucket][key].etag
+		obj := f.objects[bucket][key]
+		obj.userMeta = meta
+		f.objects[bucket][key] = obj
+		etag := obj.etag
 		f.mu.Unlock()
 		w.Header().Set("ETag", `"`+etag+`"`)
 		w.WriteHeader(http.StatusOK)
@@ -489,13 +502,19 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	}
 
 	// 3. PUT / CopyObject / DeleteObject / DeleteObjects / multipart through A invalidate B.
-	rPut := doReq(t, gwA, http.MethodPut, "/b1/obj.bin", []byte("updated-via-A"), nil)
+	rPut := doReq(t, gwA, http.MethodPut, "/b1/obj.bin", []byte("updated-via-A"), map[string]string{"x-amz-meta-author": "alice"})
 	if rPut.Code != 200 {
 		t.Fatalf("PUT = %d", rPut.Code)
 	}
 	rB2 := doReq(t, gwB, http.MethodGet, "/b1/obj.bin", nil, nil)
 	if rB2.Code != 200 || rB2.Body.String() != "updated-via-A" {
 		t.Fatalf("gwB after PUT = %d %q", rB2.Code, rB2.Body.String())
+	}
+	if got := rB2.Header().Get("x-amz-meta-author"); got != "alice" {
+		t.Fatalf("x-amz-meta-author = %q, want alice", got)
+	}
+	if bad := rB2.Header().Get("x-amz-meta-x-amz-meta-author"); bad != "" {
+		t.Fatalf("double-prefixed metadata header present: %q", bad)
 	}
 
 	rCopy := doReq(t, gwA, http.MethodPut, "/b1/copied.bin", nil, map[string]string{"x-amz-copy-source": "/b1/obj.bin"})

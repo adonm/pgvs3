@@ -229,11 +229,7 @@ func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectMeta) {
 		w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
 	}
 	for i := 0; i+1 < len(info.UserMeta); i += 2 {
-		k := info.UserMeta[i]
-		if !strings.HasPrefix(k, "x-amz-meta-") {
-			k = "x-amz-meta-" + k
-		}
-		w.Header().Set(k, info.UserMeta[i+1])
+		w.Header().Set("x-amz-meta-"+info.UserMeta[i], info.UserMeta[i+1])
 	}
 }
 
