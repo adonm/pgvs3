@@ -59,7 +59,13 @@ Prometheus metrics are exposed at `GET /metrics`:
 helm lint deploy/charts/pgvs3
 ```
 
-See `deploy/charts/pgvs3/values.yaml` for EKS Pod Identity / IRSA (`extraEnv`, `podAnnotations`, `serviceMonitor`).
+## Helm
+
+```bash
+helm lint deploy/charts/pgvs3
+```
+
+For EKS IRSA, set `serviceAccount.annotations."eks.amazonaws.com/role-arn"` and `serviceAccount.automountServiceAccountToken: true`. For EKS Pod Identity, target `serviceAccount.name` (default `pgvs3`) in the Pod Identity association and set `serviceAccount.automountServiceAccountToken: true`. See `deploy/charts/pgvs3/values.yaml` for `extraEnv` and `serviceMonitor`.
 
 ## Public S3 Smoke
 

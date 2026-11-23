@@ -23,7 +23,10 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      {{- if or .Values.serviceAccount.create .Values.serviceAccount.name }}
+      serviceAccountName: {{ .Values.serviceAccount.name | default "pgvs3" }}
+      {{- end }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.podSecurityContext }}
       securityContext:

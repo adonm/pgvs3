@@ -124,3 +124,9 @@ ci:
     mise exec go -- go test -race ./cmd/pgvs3 ./internal/objcache ./internal/s3client
     GOFLAGS=-race just integration
     mise exec helm -- helm lint deploy/charts/pgvs3
+    mise exec helm -- helm template pgvs3 deploy/charts/pgvs3 \
+      --set autoscaling.enabled=true \
+      --set serviceMonitor.enabled=true \
+      --set networkPolicy.enabled=true \
+      --set serviceAccount.create=true \
+      --set serviceAccount.automountServiceAccountToken=true >/dev/null

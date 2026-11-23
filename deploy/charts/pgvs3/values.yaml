@@ -41,7 +41,14 @@ resources:
   limits: { memory: 4Gi, ephemeral-storage: 12Gi }
 # Let in-flight transfers finish after the 5s drain window.
 terminationGracePeriodSeconds: 60
-automountServiceAccountToken: false
+# ServiceAccount for EKS IRSA (set eks.amazonaws.com/role-arn in annotations)
+# or EKS Pod Identity (target this ServiceAccount name in the association).
+# Set automountServiceAccountToken: true when using IRSA or Pod Identity.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
 podAnnotations: {}
 podLabels: {}
 # Extra environment variables and envFrom sources for the gateway container.
