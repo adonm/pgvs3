@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -66,4 +68,58 @@ func TestLimitListenerConnectionCapLivesUntilClose(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("connection slot was not released")
 	}
+}
+
+func TestRunHTTPCancelsRequestContextAndShutsDownPromptly(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inHandler := make(chan struct{})
+	handlerSawCancel := make(chan struct{})
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(inHandler)
+			<-r.Context().Done()
+			close(handlerSawCancel)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runHTTPListener(ctx, ln, srv, 500*time.Millisecond, 16, nil)
+	}()
+
+	reqDone := make(chan struct{})
+	go func() {
+		defer close(reqDone)
+		resp, err := http.Get("http://" + ln.Addr().String() + "/test")
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+
+	<-inHandler
+	t0 := time.Now()
+	cancel()
+
+	select {
+	case <-handlerSawCancel:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight request context was not cancelled on shutdown")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runHTTPListener = %v", err)
+		}
+		if time.Since(t0) > time.Second {
+			t.Fatalf("shutdown took %v, expected prompt exit", time.Since(t0))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runHTTPListener did not shut down promptly")
+	}
+	<-reqDone
 }

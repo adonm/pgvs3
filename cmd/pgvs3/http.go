@@ -24,24 +24,27 @@ func newHTTPServer(addr string, h http.Handler, readTimeout, writeTimeout time.D
 	}
 }
 
-func runHTTP(ctx context.Context, srv *http.Server, drain time.Duration, maxConns int, log *slog.Logger) error {
+func runHTTP(ctx context.Context, srv *http.Server, shutdownTimeout time.Duration, maxConns int, log *slog.Logger) error {
 	raw, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		return err
 	}
-	baseCtx, baseCancel := context.WithCancel(context.Background())
+	return runHTTPListener(ctx, raw, srv, shutdownTimeout, maxConns, log)
+}
+
+func runHTTPListener(ctx context.Context, raw net.Listener, srv *http.Server, shutdownTimeout time.Duration, maxConns int, log *slog.Logger) error {
+	baseCtx, baseCancel := context.WithCancel(ctx)
 	defer baseCancel()
 	srv.BaseContext = func(net.Listener) context.Context { return baseCtx }
 	ln := newLimitListener(raw, maxConns)
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
-	log.Info("serving", "addr", raw.Addr().String(), "protocols", "http,s3")
+	if log != nil {
+		log.Info("serving", "addr", raw.Addr().String(), "protocols", "http,s3")
+	}
 	select {
 	case <-ctx.Done():
-		if drain > 0 {
-			time.Sleep(drain)
-		}
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		err := srv.Shutdown(shutdown)
 		cancel()
 		if err != nil {

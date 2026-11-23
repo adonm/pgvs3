@@ -301,7 +301,7 @@ func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, tier *obj
 func runGateway(ctx context.Context, g *s3.Server, cfg serveConfig, log *slog.Logger) int {
 	srv := newHTTPServer(cfg.addr, g, cfg.httpReadTimeout, cfg.httpWriteTimeout, log)
 	log.Info("pgvs3 starting", "version", version, "addr", cfg.addr)
-	if err := runHTTP(ctx, srv, 5*time.Second, cfg.maxConns, log); err != nil {
+	if err := runHTTP(ctx, srv, 10*time.Second, cfg.maxConns, log); err != nil {
 		log.Error("serving", "err", err)
 		return 1
 	}
