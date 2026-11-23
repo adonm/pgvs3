@@ -15,6 +15,12 @@ import (
 	"time"
 )
 
+var (
+	// ErrIMDS indicates a real IMDSv2 failure (not a missing/disabled IMDS).
+	ErrIMDS            = errors.New("imds credential fetch failed")
+	errIMDSUnavailable = errors.New("imds unavailable")
+)
+
 // Credentials holds temporary or static AWS credentials.
 // An empty AccessKey represents anonymous/unsigned access.
 type Credentials struct {
@@ -178,7 +184,9 @@ func (p *ChainProvider) resolve(ctx context.Context) (Credentials, error) {
 		if err == nil {
 			return cred, nil
 		}
-		// If IMDS is unreachable/disabled in a non-EC2 environment, fall back to anonymous.
+		if !errors.Is(err, errIMDSUnavailable) {
+			return Credentials{}, err
+		}
 	}
 
 	// 5. Anonymous.
@@ -316,63 +324,78 @@ func (p *ChainProvider) fetchIMDSv2(ctx context.Context) (Credentials, error) {
 	tokReq.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
 	tokResp, err := p.client.Do(tokReq)
 	if err != nil {
-		return Credentials{}, err
+		if ctx.Err() != nil {
+			return Credentials{}, fmt.Errorf("%w: %w", ErrIMDS, ctx.Err())
+		}
+		return Credentials{}, errIMDSUnavailable
 	}
-	tokBytes, _ := io.ReadAll(io.LimitReader(tokResp.Body, 4096))
+	tokBytes, err := io.ReadAll(io.LimitReader(tokResp.Body, 4096))
 	_ = tokResp.Body.Close()
+	if err != nil {
+		return Credentials{}, fmt.Errorf("%w: read token: %w", ErrIMDS, err)
+	}
+	if tokResp.StatusCode == http.StatusForbidden || tokResp.StatusCode == http.StatusNotFound || tokResp.StatusCode == http.StatusMethodNotAllowed {
+		return Credentials{}, errIMDSUnavailable
+	}
 	if tokResp.StatusCode != http.StatusOK || len(tokBytes) == 0 {
-		return Credentials{}, fmt.Errorf("imds token HTTP %d", tokResp.StatusCode)
+		return Credentials{}, fmt.Errorf("%w: token HTTP %d", ErrIMDS, tokResp.StatusCode)
 	}
 	imdsToken := strings.TrimSpace(string(tokBytes))
 
 	// Step 2: Role name.
 	roleReq, err := http.NewRequestWithContext(imdsCtx, http.MethodGet, p.cfg.IMDSEndpoint+"/latest/meta-data/iam/security-credentials/", nil)
 	if err != nil {
-		return Credentials{}, err
+		return Credentials{}, fmt.Errorf("%w: %w", ErrIMDS, err)
 	}
 	roleReq.Header.Set("X-aws-ec2-metadata-token", imdsToken)
 	roleResp, err := p.client.Do(roleReq)
 	if err != nil {
-		return Credentials{}, err
+		return Credentials{}, fmt.Errorf("%w: role list: %w", ErrIMDS, err)
 	}
-	roleBytes, _ := io.ReadAll(io.LimitReader(roleResp.Body, 4096))
+	roleBytes, err := io.ReadAll(io.LimitReader(roleResp.Body, 4096))
 	_ = roleResp.Body.Close()
+	if err != nil {
+		return Credentials{}, fmt.Errorf("%w: read role list: %w", ErrIMDS, err)
+	}
+	if roleResp.StatusCode == http.StatusNotFound {
+		return Credentials{}, errIMDSUnavailable
+	}
 	if roleResp.StatusCode != http.StatusOK {
-		return Credentials{}, fmt.Errorf("imds role list HTTP %d", roleResp.StatusCode)
+		return Credentials{}, fmt.Errorf("%w: role list HTTP %d", ErrIMDS, roleResp.StatusCode)
 	}
 	roleName := strings.TrimSpace(strings.Split(string(roleBytes), "\n")[0])
 	if roleName == "" {
-		return Credentials{}, errors.New("imds returned empty role name")
+		return Credentials{}, fmt.Errorf("%w: empty role name", ErrIMDS)
 	}
 
 	// Step 3: Role credentials.
 	credReq, err := http.NewRequestWithContext(imdsCtx, http.MethodGet, p.cfg.IMDSEndpoint+"/latest/meta-data/iam/security-credentials/"+url.PathEscape(roleName), nil)
 	if err != nil {
-		return Credentials{}, err
+		return Credentials{}, fmt.Errorf("%w: %w", ErrIMDS, err)
 	}
 	credReq.Header.Set("X-aws-ec2-metadata-token", imdsToken)
 	credResp, err := p.client.Do(credReq)
 	if err != nil {
-		return Credentials{}, err
+		return Credentials{}, fmt.Errorf("%w: cred fetch: %w", ErrIMDS, err)
 	}
 	defer credResp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(credResp.Body, 1<<20))
 	if err != nil {
-		return Credentials{}, err
+		return Credentials{}, fmt.Errorf("%w: read cred: %w", ErrIMDS, err)
 	}
 	if credResp.StatusCode != http.StatusOK {
-		return Credentials{}, fmt.Errorf("imds cred HTTP %d", credResp.StatusCode)
+		return Credentials{}, fmt.Errorf("%w: cred HTTP %d", ErrIMDS, credResp.StatusCode)
 	}
 	var out containerCredResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return Credentials{}, fmt.Errorf("imds decode: %w", err)
+		return Credentials{}, fmt.Errorf("%w: decode: %w", ErrIMDS, err)
 	}
 	if out.AccessKeyID == "" || out.SecretAccessKey == "" {
-		return Credentials{}, errors.New("imds response missing credentials")
+		return Credentials{}, fmt.Errorf("%w: response missing credentials", ErrIMDS)
 	}
 	exp, err := parseCredTime(out.Expiration)
 	if err != nil {
-		return Credentials{}, fmt.Errorf("imds expiration: %w", err)
+		return Credentials{}, fmt.Errorf("%w: expiration: %w", ErrIMDS, err)
 	}
 	return Credentials{
 		AccessKey:    out.AccessKeyID,

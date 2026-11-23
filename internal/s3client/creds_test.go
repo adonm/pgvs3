@@ -3,6 +3,7 @@ package s3client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -219,5 +220,52 @@ func TestChainAnonymousFallback(t *testing.T) {
 	}
 	if c.AccessKey != "" {
 		t.Fatalf("expected empty anonymous credentials, got %+v", c)
+	}
+}
+
+func TestChainIMDSv2NoRoleFallsBackToAnonymous(t *testing.T) {
+	clearAWSCredEnv(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		switch r.URL.Path {
+		case "/latest/api/token":
+			_, _ = w.Write([]byte("tok"))
+		case "/latest/meta-data/iam/security-credentials/":
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := NewChainProvider(ChainConfig{IMDSEndpoint: srv.URL})
+	c, err := p.Get(context.Background())
+	if err != nil || c.AccessKey != "" {
+		t.Fatalf("got %+v err=%v, want anonymous nil", c, err)
+	}
+	// Second call should hit negative cache.
+	_, err = p.Get(context.Background())
+	if err != nil || calls.Load() != 2 {
+		t.Fatalf("expected negative cache hit, calls=%d err=%v", calls.Load(), err)
+	}
+}
+
+func TestChainIMDSv2RealFailureReturnsError(t *testing.T) {
+	clearAWSCredEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest/api/token":
+			_, _ = w.Write([]byte("tok"))
+		case "/latest/meta-data/iam/security-credentials/":
+			_, _ = w.Write([]byte("my-role"))
+		case "/latest/meta-data/iam/security-credentials/my-role":
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	p := NewChainProvider(ChainConfig{IMDSEndpoint: srv.URL})
+	_, err := p.Get(context.Background())
+	if !errors.Is(err, ErrIMDS) {
+		t.Fatalf("err = %v, want ErrIMDS", err)
 	}
 }
