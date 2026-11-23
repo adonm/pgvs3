@@ -25,6 +25,7 @@ import (
 	"github.com/adonm/pgvs3/internal/s3"
 	"github.com/adonm/pgvs3/internal/s3client"
 	"github.com/adonm/pgvs3/internal/store"
+	"github.com/jackc/pgx/v5"
 )
 
 type fakeObj struct {
@@ -637,6 +638,20 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	rFullHit := doReq(t, gwB, http.MethodGet, "/b1/odd.bin", nil, nil)
 	if rFullHit.Code != 200 || rFullHit.Header().Get("X-Cache") != "HIT" || fake.count("GET", "b1", "odd.bin") != getsBeforeFull+1 {
 		t.Fatalf("odd.bin warm hit failed")
+	}
+
+	// Truncate a chunk row in PG; GET must detect the short chunk, refetch from origin, and return full bytes.
+	pgConn, err := pgx.Connect(context.Background(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pgConn.Exec(context.Background(), `UPDATE cache_chunks SET data = substr(data, 1, 5) WHERE object_id = (SELECT id FROM cache_objects WHERE bucket='b1' AND key='odd.bin') AND idx = 1`); err != nil {
+		t.Fatal(err)
+	}
+	_ = pgConn.Close(context.Background())
+	rRepaired := doReq(t, gwA, http.MethodGet, "/b1/odd.bin", nil, nil)
+	if rRepaired.Code != 200 || !bytes.Equal(rRepaired.Body.Bytes(), odd) {
+		t.Fatalf("GET after truncated chunk = %d len=%d, want %d", rRepaired.Code, rRepaired.Body.Len(), len(odd))
 	}
 
 	coalData := bytes.Repeat([]byte("coalesce"), 1024)

@@ -118,7 +118,7 @@ func TestStoreCascadeDeleteETagReplaceAndOddTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sr, err := st.OpenChunkStream(ctx, id1, 1, 3, 100, int64(2*cs-100+tail))
+	sr, err := st.OpenChunkStream(ctx, id1, 1, 3, 100, int64(2*cs-100+tail), cs, total)
 	if err != nil {
 		t.Fatal(err)
 	}

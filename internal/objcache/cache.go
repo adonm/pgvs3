@@ -288,7 +288,7 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 	firstSkip := span.Start % t.chunkSize
 	totalLen := span.End - span.Start + 1
 	if m.ID > 0 && (loIdx != hiIdx || fastChunk != nil || rng.Suffix >= 0) {
-		if sr, serr := t.store.OpenChunkStream(ctx, m.ID, loIdx, hiIdx, firstSkip, totalLen); serr == nil {
+		if sr, serr := t.store.OpenChunkStream(ctx, m.ID, loIdx, hiIdx, firstSkip, totalLen, t.chunkSize, m.Size); serr == nil {
 			t.maybeTouch(m)
 			return &store.ReadResult{
 				ObjectMeta: *m,

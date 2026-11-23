@@ -266,13 +266,18 @@ func (s *Store) GetChunks(ctx context.Context, objectID int64, lo, hi int32) (ma
 	return out, rows.Err()
 }
 
-// OpenChunkStream returns a ReadCloser streaming chunk rows [lo..hi] clipped to [firstOff..lastOffInLast].
-func (s *Store) OpenChunkStream(ctx context.Context, objectID int64, lo, hi int32, firstSkip, totalLen int64) (io.ReadCloser, error) {
+// OpenChunkStream returns a ReadCloser streaming chunk rows [lo..hi] clipped to [firstSkip..totalLen].
+// Any missing or short-length chunk fails before headers are sent so callers can refill.
+func (s *Store) OpenChunkStream(ctx context.Context, objectID int64, lo, hi int32, firstSkip, totalLen, chunkSize, objectSize int64) (io.ReadCloser, error) {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := conn.Query(ctx, `SELECT idx, data, count(*) OVER () FROM cache_chunks WHERE object_id = $1 AND idx BETWEEN $2 AND $3 ORDER BY idx`, objectID, lo, hi)
+	rows, err := conn.Query(ctx, `SELECT idx, data, count(*) OVER ()
+		FROM cache_chunks
+		WHERE object_id = $1 AND idx BETWEEN $2 AND $3
+		  AND octet_length(data) = LEAST($4::bigint, $5::bigint - idx::bigint * $4::bigint)
+		ORDER BY idx`, objectID, lo, hi, chunkSize, objectSize)
 	if err != nil {
 		conn.Release()
 		return nil, err
@@ -415,7 +420,7 @@ func (s *Store) UpsertObject(ctx context.Context, m ObjectMeta) (int64, error) {
 
 func (s *Store) PutChunk(ctx context.Context, objectID int64, idx int32, data []byte) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO cache_chunks (object_id, idx, data) VALUES ($1, $2, $3)
-		ON CONFLICT (object_id, idx) DO NOTHING`, objectID, idx, data)
+		ON CONFLICT (object_id, idx) DO UPDATE SET data = EXCLUDED.data`, objectID, idx, data)
 	return err
 }
 
