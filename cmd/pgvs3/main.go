@@ -93,8 +93,7 @@ type serveConfig struct {
 	s3QueueWait             time.Duration
 }
 
-func parseServeConfig(args []string) (serveConfig, error) {
-	var cfg serveConfig
+func newServeFlagSet(cfg *serveConfig) *flag.FlagSet {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.StringVar(&cfg.url, "url", "postgres://localhost/pgvs3", "PostgreSQL URL: the writer endpoint, or a standby with --read-only (use sslmode for database TLS)")
 	fs.StringVar(&cfg.addr, "addr", "0.0.0.0:8014", "listen address for S3/HTTP, /healthz, /readyz and /metrics")
@@ -128,6 +127,12 @@ func parseServeConfig(args []string) (serveConfig, error) {
 	fs.Int64Var(&cfg.cacheMaxBytes, "cache-max-bytes", 0, "evict least recently used objects above this byte budget (0 disables)")
 	fs.IntVar(&cfg.s3Concurrency, "s3-concurrency", 32, "active S3 requests; excess waits in a queue of twice this, then gets 503 SlowDown")
 	fs.DurationVar(&cfg.s3QueueWait, "s3-queue-wait", time.Second, "maximum S3 admission wait (0 rejects excess immediately)")
+	return fs
+}
+
+func parseServeConfig(args []string) (serveConfig, error) {
+	var cfg serveConfig
+	fs := newServeFlagSet(&cfg)
 	if err := applyFlagEnv(fs, "PGVS3_"); err != nil {
 		return serveConfig{}, err
 	}
@@ -383,8 +388,8 @@ func reap(args []string) int {
 	var retention *time.Duration
 	var maxBytes *int64
 	return withStore("reap", args, 30*time.Minute, true, func(fs *flag.FlagSet) {
-		retention = fs.Duration("retention", envDuration("PGVS3_CACHE_RETENTION", 24*time.Hour), "evict cached objects idle longer than this")
-		maxBytes = fs.Int64("max-bytes", 0, "evict oldest cached objects above this byte budget (0 = unlimited)")
+		retention = fs.Duration("cache-retention", 24*time.Hour, "evict cached objects idle longer than this")
+		maxBytes = fs.Int64("cache-max-bytes", 0, "evict oldest cached objects above this byte budget (0 = unlimited)")
 	}, func(ctx context.Context, st *store.Store, _ []string) int {
 		evicted, err := st.Evict(ctx, *retention, *maxBytes)
 		if err != nil {
@@ -477,15 +482,6 @@ func applyFlagEnv(fs *flag.FlagSet, prefix string) error {
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
-	}
-	return def
-}
-
-func envDuration(key string, def time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
-		}
 	}
 	return def
 }

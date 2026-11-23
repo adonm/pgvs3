@@ -8,24 +8,38 @@ Invoke `pgvs3 <command> [flags]` (running `pgvs3` with no arguments runs `serve`
 
 Every `pgvs3 serve` flag can be set via `PGVS3_<FLAG_NAME>` environment variables (e.g. `--origin-endpoint` → `PGVS3_ORIGIN_ENDPOINT`).
 
-Key flags:
+All `pgvs3 serve` flags:
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--url` | `postgres://localhost/pgvs3` | PostgreSQL connection URL |
 | `--addr` | `0.0.0.0:8014` | HTTP listen address (`/healthz`, `/readyz`, `/metrics`, S3) |
-| `--origin-endpoint` | `""` | Custom S3 endpoint URL (empty uses AWS S3 for `--origin-region`) |
-| `--origin-region` | `us-east-1` | Origin AWS region |
+| `--pool-max` | `64` | PostgreSQL connections; each streaming GET holds one |
+| `--spool-dir` | `` | Scratch directory for unknown-length proxied uploads over 8 MiB |
+| `--spool-max-bytes` | `8589934592` | Spool byte budget (8 GiB) for unknown-length proxied uploads |
+| `--db-work-mem` | `16MB` | Session `work_mem` per sort/hash operation |
+| `--db-statement-timeout` | `5m0s` | PostgreSQL statement timeout (`0` disables) |
+| `--db-lock-timeout` | `5s` | PostgreSQL lock timeout (`0` disables) |
+| `--db-idle-tx-timeout` | `1m0s` | PostgreSQL idle-in-transaction timeout (`0` disables) |
+| `--db-max-conn-lifetime` | `1h0m0s` | PostgreSQL connection lifetime (`0` disables) |
+| `--db-max-conn-lifetime-jitter` | `5m0s` | Randomized PostgreSQL connection lifetime jitter |
+| `--max-conns` | `4096` | Concurrent client connections before shedding load |
+| `--http-read-timeout` | `30m0s` | HTTP read deadline including request bodies (`0` disables) |
+| `--http-write-timeout` | `30m0s` | HTTP response write deadline (`0` disables) |
+| `--read-only` | `false` | Reject writes and skip DDL, eviction, and cache fills (for standbys) |
+| `--log-level` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `--origin-endpoint` | `` | Custom S3 endpoint URL (empty uses AWS S3 for `--origin-region`) |
+| `--origin-region` | `us-east-1` | Origin AWS region (defaults to `AWS_REGION` when set, else `us-east-1`) |
 | `--origin-path-style` | `false` | Use path-style addressing for origin |
-| `--buckets` | `""` | Optional comma-separated bucket allowlist |
-| `--revalidate-after` | `0` | Origin revalidation interval (`0` = immutable, never revalidate hits) |
+| `--origin-insecure` | `false` | Skip TLS certificate verification for origin |
+| `--buckets` | `` | Optional comma-separated bucket allowlist |
+| `--revalidate-after` | `0s` | Origin revalidation interval (`0` = immutable, never revalidate hits) |
+| `--cache-retention` | `24h0m0s` | Idle eviction retention period |
+| `--fill-concurrency` | `8` | Max concurrent origin fills per gateway |
 | `--range-cache-chunk` | `0` | Aligned cache chunk size in bytes (`0` = 1 MiB; clamped to 64 KiB–8 MiB) |
 | `--cache-max-bytes` | `0` | Evict least recently used objects above this byte budget (`0` = unlimited) |
-| `--cache-retention` | `24h` | Idle eviction retention period |
-| `--pool-max` | `64` | PostgreSQL connections; each streaming GET holds one |
 | `--s3-concurrency` | `32` | Concurrent S3 requests per gateway before queueing (`--s3-queue-wait`) and `503 SlowDown` |
-| `--fill-concurrency` | `8` | Max concurrent origin fills per gateway |
-| `--spool-max-bytes` | `8GiB` | Spool byte budget for unknown-length proxied uploads |
+| `--s3-queue-wait` | `1s` | Maximum S3 admission wait (`0` rejects excess immediately) |
 
 ## Sizing
 

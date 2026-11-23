@@ -1,9 +1,11 @@
 package main
 
 import (
+	"flag"
 	"io"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -291,5 +293,60 @@ func TestDBZeroTimeoutsPreservedInStoreOptions(t *testing.T) {
 	if opts.StatementTimeout != 0 || opts.LockTimeout != 0 || opts.IdleTxTimeout != 0 ||
 		opts.MaxConnLifetime != 0 || opts.MaxConnLifetimeJitter != 0 {
 		t.Fatalf("zero timeouts were not preserved: %+v", opts)
+	}
+}
+
+func TestServeFlagsDocumentedInOperationsMD(t *testing.T) {
+	clearServeEnv(t)
+	raw, err := os.ReadFile("../../docs/operations.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile("(?m)^\\|\\s*`--([a-z0-9-]+)`\\s*\\|\\s*`([^`]*)`\\s*\\|")
+	docDefaults := map[string]string{}
+	for _, m := range re.FindAllStringSubmatch(string(raw), -1) {
+		docDefaults[m[1]] = m[2]
+	}
+
+	var cfg serveConfig
+	fs := newServeFlagSet(&cfg)
+	fs.VisitAll(func(f *flag.Flag) {
+		want, ok := docDefaults[f.Name]
+		if !ok {
+			t.Errorf("serve flag --%s is missing from docs/operations.md", f.Name)
+			return
+		}
+		if want != f.DefValue {
+			t.Errorf("docs/operations.md --%s default = %q, want %q", f.Name, want, f.DefValue)
+		}
+	})
+}
+
+func TestGoModDirectDepsOnlyPGX(t *testing.T) {
+	raw, err := os.ReadFile("../../go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var direct []string
+	inBlock := false
+	for line := range strings.SplitSeq(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "require (" {
+			inBlock = true
+			continue
+		}
+		if inBlock && line == ")" {
+			inBlock = false
+			continue
+		}
+		if (inBlock || strings.HasPrefix(line, "require ")) && !strings.Contains(line, "// indirect") {
+			mod := strings.Fields(strings.TrimPrefix(line, "require "))[0]
+			if mod != "" && mod != "(" {
+				direct = append(direct, mod)
+			}
+		}
+	}
+	if len(direct) != 1 || direct[0] != "github.com/jackc/pgx/v5" {
+		t.Fatalf("direct dependencies = %v, want [github.com/jackc/pgx/v5]", direct)
 	}
 }

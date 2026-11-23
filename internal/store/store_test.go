@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -59,6 +61,16 @@ func TestSchemaContainsExpectedTables(t *testing.T) {
 		if !strings.Contains(schemaSQL, want) {
 			t.Fatalf("schema.sql missing %q", want)
 		}
+	}
+}
+
+func TestSchemaHashMatchesLayoutVersion(t *testing.T) {
+	sum := sha256.Sum256([]byte(schemaSQL))
+	got := hex.EncodeToString(sum[:])
+	const wantVersion = 1
+	const wantHash = "b79d299288501453f6b581139bfa42febaf54ae5cecc8c060d7ba0d8174becb7"
+	if LayoutVersion != wantVersion || got != wantHash {
+		t.Fatalf("schema.sql changed without updating LayoutVersion/hash: version=%d hash=%s", LayoutVersion, got)
 	}
 }
 
