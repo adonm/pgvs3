@@ -7,13 +7,15 @@ import (
 	"context"
 	"io"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/adonm/pgvs3/internal/store"
+	"github.com/jackc/pgx/v5"
 )
 
-func openIntegrationStore(t *testing.T) *store.Store {
+func openIntegrationStore(t *testing.T) (*store.Store, string) {
 	t.Helper()
 	dbURL := os.Getenv("PGVS3_TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -28,17 +30,19 @@ func openIntegrationStore(t *testing.T) *store.Store {
 	if err := st.Init(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Clean state for isolated store test.
-	_, _ = st.Evict(ctx, 0, 1)
-	_ = st.DeleteMany(ctx, "st-test", []string{"a", "b", "c", "zero", "multi"})
-	return st
+	keys := []string{"a", "b", "c", "zero", "multi"}
+	_ = st.DeleteMany(ctx, "st-test", keys)
+	t.Cleanup(func() {
+		_ = st.DeleteMany(context.Background(), "st-test", keys)
+	})
+	return st, dbURL
 }
 
 func TestStoreEvictionLRUAndBudget(t *testing.T) {
-	st := openIntegrationStore(t)
+	st, dbURL := openIntegrationStore(t)
 	ctx := context.Background()
 
-	// Insert a (1000B), b (1000B), c (1000B) with staggered last_access.
+	// Insert a, b, c (1000B each) and set explicit last_access order: a (-3h) < b (-2h) < c (-1h).
 	for _, k := range []string{"a", "b", "c"} {
 		id, err := st.UpsertObject(ctx, store.ObjectMeta{
 			Bucket: "st-test", Key: k, ETag: "e-" + k, Size: 1000, LastModified: time.Now(),
@@ -49,12 +53,32 @@ func TestStoreEvictionLRUAndBudget(t *testing.T) {
 		if err := st.PutChunk(ctx, id, 0, bytes.Repeat([]byte(k), 1000)); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(15 * time.Millisecond)
+	}
+
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	for _, q := range []struct {
+		key string
+		age string
+	}{
+		{"a", "3 hours"},
+		{"b", "2 hours"},
+		{"c", "1 hour"},
+	} {
+		if _, err := conn.Exec(ctx, `UPDATE cache_objects SET last_access = now() - $1::interval WHERE bucket = 'st-test' AND key = $2`, q.age, q.key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var otherBytes int64
+	if err := conn.QueryRow(ctx, `SELECT COALESCE(sum(size), 0) FROM cache_objects WHERE bucket <> 'st-test'`).Scan(&otherBytes); err != nil {
+		t.Fatal(err)
 	}
 
 	// Touch 'a' so 'b' becomes the least-recently-used.
 	st.TouchAsync("st-test", "a")
-	// Wait briefly for async touch worker to commit.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		ma, _ := st.GetObject(ctx, "st-test", "a")
@@ -62,11 +86,11 @@ func TestStoreEvictionLRUAndBudget(t *testing.T) {
 		if ma != nil && mc != nil && ma.LastAccess.After(mc.LastAccess) {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		runtime.Gosched()
 	}
 
-	// Budget 2100B should evict 'b' (oldest) and keep 'a' and 'c'.
-	evicted, err := st.Evict(ctx, 0, 2100)
+	// Budget otherBytes+2100B should evict 'b' (oldest) and keep 'a' and 'c'.
+	evicted, err := st.Evict(ctx, 0, otherBytes+2100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +109,7 @@ func TestStoreEvictionLRUAndBudget(t *testing.T) {
 }
 
 func TestStoreCascadeDeleteETagReplaceAndOddTail(t *testing.T) {
-	st := openIntegrationStore(t)
+	st, _ := openIntegrationStore(t)
 	ctx := context.Background()
 
 	// Zero-byte object

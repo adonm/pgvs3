@@ -577,7 +577,15 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	if rImm.Body.String() != "updated-via-A" {
 		t.Fatalf("immutable cache should not see direct origin change, got %q", rImm.Body.String())
 	}
-	_, gwTTL := openTestGateway(t, dbURL, originSrv.URL, time.Nanosecond)
+	_, gwTTL := openTestGateway(t, dbURL, originSrv.URL, time.Hour)
+	pgBackdate, err := pgx.Connect(context.Background(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pgBackdate.Close(context.Background())
+	if _, err := pgBackdate.Exec(context.Background(), `UPDATE cache_objects SET filled_at = now() - interval '2 hours' WHERE bucket='b1' AND key='obj.bin'`); err != nil {
+		t.Fatal(err)
+	}
 	headsBefore := fake.count("HEAD", "b1", "obj.bin")
 	rTTL := doReq(t, gwTTL, http.MethodGet, "/b1/obj.bin", nil, nil)
 	if rTTL.Body.String() != "mutated-direct" {
@@ -587,7 +595,7 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 		t.Fatalf("stale GET issued %d HEADs, want 1", heads)
 	}
 	// HEAD-only revalidation persists refreshed metadata so subsequent HEAD within TTL is a hit.
-	_, gwTTL5s := openTestGateway(t, dbURL, originSrv.URL, 5*time.Second)
+	_, gwTTL5s := openTestGateway(t, dbURL, originSrv.URL, time.Hour)
 	fake.putDirect("b1", "headonly.bin", []byte("v1"), "text/plain")
 	if r := doReq(t, gwTTL5s, http.MethodHead, "/b1/headonly.bin", nil, nil); r.Code != 200 {
 		t.Fatalf("cold HEAD = %d", r.Code)
@@ -701,12 +709,14 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	}
 
 	// Concurrent stale GETs coalesce to 1 origin HEAD; conditional 304 refreshes without origin GET.
-	_, gwTTL2 := openTestGateway(t, dbURL, originSrv.URL, 50*time.Millisecond)
+	_, gwTTL2 := openTestGateway(t, dbURL, originSrv.URL, time.Hour)
 	fake.putDirect("b1", "stale304.bin", []byte("unchanged"), "text/plain")
 	if r := doReq(t, gwTTL2, http.MethodGet, "/b1/stale304.bin", nil, nil); r.Code != 200 {
 		t.Fatalf("cold stale304 = %d", r.Code)
 	}
-	time.Sleep(70 * time.Millisecond)
+	if _, err := pgBackdate.Exec(context.Background(), `UPDATE cache_objects SET filled_at = now() - interval '2 hours' WHERE bucket='b1' AND key='stale304.bin'`); err != nil {
+		t.Fatal(err)
+	}
 	heads304Before := fake.count("HEAD", "b1", "stale304.bin")
 	gets304Before := fake.count("GET", "b1", "stale304.bin")
 	var swg sync.WaitGroup
@@ -725,7 +735,7 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	if fake.count("GET", "b1", "stale304.bin") != gets304Before {
 		t.Fatalf("304 refresh issued origin GET")
 	}
-	// Subsequent GET within TTL is a pure PG hit (0 origin HEADs).
+	// Subsequent GET within TTL is a pure PG hit (0 additional HEADs).
 	if r := doReq(t, gwTTL2, http.MethodGet, "/b1/stale304.bin", nil, nil); r.Code != 200 || r.Header().Get("X-Cache") != "HIT" {
 		t.Fatalf("post-304 GET = %d X-Cache=%q", r.Code, r.Header().Get("X-Cache"))
 	}
