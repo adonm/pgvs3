@@ -43,6 +43,19 @@ type Store struct {
 	touchDone      chan struct{}
 }
 
+func afterConnectSQL(opts OpenOptions) string {
+	workMem := opts.WorkMem
+	if workMem == "" {
+		workMem = "16MB"
+	}
+	return fmt.Sprintf("SET work_mem = '%s'; SET statement_timeout = %d; SET lock_timeout = %d; SET idle_in_transaction_session_timeout = %d;",
+		strings.ReplaceAll(workMem, "'", ""),
+		opts.StatementTimeout.Milliseconds(),
+		opts.LockTimeout.Milliseconds(),
+		opts.IdleTxTimeout.Milliseconds(),
+	)
+}
+
 func Open(ctx context.Context, url string, maxConns int32, log *slog.Logger) (*Store, error) {
 	return OpenWithOptions(ctx, url, OpenOptions{MaxConns: maxConns}, log)
 }
@@ -57,21 +70,6 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 	if opts.WorkMem == "" {
 		opts.WorkMem = "16MB"
 	}
-	if opts.StatementTimeout == 0 {
-		opts.StatementTimeout = 5 * time.Minute
-	}
-	if opts.LockTimeout == 0 {
-		opts.LockTimeout = 5 * time.Second
-	}
-	if opts.IdleTxTimeout == 0 {
-		opts.IdleTxTimeout = time.Minute
-	}
-	if opts.MaxConnLifetime == 0 {
-		opts.MaxConnLifetime = time.Hour
-	}
-	if opts.MaxConnLifetimeJitter == 0 {
-		opts.MaxConnLifetimeJitter = 5 * time.Minute
-	}
 
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
@@ -82,13 +80,7 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 	cfg.MaxConnLifetime = opts.MaxConnLifetime
 	cfg.MaxConnLifetimeJitter = opts.MaxConnLifetimeJitter
 	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		sql := fmt.Sprintf("SET work_mem = '%s'; SET statement_timeout = %d; SET lock_timeout = %d; SET idle_in_transaction_session_timeout = %d;",
-			strings.ReplaceAll(opts.WorkMem, "'", ""),
-			opts.StatementTimeout.Milliseconds(),
-			opts.LockTimeout.Milliseconds(),
-			opts.IdleTxTimeout.Milliseconds(),
-		)
-		_, err := conn.Exec(ctx, sql)
+		_, err := conn.Exec(ctx, afterConnectSQL(opts))
 		return err
 	}
 

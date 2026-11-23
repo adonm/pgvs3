@@ -274,3 +274,22 @@ func TestServeEnvironmentUsesFlagParsers(t *testing.T) {
 		t.Fatalf("empty boolean environment: %+v %v", cfg, err)
 	}
 }
+
+func TestDBZeroTimeoutsPreservedInStoreOptions(t *testing.T) {
+	clearServeEnv(t)
+	cfg, err := parseServeConfig([]string{
+		"--db-statement-timeout=0",
+		"--db-lock-timeout=0",
+		"--db-idle-tx-timeout=0",
+		"--db-max-conn-lifetime=0",
+		"--db-max-conn-lifetime-jitter=0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := storeOpenOptions(cfg)
+	if opts.StatementTimeout != 0 || opts.LockTimeout != 0 || opts.IdleTxTimeout != 0 ||
+		opts.MaxConnLifetime != 0 || opts.MaxConnLifetimeJitter != 0 {
+		t.Fatalf("zero timeouts were not preserved: %+v", opts)
+	}
+}

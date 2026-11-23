@@ -105,3 +105,11 @@ func TestTouchWorkerShutdownAndNoPanic(t *testing.T) {
 		s.TouchAsync("b", "after-close")
 	})
 }
+
+func TestAfterConnectSQLZeroDisables(t *testing.T) {
+	got := afterConnectSQL(OpenOptions{})
+	want := "SET work_mem = '16MB'; SET statement_timeout = 0; SET lock_timeout = 0; SET idle_in_transaction_session_timeout = 0;"
+	if got != want {
+		t.Fatalf("afterConnectSQL(zero) = %q, want %q", got, want)
+	}
+}
