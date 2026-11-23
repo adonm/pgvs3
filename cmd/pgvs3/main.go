@@ -290,7 +290,7 @@ func openOrigin(st *store.Store, runtime *objcache.Runtime, cfg serveConfig, log
 }
 
 func newGateway(ctx context.Context, st *store.Store, cfg serveConfig, tier *objcache.Tier, log *slog.Logger) *s3.Server {
-	srv := s3.New(st, log, cfg.readOnly, cfg.s3Concurrency, cfg.s3QueueWait, tier)
+	srv := s3.New(st, log, cfg.s3Concurrency, cfg.s3QueueWait, tier)
 	go func() {
 		<-ctx.Done()
 		srv.SetDraining(true)

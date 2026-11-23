@@ -395,7 +395,7 @@ func openTestGateway(t *testing.T, dbURL, endpoint string, revalidateAfter time.
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = tier.Close() })
-	return st, s3.New(st, nil, false, 32, time.Second, tier)
+	return st, s3.New(st, nil, 32, time.Second, tier)
 }
 
 func doReq(t *testing.T, h http.Handler, method, target string, body []byte, headers map[string]string) *httptest.ResponseRecorder {

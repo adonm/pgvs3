@@ -33,7 +33,6 @@ type Server struct {
 	store     *store.Store
 	log       *slog.Logger
 	metrics   *requestMetrics
-	readOnly  bool
 	draining  atomic.Bool
 	tier      *objcache.Tier
 	sem       chan struct{}
@@ -44,7 +43,7 @@ type Server struct {
 	waitNanos atomic.Uint64
 }
 
-func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, queueWait time.Duration, tier *objcache.Tier) *Server {
+func New(st *store.Store, log *slog.Logger, maxConc int, queueWait time.Duration, tier *objcache.Tier) *Server {
 	if maxConc <= 0 {
 		maxConc = 32
 	}
@@ -56,7 +55,7 @@ func New(st *store.Store, log *slog.Logger, readOnly bool, maxConc int, queueWai
 		queueSize = 2 * maxConc
 	}
 	return &Server{
-		store: st, log: log, metrics: &requestMetrics{}, readOnly: readOnly,
+		store: st, log: log, metrics: &requestMetrics{},
 		tier:    tier,
 		sem:     make(chan struct{}, maxConc),
 		waiters: make(chan struct{}, queueSize), queueWait: queueWait,
@@ -212,7 +211,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
 			return errNoSuchBucket()
 		}
 	}
-	if s.readOnly && r.Method != http.MethodGet && r.Method != http.MethodHead {
+	if s.tier.ReadOnly() && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return errAccessDenied("gateway is read-only")
 	}
 	q := r.URL.Query()

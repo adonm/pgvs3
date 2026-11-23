@@ -124,6 +124,7 @@ func New(log *slog.Logger, origin originHandle, st *store.Store, runtime *Runtim
 }
 
 func (t *Tier) BucketAllowed(bucket string) bool { return t.origin.BucketAllowed(bucket) }
+func (t *Tier) ReadOnly() bool                   { return t != nil && t.readOnly }
 
 func (t *Tier) Close() error {
 	t.closeOnce.Do(func() {

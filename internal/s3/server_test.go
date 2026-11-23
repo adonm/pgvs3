@@ -35,7 +35,7 @@ func TestSpoolAdmissionMapsToRetryableSlowDown(t *testing.T) {
 
 func TestServerAdmissionBoundsWaitsAndCancels(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s := New(nil, slog.New(slog.DiscardHandler), false, 1, time.Second, nil)
+		s := New(nil, slog.New(slog.DiscardHandler), 1, time.Second, nil)
 		defer s.Close()
 		release, ok := s.acquire(t.Context())
 		if !ok {
@@ -108,7 +108,7 @@ func TestServerAdmissionBoundsWaitsAndCancels(t *testing.T) {
 		}
 	})
 	for _, canceled := range []bool{false, true} {
-		s := New(nil, slog.New(slog.DiscardHandler), false, 1, 0, nil)
+		s := New(nil, slog.New(slog.DiscardHandler), 1, 0, nil)
 		ctx, cancel := context.WithCancel(t.Context())
 		release, _ := s.acquire(ctx)
 		if canceled {
@@ -209,6 +209,26 @@ func TestOriginAPIErrorExhaustive(t *testing.T) {
 		ae := s.originAPIError(tc.kind, errors.New("boom"))
 		if ae.Status != tc.status || ae.Code != tc.code {
 			t.Fatalf("kind %d: got (%d, %s), want (%d, %s)", tc.kind, ae.Status, ae.Code, tc.status, tc.code)
+		}
+	}
+}
+
+func TestReadOnlyDerivedFromTier(t *testing.T) {
+	o, err := objcache.NewS3Origin(objcache.S3Config{Endpoint: "http://127.0.0.1:1", Region: "us-east-1", PathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	tier, err := objcache.New(nil, o, &store.Store{}, objcache.NewRuntime(objcache.RuntimeOptions{}), objcache.TierOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(nil, slog.New(slog.DiscardHandler), 4, time.Second, tier)
+	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodPost} {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(method, "/b/k", nil))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s on read-only tier = %d, want 403", method, rec.Code)
 		}
 	}
 }
@@ -433,7 +453,7 @@ func TestMetricsObserveAndWrite(t *testing.T) {
 	m.Observe("PUT", 403, 25*time.Millisecond, 0)
 
 	rr := httptest.NewRecorder()
-	s := New(nil, nil, false, 1, time.Second, nil)
+	s := New(nil, nil, 1, time.Second, nil)
 	s.metrics = m
 	s.writeMetrics(rr, nil)
 
@@ -466,7 +486,7 @@ func TestMetricsConcurrentObserve(t *testing.T) {
 	}
 	wg.Wait()
 	rr := httptest.NewRecorder()
-	s := New(nil, nil, false, 1, time.Second, nil)
+	s := New(nil, nil, 1, time.Second, nil)
 	s.metrics = m
 	s.writeMetrics(rr, nil)
 	if !strings.Contains(rr.Body.String(), `pgvs3_requests_total{method="GET",code="200"} 100`) {
