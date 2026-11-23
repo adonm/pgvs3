@@ -230,11 +230,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) error {
 
 func (s *Server) bucketRequest(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) error {
 	c := routeContext{s: s, w: w, r: r, bucket: bucket, q: q}
-	found, err := c.dispatch(bucketRoutes)
-	if !found {
+	rt := selectRoute(bucketRoutes, r, q)
+	if rt == nil {
 		return errMethodNotAllowed()
 	}
-	return err
+	return rt.run(&c)
 }
 
 func (s *Server) objectRequest(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) error {
@@ -274,7 +274,6 @@ type routeContext struct {
 }
 
 type route struct {
-	name   string
 	method string
 	query  string
 	query2 string
@@ -307,77 +306,69 @@ func selectRoute(table []route, r *http.Request, q url.Values) *route {
 	return nil
 }
 
-func (c *routeContext) dispatch(table []route) (bool, error) {
-	rt := selectRoute(table, c.r, c.q)
-	if rt == nil {
-		return false, nil
-	}
-	return true, rt.run(c)
-}
-
 var bucketRoutes = []route{
-	{name: "bucket-put", method: http.MethodPut, run: func(c *routeContext) error {
+	{method: http.MethodPut, run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
-	{name: "bucket-delete", method: http.MethodDelete, run: func(c *routeContext) error {
+	{method: http.MethodDelete, run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
-	{name: "bucket-head", method: http.MethodHead, run: func(c *routeContext) error {
+	{method: http.MethodHead, run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
-	{name: "bucket-location", method: http.MethodGet, query: "location", run: func(c *routeContext) error {
+	{method: http.MethodGet, query: "location", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
-	{name: "bucket-versions", method: http.MethodGet, query: "versions", run: func(c *routeContext) error {
+	{method: http.MethodGet, query: "versions", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
-	{name: "bucket-uploads", method: http.MethodGet, query: "uploads", run: func(c *routeContext) error {
+	{method: http.MethodGet, query: "uploads", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
-	{name: "bucket-delete-objects", method: http.MethodPost, query: "delete", run: func(c *routeContext) error {
+	{method: http.MethodPost, query: "delete", run: func(c *routeContext) error {
 		return c.s.deleteObjects(c.w, c.r, c.bucket)
 	}},
-	{name: "bucket-get", method: http.MethodGet, run: func(c *routeContext) error {
+	{method: http.MethodGet, run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, "", false)
 	}},
 }
 
 var objectRoutes = []route{
-	{name: "object-head", method: http.MethodHead, run: func(c *routeContext) error {
+	{method: http.MethodHead, run: func(c *routeContext) error {
 		return c.s.headObject(c.w, c.r, c.bucket, c.key)
 	}},
-	{name: "object-attributes", method: http.MethodGet, query: "attributes", run: func(c *routeContext) error {
+	{method: http.MethodGet, query: "attributes", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
-	{name: "object-list-parts", method: http.MethodGet, query: "uploadId", run: func(c *routeContext) error {
+	{method: http.MethodGet, query: "uploadId", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
-	{name: "object-get", method: http.MethodGet, run: func(c *routeContext) error {
+	{method: http.MethodGet, run: func(c *routeContext) error {
 		return c.s.getObject(c.w, c.r, c.bucket, c.key)
 	}},
-	{name: "object-upload-part-copy", method: http.MethodPut, query: "partNumber", query2: "uploadId",
+	{method: http.MethodPut, query: "partNumber", query2: "uploadId",
 		header: "x-amz-copy-source", run: func(c *routeContext) error {
 			return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 		}},
-	{name: "object-upload-part", method: http.MethodPut, query: "partNumber", query2: "uploadId", run: func(c *routeContext) error {
+	{method: http.MethodPut, query: "partNumber", query2: "uploadId", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
-	{name: "object-copy", method: http.MethodPut, header: "x-amz-copy-source", run: func(c *routeContext) error {
+	{method: http.MethodPut, header: "x-amz-copy-source", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, true)
 	}},
-	{name: "object-put", method: http.MethodPut, run: func(c *routeContext) error {
+	{method: http.MethodPut, run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, true)
 	}},
-	{name: "object-create-multipart", method: http.MethodPost, query: "uploads", run: func(c *routeContext) error {
+	{method: http.MethodPost, query: "uploads", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
-	{name: "object-complete-multipart", method: http.MethodPost, query: "uploadId", run: func(c *routeContext) error {
+	{method: http.MethodPost, query: "uploadId", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, true)
 	}},
-	{name: "object-abort-multipart", method: http.MethodDelete, query: "uploadId", run: func(c *routeContext) error {
+	{method: http.MethodDelete, query: "uploadId", run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, false)
 	}},
-	{name: "object-delete", method: http.MethodDelete, run: func(c *routeContext) error {
+	{method: http.MethodDelete, run: func(c *routeContext) error {
 		return c.s.proxyToOrigin(c.w, c.r, c.bucket, c.key, true)
 	}},
 }

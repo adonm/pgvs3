@@ -472,6 +472,7 @@ func (s *Store) Evict(ctx context.Context, retention time.Duration, maxBytes int
 			if cur <= maxBytes {
 				break
 			}
+			// Window sum deletes oldest rows only while cumulative excess > 0, avoiding over-eviction.
 			excess := cur - maxBytes
 			tag, err := s.pool.Exec(ctx, `WITH ranked AS (
 				SELECT id, size, sum(size) OVER (ORDER BY last_access, id) AS cum

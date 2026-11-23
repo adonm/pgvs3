@@ -204,6 +204,7 @@ func attrsFromS3(meta s3client.ObjectInfo, bucket, key string) store.ObjectMeta 
 	}
 }
 
+// Maps origin 301/412 to client-facing 301 PermanentRedirect / 412 PreconditionFailed.
 func mapOriginError(err error) error {
 	switch {
 	case s3client.NotFound(err):

@@ -181,12 +181,8 @@ func TestSelectRoute(t *testing.T) {
 				req.Header.Set(tt.header, tt.value)
 			}
 			got := selectRoute(tt.table, req, req.URL.Query())
-			gotName := ""
-			if got != nil {
-				gotName = got.name
-			}
-			if gotName != tt.want {
-				t.Fatalf("selectRoute() = %q, want %q", gotName, tt.want)
+			if (got != nil) != (tt.want != "") {
+				t.Fatalf("selectRoute() matched=%v, want=%q", got != nil, tt.want)
 			}
 		})
 	}

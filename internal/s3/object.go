@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -139,7 +140,7 @@ func (s *Server) proxyToOrigin(w http.ResponseWriter, r *http.Request, bucket, k
 			s.log.Warn("cache invalidation failed", "bucket", bucket, "key", key, "err", err)
 		}
 	}
-	copyResponse(w, resp)
+	copyResponse(w, resp, s.log)
 	return nil
 }
 
@@ -177,7 +178,7 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket st
 			s.log.Warn("batch cache invalidation failed", "bucket", bucket, "count", len(keys), "err", err)
 		}
 	}
-	copyResponse(w, resp)
+	copyResponse(w, resp, s.log)
 	return nil
 }
 
@@ -199,7 +200,7 @@ func forwardHeaders(h http.Header) [][2]string {
 	return out
 }
 
-func copyResponse(w http.ResponseWriter, resp *http.Response) {
+func copyResponse(w http.ResponseWriter, resp *http.Response, log *slog.Logger) {
 	for name, vals := range resp.Header {
 		if strings.EqualFold(name, "Connection") || strings.EqualFold(name, "Transfer-Encoding") {
 			continue
@@ -211,7 +212,9 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	w.WriteHeader(resp.StatusCode)
 	buf := copyBuf()
 	defer putCopyBuf(buf)
-	_, _ = io.CopyBuffer(w, resp.Body, buf)
+	if _, err := io.CopyBuffer(w, resp.Body, buf); err != nil && log != nil {
+		log.Warn("proxy response write failed", "status", resp.StatusCode, "err", err)
+	}
 }
 
 func setObjectInfoHeaders(w http.ResponseWriter, info store.ObjectMeta) {

@@ -23,9 +23,11 @@ import (
 const (
 	defaultChunkSize = 1 << 20 // 1 MiB
 	maxChunkSize     = 8 << 20 // 8 MiB
-	maxRangeFillSpan = 8 << 20 // 8 MiB per origin range fill
+	// Caps a single origin range fill so one request does not buffer an unbounded span.
+	maxRangeFillSpan = 8 << 20
 	memSpoolMax      = 8 << 20
-	touchCooldown    = 30 * time.Second
+	// Bounds UPDATE amplification on hot keys; LRU accuracy lags by up to 30s.
+	touchCooldown = 30 * time.Second
 )
 
 var ErrSpoolBusy = errors.New("cache spool byte budget exhausted")
@@ -72,6 +74,7 @@ type Tier struct {
 	ttl       time.Duration
 	chunkSize int64
 	readOnly  bool
+	// Singleflight scope is per-process; separate gateway replicas may fill the same key.
 	group     syncx.Group
 	log       *slog.Logger
 	ctx       context.Context
@@ -172,6 +175,7 @@ func (t *Tier) resolveMeta(ctx context.Context, bucket, key string, m *store.Obj
 		changed bool
 	}
 	ch := t.group.DoChan("reval:"+bucket+"/"+key, func() (any, error) {
+		// Detached from request ctx so fills outlive a disconnecting client (bounded by 30s/2m timeouts).
 		rctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 		defer cancel()
 
@@ -190,7 +194,9 @@ func (t *Tier) resolveMeta(ctx context.Context, bucket, key string, m *store.Obj
 		if herr != nil {
 			if isObjectNotFound(herr) {
 				if cur != nil && !t.readOnly {
-					_ = t.store.Delete(context.WithoutCancel(rctx), bucket, key)
+					if derr := t.store.Delete(context.WithoutCancel(rctx), bucket, key); derr != nil {
+						t.log.Warn("revalidate delete failed", "bucket", bucket, "key", key, "err", derr)
+					}
 				}
 				return nil, store.ErrNotFound
 			}
@@ -198,7 +204,9 @@ func (t *Tier) resolveMeta(ctx context.Context, bucket, key string, m *store.Obj
 		}
 		if cur != nil && (notMod || (attrs.ETag == cur.ETag && attrs.Size == cur.Size)) {
 			if !t.readOnly {
-				_ = t.store.MarkRevalidated(rctx, bucket, key, cur.ETag)
+				if rerr := t.store.MarkRevalidated(rctx, bucket, key, cur.ETag); rerr != nil {
+					t.log.Warn("mark revalidated failed", "bucket", bucket, "key", key, "err", rerr)
+				}
 			}
 			return revalRes{meta: cur, hit: true, changed: false}, nil
 		}
@@ -295,9 +303,9 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 	}
 
 	loIdx := int32(span.Start / t.chunkSize)
+	// Chunk alignment: firstSkip clips the leading chunk; hiIdx is inclusive of the final byte.
 	hiIdx := int32(span.End / t.chunkSize)
 
-	// 1-RTT single-chunk hit!
 	if loIdx == hiIdx && loIdx == fastIdx && fastChunk != nil {
 		wantLen := t.chunkLen(m.Size, loIdx)
 		if int64(len(fastChunk)) == wantLen {
@@ -312,7 +320,6 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 		}
 	}
 
-	// Multi-chunk or suffix fast-path stream from PostgreSQL if all chunks are already cached.
 	firstSkip := span.Start % t.chunkSize
 	totalLen := span.End - span.Start + 1
 	if m.ID > 0 && (loIdx != hiIdx || fastChunk != nil || rng.Suffix >= 0) {
@@ -328,7 +335,6 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 		}
 	}
 
-	// Fill missing chunks from origin.
 	chunks, err := t.store.GetChunks(ctx, m.ID, loIdx, hiIdx)
 	if err != nil {
 		return nil, err
@@ -364,7 +370,6 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 		idx = runEnd + 1
 	}
 
-	// Assemble response body from the chunks.
 	var readers []io.Reader
 	for idx := loIdx; idx <= hiIdx; idx++ {
 		c := chunks[idx]
@@ -447,7 +452,7 @@ func (t *Tier) fillChunkRun(ctx context.Context, m *store.ObjectMeta, firstIdx, 
 			chunk := buf[relOff : relOff+cLen]
 			out = append(out, chunk)
 			if err := t.store.PutChunk(fctx, m.ID, idx, chunk); err != nil {
-				t.log.Debug("store chunk failed", "bucket", m.Bucket, "key", m.Key, "idx", idx, "err", err)
+				t.log.Warn("store chunk failed", "bucket", m.Bucket, "key", m.Key, "idx", idx, "err", err)
 			}
 		}
 		return out, nil
