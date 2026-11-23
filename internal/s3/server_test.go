@@ -233,6 +233,43 @@ func TestReadOnlyDerivedFromTier(t *testing.T) {
 	}
 }
 
+func TestCheckReadPreconditions(t *testing.T) {
+	mod := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	before := mod.Add(-time.Hour).Format(http.TimeFormat)
+	same := mod.Format(http.TimeFormat)
+	after := mod.Add(time.Hour).Format(http.TimeFormat)
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+		wantErr error
+	}{
+		{"if-modified-since past", map[string]string{"If-Modified-Since": before}, nil},
+		{"if-modified-since equal", map[string]string{"If-Modified-Since": same}, store.ErrNotModified},
+		{"if-modified-since future", map[string]string{"If-Modified-Since": after}, store.ErrNotModified},
+		{"if-none-match overrides if-modified-since", map[string]string{"If-None-Match": `"other"`, "If-Modified-Since": after}, nil},
+		{"if-unmodified-since past", map[string]string{"If-Unmodified-Since": before}, errPreconditionFailed()},
+		{"if-unmodified-since equal", map[string]string{"If-Unmodified-Since": same}, nil},
+		{"if-unmodified-since future", map[string]string{"If-Unmodified-Since": after}, nil},
+		{"if-match overrides if-unmodified-since", map[string]string{"If-Match": `"etag1"`, "If-Unmodified-Since": before}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/b/k", nil)
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			err := checkReadPreconditions(req, "etag1", mod)
+			if tc.wantErr == nil && err != nil {
+				t.Fatalf("got %v, want nil", err)
+			}
+			if tc.wantErr != nil && (err == nil || err.Error() != tc.wantErr.Error()) {
+				t.Fatalf("got %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestParseRange(t *testing.T) {
 	tests := []struct {
 		in   string

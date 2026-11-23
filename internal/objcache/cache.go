@@ -166,37 +166,64 @@ func (t *Tier) resolveMeta(ctx context.Context, bucket, key string, m *store.Obj
 		return m, true, false, nil
 	}
 
-	ifNoneMatch := ""
-	if m != nil {
-		ifNoneMatch = m.ETag
+	type revalRes struct {
+		meta    *store.ObjectMeta
+		hit     bool
+		changed bool
 	}
-	attrs, notMod, herr := t.headOrigin(ctx, bucket, key, ifNoneMatch)
-	if herr != nil {
-		if isObjectNotFound(herr) {
-			if m != nil && !t.readOnly {
-				_ = t.store.Delete(context.WithoutCancel(ctx), bucket, key)
+	ch := t.group.DoChan("reval:"+bucket+"/"+key, func() (any, error) {
+		rctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
+		defer cancel()
+
+		cur := m
+		if cur != nil && !t.readOnly {
+			if fresh, gerr := t.store.GetObject(rctx, bucket, key); gerr == nil && t.isFresh(fresh.FilledAt) {
+				return revalRes{meta: fresh, hit: fresh.ETag == cur.ETag, changed: fresh.ETag != cur.ETag}, nil
 			}
-			return nil, false, false, store.ErrNotFound
 		}
-		return nil, false, false, herr
-	}
-	if m != nil && (notMod || (attrs.ETag == m.ETag && attrs.Size == m.Size)) {
+
+		ifNoneMatch := ""
+		if cur != nil {
+			ifNoneMatch = cur.ETag
+		}
+		attrs, notMod, herr := t.origin.AttributesIfNoneMatch(rctx, bucket, key, ifNoneMatch)
+		if herr != nil {
+			if isObjectNotFound(herr) {
+				if cur != nil && !t.readOnly {
+					_ = t.store.Delete(context.WithoutCancel(rctx), bucket, key)
+				}
+				return nil, store.ErrNotFound
+			}
+			return nil, herr
+		}
+		if cur != nil && (notMod || (attrs.ETag == cur.ETag && attrs.Size == cur.Size)) {
+			if !t.readOnly {
+				_ = t.store.MarkRevalidated(rctx, bucket, key, cur.ETag)
+			}
+			return revalRes{meta: cur, hit: true, changed: false}, nil
+		}
+		if attrs.ContentType == "" {
+			attrs.ContentType = contentTypeFor(key)
+		}
 		if !t.readOnly {
-			_ = t.store.MarkRevalidated(t.ctx, bucket, key, m.ETag)
+			id, uerr := t.store.UpsertObject(rctx, attrs)
+			if uerr != nil {
+				return nil, uerr
+			}
+			attrs.ID = id
 		}
-		return m, true, false, nil
-	}
-	if attrs.ContentType == "" {
-		attrs.ContentType = contentTypeFor(key)
-	}
-	if !t.readOnly {
-		id, uerr := t.store.UpsertObject(ctx, attrs)
-		if uerr != nil {
-			return nil, false, false, uerr
+		return revalRes{meta: &attrs, hit: false, changed: true}, nil
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, false, false, res.Err
 		}
-		attrs.ID = id
+		rr := res.Val.(revalRes)
+		return rr.meta, rr.hit, rr.changed, nil
+	case <-ctx.Done():
+		return nil, false, false, ctx.Err()
 	}
-	return &attrs, false, true, nil
 }
 
 func (t *Tier) Head(ctx context.Context, bucket, key string) (*store.ReadResult, error) {
@@ -362,32 +389,6 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 func (t *Tier) chunkLen(size int64, idx int32) int64 {
 	off := int64(idx) * t.chunkSize
 	return min(t.chunkSize, size-off)
-}
-
-func (t *Tier) headOrigin(ctx context.Context, bucket, key, ifNoneMatch string) (store.ObjectMeta, bool, error) {
-	type headRes struct {
-		attrs       store.ObjectMeta
-		notModified bool
-	}
-	ch := t.group.DoChan("head:"+bucket+"/"+key+":"+ifNoneMatch, func() (any, error) {
-		hctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
-		defer cancel()
-		attrs, notMod, err := t.origin.AttributesIfNoneMatch(hctx, bucket, key, ifNoneMatch)
-		if err != nil {
-			return nil, err
-		}
-		return headRes{attrs: attrs, notModified: notMod}, nil
-	})
-	select {
-	case res := <-ch:
-		if res.Err != nil {
-			return store.ObjectMeta{}, false, res.Err
-		}
-		hr := res.Val.(headRes)
-		return hr.attrs, hr.notModified, nil
-	case <-ctx.Done():
-		return store.ObjectMeta{}, false, ctx.Err()
-	}
 }
 
 func (t *Tier) fillChunkRun(ctx context.Context, m *store.ObjectMeta, firstIdx, lastIdx int32) ([][]byte, error) {

@@ -43,6 +43,7 @@ type fakeS3Origin struct {
 	nextUpload   int
 	counts       map[string]int // "OP:bucket/key" -> count
 	outage       bool
+	redirectReg  string
 	expectAK     string
 	expectRegion string
 	t            *testing.T
@@ -107,6 +108,12 @@ func (f *fakeS3Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if f.outage {
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if redir := f.redirectReg; redir != "" {
+		f.mu.Unlock()
+		w.Header().Set("x-amz-bucket-region", redir)
+		w.WriteHeader(http.StatusMovedPermanently)
 		return
 	}
 	f.mu.Unlock()
@@ -691,6 +698,51 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	cwg.Wait()
 	if got := fake.count("GET", "b1", "coal.bin"); got != 1 {
 		t.Fatalf("concurrent coalesce origin GETs = %d, want 1", got)
+	}
+
+	// Concurrent stale GETs coalesce to 1 origin HEAD; conditional 304 refreshes without origin GET.
+	_, gwTTL2 := openTestGateway(t, dbURL, originSrv.URL, 50*time.Millisecond)
+	fake.putDirect("b1", "stale304.bin", []byte("unchanged"), "text/plain")
+	if r := doReq(t, gwTTL2, http.MethodGet, "/b1/stale304.bin", nil, nil); r.Code != 200 {
+		t.Fatalf("cold stale304 = %d", r.Code)
+	}
+	time.Sleep(70 * time.Millisecond)
+	heads304Before := fake.count("HEAD", "b1", "stale304.bin")
+	gets304Before := fake.count("GET", "b1", "stale304.bin")
+	var swg sync.WaitGroup
+	for range 16 {
+		swg.Go(func() {
+			r := doReq(t, gwTTL2, http.MethodGet, "/b1/stale304.bin", nil, nil)
+			if r.Code != 200 || r.Body.String() != "unchanged" {
+				t.Errorf("concurrent stale304 = %d %q", r.Code, r.Body.String())
+			}
+		})
+	}
+	swg.Wait()
+	if got := fake.count("HEAD", "b1", "stale304.bin") - heads304Before; got != 1 {
+		t.Fatalf("concurrent stale GETs issued %d HEADs, want 1", got)
+	}
+	if fake.count("GET", "b1", "stale304.bin") != gets304Before {
+		t.Fatalf("304 refresh issued origin GET")
+	}
+	// Subsequent GET within TTL is a pure PG hit (0 origin HEADs).
+	if r := doReq(t, gwTTL2, http.MethodGet, "/b1/stale304.bin", nil, nil); r.Code != 200 || r.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("post-304 GET = %d X-Cache=%q", r.Code, r.Header().Get("X-Cache"))
+	}
+	if fake.count("HEAD", "b1", "stale304.bin") != heads304Before+1 {
+		t.Fatalf("post-304 GET within TTL hit origin")
+	}
+
+	// Gateway-level 301 PermanentRedirect with x-amz-bucket-region.
+	fake.mu.Lock()
+	fake.redirectReg = "us-west-2"
+	fake.mu.Unlock()
+	r301 := doReq(t, gwA, http.MethodGet, "/b1/wrong-region.bin", nil, nil)
+	fake.mu.Lock()
+	fake.redirectReg = ""
+	fake.mu.Unlock()
+	if r301.Code != http.StatusMovedPermanently || !strings.Contains(r301.Body.String(), "PermanentRedirect") || !strings.Contains(r301.Body.String(), "us-west-2") {
+		t.Fatalf("301 response = %d %s", r301.Code, r301.Body.String())
 	}
 
 	// Verify /metrics includes cache counters and latency buckets.
