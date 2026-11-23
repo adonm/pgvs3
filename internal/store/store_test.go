@@ -1,9 +1,12 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 )
 
 func TestByteRangeResolve(t *testing.T) {
@@ -57,4 +60,48 @@ func TestSchemaContainsExpectedTables(t *testing.T) {
 			t.Fatalf("schema.sql missing %q", want)
 		}
 	}
+}
+
+func TestTouchWorkerShutdownAndNoPanic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan struct{})
+		touchCtx, touchCancel := context.WithCancel(context.Background())
+		s := &Store{
+			touchCh:     make(chan [2]string, 16),
+			touchStop:   make(chan struct{}),
+			touchCancel: touchCancel,
+			touchDone:   make(chan struct{}),
+		}
+		go s.runTouchWorkerWith(touchCtx, func(ctx context.Context, _, _ string) error {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		})
+
+		// Fill buffer and wait for worker to enter first touch.
+		for i := range 16 {
+			s.TouchAsync("b", string(rune('a'+i)))
+		}
+		<-started
+
+		// Close must cancel in-flight work and return promptly without draining all 16 items.
+		done := make(chan struct{})
+		go func() {
+			s.Close()
+			close(done)
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("Close did not return promptly")
+		}
+
+		// TouchAsync after Close must be a no-op, not panic.
+		s.TouchAsync("b", "after-close")
+	})
 }

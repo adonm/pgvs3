@@ -37,6 +37,8 @@ type Store struct {
 	evictedObjects atomic.Int64
 	expiredObjects atomic.Int64
 	touchCh        chan [2]string
+	touchStop      chan struct{}
+	touchCancel    context.CancelFunc
 	closeOnce      sync.Once
 	touchDone      chan struct{}
 }
@@ -98,20 +100,31 @@ func OpenWithOptions(ctx context.Context, url string, opts OpenOptions, log *slo
 		pool.Close()
 		return nil, err
 	}
+	touchCtx, touchCancel := context.WithCancel(context.Background())
 	s := &Store{
-		pool:      pool,
-		log:       log,
-		touchCh:   make(chan [2]string, 1024),
-		touchDone: make(chan struct{}),
+		pool:        pool,
+		log:         log,
+		touchCh:     make(chan [2]string, 1024),
+		touchStop:   make(chan struct{}),
+		touchCancel: touchCancel,
+		touchDone:   make(chan struct{}),
 	}
-	go s.runTouchWorker()
+	go s.runTouchWorkerWith(touchCtx, func(ctx context.Context, bucket, key string) error {
+		_, err := s.pool.Exec(ctx, `UPDATE cache_objects SET last_access = now() WHERE bucket = $1 AND key = $2`, bucket, key)
+		return err
+	})
 	return s, nil
 }
 
 func (s *Store) Close() {
 	s.closeOnce.Do(func() {
-		if s.touchCh != nil {
-			close(s.touchCh)
+		if s.touchStop != nil {
+			close(s.touchStop)
+		}
+		if s.touchCancel != nil {
+			s.touchCancel()
+		}
+		if s.touchDone != nil {
 			<-s.touchDone
 		}
 		if s.pool != nil {
@@ -120,21 +133,35 @@ func (s *Store) Close() {
 	})
 }
 
-func (s *Store) runTouchWorker() {
+func (s *Store) runTouchWorkerWith(baseCtx context.Context, fn func(context.Context, string, string) error) {
 	defer close(s.touchDone)
-	for bk := range s.touchCh {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, _ = s.pool.Exec(ctx, `UPDATE cache_objects SET last_access = now() WHERE bucket = $1 AND key = $2`, bk[0], bk[1])
-		cancel()
+	for {
+		select {
+		case <-s.touchStop:
+			return
+		case bk := <-s.touchCh:
+			ctx, reqCancel := context.WithTimeout(baseCtx, 2*time.Second)
+			err := fn(ctx, bk[0], bk[1])
+			reqCancel()
+			if err != nil && !errors.Is(err, context.Canceled) && s.log != nil {
+				s.log.Warn("touch last_access failed", "bucket", bk[0], "key", bk[1], "err", err)
+			}
+		}
 	}
 }
 
 func (s *Store) TouchAsync(bucket, key string) {
-	if s.touchCh == nil {
+	if s.touchCh == nil || s.touchStop == nil {
 		return
 	}
 	select {
+	case <-s.touchStop:
+		return
+	default:
+	}
+	select {
 	case s.touchCh <- [2]string{bucket, key}:
+	case <-s.touchStop:
 	default:
 	}
 }
