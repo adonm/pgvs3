@@ -192,6 +192,27 @@ func TestSelectRoute(t *testing.T) {
 	}
 }
 
+func TestOriginAPIErrorExhaustive(t *testing.T) {
+	s := &Server{log: slog.New(slog.DiscardHandler)}
+	cases := []struct {
+		kind   objcache.OriginErrorKind
+		status int
+		code   string
+	}{
+		{objcache.OriginNotFound, http.StatusNotFound, "NoSuchKey"},
+		{objcache.OriginPrecondition, http.StatusPreconditionFailed, "PreconditionFailed"},
+		{objcache.OriginConflict, http.StatusConflict, "OperationAborted"},
+		{objcache.OriginWrongRegion, http.StatusMovedPermanently, "PermanentRedirect"},
+		{objcache.OriginOther, http.StatusInternalServerError, "InternalError"},
+	}
+	for _, tc := range cases {
+		ae := s.originAPIError(tc.kind, errors.New("boom"))
+		if ae.Status != tc.status || ae.Code != tc.code {
+			t.Fatalf("kind %d: got (%d, %s), want (%d, %s)", tc.kind, ae.Status, ae.Code, tc.status, tc.code)
+		}
+	}
+}
+
 func TestParseRange(t *testing.T) {
 	tests := []struct {
 		in   string

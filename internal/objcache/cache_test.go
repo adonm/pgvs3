@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adonm/pgvs3/internal/store"
+	"github.com/adonm/pgvs3/internal/s3client"
 )
 
 func TestS3OriginAllowlistAndTransparentBucket(t *testing.T) {
@@ -88,8 +88,8 @@ func TestS3OriginAllowlistAndTransparentBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer o412.Close()
-	if _, err := o412.GetRange(context.Background(), "b", "k", 0, 10, "stale"); !errors.Is(err, store.ErrPrecondition) {
-		t.Fatalf("412 range err = %v, want store.ErrPrecondition", err)
+	if _, err := o412.GetRange(context.Background(), "b", "k", 0, 10, "stale"); !errors.Is(err, s3client.ErrPrecondition) {
+		t.Fatalf("412 range err = %v, want ErrPrecondition", err)
 	}
 }
 

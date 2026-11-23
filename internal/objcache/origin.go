@@ -15,11 +15,25 @@ import (
 	"github.com/adonm/pgvs3/internal/store"
 )
 
-var (
-	ErrOriginConflict   = errors.New("origin conditional request conflict")
-	ErrWrongRegion      = errors.New("origin bucket is in a different region")
-	ErrBucketNotAllowed = errors.New("bucket is not in --buckets allowlist")
+type OriginErrorKind uint8
+
+const (
+	OriginOther OriginErrorKind = iota
+	OriginNotFound
+	OriginPrecondition
+	OriginConflict
+	OriginWrongRegion
 )
+
+type OriginError struct {
+	Kind OriginErrorKind
+	Err  error
+}
+
+func (e *OriginError) Error() string { return e.Err.Error() }
+func (e *OriginError) Unwrap() error { return e.Err }
+
+var ErrBucketNotAllowed = errors.New("bucket is not in --buckets allowlist")
 
 type S3Config struct {
 	Endpoint   string
@@ -192,17 +206,22 @@ func attrsFromS3(meta s3client.ObjectInfo, bucket, key string) store.ObjectMeta 
 
 func mapOriginError(err error) error {
 	switch {
-	case s3client.Conflict(err):
-		return ErrOriginConflict
+	case s3client.NotFound(err):
+		return &OriginError{Kind: OriginNotFound, Err: err}
 	case s3client.Precondition(err):
-		return store.ErrPrecondition
+		return &OriginError{Kind: OriginPrecondition, Err: err}
+	case s3client.Conflict(err):
+		return &OriginError{Kind: OriginConflict, Err: err}
 	case s3client.WrongRegion(err):
-		return fmt.Errorf("%w: %w", ErrWrongRegion, err)
+		return &OriginError{Kind: OriginWrongRegion, Err: err}
 	default:
-		return err
+		return &OriginError{Kind: OriginOther, Err: err}
 	}
 }
 
 func isObjectNotFound(err error) bool {
+	if oe, ok := errors.AsType[*OriginError](err); ok {
+		return oe.Kind == OriginNotFound
+	}
 	return s3client.NotFound(err)
 }

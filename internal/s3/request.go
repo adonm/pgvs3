@@ -78,19 +78,33 @@ func (s *Server) apiError(err error) error {
 	if ae, ok := errors.AsType[*APIError](err); ok {
 		return ae
 	}
+	if oe, ok := errors.AsType[*objcache.OriginError](err); ok {
+		return s.originAPIError(oe.Kind, oe.Err)
+	}
 	switch {
 	case errors.Is(err, objcache.ErrSpoolBusy):
 		return apiErr("SlowDown", "The cache scratch byte budget is busy; retry shortly.", http.StatusServiceUnavailable)
-	case errors.Is(err, objcache.ErrOriginConflict):
-		return apiErr("OperationAborted", "A conflicting conditional operation is in progress. Retry the request.", http.StatusConflict)
-	case errors.Is(err, objcache.ErrWrongRegion):
-		return apiErr("PermanentRedirect", err.Error(), http.StatusMovedPermanently)
 	case errors.Is(err, store.ErrPrecondition):
 		return errPreconditionFailed()
 	case errors.Is(err, store.ErrNotFound):
 		return errNoSuchKey()
 	case errors.Is(err, store.ErrInvalidRange):
 		return errInvalidRange()
+	default:
+		return errInternal(err, s.log)
+	}
+}
+
+func (s *Server) originAPIError(kind objcache.OriginErrorKind, err error) *APIError {
+	switch kind {
+	case objcache.OriginNotFound:
+		return errNoSuchKey()
+	case objcache.OriginPrecondition:
+		return errPreconditionFailed()
+	case objcache.OriginConflict:
+		return apiErr("OperationAborted", "A conflicting conditional operation is in progress. Retry the request.", http.StatusConflict)
+	case objcache.OriginWrongRegion:
+		return apiErr("PermanentRedirect", err.Error(), http.StatusMovedPermanently)
 	default:
 		return errInternal(err, s.log)
 	}
