@@ -607,8 +607,12 @@ func TestReadThroughCacheIntegration(t *testing.T) {
 	// 8. Partial fills, concurrent coalesce, odd-tail multi-chunk, zero-byte object.
 	fake.putDirect("b1", "empty.bin", []byte{}, "application/octet-stream")
 	rz := doReq(t, gwA, http.MethodGet, "/b1/empty.bin", nil, nil)
-	if rz.Code != 200 || rz.Body.Len() != 0 {
-		t.Fatalf("zero-byte GET = %d len=%d", rz.Code, rz.Body.Len())
+	if rz.Code != 200 || rz.Body.Len() != 0 || rz.Header().Get("X-Cache") != "MISS" {
+		t.Fatalf("cold zero-byte GET = %d len=%d X-Cache=%q, want 200 len=0 MISS", rz.Code, rz.Body.Len(), rz.Header().Get("X-Cache"))
+	}
+	rz2 := doReq(t, gwA, http.MethodGet, "/b1/empty.bin", nil, nil)
+	if rz2.Code != 200 || rz2.Body.Len() != 0 || rz2.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("warm zero-byte GET = %d len=%d X-Cache=%q, want 200 len=0 HIT", rz2.Code, rz2.Body.Len(), rz2.Header().Get("X-Cache"))
 	}
 	if rzr := doReq(t, gwA, http.MethodGet, "/b1/empty.bin", nil, map[string]string{"Range": "bytes=0-0"}); rzr.Code != 416 {
 		t.Fatalf("zero-byte range = %d, want 416", rzr.Code)

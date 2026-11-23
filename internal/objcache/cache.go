@@ -242,7 +242,7 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 		return nil, err
 	}
 
-	m, _, changed, err := t.resolveMeta(ctx, bucket, key, m)
+	m, metaHit, changed, err := t.resolveMeta(ctx, bucket, key, m)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +262,7 @@ func (t *Tier) open(ctx context.Context, bucket, key string, rng store.ByteRange
 		return &store.ReadResult{
 			ObjectMeta: *m,
 			Body:       io.NopCloser(bytes.NewReader(nil)),
-			Start:      span.Start, End: span.End, Ranged: span.Ranged, Hit: true,
+			Start:      span.Start, End: span.End, Ranged: span.Ranged, Hit: metaHit,
 		}, nil
 	}
 
