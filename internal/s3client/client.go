@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -176,7 +177,11 @@ func (b *Bucket) Proxy(ctx context.Context, method, key string, query url.Values
 			return nil, err
 		}
 	}
-	return b.client.do(ctx, method, object, query, body, size, extra...)
+	req, err := b.client.newRequest(ctx, method, object, query, body, size, extra...)
+	if err != nil {
+		return nil, err
+	}
+	return b.client.send(req)
 }
 
 func (c *client) target(object string) (decoded, escaped string) {
@@ -292,16 +297,18 @@ func replayableBody(body io.Reader) bool {
 }
 
 func retryableStatus(code int) bool {
-	switch code {
-	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
-		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	}
-	return false
+	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable
 }
 
 func retryableError(err error) bool {
-	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func (c *client) do(ctx context.Context, method, object string, query url.Values, body io.Reader, size int64, extra ...[2]string) (*http.Response, error) {
@@ -309,11 +316,11 @@ func (c *client) do(ctx context.Context, method, object string, query url.Values
 	if err != nil {
 		return nil, err
 	}
-	replayable := replayableBody(body)
+	canRetry := (method == http.MethodGet || method == http.MethodHead) && replayableBody(body)
 	backoff := 15 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		resp, err := c.send(req)
-		retry := attempt < 2 && replayable &&
+		retry := canRetry && attempt < 2 &&
 			((err != nil && retryableError(err)) || (err == nil && retryableStatus(resp.StatusCode)))
 		if !retry {
 			return resp, err

@@ -2,11 +2,14 @@ package s3client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -109,5 +112,65 @@ func TestStatWrongRegionMapsToErrWrongRegion(t *testing.T) {
 	_, err = b.Stat(context.Background(), "key.txt")
 	if !WrongRegion(err) || !strings.Contains(err.Error(), "us-west-2") {
 		t.Fatalf("Stat 301 err = %v, want WrongRegion mentioning us-west-2", err)
+	}
+}
+
+func TestProxyDoesNotRetryAndGetRetriesOnlyTransient(t *testing.T) {
+	var putAttempts, get500Attempts, get503Attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "PUT /bkt/no-retry":
+			putAttempts.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case "GET /bkt/no-retry-500":
+			get500Attempts.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		case "GET /bkt/retry-503":
+			if get503Attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok")
+		}
+	}))
+	defer srv.Close()
+
+	b, err := New(Config{Bucket: "bkt", Endpoint: srv.URL, Region: "us-east-1", PathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	resp, err := b.Proxy(context.Background(), http.MethodPut, "no-retry", nil, strings.NewReader("payload"), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if putAttempts.Load() != 1 {
+		t.Fatalf("Proxy PUT attempts = %d, want 1", putAttempts.Load())
+	}
+
+	if _, err := b.Get(context.Background(), "no-retry-500", 0, -1, ""); err == nil {
+		t.Fatal("expected error on 500")
+	}
+	if get500Attempts.Load() != 1 {
+		t.Fatalf("GET 500 attempts = %d, want 1", get500Attempts.Load())
+	}
+
+	rc, err := b.Get(context.Background(), "retry-503", 0, -1, "")
+	if err != nil {
+		t.Fatalf("GET 503->200 err = %v", err)
+	}
+	_ = rc.Close()
+	if get503Attempts.Load() != 2 {
+		t.Fatalf("GET 503 attempts = %d, want 2", get503Attempts.Load())
+	}
+
+	if retryableError(errors.New("permanent failure")) {
+		t.Fatal("non-transient error should not be retryable")
+	}
+	if !retryableError(syscall.ECONNRESET) {
+		t.Fatal("ECONNRESET should be retryable")
 	}
 }
