@@ -6,9 +6,7 @@ This package is pgvs3's S3 origin client. It began as a fork of
 `h1:PYHcGLECRzYkBY5bL6SKgdE1iHo9A47BqsY+hGfkNvE=`) and is now trimmed to
 the surface pgvs3's read-through cache and passthrough proxy use.
 
-The Apache License 2.0 text is preserved in `LICENSE`. Files derived from
-upstream retain their copyright headers. The SigV4 implementation in
-`signer.go` is adapted from upstream `aws/v4.go`.
+The Apache License 2.0 text is preserved in `LICENSE`. `client.go`, `signer.go`, and their tests retain their upstream copyright headers (`object.go` was rewritten for pgvs3 and carries no upstream header). The SigV4 implementation in `signer.go` is adapted from upstream `aws/v4.go`.
 
 ## Supported surface
 
@@ -44,8 +42,9 @@ func (*Bucket) Proxy(ctx context.Context, method, key string, query url.Values, 
 func (*Bucket) Close() error
 
 type Error struct { Op, Key string; StatusCode int; Code, Message string; Err error }
-var ErrNotFound, ErrPrecondition, ErrConflict error
+var ErrNotFound, ErrPrecondition, ErrConflict, ErrWrongRegion, ErrIMDS error
 func NotFound(error) bool
 func Precondition(error) bool
 func Conflict(error) bool
+func WrongRegion(error) bool
 ```

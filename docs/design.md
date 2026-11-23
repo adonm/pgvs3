@@ -12,7 +12,7 @@
   3. IRSA web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` via STS `AssumeRoleWithWebIdentity`)
   4. IMDSv2 (`169.254.169.254`)
   5. Anonymous/unsigned
-- **PostgreSQL store (`internal/store`)**: two tables (`internal/store/schema.sql`):
+- **PostgreSQL store (`internal/store`)**: two cache tables plus `cache_layout` (`internal/store/schema.sql`):
   - `cache_objects`: one row per `(bucket, key)` with origin ETag, size and response metadata, plus `last_access` for LRU eviction.
   - `cache_chunks`: `(object_id, idx)` → raw chunk bytes (`STORAGE EXTERNAL`), deleted with their object. Bytes are stored uncompressed because lake formats are already compressed.
 

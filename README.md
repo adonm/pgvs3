@@ -33,4 +33,4 @@ pgvs3 serve \
 
 ## Public S3 Smoke
 
-`just s3-public` (`test/s3-public.sh`) runs an optional, network-dependent smoke against real anonymous-access AWS S3 RODA buckets (`overturemaps-us-west-2`, `noaa-gsod-pds`, `tripdata`); it is excluded from `just ci` and runs weekly via `.github/workflows/s3-public.yml`.
+`just s3-public` (`test/s3-public.sh`) runs an optional, network-dependent smoke against real anonymous-access Registry of Open Data on AWS (RODA) buckets (`overturemaps-us-west-2`, `noaa-gsod-pds`, `tripdata`); it is excluded from `just ci` and runs weekly via `.github/workflows/s3-public.yml`.

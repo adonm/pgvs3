@@ -44,7 +44,7 @@ otherwise starts a disposable PostgreSQL container. Test layers:
 | --- | --- |
 | Pure logic | Go unit tests |
 | Store, cache and S3 behaviour against PostgreSQL | `-tags=integration` Go tests with the in-process fake origin |
-| Real S3 wire behaviour and clients | versitygw + boto3/DuckDB smoke in `test/integration.sh` |
+| Real S3 wire behaviour and clients | versitygw + uv-managed Python (`boto3`/DuckDB) smoke in `test/integration.sh` |
 | Real AWS S3 public buckets (weekly/manual) | `just s3-public` (`test/s3-public.sh`, network-dependent, not in `just ci`) |
 
 ## Style
